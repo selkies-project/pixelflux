@@ -213,6 +213,24 @@ fn get_shm_usage_bytes() -> u64 {
     total_size
 }
 
+/// Memory reads for the throttle watchdog, answered from a 100 ms cache: the
+/// render timer re-arms at 1 ms while an encode pool is saturated, and a
+/// per-tick /proc read plus a full /dev/shm directory walk would spin the
+/// syscall count of an otherwise deliberate busy-wait. The watchdog is a
+/// hysteresis and tolerates the staleness.
+fn get_cached_mem_usage() -> (usize, u64) {
+    static CACHE: std::sync::Mutex<Option<(Instant, usize, u64)>> = std::sync::Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, rss, shm)) = *guard {
+        if at.elapsed() < Duration::from_millis(100) {
+            return (rss, shm);
+        }
+    }
+    let sampled = (Instant::now(), get_process_rss_bytes(), get_shm_usage_bytes());
+    *guard = Some(sampled);
+    (sampled.1, sampled.2)
+}
+
 fn calculate_memory_threshold(width: i32, height: i32) -> usize {
     let frame_size = (width.max(0) as usize)
         .saturating_mul(height.max(0) as usize)
@@ -3912,8 +3930,7 @@ fn run_wayland_thread(
             let loop_start_time = Instant::now();
             state.space.refresh();
 
-            let current_rss = get_process_rss_bytes();
-            let shm_usage = get_shm_usage_bytes();
+            let (current_rss, shm_usage) = get_cached_mem_usage();
             // The threshold follows the largest active capture (fallback: primary settings).
             let (max_w, max_h) = state
                 .output_nodes

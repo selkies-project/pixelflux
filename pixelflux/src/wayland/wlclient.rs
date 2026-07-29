@@ -218,10 +218,30 @@ pub(crate) fn read_fd_to_end(fd: &OwnedFd, idle: Duration) -> Result<Vec<u8>, St
 
 /// Write all of `data` to `fd`, tolerating a slow reader up to `idle` per chunk.
 /// EPIPE is success-shaped: the paster stopped reading, which is its right.
+///
+/// The fd is switched to non-blocking for the transfer (original flags are
+/// restored on every exit path): a single blocking write() of a large payload
+/// would stay parked in the kernel once the peer stops draining mid-transfer,
+/// and the poll deadline could never fire. With O_NONBLOCK, write() returns
+/// EAGAIN instead and the idle deadline bounds the whole transfer.
 pub(crate) fn write_fd_all(fd: &OwnedFd, data: &[u8], idle: Duration) -> Result<(), String> {
+    let raw = fd.as_raw_fd();
+    let old_flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if old_flags < 0 {
+        return Err(format!("fcntl F_GETFL: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::fcntl(raw, libc::F_SETFL, old_flags | libc::O_NONBLOCK) } < 0 {
+        return Err(format!("fcntl F_SETFL: {}", std::io::Error::last_os_error()));
+    }
+    let result = write_fd_all_nb(raw, data, idle);
+    unsafe { libc::fcntl(raw, libc::F_SETFL, old_flags) };
+    result
+}
+
+fn write_fd_all_nb(raw: i32, data: &[u8], idle: Duration) -> Result<(), String> {
     let mut written = 0;
     while written < data.len() {
-        let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        let mut pfd = libc::pollfd { fd: raw, events: libc::POLLOUT, revents: 0 };
         let n = unsafe { libc::poll(&mut pfd, 1, idle.as_millis().max(1) as libc::c_int) };
         if n < 0 {
             let err = std::io::Error::last_os_error();
@@ -235,7 +255,7 @@ pub(crate) fn write_fd_all(fd: &OwnedFd, data: &[u8], idle: Duration) -> Result<
         }
         let w = unsafe {
             libc::write(
-                fd.as_raw_fd(),
+                raw,
                 data[written..].as_ptr() as *const libc::c_void,
                 data.len() - written,
             )
@@ -243,7 +263,7 @@ pub(crate) fn write_fd_all(fd: &OwnedFd, data: &[u8], idle: Duration) -> Result<
         if w < 0 {
             let err = std::io::Error::last_os_error();
             match err.raw_os_error() {
-                Some(libc::EINTR) => continue,
+                Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
                 Some(libc::EPIPE) => return Ok(()),
                 _ => return Err(format!("write: {err}")),
             }

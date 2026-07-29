@@ -1304,7 +1304,8 @@ impl SelectionHandler for AppState {
     }
 
     /// A client pastes the Python-owned selection: stream the stored bytes into the client's
-    /// fd on a spawned thread, since the receiving pipe may backpressure.
+    /// fd on a spawned thread, since the receiving pipe may backpressure. Bounded by an
+    /// idle deadline: a client that never reads its paste fd must not pin the thread.
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
@@ -1318,9 +1319,11 @@ impl SelectionHandler for AppState {
         }
         let payload = user_data.clone();
         std::thread::spawn(move || {
-            use std::io::Write;
-            let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&payload.1);
+            let _ = crate::wayland::wlclient::write_fd_all(
+                &fd,
+                &payload.1,
+                crate::wayland::wlclient::IO_TIMEOUT,
+            );
         });
     }
 }
