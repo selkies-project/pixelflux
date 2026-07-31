@@ -139,6 +139,26 @@ pub mod encoders {
     pub mod software;
     /// VA-API hardware H.264 encoder for Intel / AMD GPUs via FFmpeg.
     pub mod vaapi;
+    /// Minimum H.264 level for a stream of these dimensions at this frame rate, on the
+    /// 5.2-6.2 conformance ladder every hardware encoder here shares. NVENC's startup
+    /// clamp historically also covers all smaller sizes; keeping ONE ladder avoids two
+    /// encoders disagreeing on the same geometry.
+    pub(crate) fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
+        let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
+        let mbps = mbs * fps.max(1) as u64;
+        const LEVELS: [(u32, u64, u64); 4] = [
+            (52, 36864, 2073600),
+            (60, 139264, 4177920),
+            (61, 139264, 8355840),
+            (62, 139264, 16711680),
+        ];
+        for &(level, max_fs, max_mbps) in &LEVELS {
+            if mbs <= max_fs && mbps <= max_mbps {
+                return level;
+            }
+        }
+        62
+    }
 
     /// Size the CBR VBV/HRD buffer so rate control has enough slack to hold quality steady
     /// without letting end-to-end latency drift upward.
@@ -1554,6 +1574,89 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
 /// the new logical size, resolve the encode path (zero-copy vs readback), and spawn the
 /// delivery (and readback-mode encode) threads. The single-display behavior of the former
 /// global StartCapture is preserved exactly for display 0.
+/// Bring up the readback encode path (pixman readback → pool → encode thread) for a
+/// capture whose zero-copy session is absent or just died. Mirrors the start-capture
+/// bootstrap: u64::MAX content generations mark every pool slot stale so each one is
+/// read back before its first publish, whatever the damage says.
+fn bootstrap_readback_pool(
+    cap: &mut wayland::frontend::WlCapture,
+    display_id: u32,
+    use_gpu: bool,
+    try_gpu: bool,
+    prior: Option<GpuEncoder>,
+) {
+    let Some(deliver_tx) = cap.deliver_tx.clone() else {
+        return;
+    };
+    let settings = cap.settings.clone();
+    let pool = Arc::new(WlFramePool::new(
+        WL_POOL_SURFACES,
+        (settings.width.max(0) as usize) * (settings.height.max(0) as usize) * 4,
+    ));
+    cap.pool_last_render = vec![0; WL_POOL_SURFACES];
+    cap.render_seq = 0;
+    cap.pool_content_gen = vec![u64::MAX; WL_POOL_SURFACES];
+    cap.content_gen = 0;
+    let c = &cap.encode_controls;
+    c.bitrate_kbps.store(settings.video_bitrate_kbps, Ordering::Relaxed);
+    c.vbv_mult_milli.store(
+        (settings.video_vbv_multiplier * 1000.0).round() as i32,
+        Ordering::Relaxed,
+    );
+    c.fps_milli.store(
+        (settings.target_fps.max(1.0) * 1000.0) as u64,
+        Ordering::Relaxed,
+    );
+    let cfg = WlEncodeConfig {
+        settings: settings.clone(),
+        display_id,
+        use_gpu,
+        try_gpu,
+        prior,
+        recording_sink: cap.recording_sink.clone(),
+        deliver_tx,
+        controls: cap.encode_controls.clone(),
+        stats: cap.encode_stats.clone(),
+    };
+    let pool2 = pool.clone();
+    cap.encode_join = Some(
+        thread::Builder::new()
+            .name(format!("wl-encode-{display_id}"))
+            .spawn(move || wayland_encode_loop(&pool2, cfg))
+            .expect("failed to spawn wl-encode thread"),
+    );
+    cap.encode_pool = Some(pool);
+}
+
+/// Rebuild a broken zero-copy hardware session with the startup construction (driver
+/// match, EGL display hand-over); VAAPI stays excluded under fullcolor exactly like
+/// startup. `None` means unrecoverable — the caller demotes to readback.
+fn rebuild_zerocopy_encoder(
+    cap: &wayland::frontend::WlCapture,
+    state: &mut AppState,
+) -> Option<GpuEncoder> {
+    let settings = &cap.settings;
+    let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
+    if encode_driver.contains("nvidia") {
+        let egl_display = state
+            .gles_renderer
+            .as_ref()
+            .map(|r| r.egl_context().display().get_display_handle().handle)
+            .unwrap_or(std::ptr::null());
+        NvencEncoder::new(settings, egl_display)
+            .ok()
+            .map(GpuEncoder::Nvenc)
+    } else if !settings.video_fullcolor {
+        VaapiEncoder::new(settings).ok().map(GpuEncoder::Vaapi)
+    } else {
+        None
+    }
+}
+
+/// Consecutive encode failures before the zero-copy path recovers (~0.5s at 60fps):
+/// a hiccup outlasts it, anything longer starts to look like a dead session.
+const HW_ERROR_RECOVERY_THRESHOLD: u32 = 30;
+
 fn start_capture_on_display(
     state: &mut AppState,
     display_id: u32,
@@ -1882,6 +1985,7 @@ fn start_capture_on_display(
         pending_force_idr: false,
         needs_full_render: true,
         last_tick: None,
+        hw_error_streak: 0,
     };
 
     {
@@ -1914,47 +2018,13 @@ fn start_capture_on_display(
     }
 
     if cap.video_encoder.is_none() {
-        if let Some(deliver_tx) = cap.deliver_tx.clone() {
-            let pool = Arc::new(WlFramePool::new(
-                WL_POOL_SURFACES,
-                (settings.width.max(0) as usize) * (settings.height.max(0) as usize) * 4,
-            ));
-            cap.pool_last_render = vec![0; WL_POOL_SURFACES];
-            cap.render_seq = 0;
-            // u64::MAX marks every slot stale so each one is read back before its
-            // first publish, whatever the damage says.
-            cap.pool_content_gen = vec![u64::MAX; WL_POOL_SURFACES];
-            cap.content_gen = 0;
-            let c = &cap.encode_controls;
-            c.bitrate_kbps.store(settings.video_bitrate_kbps, Ordering::Relaxed);
-            c.vbv_mult_milli.store(
-                (settings.video_vbv_multiplier * 1000.0).round() as i32,
-                Ordering::Relaxed,
-            );
-            c.fps_milli.store(
-                (settings.target_fps.max(1.0) * 1000.0) as u64,
-                Ordering::Relaxed,
-            );
-            let cfg = WlEncodeConfig {
-                settings: settings.clone(),
-                display_id,
-                use_gpu: state.use_gpu,
-                try_gpu: gpu_intent && (!state.use_gpu || different_gpu),
-                prior: prior_readback_encoder.take(),
-                recording_sink: cap.recording_sink.clone(),
-                deliver_tx,
-                controls: cap.encode_controls.clone(),
-                stats: cap.encode_stats.clone(),
-            };
-            let pool2 = pool.clone();
-            cap.encode_join = Some(
-                thread::Builder::new()
-                    .name(format!("wl-encode-{display_id}"))
-                    .spawn(move || wayland_encode_loop(&pool2, cfg))
-                    .expect("failed to spawn wl-encode thread"),
-            );
-            cap.encode_pool = Some(pool);
-        }
+        bootstrap_readback_pool(
+            &mut cap,
+            display_id,
+            state.use_gpu,
+            gpu_intent && (!state.use_gpu || different_gpu),
+            prior_readback_encoder.take(),
+        );
     } else {
         cap.encode_stats.n_stripes.store(1, Ordering::Relaxed);
         *cap.encode_stats.desc.lock().unwrap() =
@@ -2700,6 +2770,27 @@ fn render_node_tick(
         }
 
         if let Some(cap) = node.capture.as_mut() {
+            // A dead encode thread (panic, unexpected exit) cannot drain the pool;
+            // every publish would park the slot and each tick would silently skip
+            // while is_capturing still reports true. Rebuild the readback path in
+            // place, reusing a cleanly handed-back encoder session if any.
+            if cap.encode_join.as_ref().is_some_and(|j| j.is_finished()) {
+                let prior = cap
+                    .encode_join
+                    .take()
+                    .map(|j| j.join().ok().flatten())
+                    .flatten();
+                if let Some(pool) = cap.encode_pool.take() {
+                    pool.shutdown();
+                }
+                let s = &cap.settings;
+                let try_gpu = s.output_mode == 1
+                    && !s.use_openh264
+                    && !(s.use_cpu || s.encode_node_index == -1);
+                eprintln!("[Wayland] encode thread died; rebuilding the readback path.");
+                bootstrap_readback_pool(cap, node.id, state.use_gpu, try_gpu, prior);
+                cap.request_idr();
+            }
             if is_memory_throttling {
                 if cap.encode_pool.is_none() {
                     cap.frame_counter = cap.frame_counter.wrapping_add(1);
@@ -2792,6 +2883,7 @@ fn render_node_tick(
                     };
 
                     if let Ok(data) = result {
+                        cap.hw_error_streak = 0;
                         if !data.is_empty() {
                             frame_out = true;
                             cap.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
@@ -2818,6 +2910,34 @@ fn render_node_tick(
                         }
                     } else if let Err(e) = result {
                         eprintln!("HW Encode Error: {}", e);
+                        cap.hw_error_streak = cap.hw_error_streak.saturating_add(1);
+                        if cap.hw_error_streak == HW_ERROR_RECOVERY_THRESHOLD {
+                            // The zero-copy session persistently fails after having
+                            // worked (driver hiccup, CUDA pressure from a co-tenant):
+                            // rebuild the session once, else demote to the readback
+                            // path. Streaming black frames forever is not an option.
+                            match rebuild_zerocopy_encoder(cap, state) {
+                                Some(enc) => {
+                                    cap.video_encoder = Some(enc);
+                                    cap.pending_force_idr = true;
+                                    eprintln!("[Wayland] zero-copy HW encoder rebuilt after repeated encode errors.");
+                                }
+                                None => {
+                                    eprintln!("[Wayland] zero-copy HW encoder unrecoverable; demoting to readback encode.");
+                                    cap.video_encoder = None;
+                                    // Mirror the startup intent: readback still
+                                    // tries the GPU unless the operator opted out.
+                                    let s = &cap.settings;
+                                    let try_gpu = s.output_mode == 1
+                                        && !s.use_openh264
+                                        && !(s.use_cpu || s.encode_node_index == -1);
+                                    bootstrap_readback_pool(
+                                        cap, node.id, state.use_gpu, try_gpu, None,
+                                    );
+                                }
+                            }
+                            cap.hw_error_streak = 0;
+                        }
                     }
                 }
                 // An unserved request stays armed: on an infinite GOP an IDR lost to an
@@ -3529,11 +3649,20 @@ fn run_wayland_thread(
                     } else {
                         vec![mime.clone()]
                     };
+                    let payload = std::sync::Arc::new((mime, data));
                     smithay::wayland::selection::data_device::set_data_device_selection(
                         &state.dh,
                         &state.seat.clone(),
+                        mimes.clone(),
+                        payload.clone(),
+                    );
+                    // Middle-click parity with the X11 clipboard bridge: the same
+                    // offer backs the primary selection too.
+                    smithay::wayland::selection::primary_selection::set_primary_selection(
+                        &state.dh,
+                        &state.seat.clone(),
                         mimes,
-                        std::sync::Arc::new((mime, data)),
+                        payload,
                     );
                     // The selection is compositor-owned now; a later SetClipboardCallback
                     // must not try to re-read a client source that no longer holds it.
@@ -5529,9 +5658,15 @@ impl ScreenCapture {
 /// atexit sweep.
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
-        if let Ok(st) = self.inner.lock() {
+        if let Ok(mut st) = self.inner.lock() {
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
+            }
+            // Pair the cursor-monitor acquire from start_capture: a dropped
+            // handle that never got stop_capture would pin the refcount and its
+            // monitor thread forever.
+            if std::mem::take(&mut st.cursor_ref) && !crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+                Python::attach(crate::x11::cursor::release);
             }
         }
     }
@@ -5667,6 +5802,7 @@ fn _stop_all_captures(py: Python<'_>) {
     py.detach(crate::recorder::finalize_on_exit);
     *PENDING_CURSOR_CALLBACK.lock().unwrap() = None;
     crate::x11::cursor::shutdown();
+    crate::wayland::dcclient::unwatch_all();
     if let Some(slot) = LIVE_X11.get() {
         for c in slot.lock().unwrap().iter() {
             c.stop.store(true, Ordering::Relaxed);

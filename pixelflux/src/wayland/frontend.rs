@@ -226,6 +226,9 @@ pub struct WlCapture {
     /// Last tick this capture actually rendered; paces per-display fps under the one
     /// shared render timer (which fires at the fastest active capture's rate).
     pub last_tick: Option<Instant>,
+    /// Consecutive zero-copy encode failures: past the recovery threshold the session
+    /// is rebuilt once, then the capture demotes to the readback path.
+    pub hw_error_streak: u32,
 }
 
 impl WlCapture {
@@ -1314,7 +1317,7 @@ impl SelectionHandler for AppState {
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
-        if ty != SelectionTarget::Clipboard {
+        if ty != SelectionTarget::Clipboard && ty != SelectionTarget::Primary {
             return;
         }
         let payload = user_data.clone();

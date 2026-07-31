@@ -21,6 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::io::Cursor;
+use std::io::Read;
 
 use smithay::input::keyboard::xkb;
 
@@ -917,8 +918,15 @@ pub fn run_cu_server(addr: String) {
 
     let mut last_backend = "";
     for mut request in server.incoming_requests() {
+        // A CU body is a single input command: cap its size so a hostile client
+        // of the (unauthenticated) endpoint cannot exhaust memory with a giant POST.
+        const MAX_CU_BODY: u64 = 4 * 1024 * 1024;
         let mut body = String::new();
-        if let Err(e) = request.as_reader().read_to_string(&mut body) {
+        if let Err(e) = request
+            .as_reader()
+            .take(MAX_CU_BODY + 1)
+            .read_to_string(&mut body)
+        {
             let _ = request.respond(tiny_http::Response::from_string(format!(
                 "{{\"error\":\"{}\"}}", e
             ))
@@ -926,6 +934,18 @@ pub fn run_cu_server(addr: String) {
             .with_header(
                 "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
             ));
+            continue;
+        }
+
+        if body.len() as u64 > MAX_CU_BODY {
+            let resp = tiny_http::Response::from_string(
+                "{\"error\":\"request body too large\"}".to_string(),
+            )
+            .with_status_code(413)
+            .with_header(
+                "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
+            );
+            let _ = request.respond(resp);
             continue;
         }
 

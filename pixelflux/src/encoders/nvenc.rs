@@ -533,22 +533,7 @@ impl Drop for NvencEncoder {
 /// level is fixed from frame 1 (with the profile held at High) the stream never bumps its level
 /// mid-GOP — which would force some hardware decoders to re-initialize. Above 6.2's limits there is
 /// no higher level, so it returns 6.2 as a best effort.
-fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
-    let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
-    let mbps = mbs * fps.max(1) as u64;
-    const LEVELS: [(u32, u64, u64); 4] = [
-        (52, 36864, 2073600),
-        (60, 139264, 4177920),
-        (61, 139264, 8355840),
-        (62, 139264, 16711680),
-    ];
-    for &(level, max_fs, max_mbps) in &LEVELS {
-        if mbs <= max_fs && mbps <= max_mbps {
-            return level;
-        }
-    }
-    62
-}
+use super::min_h264_level;
 
 impl NvencEncoder {
     /// Resolve EGL at runtime rather than link against it, so one binary boots even on hosts

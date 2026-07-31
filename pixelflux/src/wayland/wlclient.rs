@@ -193,9 +193,25 @@ pub(crate) fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
 /// Read `fd` to EOF. The deadline is per-chunk (idle), so a large transfer that
 /// keeps flowing is never cut off while a stalled writer still errors out.
 pub(crate) fn read_fd_to_end(fd: &OwnedFd, idle: Duration) -> Result<Vec<u8>, String> {
+    read_fd_to_end_capped(fd, idle, READ_CAP_MAX)
+}
+
+/// Same as `read_fd_to_end` but bounded: a hostile or stuck source can otherwise
+/// stream unbounded bytes into memory (the compositor-internal read caps at the
+/// same 64 MiB the selkies clipboard protocol allows).
+const READ_CAP_MAX: usize = 64 * 1024 * 1024;
+
+pub(crate) fn read_fd_to_end_capped(
+    fd: &OwnedFd,
+    idle: Duration,
+    cap: usize,
+) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 65536];
     loop {
+        if out.len() >= cap {
+            return Err(format!("clipboard source exceeds the {cap} byte cap"));
+        }
         if !wait_readable(fd.as_raw_fd(), idle)? {
             return Err("clipboard source stalled".into());
         }
@@ -212,7 +228,8 @@ pub(crate) fn read_fd_to_end(fd: &OwnedFd, idle: Duration) -> Result<Vec<u8>, St
         if n == 0 {
             return Ok(out);
         }
-        out.extend_from_slice(&chunk[..n as usize]);
+        let take = (cap - out.len()).min(n as usize);
+        out.extend_from_slice(&chunk[..take]);
     }
 }
 

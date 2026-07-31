@@ -294,7 +294,8 @@ impl VaapiEncoder {
 
         let width = settings.width;
         let height = settings.height;
-        let fps = settings.target_fps as i32;
+        // AVRational.den must stay nonzero: a sub-1 fps setting would truncate to 0.
+        let fps = (settings.target_fps as i32).max(1);
 
         unsafe {
             let mut drm_device_ctx: *mut ff::AVBufferRef = ptr::null_mut();
@@ -436,7 +437,11 @@ impl VaapiEncoder {
             }
             set_opt(&mut opts, "async_depth", "1");
             set_opt(&mut opts, "profile", "high");
-            set_opt(&mut opts, "level", "4.1");
+            set_opt(
+                &mut opts,
+                "level",
+                &super::min_h264_level(width as u32, height as u32, fps as u32).to_string(),
+            );
 
             let ret = ff::avcodec_open2(encoder_ctx, codec, &mut opts);
             ff::av_dict_free(&mut opts);
@@ -699,7 +704,12 @@ impl VaapiEncoder {
         }
         set_opt(&mut opts, "async_depth", "1");
         set_opt(&mut opts, "profile", "high");
-        set_opt(&mut opts, "level", "4.1");
+        set_opt(
+            &mut opts,
+            "level",
+            &super::min_h264_level(self.width as u32, self.height as u32, self.fps.max(1) as u32)
+                .to_string(),
+        );
 
         let ret = ff::avcodec_open2(self.encoder_ctx, self.codec, &mut opts);
         ff::av_dict_free(&mut opts);

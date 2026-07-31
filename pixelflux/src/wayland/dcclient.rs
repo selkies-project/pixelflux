@@ -329,6 +329,17 @@ pub(crate) fn watch(socket_path: &str, callback: Py<PyAny>) -> Result<(), String
     Ok(())
 }
 
+/// Stop every clipboard watch (process teardown sweep; watches are NOT tied to
+/// captures, so the global stop helper must reach them explicitly).
+pub(crate) fn unwatch_all() {
+    let mut reg = WATCHERS.lock().unwrap();
+    if let Some(map) = reg.as_mut() {
+        for (_, handle) in map.drain() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Stop the watch on `socket_path` (no-op when none is running).
 pub(crate) fn unwatch(socket_path: &str) {
     let mut reg = WATCHERS.lock().unwrap();
@@ -350,6 +361,9 @@ fn watch_loop(socket_path: &str, callback: Py<PyAny>, stop: &AtomicBool) -> Resu
                 .and_then(|o| state.offer_mimes.get(&o.id()).cloned())
                 .unwrap_or_default();
             if !mimes.is_empty() {
+                if crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+                    break;
+                }
                 Python::attach(|py| {
                     if let Err(e) = callback.call1(py, (mimes,)) {
                         e.print(py);

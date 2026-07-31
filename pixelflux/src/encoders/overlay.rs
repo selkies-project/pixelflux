@@ -111,6 +111,23 @@ pub(crate) fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
     }
 }
 
+/// Source-over compositing for PREMULTIPLIED sources (XFixes/Xcursor pixels are
+/// premultiplied by format definition): dst = src + dst*(1-a). The straight-alpha
+/// `blend_pixel` on premultiplied input multiplies alpha in twice and darkens
+/// every translucent pixel (visible dark fringes on the composited cursor).
+pub(crate) fn blend_pixel_premultiplied(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
+    if a == 255 {
+        dst[0] = b;
+        dst[1] = g;
+        dst[2] = r;
+    } else if a > 0 {
+        let ia = 255 - a as u32;
+        dst[0] = (b as u32 + dst[0] as u32 * ia / 255) as u8;
+        dst[1] = (g as u32 + dst[1] as u32 * ia / 255) as u8;
+        dst[2] = (r as u32 + dst[2] as u32 * ia / 255) as u8;
+    }
+}
+
 impl OverlayState {
     /// Load the watermark image from disk; `output_scale` is the output's fractional
     /// scale, ceiled to the integer buffer scale of the upload. A failed load clears the overlay.
