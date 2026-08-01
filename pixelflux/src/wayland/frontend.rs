@@ -1253,6 +1253,8 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "image/jpeg",
     "image/webp",
     "image/bmp",
+    "image/svg+xml",
+    "image/svg",
     "text/plain;charset=utf-8",
     "UTF8_STRING",
     "text/plain",

@@ -29,6 +29,9 @@ pub enum CursorJob {
     SetCallback(Py<PyAny>),
     /// Reload the worker's theme handle at a new pixel size; later `Named` jobs render at it.
     SetSize(i32),
+    /// Cap the longest delivered cursor edge; larger images are downscaled like the X11
+    /// XFixes monitor does (parity: `CaptureSettings.cursor_size_cap` was X11-only).
+    SetSizeCap(i32),
     Named { name: &'static str },
     Hide,
     /// wl_shm cursor sprite: raw pool bytes plus the sub-image descriptor.
@@ -57,10 +60,11 @@ pub enum CursorJob {
 /// Spawn the cursor delivery worker; returns its job channel. The worker owns its own
 /// theme handle, the PNG cache, and the Python callback for the life of the process (like the
 /// compositor thread itself); `PY_SHUTDOWN` gates every Python call.
-pub fn spawn_cursor_worker(cursor_size: i32) -> std::sync::mpsc::Sender<CursorJob> {
+pub fn spawn_cursor_worker(cursor_size: i32, size_cap: i32) -> std::sync::mpsc::Sender<CursorJob> {
     let (tx, rx) = std::sync::mpsc::channel::<CursorJob>();
     let _ = std::thread::Builder::new().name("wl-cursor".into()).spawn(move || {
         let mut helper = Cursor::load(cursor_size);
+        let mut cap = size_cap;
         let mut cache: HashMap<u64, Vec<u8>> = HashMap::new();
         let mut callback: Option<Py<PyAny>> = None;
         while let Ok(job) = rx.recv() {
@@ -73,8 +77,15 @@ pub fn spawn_cursor_worker(cursor_size: i32) -> std::sync::mpsc::Sender<CursorJo
                     helper = Cursor::load(size);
                     continue;
                 }
+                CursorJob::SetSizeCap(c) => {
+                    cap = c;
+                    continue;
+                }
                 CursorJob::Named { name } => match helper.get_png_data(name) {
-                    Some((png, x, y)) => ("png", png, x as i32, y as i32),
+                    Some((png, x, y)) => {
+                        let (png, x, y) = cap_cursor_png(png, x as i32, y as i32, cap);
+                        ("png", png, x, y)
+                    }
                     None => ("error", Vec::new(), 0, 0),
                 },
                 CursorJob::Hide => ("hide", Vec::new(), 0, 0),
@@ -88,18 +99,22 @@ pub fn spawn_cursor_worker(cursor_size: i32) -> std::sync::mpsc::Sender<CursorJo
                     bytes,
                     hot_x,
                     hot_y,
-                } => {
-                    let png = cached_png(&mut cache, hash, || {
-                        encode_shm_cursor(width, height, stride, offset, opaque, &bytes)
-                    });
-                    ("png", png, hot_x, hot_y)
-                }
-                CursorJob::Gles { hash, width, height, bytes, hot_x, hot_y } => {
-                    let png = cached_png(&mut cache, hash, || {
-                        encode_gles_cursor(width, height, &bytes)
-                    });
-                    ("png", png, hot_x, hot_y)
-                }
+                } => capped_job(
+                    &mut cache,
+                    hash,
+                    cap,
+                    hot_x,
+                    hot_y,
+                    || encode_shm_cursor(width, height, stride, offset, opaque, &bytes),
+                ),
+                CursorJob::Gles { hash, width, height, bytes, hot_x, hot_y } => capped_job(
+                    &mut cache,
+                    hash,
+                    cap,
+                    hot_x,
+                    hot_y,
+                    || encode_gles_cursor(width, height, &bytes),
+                ),
             };
             // A sprite whose pixels could not be read yields empty data; suppressing it
             // preserves the consumer's last cursor instead of blanking it (only an
@@ -141,6 +156,61 @@ fn cached_png(
         }
     }
     png
+}
+
+/// Downscale a cursor PNG so its longest edge is at most `cap` (<= 0 = uncapped), scaling
+/// the hotspot with it. Mirrors the X11 XFixes monitor's `cursor_size_cap` handling so a
+/// Wayland session ships cursor payloads no larger than an X11 one.
+fn cap_cursor_png(png: Vec<u8>, hot_x: i32, hot_y: i32, cap: i32) -> (Vec<u8>, i32, i32) {
+    if cap <= 0 || png.is_empty() {
+        return (png, hot_x, hot_y);
+    }
+    let img = match image::load_from_memory(&png) {
+        Ok(i) => i.to_rgba8(),
+        Err(_) => return (png, hot_x, hot_y),
+    };
+    let (w, h) = (img.width(), img.height());
+    let longest = w.max(h);
+    if longest <= cap as u32 || longest == 0 {
+        return (png, hot_x, hot_y);
+    }
+    let scale = cap as f64 / longest as f64;
+    let nw = ((w as f64 * scale).round() as u32).max(1);
+    let nh = ((h as f64 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(
+        &img,
+        nw,
+        nh,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut out = Vec::new();
+    if resized
+        .write_to(&mut IoCursor::new(&mut out), image::ImageFormat::Png)
+        .is_err()
+    {
+        return (png, hot_x, hot_y);
+    }
+    (
+        out,
+        (hot_x as f64 * scale).round() as i32,
+        (hot_y as f64 * scale).round() as i32,
+    )
+}
+
+/// Cache wrapper for sprite jobs: encode (or reuse) the full-size PNG, then apply the
+/// size cap. `cap_cursor_png` is idempotent for already-capped images, so cache hits
+/// only pay a cheap dimension check.
+fn capped_job(
+    cache: &mut HashMap<u64, Vec<u8>>,
+    hash: u64,
+    cap: i32,
+    hot_x: i32,
+    hot_y: i32,
+    encode: impl FnOnce() -> Vec<u8>,
+) -> (&'static str, Vec<u8>, i32, i32) {
+    let png = cached_png(cache, hash, encode);
+    let (png, sx, sy) = cap_cursor_png(png, hot_x, hot_y, cap);
+    ("png", png, sx, sy)
 }
 
 /// Convert a wl_shm BGRA/XRGB sprite sub-image to a straight-alpha PNG. Stride/offset are

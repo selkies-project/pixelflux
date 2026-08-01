@@ -934,11 +934,11 @@ impl NvencEncoder {
                 NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag = 1;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourPrimaries =
-                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_SMPTE170M;
             config.encodeCodecConfig.h264Config.h264VUIParameters.transferCharacteristics =
-                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE170M;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix =
-                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
+                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag =
                 if is_444 { 1 } else { 0 };
@@ -1616,7 +1616,11 @@ impl NvencEncoder {
     }
 
     /// Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
-    /// CPU-side colour conversion.
+    /// CPU-side colour conversion. NVENC performs its hardware ARGB->YUV conversion with the
+    /// BT.601 matrix while the session's VUI is written BT.709 (a slight core-visual shift vs
+    /// the BT.709 CPU path): the VUI is reinterpreted by decoders but cannot be made to match
+    /// the nvenc hardware conversion — a 601->709 CPU prepass is intentionally skipped here to
+    /// keep this path zero-copy.
     ///
     /// The packed rows are copied host→device into the registered ARGB surface and NVENC's hardware
     /// CSC produces the YUV. Bytes must be in NVENC ARGB order (`B,G,R,A` in memory) — the host BGRA

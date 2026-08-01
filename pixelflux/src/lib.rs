@@ -388,6 +388,7 @@ pub struct LiveTunables {
     pub video_streaming_mode: bool,
     pub keyframe_interval_s: f64,
     pub capture_cursor: bool,
+    pub cursor_size_cap: i32,
 }
 
 impl LiveTunables {
@@ -404,6 +405,7 @@ impl LiveTunables {
             video_streaming_mode: s.video_streaming_mode,
             keyframe_interval_s: s.keyframe_interval_s,
             capture_cursor: s.capture_cursor,
+            cursor_size_cap: s.cursor_size_cap,
         }
     }
 
@@ -418,6 +420,7 @@ impl LiveTunables {
         s.video_paintover_burst_frames = self.video_paintover_burst_frames;
         s.video_streaming_mode = self.video_streaming_mode;
         s.keyframe_interval_s = self.keyframe_interval_s;
+        s.cursor_size_cap = self.cursor_size_cap;
         s.capture_cursor = self.capture_cursor;
     }
 }
@@ -499,15 +502,27 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         .and_then(|x| x.extract().ok())
         .unwrap_or(1.0);
 
+    // NaN/inf from Python would otherwise reach Duration::from_secs_f64 (which
+    // panics) or own_allocations; clamp every untrusted float/dimension here.
+    let sanitize_dim = |v: i32| -> i32 {
+        if v <= 0 { 0 } else { v.min(MAX_CAPTURE_DIM) }
+    };
+    let sanitize_fps = |v: f64| -> f64 {
+        if v.is_finite() && v > 0.0 { v.min(MAX_FPS) } else { DEFAULT_FPS }
+    };
+    let sanitize_scale = |v: f64| -> f64 {
+        if v.is_finite() && v > 0.0 { v.min(MAX_SCALE) } else { 1.0 }
+    };
+
     Ok(RustCaptureSettings {
-        width: settings.getattr("capture_width")?.extract()?,
-        height: settings.getattr("capture_height")?.extract()?,
-        scale,
+        width: sanitize_dim(settings.getattr("capture_width")?.extract()?),
+        height: sanitize_dim(settings.getattr("capture_height")?.extract()?),
+        scale: sanitize_scale(scale),
         capture_x: settings.getattr("capture_x")?.extract()?,
         capture_y: settings.getattr("capture_y")?.extract()?,
-        target_fps: settings.getattr("target_fps")?.extract()?,
-        jpeg_quality: settings.getattr("jpeg_quality")?.extract()?,
-        paint_over_jpeg_quality: settings.getattr("paint_over_jpeg_quality")?.extract()?,
+        target_fps: sanitize_fps(settings.getattr("target_fps")?.extract()?),
+        jpeg_quality: settings.getattr("jpeg_quality")?.extract::<i32>()?.clamp(1, 100),
+        paint_over_jpeg_quality: settings.getattr("paint_over_jpeg_quality")?.extract::<i32>()?.clamp(1, 100),
         use_paint_over_quality: settings.getattr("use_paint_over_quality")?.extract()?,
         paint_over_trigger_frames: settings.getattr("paint_over_trigger_frames")?.extract()?,
         damage_block_threshold: settings.getattr("damage_block_threshold")?.extract()?,
@@ -1042,6 +1057,14 @@ impl WlEncodeControls {
 /// Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
 /// publish slot, so a deeper pool would only add latency (staler frames), never overlap.
 const WL_POOL_SURFACES: usize = 2;
+
+/// Upper bounds for Python-supplied capture geometry: keeps a hostile or buggy setting from
+/// turning into a multi-GB `vec![]` allocation that would abort the process. 16384 covers every
+/// real display wall; the fps/scale bounds keep timing math finite and sane.
+const MAX_CAPTURE_DIM: i32 = 16384;
+const MAX_FPS: f64 = 1000.0;
+const DEFAULT_FPS: f64 = 60.0;
+const MAX_SCALE: f64 = 8.0;
 
 /// Shared capture stats: whichever thread owns the encoders counts frames/stripes and
 /// composes `desc` + `n_stripes` (the encoder half of the 1 s debug log line); the calloop
@@ -3298,8 +3321,20 @@ fn run_wayland_thread(
     let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
     let height: i32 = if initial_height > 0 { initial_height } else { 768 };
 
-    let mut event_loop = EventLoop::<AppState>::try_new().expect("Unable to create event_loop");
-    let display: Display<AppState> = Display::new().unwrap();
+    let mut event_loop = match EventLoop::<AppState>::try_new() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[Wayland] compositor thread aborting: event loop init failed: {e}");
+            return;
+        }
+    };
+    let display: Display<AppState> = match Display::new() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[Wayland] compositor thread aborting: display init failed: {e}");
+            return;
+        }
+    };
     let dh: DisplayHandle = display.handle();
     unsafe {
         if let Ok(lib) = libloading::Library::new("libwayland-server.so.0") {
@@ -3461,7 +3496,7 @@ fn run_wayland_thread(
             ..RustCaptureSettings::default()
         },
         cursor_callback_set: false,
-        cursor_tx: wayland::cursor::spawn_cursor_worker(cursor_size),
+        cursor_tx: wayland::cursor::spawn_cursor_worker(cursor_size, 32),
         clipboard_callback: None,
         pending_clipboard_read: None,
         current_selection_mime: None,
@@ -3972,6 +4007,7 @@ fn run_wayland_thread(
                 }
                 ThreadCommand::UpdateTunables { display_id, tunables: t } => {
                     state.render_cursor_on_framebuffer = t.capture_cursor;
+                    let _ = state.cursor_tx.send(CursorJob::SetSizeCap(t.cursor_size_cap));
                     if display_id == 0 {
                         t.apply_to(&mut state.settings);
                     }
@@ -4030,7 +4066,13 @@ fn run_wayland_thread(
         })
         .unwrap();
 
-    let source = ListeningSocketSource::new_auto().unwrap();
+    let source = match ListeningSocketSource::new_auto() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[Wayland] compositor thread aborting: could not bind a wayland-N socket (XDG_RUNTIME_DIR unset/full?): {e}");
+            return;
+        }
+    };
     let socket_name = source.socket_name().to_string_lossy().into_owned();
     println!("[Wayland] Socket listening on: {:?}", socket_name);
     std::env::set_var("WAYLAND_DISPLAY", &socket_name);
@@ -4147,14 +4189,16 @@ fn run_wayland_thread(
                 .iter()
                 .filter_map(|n| n.capture.as_ref().map(|c| c.settings.target_fps))
                 .fold(0.0f64, f64::max);
-            let fps = (if is_memory_throttling {
+            let raw_fps = if is_memory_throttling {
                 5.0
             } else if max_fps > 0.0 {
                 max_fps
             } else {
                 state.settings.target_fps
-            })
-            .max(1.0);
+            };
+            // Settings are sanitized at the Python boundary; this final guard keeps a
+            // non-finite value from ever reaching Duration::from_secs_f64 (panics on NaN).
+            let fps = if raw_fps.is_finite() && raw_fps > 0.0 { raw_fps.min(MAX_FPS) } else { DEFAULT_FPS };
             let target_frame_duration = Duration::from_secs_f64(1.0 / fps);
             let wait_duration = target_frame_duration.saturating_sub(work_elapsed);
             let final_wait = if wait_duration.as_millis() < 1 { Duration::from_millis(1) } else { wait_duration };
@@ -4165,7 +4209,11 @@ fn run_wayland_thread(
     event_loop
         .handle()
         .insert_source(Generic::new(display, Interest::READ, Mode::Level), |_, display, _state| {
-            unsafe { display.get_mut().dispatch_clients(_state).unwrap(); }
+            // A single misbehaving client must not take the compositor (and every other
+            // session) down with it.
+            if let Err(e) = unsafe { display.get_mut().dispatch_clients(_state) } {
+                eprintln!("[Wayland] client dispatch error: {e:?}");
+            }
             Ok(PostAction::Continue)
         })
         .unwrap();
@@ -4173,10 +4221,10 @@ fn run_wayland_thread(
     crate::computer_use::register_wayland_backend(command_tx.clone());
     crate::computer_use::spawn_cu_from_env();
 
-    event_loop.run(None, &mut state, |state| {
+    let _ = event_loop.run(None, &mut state, |state| {
         state.process_pending_clipboard_read();
-        state.dh.flush_clients().unwrap();
-    }).unwrap();
+        let _ = state.dh.flush_clients();
+    });
 }
 
 /// Zero-copy encoded-frame handoff to Python. Owns the encoded `Vec<u8>` and
@@ -5115,6 +5163,10 @@ impl ScreenCapture {
             return Ok(());
         }
 
+        // A fresh start proves the interpreter is alive: clear the teardown flag the atexit
+        // sweep may have set (the Wayland start path already does the same), or the delivery
+        // thread below would drop every frame.
+        PY_SHUTDOWN.store(false, Ordering::Relaxed);
         let mut rs = rs;
         if rs.encode_node_index < -1 {
             let auto_gpu = settings
@@ -5661,6 +5713,29 @@ impl Drop for ScreenCapture {
         if let Ok(mut st) = self.inner.lock() {
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
+            }
+            // A Wayland capture is owned by this instance: release it, or a GC'd handle
+            // would leave the compositor encoding and delivering forever.
+            if st.backend == 2 && !crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+                let did = st.wl_display;
+                let owned = {
+                    let mut owners = wayland_owners().lock().unwrap();
+                    if owners.get(&did) == Some(&self.id) {
+                        owners.remove(&did);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if owned {
+                    if let Some(slot) = WAYLAND_BACKEND.get() {
+                        if let Some(be) = slot.lock().unwrap().as_ref() {
+                            Python::attach(|py| {
+                                let _ = be.bind(py).borrow().stop_capture(did);
+                            });
+                        }
+                    }
+                }
             }
             // Pair the cursor-monitor acquire from start_capture: a dropped
             // handle that never got stop_capture would pin the refcount and its
