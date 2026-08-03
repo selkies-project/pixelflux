@@ -642,7 +642,14 @@ where
                     if psettings.output_mode == 0 {
                         log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", psettings.jpeg_quality));
                     } else {
-                        log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                        if psettings.video_cbr_mode {
+                            log_msg.push_str(&format!(" | Mode: H264 CBR {}", psettings.video_bitrate_kbps));
+                        } else {
+                            log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                            if psettings.video_bitrate_kbps > 0 {
+                                log_msg.push_str(&format!(" | VBV: {} kbps", psettings.video_bitrate_kbps));
+                            }
+                        }
                         if psettings.video_fullcolor {
                             log_msg.push_str(" | Colorspace: I444 (Full Range)");
                         } else {

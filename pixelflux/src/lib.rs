@@ -1524,7 +1524,14 @@ fn log_stream_settings(
             log_msg.push_str(" Streaming");
         }
 
-        log_msg.push_str(&format!(" | CRF: {}", settings.video_crf));
+        if settings.video_cbr_mode {
+            log_msg.push_str(&format!(" | CBR {}", settings.video_bitrate_kbps));
+        } else {
+            log_msg.push_str(&format!(" | CRF: {}", settings.video_crf));
+            if settings.video_bitrate_kbps > 0 {
+                log_msg.push_str(&format!(" | VBV: {} kbps", settings.video_bitrate_kbps));
+            }
+        }
 
         if settings.use_paint_over_quality {
             log_msg.push_str(&format!(
