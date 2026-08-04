@@ -14,7 +14,9 @@
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
+#[cfg(feature = "gpl")]
 use std::ffi::CString;
+#[cfg(feature = "gpl")]
 use std::ptr;
 use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
@@ -152,6 +154,7 @@ thread_local! {
 /// state and corrupt the heap. The lock is deliberately held only around open and close, never
 /// around `x264_encoder_encode`, so serializing setup costs nothing in the hot per-stripe encode
 /// path where the real parallelism lives.
+#[cfg(feature = "gpl")]
 static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One long-lived libx264 session for a stripe, holding the raw `x264_t` handle alongside a
@@ -165,6 +168,7 @@ static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// chosen at open and gates which of the live reconfigures apply. The manual `Send` impl exists only
 /// because a raw pointer is not `Send` by default and the handle must move onto the rayon stripe
 /// workers; `Drop` closes it under the global open/close lock for the same reason that lock exists.
+#[cfg(feature = "gpl")]
 pub struct H264EncoderWrapper {
     encoder: *mut x264_sys::x264_t,
     pub width: i32,
@@ -179,8 +183,10 @@ pub struct H264EncoderWrapper {
     full_range: bool,
 }
 
+#[cfg(feature = "gpl")]
 unsafe impl Send for H264EncoderWrapper {}
 
+#[cfg(feature = "gpl")]
 impl Drop for H264EncoderWrapper {
     fn drop(&mut self) {
         if !self.encoder.is_null() {
@@ -191,6 +197,7 @@ impl Drop for H264EncoderWrapper {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl H264EncoderWrapper {
     /// Open an x264 encoder tuned for real-time screen streaming, or `None` on failure.
     ///
@@ -491,10 +498,14 @@ impl H264EncoderWrapper {
 pub struct StripeState {
     pub no_motion_frame_count: u32,
     pub paint_over_sent: bool,
+    #[cfg(feature = "gpl")]
     pub h264_encoder: Option<H264EncoderWrapper>,
     pub h264_burst_frames_remaining: i32,
+    #[cfg(feature = "gpl")]
     pub y_buf: Vec<u8>,
+    #[cfg(feature = "gpl")]
     pub u_buf: Vec<u8>,
+    #[cfg(feature = "gpl")]
     pub v_buf: Vec<u8>,
     pub packet_buf: Vec<u8>,
     pub last_hash: u64,
@@ -677,6 +688,7 @@ pub struct EncodedStripe {
 ///    conversion band each, since the parallelism there already comes from encoding the stripes
 ///    concurrently.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "gpl"), allow(unused_assignments, unused_mut, unused_variables))]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
     raw_pixels: &[u8],
@@ -786,6 +798,7 @@ pub fn encode_cpu(
     let video_crf = settings.video_crf;
     let video_po_crf = settings.video_paintover_crf;
     let video_burst = settings.video_paintover_burst_frames;
+    #[cfg(feature = "gpl")]
     let video_fullcolor = settings.video_fullcolor;
     let video_streaming = settings.video_streaming_mode;
     let jpeg_q = settings.jpeg_quality;
@@ -793,12 +806,16 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let burst_crf = if use_paint_over && video_po_crf < video_crf { video_po_crf } else { video_crf };
+    #[cfg(feature = "gpl")]
     let target_fps = settings.target_fps;
     let omit_headers = settings.omit_stripe_headers;
     let damage_block_threshold = settings.damage_block_threshold;
     let damage_block_duration = settings.damage_block_duration as i32;
+    #[cfg(feature = "gpl")]
     let video_cbr = settings.video_cbr_mode;
+    #[cfg(feature = "gpl")]
     let video_bitrate = settings.video_bitrate_kbps;
+    #[cfg(feature = "gpl")]
     let video_vbv = (crate::encoders::vbv_bits(
         (video_bitrate.max(0) as u32).saturating_mul(1000),
         target_fps,
@@ -809,11 +826,13 @@ pub fn encode_cpu(
     // Full-frame x264 threads follow the same policy as the OpenH264 encoder:
     // one fewer than the cores (headroom for the capture thread), clamped to
     // [1, 4] to match the four-slice ceiling below.
+    #[cfg(feature = "gpl")]
     let h264_threads = if n_processing_stripes == 1 {
         num_cores.saturating_sub(1).clamp(1, 4) as i32
     } else {
         1
     };
+    #[cfg(feature = "gpl")]
     let csc_bands = 1;
 
     let stripe_body = |(i, stripe_state): (usize, &mut StripeState)| -> Option<EncodedStripe> {
@@ -938,6 +957,8 @@ pub fn encode_cpu(
                         })
                     })
                 } else {
+                    cfg_if::cfg_if! {
+                        if #[cfg(feature = "gpl")] {
                     let needs_reinit = if let Some(ref enc) = stripe_state.h264_encoder {
                         enc.width != width_usize as i32
                             || enc.height != actual_height as i32
@@ -1034,6 +1055,15 @@ pub fn encode_cpu(
                         }
                     } else {
                         None
+                    }
+                        } else {
+                            static GPL_OFF_LOGGED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !GPL_OFF_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("[software] software H.264 encoding unavailable: pixelflux was built without GPL components (libx264 disabled). Use JPEG, OpenH264 (`use_openh264 = true`), or a hardware encoder.");
+                            }
+                            None
+                        }
                     }
                 }
             } else {

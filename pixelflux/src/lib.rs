@@ -1130,12 +1130,23 @@ fn build_readback_encoders(
                 return (None, Some(e));
             }
             None => {
+                #[cfg(feature = "gpl")]
                 eprintln!("[Wayland] OpenH264 init failed; falling back to x264 software.");
+                #[cfg(not(feature = "gpl"))]
+                eprintln!("[Wayland] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
                 return (None, None);
             }
         }
     }
     if !try_gpu {
+        #[cfg(not(feature = "gpl"))]
+        if settings.output_mode == 1 && !settings.use_openh264 {
+            println!("[Wayland] pixelflux was built without GPL components (libx264 disabled); substituting the BSD-licensed OpenH264 software encoder.");
+            if let Some(e) = crate::encoders::oh264::Openh264Encoder::new(settings) {
+                return (None, Some(e));
+            }
+            eprintln!("[Wayland] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
+        }
         return (None, None);
     }
     let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
@@ -1176,6 +1187,14 @@ fn build_readback_encoders(
                 Err(e) => eprintln!("[Wayland] Failed to init VAAPI: {}. Falling back to CPU.", e),
             }
         }
+    }
+    #[cfg(not(feature = "gpl"))]
+    if settings.output_mode == 1 && !settings.use_openh264 {
+        println!("[Wayland] pixelflux was built without GPL components (libx264 disabled); substituting the BSD-licensed OpenH264 software encoder.");
+        if let Some(e) = crate::encoders::oh264::Openh264Encoder::new(settings) {
+            return (None, Some(e));
+        }
+        eprintln!("[Wayland] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
     }
     (None, None)
 }

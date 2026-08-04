@@ -155,6 +155,31 @@ enum X11Encoder {
     Openh264(Openh264Encoder),
 }
 
+/// Software H.264 encoder used when hardware encoders are unavailable or the CPU is forced.
+/// With GPL components this is the striped x264 path (its state lives per-stripe inside
+/// `encode_cpu`, so no persistent object exists here); without them (the crate built with the
+/// `gpl` feature disabled) the BSD-licensed OpenH264 full-frame encoder is substituted instead.
+#[cfg(feature = "gpl")]
+fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
+    let _ = settings;
+    X11Encoder::None
+}
+
+#[cfg(not(feature = "gpl"))]
+fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
+    if settings.output_mode != 1 {
+        return X11Encoder::None;
+    }
+    println!("[x11] pixelflux was built without GPL components (libx264 disabled); substituting the BSD-licensed OpenH264 software encoder.");
+    match Openh264Encoder::new(settings) {
+        Some(e) => X11Encoder::Openh264(e),
+        None => {
+            eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
+            X11Encoder::None
+        }
+    }
+}
+
 /// Everything the X11 host-ARGB path has to remember between frames.
 ///
 /// Unlike the Wayland backend, X11 capture has no compositor to report what changed, so this
@@ -194,7 +219,10 @@ impl X11Pipeline {
             match Openh264Encoder::new(&settings) {
                 Some(e) => X11Encoder::Openh264(e),
                 None => {
+                    #[cfg(feature = "gpl")]
                     eprintln!("[x11] OpenH264 init failed; falling back to software x264");
+                    #[cfg(not(feature = "gpl"))]
+                    eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
                     X11Encoder::None
                 }
             }
@@ -205,7 +233,7 @@ impl X11Pipeline {
             if !encode_driver.is_empty() && !encode_driver.contains("nvidia") {
                 if settings.video_fullcolor {
                     println!("[x11] 4:4:4 full-color requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-                    X11Encoder::None
+                    software_h264_encoder(&settings)
                 } else {
                     println!("[x11] Initializing Unified VAAPI Encoder...");
                     match VaapiEncoder::new_host(&settings) {
@@ -215,7 +243,7 @@ impl X11Pipeline {
                         }
                         Err(err) => {
                             eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
-                            X11Encoder::None
+                            software_h264_encoder(&settings)
                         }
                     }
                 }
@@ -228,7 +256,7 @@ impl X11Pipeline {
                     }
                     Err(err) => {
                         eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU.");
-                        X11Encoder::None
+                        software_h264_encoder(&settings)
                     }
                 }
             }
@@ -236,7 +264,7 @@ impl X11Pipeline {
             if settings.output_mode == 1 {
                 println!("[x11] No GPU Encoder available -> Using CPU Software Encoding.");
             }
-            X11Encoder::None
+            software_h264_encoder(&settings)
         };
         Self {
             settings,
