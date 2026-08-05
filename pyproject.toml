@@ -16,7 +16,21 @@ PATH = "$HOME/.cargo/bin:$PATH"
 [tool.cibuildwheel.linux]
 before-all = """
     set -euxo pipefail
-    
+
+    # A transient clone failure fails the whole wheel build, so every source is
+    # retried; FFmpeg is additionally mirrored on GitHub at the identical tag.
+    clone_source() {
+        ref="$1"; dir="$2"; shift 2
+        for url in "$@"; do
+            for attempt in 1 2 3; do
+                rm -rf "${dir}"
+                git clone --branch "${ref}" --depth 1 "${url}" "${dir}" && return 0
+                sleep $((attempt * 5))
+            done
+        done
+        return 1
+    }
+
     # --- MANYLINUX (RPM-based) ---
     # x264 is built from source for x264-sys (manylinux has no usable package);
     # ffmpeg n8.1 is built plain LGPL (no --enable-libx264/--enable-gpl: only
@@ -48,17 +62,17 @@ before-all = """
             cmake \
             gcc-c++ && \
         \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && \
+        curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal && \
         \
         (cd /tmp && \
-            git clone --branch stable --depth 1 https://code.videolan.org/videolan/x264.git && \
+            clone_source stable x264 https://code.videolan.org/videolan/x264.git && \
             cd x264 && \
             ./configure --prefix=/usr/local --enable-shared --disable-cli && \
             make -j$(nproc) && \
             make install) && \
         \
         (cd /tmp && \
-            git clone --branch n8.1 --depth 1 https://git.ffmpeg.org/ffmpeg.git && \
+            clone_source n8.1 ffmpeg https://git.ffmpeg.org/ffmpeg.git https://github.com/FFmpeg/FFmpeg.git && \
             cd ffmpeg && \
             ./configure \
                 --prefix=/usr/local \
@@ -97,7 +111,7 @@ before-all = """
             musl-dev \
             ffmpeg-dev && \
         \
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+        curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal
     else
         echo "Unsupported package manager"
         exit 1
