@@ -76,4 +76,3 @@ cython_debug/
 .ruff_cache/
 .pypirc
 codeto*
-Cargo.lock
