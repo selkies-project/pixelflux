@@ -7,7 +7,7 @@ archs = [ "x86_64", "aarch64" ]
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
-skip = "*t-* pp*"
+skip = "*t-*"
 
 [tool.cibuildwheel.environment]
 LD_LIBRARY_PATH = "/usr/local/lib:/usr/local/lib64"

@@ -138,7 +138,7 @@ use crate::encoders::vaapi::VaapiEncoder;
 use crate::nvenc::NvencEncoder;
 use crate::{RustCaptureSettings, StripeState};
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -296,10 +296,16 @@ impl OutputNode {
 static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Per-window bookkeeping carried in the window's user-data map: a stable numeric id the
-/// Python side addresses the window by, and the display id of the output it is placed on.
+/// Python side addresses the window by, the display id of the output it is placed on, and
+/// whether that output has been chosen yet.
 pub struct WindowMeta {
     pub id: u32,
     pub output: AtomicU32,
+    /// Set once the first commit has picked the window's output. The choice cannot key off
+    /// xdg's `initial_configure_sent`: a client that negotiates xdg-decoration (every
+    /// wlroots-based nested compositor, GTK and Qt) is answered with a configure before it
+    /// ever commits, which would leave every window on the pointer's output.
+    pub placed: AtomicBool,
 }
 
 /// The window's meta, inserted at `new_toplevel`; windows created before that (none in
@@ -677,17 +683,15 @@ impl CompositorHandler for AppState {
             let window = self.pending_windows.remove(idx);
             let toplevel = window.toplevel().unwrap();
 
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            });
+            // Whether this window still needs an output. Deliberately not xdg's
+            // `initial_configure_sent`: the decoration handshake answers with a configure
+            // before the client's first commit, which would skip the choice below for
+            // every client that negotiates decorations.
+            let needs_placement = window_meta(&window)
+                .map(|meta| !meta.placed.swap(true, Ordering::Relaxed))
+                .unwrap_or(false);
 
-            if !initial_configure_sent {
+            if needs_placement {
                 // A new toplevel opens fullscreened on the output the pointer is on
                 // (primary when indeterminate); the choice is pinned on the window's
                 // meta so the acked commit maps to the same output.
@@ -1987,6 +1991,7 @@ impl XdgShellHandler for AppState {
         window.user_data().insert_if_missing_threadsafe(|| WindowMeta {
             id: NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             output: AtomicU32::new(target_id),
+            placed: AtomicBool::new(false),
         });
         self.pending_windows.push(window);
         let (title, app_id) = with_states(surface.wl_surface(), |states| {
@@ -2037,12 +2042,40 @@ impl XdgShellHandler for AppState {
         let _ = surface.send_repositioned(token);
     }
     /// Client fullscreen request: always granted at the compositor's forced-fullscreen
-    /// geometry (the CURRENT logical size), so the toggle gets a definite answer.
+    /// geometry (the CURRENT logical size), so the toggle gets a definite answer. A request
+    /// naming an output moves the window there, which is how a nested compositor puts each
+    /// of its screens on a monitor of its choosing.
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
+        if let Some(id) = output
+            .as_ref()
+            .and_then(|wlo| self.output_nodes.iter().find(|n| n.output.owns(wlo)).map(|n| n.id))
+        {
+            let mapped = self
+                .space
+                .elements()
+                .find(|w| w.toplevel().map(|tl| *tl == surface).unwrap_or(false))
+                .cloned();
+            if let Some(window) = mapped {
+                if self.place_window_on_output(&window, id) {
+                    return;
+                }
+            } else if let Some(meta) = self
+                .pending_windows
+                .iter()
+                .find(|w| w.toplevel().map(|tl| *tl == surface).unwrap_or(false))
+                .and_then(window_meta)
+            {
+                // Still waiting for its first buffer: record the output instead of mapping
+                // it, so nothing renders or hit-tests before the client has drawn. The
+                // configure below then carries that output's geometry.
+                meta.output.store(id, Ordering::Relaxed);
+                meta.placed.store(true, Ordering::Relaxed);
+            }
+        }
         self.send_forced_fullscreen_configure(&surface);
     }
     /// Client unfullscreen request: the forced-fullscreen policy stands, but the client
