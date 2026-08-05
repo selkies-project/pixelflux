@@ -139,14 +139,23 @@ pub mod encoders {
     pub mod software;
     /// VA-API hardware H.264 encoder for Intel / AMD GPUs via FFmpeg.
     pub mod vaapi;
-    /// Minimum H.264 level for a stream of these dimensions at this frame rate, on the
-    /// 5.2-6.2 conformance ladder every hardware encoder here shares. NVENC's startup
-    /// clamp historically also covers all smaller sizes; keeping ONE ladder avoids two
-    /// encoders disagreeing on the same geometry.
+    /// Lowest H.264 level whose Annex-A Table A-1 limits admit a `width` x `height` stream at
+    /// `fps`, as level_idc (41 = 4.1, 52 = 5.2, 62 = 6.2).
+    ///
+    /// A frame is charged two ways: **MaxFS**, its size in macroblocks, and **MaxMBPS**, that
+    /// size times the frame rate. Advertising the lowest fitting level asks the least of a
+    /// decoder, so clients that gate hardware decode on the level accept the widest range of
+    /// streams. One shared ladder keeps two encoders from disagreeing on the same geometry;
+    /// it starts at 4.1 and a caller needing more raises the floor itself. Above 6.2's limits
+    /// there is no higher level, so it returns 62 as a best effort.
     pub(crate) fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
         let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
         let mbps = mbs * fps.max(1) as u64;
-        const LEVELS: [(u32, u64, u64); 4] = [
+        const LEVELS: [(u32, u64, u64); 8] = [
+            (41, 8192, 245760),
+            (42, 8704, 522240),
+            (50, 22080, 589824),
+            (51, 36864, 983040),
             (52, 36864, 2073600),
             (60, 139264, 4177920),
             (61, 139264, 8355840),
@@ -1118,6 +1127,10 @@ struct WlEncodeConfig {
 /// compatible NVENC session is handed over from the previous encode thread it is reconfigured in
 /// place (milliseconds) rather than rebuilt, which would stall the stream. The EGL display is
 /// always null here: readback mode never imports dmabufs.
+///
+/// Without the `gpl` feature there is no striped x264: an `output_mode == 1` request that reaches
+/// the software fallback is served by the BSD-licensed OpenH264 full-frame encoder instead, so
+/// `(None, None)` then means the striped JPEG path alone.
 fn build_readback_encoders(
     settings: &RustCaptureSettings,
     try_gpu: bool,
@@ -1216,9 +1229,10 @@ fn build_readback_encoders(
 /// 2. **Dispatch by encoder**: a hardware session runs `decide_hw_fullframe`, then colorspace-
 ///    converts only the frames actually being encoded (RGBA vs BGRA source chosen by the renderer)
 ///    into the reused NV12/YUV444 buffer and calls `encode_raw`; OpenH264 encodes host pixels
-///    directly; otherwise `encode_cpu` runs the striped x264/JPEG path with compositor damage. The
-///    software H.264 path keeps an infinite GOP, forcing an IDR only on an explicit request or the
-///    configured interval, and an explicit request also forces a full JPEG resend for joiners.
+///    directly; otherwise `encode_cpu` runs the striped x264/JPEG path with compositor damage
+///    (JPEG alone in a build without the `gpl` feature). The software H.264 path keeps an infinite
+///    GOP, forcing an IDR only on an explicit request or the configured interval, and an explicit
+///    request also forces a full JPEG resend for joiners.
 /// 3. **Recycle then deliver**: the capture buffer is recycled BEFORE delivery so a slow consumer
 ///    never pins one, then the stripes go to the delivery thread through a single-slot `send` whose
 ///    blocking is the backpressure that overlaps delivery with the next render + encode.
@@ -1303,6 +1317,15 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             if decision.send {
                 let w = width as u32;
                 let h = height as u32;
+                // Host-planar input must be converted with the matrix its session's VUI
+                // declares. NVENC's ARGB input paths go through a fixed BT.601 hardware CSC
+                // that no session flag can retarget, so the VUI is SMPTE170M for every NVENC
+                // entry point and this conversion has to match it; VA-API converts and
+                // declares BT.709.
+                let matrix = match encoder {
+                    GpuEncoder::Nvenc(_) => YuvStandardMatrix::Bt601,
+                    GpuEncoder::Vaapi(_) => YuvStandardMatrix::Bt709,
+                };
                 if settings.video_fullcolor {
                     let y_size = (w * h) as usize;
                     let (y_plane, rest) = nv12_buffer.split_at_mut(y_size);
@@ -1318,9 +1341,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         height: h,
                     };
                     let _ = if cfg.use_gpu {
-                        yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, YuvStandardMatrix::Bt709, YuvConversionMode::Fast)
+                        yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, matrix, YuvConversionMode::Fast)
                     } else {
-                        yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, YuvStandardMatrix::Bt709, YuvConversionMode::Fast)
+                        yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, matrix, YuvConversionMode::Fast)
                     };
                 } else {
                     let y_size = (w * h) as usize;
@@ -1334,9 +1357,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         height: h,
                     };
                     let csc = if cfg.use_gpu {
-                        yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, YuvStandardMatrix::Bt709, YuvConversionMode::Fast)
+                        yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, matrix, YuvConversionMode::Fast)
                     } else {
-                        yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, YuvStandardMatrix::Bt709, YuvConversionMode::Fast)
+                        yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, matrix, YuvConversionMode::Fast)
                     };
                     if let Err(e) = csc {
                         eprintln!("[wl-encode] NV12 CSC failed: {e:?}");
@@ -1714,6 +1737,10 @@ fn start_capture_on_display(
 ) {
     use smithay::wayland::fractional_scale::with_fractional_scale;
 
+    // The cursor worker outlives individual captures, so the starting settings have to
+    // reach it here — same point X11 applies the cap — or it keeps the previous capture's.
+    let _ = state.cursor_tx.send(CursorJob::SetSizeCap(settings.cursor_size_cap));
+
     // Host-capture mode: connect on first use and point this display's capture
     // thread at the requested size. The compositor keeps running (CU, clipboard
     // callbacks, input fallbacks) but its renderer is bypassed.
@@ -2035,6 +2062,7 @@ fn start_capture_on_display(
         needs_full_render: true,
         last_tick: None,
         hw_error_streak: 0,
+        hw_rebuilt: false,
     };
 
     {
@@ -2933,6 +2961,7 @@ fn render_node_tick(
 
                     if let Ok(data) = result {
                         cap.hw_error_streak = 0;
+                        cap.hw_rebuilt = false;
                         if !data.is_empty() {
                             frame_out = true;
                             cap.encode_stats.frames.fetch_add(1, Ordering::Relaxed);
@@ -2965,15 +2994,25 @@ fn render_node_tick(
                             // worked (driver hiccup, CUDA pressure from a co-tenant):
                             // rebuild the session once, else demote to the readback
                             // path. Streaming black frames forever is not an option.
-                            match rebuild_zerocopy_encoder(cap, state) {
+                            // A session whose encodes keep failing still constructs, so
+                            // the rebuild only counts as recovery until the next streak;
+                            // otherwise the stream would rebuild in a loop and never demote.
+                            let rebuilt = if cap.hw_rebuilt {
+                                None
+                            } else {
+                                rebuild_zerocopy_encoder(cap, state)
+                            };
+                            match rebuilt {
                                 Some(enc) => {
                                     cap.video_encoder = Some(enc);
                                     cap.pending_force_idr = true;
+                                    cap.hw_rebuilt = true;
                                     eprintln!("[Wayland] zero-copy HW encoder rebuilt after repeated encode errors.");
                                 }
                                 None => {
                                     eprintln!("[Wayland] zero-copy HW encoder unrecoverable; demoting to readback encode.");
                                     cap.video_encoder = None;
+                                    cap.hw_rebuilt = false;
                                     // Mirror the startup intent: readback still
                                     // tries the GPU unless the operator opted out.
                                     let s = &cap.settings;
@@ -3522,7 +3561,10 @@ fn run_wayland_thread(
             ..RustCaptureSettings::default()
         },
         cursor_callback_set: false,
-        cursor_tx: wayland::cursor::spawn_cursor_worker(cursor_size, 32),
+        cursor_tx: wayland::cursor::spawn_cursor_worker(
+            cursor_size,
+            RustCaptureSettings::default().cursor_size_cap,
+        ),
         clipboard_callback: None,
         pending_clipboard_read: None,
         current_selection_mime: None,

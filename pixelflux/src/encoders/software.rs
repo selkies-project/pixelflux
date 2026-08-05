@@ -688,7 +688,6 @@ pub struct EncodedStripe {
 ///    conversion band each, since the parallelism there already comes from encoding the stripes
 ///    concurrently.
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(feature = "gpl"), allow(unused_assignments, unused_mut, unused_variables))]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
     raw_pixels: &[u8],
@@ -846,6 +845,9 @@ pub fn encode_cpu(
 
             let mut send_this_stripe = false;
             let mut quality_or_crf = if output_mode == 0 { jpeg_q } else { video_crf };
+            // Only the x264 stripe encoder consumes this; without `gpl` there is no
+            // consumer, so the flag and its sites go away with it.
+            #[cfg(feature = "gpl")]
             let mut force_idr = false;
             let is_dirty = if !hash_damage {
                 stripe_is_dirty[i]
@@ -892,7 +894,10 @@ pub fn encode_cpu(
                         send_this_stripe = true;
                         stripe_state.paint_over_sent = true;
                         quality_or_crf = video_po_crf;
-                        force_idr = true;
+                        #[cfg(feature = "gpl")]
+                        {
+                            force_idr = true;
+                        }
                         stripe_state.h264_burst_frames_remaining = video_burst - 1;
                     }
                 }
@@ -901,7 +906,10 @@ pub fn encode_cpu(
             if force_idr_all {
                 send_this_stripe = true;
                 if output_mode == 1 {
-                    force_idr = true;
+                    #[cfg(feature = "gpl")]
+                    {
+                        force_idr = true;
+                    }
                     if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
                         stripe_state.paint_over_sent = true;
                         stripe_state.h264_burst_frames_remaining = video_burst;
@@ -1280,8 +1288,9 @@ mod qp_bound_sweep {
     //! Invariants under test: the CBR QP clamp reaches libx264/OpenH264 (a max clamp must
     //! raise worst-case fidelity on rate-starved text at the cost of bitrate overshoot;
     //! a min clamp must cut spend on over-budgeted content) and defaults (0) leave the
-    //! encoders' own behavior untouched. The printed table is the measurement behind the
-    //! shipped guidance for video_min_qp/video_max_qp.
+    //! encoders' own behavior untouched. Each encoder is swept separately so the OpenH264
+    //! sweep still runs without the `gpl` feature, where it is the only software H.264 path.
+    #[cfg(feature = "gpl")]
     use super::H264EncoderWrapper;
     use crate::encoders::oh264::Openh264Encoder;
     use crate::RustCaptureSettings;
@@ -1328,6 +1337,7 @@ mod qp_bound_sweep {
 
     /// Encode `FRAMES` scrolling-text luma frames through the x264 stripe encoder at the
     /// given rate-control settings (constant grey chroma), returning each frame's raw bitstream.
+    #[cfg(feature = "gpl")]
     fn encode_x264(cbr: bool, kbps: i32, crf: i32, min_qp: i32, max_qp: i32) -> Vec<Vec<u8>> {
         let mut enc = H264EncoderWrapper::new(
             W as i32, H as i32, crf, false, 60.0, 4, cbr, kbps, 50, min_qp, max_qp,
@@ -1429,53 +1439,67 @@ mod qp_bound_sweep {
             / 1000.0
     }
 
-    /// Diagnostic that the CBR QP clamp is actually plumbed through to both x264 and
-    /// OpenH264, printing a bitrate/PSNR table on scrolling text and asserting the effect.
+    /// Diagnostic that the CBR QP clamp is actually plumbed through to x264, printing a
+    /// bitrate/PSNR table on scrolling text and asserting the effect.
     ///
     /// Encodes worst-case scrolling text at 2 Mbps CBR across a sweep of `max_qp` values (plus a
     /// separate `min_qp` sweep on an over-provisioned 12 Mbps budget), measuring luma PSNR against a
-    /// per-encoder near-lossless CRF/QP-12 reference so colour-conversion differences cancel out. It
-    /// asserts that capping `max_qp` at 30 on rate-starved content lifts fidelity by more than
-    /// 0.5 dB over the unclamped run on both encoders — proving the clamp reaches the encoder rather
-    /// than being silently dropped (paid for in bitrate overshoot).
+    /// near-lossless CRF-12 reference from the same encoder so colour-conversion differences cancel
+    /// out. Capping `max_qp` at 30 on rate-starved content must lift fidelity by more than 0.5 dB
+    /// over the unclamped run — proving the clamp reaches the encoder rather than being silently
+    /// dropped (paid for in bitrate overshoot).
+    #[cfg(feature = "gpl")]
     #[test]
-    fn cbr_qp_bound_sweep_diagnostic() {
-        let ref_x264 = decode_luma(&encode_x264(false, 0, 12, 0, 0));
-        let ref_oh264 = decode_luma(&encode_oh264(false, 0, 12, 0, 0));
+    fn cbr_qp_bound_sweep_x264() {
+        let reference = decode_luma(&encode_x264(false, 0, 12, 0, 0));
 
-        println!("scrolling-text 720p60 @ 2 Mbps CBR (PSNR vs own CRF/QP-12 decode):");
+        println!("scrolling-text 720p60 @ 2 Mbps CBR, x264 (PSNR vs own CRF-12 decode):");
         let mut rows = Vec::new();
         for &max_qp in &[0i32, 45, 40, 35, 30] {
             let x = encode_x264(true, 2000, 25, 0, max_qp);
-            let o = encode_oh264(true, 2000, 25, 0, max_qp);
-            let px = mean_psnr(&decode_luma(&x), &ref_x264);
-            let po = mean_psnr(&decode_luma(&o), &ref_oh264);
-            println!(
-                "  max_qp {:>2}: x264 {:>8.1} kbps / {:>5.2} dB | oh264 {:>8.1} kbps / {:>5.2} dB",
-                max_qp, kbps(&x), px, kbps(&o), po
-            );
-            rows.push((max_qp, kbps(&x), px, kbps(&o), po));
+            let psnr = mean_psnr(&decode_luma(&x), &reference);
+            println!("  max_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", max_qp, kbps(&x), psnr);
+            rows.push((max_qp, psnr));
         }
-        println!("scrolling-text 720p60 @ 12 Mbps CBR, min-QP sweep:");
+        println!("scrolling-text 720p60 @ 12 Mbps CBR, x264 min-QP sweep:");
         for &min_qp in &[0i32, 10, 15] {
             let x = encode_x264(true, 12000, 25, min_qp, 0);
-            let px = mean_psnr(&decode_luma(&x), &ref_x264);
-            println!("  min_qp {:>2}: x264 {:>8.1} kbps / {:>5.2} dB", min_qp, kbps(&x), px);
+            let psnr = mean_psnr(&decode_luma(&x), &reference);
+            println!("  min_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", min_qp, kbps(&x), psnr);
         }
 
-        let base = &rows[0];
-        let capped = rows.last().unwrap();
+        let base = rows[0].1;
+        let capped = rows.last().unwrap().1;
         assert!(
-            capped.2 > base.2 + 0.5,
-            "x264 max-QP clamp had no effect: {:.2} vs {:.2} dB",
-            capped.2,
-            base.2
+            capped > base + 0.5,
+            "x264 max-QP clamp had no effect: {capped:.2} vs {base:.2} dB"
         );
+    }
+
+    /// The OpenH264 counterpart of [`cbr_qp_bound_sweep_x264`], and the only software H.264
+    /// sweep that runs in a build without the `gpl` feature.
+    ///
+    /// Same scrolling-text workload and 2 Mbps CBR `max_qp` sweep, with luma PSNR measured against
+    /// this encoder's own near-lossless QP-12 reference. Capping `max_qp` at 30 must lift fidelity
+    /// by more than 0.5 dB over the unclamped run.
+    #[test]
+    fn cbr_qp_bound_sweep_openh264() {
+        let reference = decode_luma(&encode_oh264(false, 0, 12, 0, 0));
+
+        println!("scrolling-text 720p60 @ 2 Mbps CBR, oh264 (PSNR vs own QP-12 decode):");
+        let mut rows = Vec::new();
+        for &max_qp in &[0i32, 45, 40, 35, 30] {
+            let o = encode_oh264(true, 2000, 25, 0, max_qp);
+            let psnr = mean_psnr(&decode_luma(&o), &reference);
+            println!("  max_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", max_qp, kbps(&o), psnr);
+            rows.push((max_qp, psnr));
+        }
+
+        let base = rows[0].1;
+        let capped = rows.last().unwrap().1;
         assert!(
-            capped.4 > base.4 + 0.5,
-            "oh264 max-QP clamp had no effect: {:.2} vs {:.2} dB",
-            capped.4,
-            base.4
+            capped > base + 0.5,
+            "oh264 max-QP clamp had no effect: {capped:.2} vs {base:.2} dB"
         );
     }
 }

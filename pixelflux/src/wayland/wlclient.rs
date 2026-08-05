@@ -196,11 +196,16 @@ pub(crate) fn read_fd_to_end(fd: &OwnedFd, idle: Duration) -> Result<Vec<u8>, St
     read_fd_to_end_capped(fd, idle, READ_CAP_MAX)
 }
 
-/// Same as `read_fd_to_end` but bounded: a hostile or stuck source can otherwise
-/// stream unbounded bytes into memory (the compositor-internal read caps at the
-/// same 64 MiB the selkies clipboard protocol allows).
+/// Ceiling on an unbounded clipboard source, matching what the selkies clipboard protocol
+/// allows: a hostile or stuck peer could otherwise stream bytes into memory forever.
 const READ_CAP_MAX: usize = 64 * 1024 * 1024;
 
+/// Same as `read_fd_to_end` but refuses a source larger than `cap`.
+///
+/// `cap` is inclusive: a payload of exactly `cap` bytes is accepted. The limit is therefore
+/// tested against the size this chunk *would* produce, before appending — a test on the
+/// already-accumulated length is reached again before EOF can be observed, so it would reject
+/// a payload that exactly fills the cap.
 pub(crate) fn read_fd_to_end_capped(
     fd: &OwnedFd,
     idle: Duration,
@@ -209,9 +214,6 @@ pub(crate) fn read_fd_to_end_capped(
     let mut out = Vec::new();
     let mut chunk = [0u8; 65536];
     loop {
-        if out.len() >= cap {
-            return Err(format!("clipboard source exceeds the {cap} byte cap"));
-        }
         if !wait_readable(fd.as_raw_fd(), idle)? {
             return Err("clipboard source stalled".into());
         }
@@ -228,8 +230,10 @@ pub(crate) fn read_fd_to_end_capped(
         if n == 0 {
             return Ok(out);
         }
-        let take = (cap - out.len()).min(n as usize);
-        out.extend_from_slice(&chunk[..take]);
+        if out.len() + n as usize > cap {
+            return Err(format!("clipboard source exceeds the {cap} byte cap"));
+        }
+        out.extend_from_slice(&chunk[..n as usize]);
     }
 }
 

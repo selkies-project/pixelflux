@@ -195,6 +195,29 @@ impl ShmSurface {
     }
 }
 
+/// Reject a server whose root visual is not 32 bits per pixel.
+///
+/// Every `ShmSurface` is sized at `width * 4` bytes per row and the capture is read as packed
+/// BGRA, so a root of any other depth would be grabbed as garbage rather than failing. Checked
+/// on the initial connection and again on every reconnect, since a restarted server can come
+/// back with a different visual.
+fn require_32bpp(conn: &RustConnection, screen: usize) -> Result<(), String> {
+    let root_depth = conn.setup().roots[screen].root_depth;
+    let bpp = conn
+        .setup()
+        .pixmap_formats
+        .iter()
+        .find(|f| f.depth == root_depth)
+        .map(|f| f.bits_per_pixel)
+        .unwrap_or(32);
+    if bpp != 32 {
+        return Err(format!(
+            "unsupported root depth {root_depth} ({bpp} bpp); only 32-bpp BGRA is supported"
+        ));
+    }
+    Ok(())
+}
+
 /// Clamp a capture offset to the live root so a grab always has at least one root pixel in
 /// range: a past-end offset fails every `shm_get_image` with BadMatch and would burn out the
 /// failure budget with no chance of recovery. The upper clamp also keeps protocol-range roots
@@ -251,6 +274,8 @@ fn try_rebuild_channel(
     cap_y: &mut i16,
     cap_w: &mut u16,
     cap_h: &mut u16,
+    root_w: &mut u16,
+    root_h: &mut u16,
     pool_n: usize,
     pool: &FramePool,
     surfaces: &mut Vec<ShmSurface>,
@@ -258,6 +283,7 @@ fn try_rebuild_channel(
 ) -> Result<(), String> {
     let (new_conn, new_screen) =
         x11rb::connect(None).map_err(|e| format!("X11 reconnect failed: {e}"))?;
+    require_32bpp(&new_conn, new_screen)?;
     new_conn
         .shm_query_version()
         .map_err(|e| format!("shm_query_version: {e}"))?
@@ -299,6 +325,8 @@ fn try_rebuild_channel(
     *cap_y = clamp_offset(rsettings.capture_y, geo.height);
     *cap_w = fw;
     *cap_h = fh;
+    *root_w = geo.width;
+    *root_h = geo.height;
     *surfaces = fresh;
     pool.bump_generation();
     Ok(())
@@ -774,20 +802,7 @@ where
     let (mut conn, screen_num) =
         x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
     let mut root = conn.setup().roots[screen_num].root;
-    let root_depth = conn.setup().roots[screen_num].root_depth;
-
-    let bpp = conn
-        .setup()
-        .pixmap_formats
-        .iter()
-        .find(|f| f.depth == root_depth)
-        .map(|f| f.bits_per_pixel)
-        .unwrap_or(32);
-    if bpp != 32 {
-        return Err(format!(
-            "unsupported root depth {root_depth} ({bpp} bpp); only 32-bpp BGRA is supported"
-        ));
-    }
+    require_32bpp(&conn, screen_num)?;
 
     conn.shm_query_version()
         .map_err(|e| format!("shm_query_version: {e}"))?
@@ -808,6 +823,9 @@ where
     let (mut cap_w, mut cap_h) = resolve_dims(geo.width, geo.height, &rsettings);
     let mut cap_x = clamp_offset(rsettings.capture_x, geo.width);
     let mut cap_y = clamp_offset(rsettings.capture_y, geo.height);
+    // Last root size seen. A live pan has to clamp against something even when the geometry
+    // round-trip fails, or the requested origin would be dropped instead of applied.
+    let (mut root_w, mut root_h) = (geo.width, geo.height);
 
     const POOL_N: usize = 3;
     let mut surfaces: Vec<ShmSurface> = Vec::with_capacity(POOL_N);
@@ -828,13 +846,17 @@ where
     let enc_pool = pool.clone();
     let enc_controls = controls.clone();
     let enc_settings = settings.clone();
+    let encode_panicked = Arc::new(AtomicBool::new(false));
+    let guard_panicked = encode_panicked.clone();
     let encode_thread = thread::spawn(move || {
         crate::boost_thread_priority(-10);
         let _ = encode_tid_tx.send(thread::current().id());
         let mut on_frame = on_frame;
         // An encoder panic must never wedge the capture: without the pool shutdown
         // the capture thread would block in publish forever while is_capturing still
-        // reports true on this thread's handle.
+        // reports true on this thread's handle. Shutting the pool unblocks it through
+        // the same path a clean stop takes, so the panic is also recorded — otherwise
+        // the capture would return Ok and Python could not tell the two apart.
         let guard_pool = enc_pool.clone();
         let guard_controls = enc_controls.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -842,6 +864,7 @@ where
         }));
         if result.is_err() {
             eprintln!("[pixelflux x11] encode thread panicked; shutting the pool to fail the capture");
+            guard_panicked.store(true, Ordering::Release);
             guard_pool.shutdown();
             guard_controls.stop.store(true, Ordering::Relaxed);
         }
@@ -882,9 +905,13 @@ where
                 // settings) would glue resolve_dims back to the ROOT size, undoing the
                 // re-target on the next geometry poll. w/h <= 0 keep following the root.
                 rsettings.auto_adjust_screen_capture_size = nw <= 0 || nh <= 0;
+                cap_x = clamp_offset(nx, root_w);
+                cap_y = clamp_offset(ny, root_h);
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
-                    cap_x = clamp_offset(nx, g.width);
-                    cap_y = clamp_offset(ny, g.height);
+                    root_w = g.width;
+                    root_h = g.height;
+                    cap_x = clamp_offset(nx, root_w);
+                    cap_y = clamp_offset(ny, root_h);
                     let (fw, fh) = resolve_dims(g.width, g.height, &rsettings);
                     if fw != cap_w || fh != cap_h {
                         if !pool.drain_for_resize(POOL_N, &controls.stop) {
@@ -916,8 +943,10 @@ where
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
                     // A root shrink can strand even a previously-valid offset past
                     // the new edge; re-clamp it against the live root.
-                    cap_x = clamp_offset(rsettings.capture_x, g.width);
-                    cap_y = clamp_offset(rsettings.capture_y, g.height);
+                    root_w = g.width;
+                    root_h = g.height;
+                    cap_x = clamp_offset(rsettings.capture_x, root_w);
+                    cap_y = clamp_offset(rsettings.capture_y, root_h);
                     let (nw, nh) = resolve_dims(g.width, g.height, &rsettings);
                     if nw != cap_w || nh != cap_h {
                         if !pool.drain_for_resize(POOL_N, &controls.stop) {
@@ -976,6 +1005,7 @@ where
                         match try_rebuild_channel(
                             &mut conn, &mut root, &rsettings,
                             &mut cap_x, &mut cap_y, &mut cap_w, &mut cap_h,
+                            &mut root_w, &mut root_h,
                             POOL_N, &pool, &mut surfaces, &controls.stop,
                         ) {
                             Ok(()) => { recovered = true; break; }
@@ -1068,7 +1098,12 @@ where
     for s in surfaces.iter_mut() {
         s.destroy(&conn);
     }
-    result
+    match result {
+        // A real capture error is the more specific diagnosis, so it outranks the panic flag.
+        Err(e) => Err(e),
+        Ok(()) if encode_panicked.load(Ordering::Acquire) => Err("encode thread panicked".into()),
+        Ok(()) => Ok(()),
+    }
 }
 
 #[cfg(test)]

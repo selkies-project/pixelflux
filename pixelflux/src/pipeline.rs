@@ -211,8 +211,11 @@ impl X11Pipeline {
     ///
     /// 1. **OpenH264** — when `use_openh264` is set (explicit opt-in, full-frame software).
     /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
-    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls to x264).
-    /// 4. **Software** (`X11Encoder::None`) — on any hardware init failure or explicit software.
+    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls back to the
+    ///    software path).
+    /// 4. **Software** — `software_h264_encoder`: `X11Encoder::None`, meaning the striped x264
+    ///    inside `encode_cpu`, in a GPL build; the full-frame OpenH264 encoder when the `gpl`
+    ///    feature is disabled.
     pub fn new(settings: RustCaptureSettings) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");

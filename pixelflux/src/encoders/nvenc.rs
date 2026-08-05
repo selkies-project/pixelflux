@@ -521,19 +521,19 @@ impl Drop for NvencEncoder {
     }
 }
 
-/// The lowest H.264 level (nvcodec-sys numeric encoding: 52/60/61/62 for 5.2/6.0/6.1/6.2)
-/// whose Annex-A limits fit this resolution and frame rate, floored at 5.2.
-///
-/// A frame's cost is measured two ways against Annex-A Table A-1: **MaxFS**, the frame size in
-/// macroblocks, and **MaxMBPS**, the macroblock rate (frame size × fps). The candidate table is
-/// ascending and begins at 5.2 — there is no 5.1 entry — so every resolution up to 4K resolves
-/// deterministically to High@5.2. Only above 4K does the level step up to 6.0 / 6.1 / 6.2; a flat
-/// 5.2 would fail NVENC init there (5.2's MaxFS of 36864 MBs is ≈ 4096×2304). Picking the lowest
-/// fitting level makes the SPS advertise the smallest level a decoder must support, and because the
-/// level is fixed from frame 1 (with the profile held at High) the stream never bumps its level
-/// mid-GOP — which would force some hardware decoders to re-initialize. Above 6.2's limits there is
-/// no higher level, so it returns 6.2 as a best effort.
 use super::min_h264_level;
+
+/// The level an NVENC session advertises for this geometry, floored at 5.2 (`NV_ENC_LEVEL`
+/// shares level_idc's numbering: 52/60/61/62 for 5.2/6.0/6.1/6.2).
+///
+/// `reconfigure_resolution` resizes a live session in place, so the level has to cover every
+/// geometry that session can still reach — a level bump mid-GOP forces some hardware decoders to
+/// re-initialize. 5.2's MaxFS of 36864 macroblocks (≈ 4096×2304) spans everything up to 4K, so
+/// pinning that floor makes the whole range resolve to High@5.2; only beyond 4K does the shared
+/// ladder step up to 6.0 / 6.1 / 6.2.
+fn nvenc_h264_level(width: u32, height: u32, fps: u32) -> u32 {
+    min_h264_level(width, height, fps).max(52)
+}
 
 impl NvencEncoder {
     /// Resolve EGL at runtime rather than link against it, so one binary boots even on hosts
@@ -732,10 +732,11 @@ impl NvencEncoder {
     ///    High-4:4:4 profile; CBR (two-pass quarter-resolution for tighter per-frame rate adherence,
     ///    VBV sizing, optional min/max QP clamps) or ConstQP; infinite GOP (`gopLength` / `idrPeriod`
     ///    = `0xFFFFFFFF`); `zeroReorderDelay` plus a bitstream-restriction VUI (`max_num_reorder_frames=0`)
-    ///    so no-reorder decoders don't buffer; an explicit Annex-A level from `min_h264_level` pinned
-    ///    from frame 1 so the level never bumps mid-stream; BT.709 VUI colorimetry; chroma 4:2:0 or
-    ///    4:4:4 with the matching full-range flag; repeated SPS/PPS; CABAC; no AUD; strict GOP
-    ///    target; and lookahead disabled for real-time latency.
+    ///    so no-reorder decoders don't buffer; an explicit Annex-A level from `nvenc_h264_level`
+    ///    pinned from frame 1 so the level never bumps mid-stream; SMPTE170M VUI colorimetry,
+    ///    matching the fixed BT.601 matrix the hardware ARGB CSC applies; chroma 4:2:0 or 4:4:4
+    ///    with the matching full-range flag; repeated SPS/PPS; CABAC; no AUD; strict GOP target;
+    ///    and lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to at
     ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place; this costs
     ///    ~290 MiB of device memory, so a failed init retries at the exact size (in-place resize then
@@ -927,7 +928,7 @@ impl NvencEncoder {
             config.rcParams.set_zeroReorderDelay(1);
             config.encodeCodecConfig.h264Config.h264VUIParameters.bitstreamRestrictionFlag = 1;
             config.encodeCodecConfig.h264Config.level =
-                min_h264_level(width, height, settings.target_fps as u32);
+                nvenc_h264_level(width, height, settings.target_fps as u32);
             config.encodeCodecConfig.h264Config.idrPeriod = 0xFFFFFFFF;
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoSignalTypePresentFlag = 1;
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat =
@@ -1175,7 +1176,7 @@ impl NvencEncoder {
             }
 
             self.encode_config.encodeCodecConfig.h264Config.level =
-                min_h264_level(new_w, new_h, settings.target_fps as u32);
+                nvenc_h264_level(new_w, new_h, settings.target_fps as u32);
             if is_cbr {
                 let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
                 self.encode_config.rcParams.averageBitRate = bps;
@@ -1365,7 +1366,7 @@ impl NvencEncoder {
             if self.init_params.frameRateNum != fps {
                 self.init_params.frameRateNum = fps;
                 self.init_params.frameRateDen = 1;
-                self.encode_config.encodeCodecConfig.h264Config.level = min_h264_level(
+                self.encode_config.encodeCodecConfig.h264Config.level = nvenc_h264_level(
                     self.init_params.encodeWidth,
                     self.init_params.encodeHeight,
                     fps,
@@ -1616,11 +1617,9 @@ impl NvencEncoder {
     }
 
     /// Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
-    /// CPU-side colour conversion. NVENC performs its hardware ARGB->YUV conversion with the
-    /// BT.601 matrix while the session's VUI is written BT.709 (a slight core-visual shift vs
-    /// the BT.709 CPU path): the VUI is reinterpreted by decoders but cannot be made to match
-    /// the nvenc hardware conversion — a 601->709 CPU prepass is intentionally skipped here to
-    /// keep this path zero-copy.
+    /// CPU-side colour conversion. NVENC's hardware ARGB→YUV conversion is fixed at the BT.601
+    /// matrix, which is why the session VUI declares SMPTE170M; a CPU 601→709 prepass would cost
+    /// this path its zero-copy property.
     ///
     /// The packed rows are copied host→device into the registered ARGB surface and NVENC's hardware
     /// CSC produces the YUV. Bytes must be in NVENC ARGB order (`B,G,R,A` in memory) — the host BGRA

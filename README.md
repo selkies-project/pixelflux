@@ -177,7 +177,7 @@ settings.damage_block_duration = 30     # Frames a stripe stays "damaged"
 # --- Watermarking ---
 # Must be a bytes object. The path to your PNG image.
 settings.watermark_path = b"/path/to/your/watermark.png" 
-settings.cursor_size_cap = 0                       # Cap out-of-band hardware-cursor PNGs to this longest edge (<= 0 = uncapped)
+settings.cursor_size_cap = 32                      # Cap out-of-band hardware-cursor PNGs to this longest edge (<= 0 = uncapped)
 # 0:None, 1:TopLeft, 2:TopRight, 3:BottomLeft, 4:BottomRight, 5:Middle, 6:Animated
 settings.watermark_location_enum = 4 
 ```

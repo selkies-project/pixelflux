@@ -226,9 +226,13 @@ pub struct WlCapture {
     /// Last tick this capture actually rendered; paces per-display fps under the one
     /// shared render timer (which fires at the fastest active capture's rate).
     pub last_tick: Option<Instant>,
-    /// Consecutive zero-copy encode failures: past the recovery threshold the session
-    /// is rebuilt once, then the capture demotes to the readback path.
+    /// Consecutive zero-copy encode failures; reset by any frame that encodes cleanly.
+    /// Reaching `HW_ERROR_RECOVERY_THRESHOLD` triggers recovery.
     pub hw_error_streak: u32,
+    /// Whether the zero-copy session has already been rebuilt without a clean frame since.
+    /// Recovery rebuilds once and demotes to readback on the next streak, so a session that
+    /// constructs but never encodes cannot loop rebuilding forever.
+    pub hw_rebuilt: bool,
 }
 
 impl WlCapture {
