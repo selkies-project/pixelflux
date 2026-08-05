@@ -642,7 +642,7 @@ pub enum ThreadCommand {
     /// Move the window with the given id onto output `output_id` (fullscreened there).
     MoveWindowToOutput { window_id: u32, output_id: u32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every mapped window as `(window_id, title, app_id, output_id)`.
-    ListWindows { reply: std::sync::mpsc::Sender<Vec<(u32, String, String, u32)>> },
+    ListWindows { reply: std::sync::mpsc::Sender<Vec<(u32, String, String, u32, bool)>> },
     SetCursorCallback(Py<PyAny>),
     SetClipboardCallback(Py<PyAny>),
     /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
@@ -3205,9 +3205,10 @@ fn create_output_on(
         overlay_state: OverlayState::default(),
         capture: None,
     });
-    // A nested session opens one host toplevel per screen and stacks the extras
-    // on an existing output until a display exists for them: hand the newest
-    // stacked window to the new output.
+    // A nested session opens one host toplevel per screen and the extras wait
+    // parked until a display exists for them: hand the newest waiting window to
+    // the new output. Windows stacked on an output rather than parked — anything
+    // placed before this compositor started parking them — remain candidates.
     let mut counts: Vec<(u32, usize)> = Vec::new();
     for w in state.space.elements() {
         let oid = wayland::frontend::window_output_id(w);
@@ -3216,19 +3217,29 @@ fn create_output_on(
             None => counts.push((oid, 1)),
         }
     }
-    let adopt = state
-        .space
-        .elements()
-        .filter(|w| {
+    let newest = |pred: &dyn Fn(&smithay::desktop::Window) -> bool| {
+        state
+            .space
+            .elements()
+            .filter(|w| pred(w))
+            .max_by_key(|w| wayland::frontend::window_meta(w).map(|m| m.id).unwrap_or(0))
+            .cloned()
+    };
+    let adopt = newest(&|w| {
+        wayland::frontend::window_meta(w)
+            .map(|m| m.parked.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    })
+    .or_else(|| {
+        newest(&|w| {
             let oid = wayland::frontend::window_output_id(w);
             counts.iter().any(|(o, c)| *o == oid && *c >= 2)
         })
-        .max_by_key(|w| wayland::frontend::window_meta(w).map(|m| m.id).unwrap_or(0))
-        .cloned();
+    });
     if let Some(window) = adopt {
         state.place_window_on_output(&window, id);
         println!(
-            "[Wayland] Output {id}: adopted stacked window {}.",
+            "[Wayland] Output {id}: adopted waiting window {}.",
             wayland::frontend::window_meta(&window).map(|m| m.id).unwrap_or(0)
         );
     }
@@ -3311,7 +3322,13 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
         .cloned()
         .collect();
     for window in &windows {
-        state.place_window_on_output(window, 0);
+        // The primary keeps whichever screen it already shows: a nested session's
+        // second screen parks again rather than covering the first.
+        if state.would_cover_screen(window, 0) {
+            state.park_window(window, 0);
+        } else {
+            state.place_window_on_output(window, 0);
+        }
     }
     for w in &state.pending_windows {
         if let Some(meta) = wayland::frontend::window_meta(w) {
@@ -3732,7 +3749,13 @@ fn run_wayland_thread(
                                 })
                             })
                             .unwrap_or_default();
-                        list.push((meta.id, title, app_id, meta.output.load(Ordering::Relaxed)));
+                        list.push((
+                            meta.id,
+                            title,
+                            app_id,
+                            meta.output.load(Ordering::Relaxed),
+                            meta.parked.load(Ordering::Relaxed),
+                        ));
                     }
                     let _ = reply.send(list);
                 }
@@ -4504,8 +4527,10 @@ impl WaylandBackend {
             .unwrap_or(false))
     }
 
-    /// Every mapped window as `(window_id, title, app_id, output_id)`.
-    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32)>> {
+    /// Every mapped window as `(window_id, title, app_id, output_id, waiting)`. A waiting
+    /// window is tagged for that output but mapped clear of every one of them, holding its
+    /// size until an output exists for it — a nested session's spare screens.
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32, bool)>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.send(ThreadCommand::ListWindows { reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to list windows: {}", e)))?;
@@ -5763,9 +5788,9 @@ impl ScreenCapture {
             be.bind(py).borrow().move_window_to_output(py, window_id, output_id)
         })
     }
-    /// Every mapped window as `(window_id, title, app_id, output_id)`; empty when no
-    /// backend runs.
-    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32)>> {
+    /// Every mapped window as `(window_id, title, app_id, output_id, waiting)`; empty when
+    /// no backend runs.
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32, bool)>> {
         wayland_backend_running(py)
             .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_windows(py))
     }

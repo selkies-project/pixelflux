@@ -306,7 +306,15 @@ pub struct WindowMeta {
     /// wlroots-based nested compositor, GTK and Qt) is answered with a configure before it
     /// ever commits, which would leave every window on the pointer's output.
     pub placed: AtomicBool,
+    /// Set while the window is mapped outside every output, tagged to the output it will
+    /// take once one exists. See `park_window`.
+    pub parked: AtomicBool,
 }
+
+/// Where a parked window is mapped: clear of every output, so it is composited into none of
+/// them. Layout offsets are non-negative — the union layout Selkies computes re-anchors at
+/// the origin — so far negative coordinates can never collide with a real output.
+pub const PARKED_POS: (i32, i32) = (-(1 << 20), -(1 << 20));
 
 /// The window's meta, inserted at `new_toplevel`; windows created before that (none in
 /// practice) read as id 0 / primary output.
@@ -698,34 +706,26 @@ impl CompositorHandler for AppState {
                 let mut target_id = self.pointer_display();
                 // A second fullscreen surface from a client that already owns one on
                 // the target output is screen-like (a nested compositor opens one
-                // host toplevel per screen): place it on an empty output when one
-                // exists instead of stacking it.
-                if let Some(client) = toplevel.wl_surface().client() {
-                    let same_client = |w: &Window| {
-                        w.wl_surface()
-                            .and_then(|s| s.client())
-                            .map_or(false, |c| c.id() == client.id())
-                    };
-                    let crowded = self
-                        .space
-                        .elements()
-                        .chain(self.pending_windows.iter())
-                        .any(|w| window_output_id(w) == target_id && same_client(w));
-                    if crowded {
-                        let empty = self.output_nodes.iter().map(|n| n.id).find(|oid| {
-                            !self
-                                .space
-                                .elements()
-                                .chain(self.pending_windows.iter())
-                                .any(|w| window_output_id(w) == *oid)
-                        });
-                        if let Some(oid) = empty {
-                            target_id = oid;
-                        }
+                // host toplevel per screen): give it an empty output when one exists,
+                // and park it otherwise rather than let it cover the screen already
+                // there. `create_output` hands it the output it is waiting for.
+                let mut park = false;
+                if self.would_cover_screen(&window, target_id) {
+                    let empty = self.output_nodes.iter().map(|n| n.id).find(|oid| {
+                        !self
+                            .space
+                            .elements()
+                            .chain(self.pending_windows.iter())
+                            .any(|w| window_output_id(w) == *oid)
+                    });
+                    match empty {
+                        Some(oid) => target_id = oid,
+                        None => park = true,
                     }
                 }
                 if let Some(meta) = window_meta(&window) {
                     meta.output.store(target_id, Ordering::Relaxed);
+                    meta.parked.store(park, Ordering::Relaxed);
                 }
                 let (logical_width, logical_height) =
                     if let Some(size) = self.logical_size_of(target_id) {
@@ -762,15 +762,24 @@ impl CompositorHandler for AppState {
                 self.send_forced_fullscreen_configure(&tl);
             } else {
                 let target_id = window_output_id(&window);
+                let parked = window_meta(&window)
+                    .map(|meta| meta.parked.load(Ordering::Relaxed))
+                    .unwrap_or(false);
                 let node_idx = self.node_idx_for_id(target_id).unwrap_or(0);
                 let (target_output, pos) = {
                     let node = &self.output_nodes[node_idx];
                     (node.output.clone(), node.pos)
                 };
-                self.space.map_element(window.clone(), pos, true);
+                // A parked window enters no output and takes no focus: it is waiting for
+                // an output of its own, and holds its size until one arrives.
+                self.space.map_element(
+                    window.clone(),
+                    if parked { PARKED_POS } else { pos },
+                    !parked,
+                );
                 window.on_commit();
 
-                {
+                if !parked {
                     target_output.enter(surface);
                     let scale = target_output.current_scale().fractional_scale();
                     with_states(surface, |states| {
@@ -793,12 +802,12 @@ impl CompositorHandler for AppState {
                             toplevel.send_configure();
                         }
                     }
-                }
 
-                let serial = next_serial();
-                let target = FocusTarget::Window(window.clone());
-                if let Some(keyboard) = self.seat.get_keyboard() {
-                    keyboard.set_focus(self, Some(target.clone()), serial);
+                    let serial = next_serial();
+                    let target = FocusTarget::Window(window.clone());
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Some(target.clone()), serial);
+                    }
                 }
             }
         }
@@ -896,6 +905,39 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    /// Whether `window` would land on top of a screen another window from the same client
+    /// already occupies. A nested session opens one host toplevel per screen, and a second
+    /// one covering the first would replace what the display shows rather than add to it.
+    pub(crate) fn would_cover_screen(&self, window: &Window, id: u32) -> bool {
+        let Some(client) = window.wl_surface().and_then(|s| s.client()) else { return false };
+        self.space
+            .elements()
+            .chain(self.pending_windows.iter())
+            .filter(|w| !std::ptr::eq(*w, window) && w.wl_surface() != window.wl_surface())
+            .any(|w| {
+                window_output_id(w) == id
+                    && !window_meta(w).map(|m| m.parked.load(Ordering::Relaxed)).unwrap_or(false)
+                    && w.wl_surface()
+                        .and_then(|s| s.client())
+                        .map_or(false, |c| c.id() == client.id())
+            })
+    }
+
+    /// Map `window` clear of every output while keeping it tagged for `id`, so it holds its
+    /// size and its place in the window list without being composited anywhere. A nested
+    /// session's spare screens wait here until `create_output` gives them one.
+    pub(crate) fn park_window(&mut self, window: &Window, id: u32) {
+        let old_id = window_output_id(window);
+        if let Some(meta) = window_meta(window) {
+            meta.output.store(id, Ordering::Relaxed);
+            meta.parked.store(true, Ordering::Relaxed);
+        }
+        if let (Some(surface), Some(idx)) = (window.wl_surface(), self.node_idx_for_id(old_id)) {
+            self.output_nodes[idx].output.leave(&surface);
+        }
+        self.space.map_element(window.clone(), PARKED_POS, false);
+    }
+
     /// Place `window` on output `id`: retag its meta, remap it at the output's layout
     /// origin, move output enter/leave, push the output's fractional scale, and send the
     /// forced-fullscreen configure at that output's logical size.
@@ -911,6 +953,7 @@ impl AppState {
             .map(|i| self.output_nodes[i].output.clone());
         if let Some(meta) = window_meta(window) {
             meta.output.store(id, Ordering::Relaxed);
+            meta.parked.store(false, Ordering::Relaxed);
         }
         self.space.map_element(window.clone(), pos, true);
         if let Some(surface) = window.wl_surface() {
@@ -1992,6 +2035,7 @@ impl XdgShellHandler for AppState {
             id: NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
             output: AtomicU32::new(target_id),
             placed: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
         });
         self.pending_windows.push(window);
         let (title, app_id) = with_states(surface.wl_surface(), |states| {
