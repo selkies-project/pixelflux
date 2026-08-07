@@ -33,12 +33,13 @@ use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
 use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
-use crate::encoders::overlay::WatermarkLocation;
+use crate::encoders::overlay::blend_pixel_premultiplied;
 use crate::encoders::software::EncodedStripe;
 use crate::pipeline::X11Pipeline;
 use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 
+pub mod computer_use;
 pub mod cursor;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
@@ -194,20 +195,48 @@ impl ShmSurface {
     }
 }
 
-/// Resolve the capture dimensions `shm_get_image` will read, bounded so the region can never
-/// run past the live root from the capture offset.
+/// Reject a server whose root visual is not 32 bits per pixel.
 ///
-/// The bound is the reason this function exists: a grab that ran off the root edge would fail the
-/// request outright, so the size is always clamped to what is actually there. With auto-adjust (or
-/// an unset width/height `<= 0`) the capture tracks the full root minus the capture offset;
-/// otherwise the requested size is clamped to what is available from that offset. `capture_x` /
-/// `capture_y` are floored at `>= 0` exactly as `shm_get_image` consumes them, and saturating
-/// subtraction plus a final `u16` clamp (minimum 2) keep pathological settings from overflowing or
-/// collapsing to an unusable surface. H.264 (`output_mode == 1`) requires even dimensions, so both
-/// are then rounded down to a multiple of two.
+/// Every `ShmSurface` is sized at `width * 4` bytes per row and the capture is read as packed
+/// BGRA, so a root of any other depth would be grabbed as garbage rather than failing. Checked
+/// on the initial connection and again on every reconnect, since a restarted server can come
+/// back with a different visual.
+fn require_32bpp(conn: &RustConnection, screen: usize) -> Result<(), String> {
+    let root_depth = conn.setup().roots[screen].root_depth;
+    let bpp = conn
+        .setup()
+        .pixmap_formats
+        .iter()
+        .find(|f| f.depth == root_depth)
+        .map(|f| f.bits_per_pixel)
+        .unwrap_or(32);
+    if bpp != 32 {
+        return Err(format!(
+            "unsupported root depth {root_depth} ({bpp} bpp); only 32-bpp BGRA is supported"
+        ));
+    }
+    Ok(())
+}
+
+/// Clamp a capture offset to the live root so a grab always has at least one root pixel in
+/// range: a past-end offset fails every `shm_get_image` with BadMatch and would burn out the
+/// failure budget with no chance of recovery. The upper clamp also keeps protocol-range roots
+/// (INT16 coordinates) from truncating a wider value through the `as i16` cast.
+fn clamp_offset(x: i32, root: u16) -> i16 {
+    let upper = (root as i32).saturating_sub(1).min(i16::MAX as i32 - 1);
+    x.max(0).min(upper) as i16
+}
+
+/// Resolve the capture dimensions `shm_get_image` will read, bounded so the region can never
+/// run past the live root from the (clamped) capture offset: with auto-adjust (or unset
+/// width/height `<= 0`) the capture tracks the full root minus the offset, otherwise the
+/// requested size is clamped to what is available from it. Saturating subtraction plus a final
+/// `u16` clamp (minimum 2) keep pathological settings from overflowing or collapsing to an
+/// unusable surface. H.264 (`output_mode == 1`) requires even dimensions, so both are then
+/// rounded down to a multiple of two.
 fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16) {
-    let cap_x = s.capture_x.max(0);
-    let cap_y = s.capture_y.max(0);
+    let cap_x = clamp_offset(s.capture_x, root_w) as i32;
+    let cap_y = clamp_offset(s.capture_y, root_h) as i32;
     let avail_w = (root_w as i32).saturating_sub(cap_x).max(2);
     let avail_h = (root_h as i32).saturating_sub(cap_y).max(2);
     let mut w = if s.auto_adjust_screen_capture_size || s.width <= 0 {
@@ -227,6 +256,80 @@ fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16)
         h &= !1;
     }
     (w as u16, h as u16)
+}
+
+/// Rebuild the X channel + capture surfaces after a connection-level failure (Xorg restart,
+/// VT switch), refreshing the offset/dims state against the live root. The pool is drained
+/// first so the encode thread can never be reading a surface as it is destroyed, and its
+/// generation is bumped so the encoder rebuilds against the new layout. Every fallible step
+/// completes before the swap, and the old channel/surfaces are destroyed best-effort after
+/// it (their server is likely gone; the local detaches still run, and the kernel frees
+/// each old segment once nothing maps it).
+#[allow(clippy::too_many_arguments)]
+fn try_rebuild_channel(
+    conn: &mut RustConnection,
+    root: &mut u32,
+    rsettings: &RustCaptureSettings,
+    cap_x: &mut i16,
+    cap_y: &mut i16,
+    cap_w: &mut u16,
+    cap_h: &mut u16,
+    root_w: &mut u16,
+    root_h: &mut u16,
+    pool_n: usize,
+    pool: &FramePool,
+    surfaces: &mut Vec<ShmSurface>,
+    stop: &AtomicBool,
+) -> Result<(), String> {
+    let (new_conn, new_screen) =
+        x11rb::connect(None).map_err(|e| format!("X11 reconnect failed: {e}"))?;
+    require_32bpp(&new_conn, new_screen)?;
+    new_conn
+        .shm_query_version()
+        .map_err(|e| format!("shm_query_version: {e}"))?
+        .reply()
+        .map_err(|e| format!("XShm unavailable on reconnect: {e}"))?;
+    new_conn
+        .xfixes_query_version(5, 0)
+        .map_err(|e| format!("xfixes_query_version: {e}"))?
+        .reply()
+        .map_err(|e| format!("XFixes unavailable on reconnect: {e}"))?;
+    let new_root = new_conn.setup().roots[new_screen].root;
+    let geo = new_conn
+        .get_geometry(new_root)
+        .map_err(|e| format!("get_geometry: {e}"))?
+        .reply()
+        .map_err(|e| format!("get_geometry reply on reconnect: {e}"))?;
+    if !pool.drain_for_resize(pool_n, stop) {
+        return Err("pool drain interrupted by stop during reconnect".to_string());
+    }
+    let (fw, fh) = resolve_dims(geo.width, geo.height, rsettings);
+    let mut fresh: Vec<ShmSurface> = Vec::with_capacity(pool_n);
+    for _ in 0..pool_n {
+        match ShmSurface::create(&new_conn, fw, fh) {
+            Ok(s) => fresh.push(s),
+            Err(e) => {
+                for s in fresh.iter_mut() {
+                    s.destroy(&new_conn);
+                }
+                return Err(e);
+            }
+        }
+    }
+    for s in surfaces.iter_mut() {
+        s.destroy(conn);
+    }
+    *conn = new_conn;
+    *root = new_root;
+    *cap_x = clamp_offset(rsettings.capture_x, geo.width);
+    *cap_y = clamp_offset(rsettings.capture_y, geo.height);
+    *cap_w = fw;
+    *cap_h = fh;
+    *root_w = geo.width;
+    *root_h = geo.height;
+    *surfaces = fresh;
+    pool.bump_generation();
+    Ok(())
 }
 
 /// Grab one frame of the capture region into `surface` with a single XShm round-trip.
@@ -261,28 +364,6 @@ fn grab_frame(
     Ok(())
 }
 
-/// Alpha-blend a source pixel (pre-split into r,g,b,a) over a BGRA destination pixel.
-///
-/// Cursor and watermark pixels are overwhelmingly either fully opaque or fully transparent, and this
-/// runs per pixel per frame on the CPU, so the two extremes are special-cased to skip the blend
-/// arithmetic entirely: an opaque source (`a == 255`) simply overwrites, a fully transparent source
-/// (`a == 0`) is left as-is, and only genuine edge pixels pay for the integer source-over. In every
-/// case only the B / G / R bytes are written; the destination's alpha byte is left as the capture
-/// delivered it.
-#[inline]
-fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
-    if a == 255 {
-        dst[0] = b;
-        dst[1] = g;
-        dst[2] = r;
-    } else if a > 0 {
-        let ia = 255 - a as u32;
-        dst[0] = ((b as u32 * a as u32 + dst[0] as u32 * ia) / 255) as u8;
-        dst[1] = ((g as u32 * a as u32 + dst[1] as u32 * ia) / 255) as u8;
-        dst[2] = ((r as u32 * a as u32 + dst[2] as u32 * ia) / 255) as u8;
-    }
-}
-
 /// Frame-space top-left of the cursor image, given the XFixes hotspot position.
 ///
 /// XFixes reports the cursor position at its HOTSPOT; X draws the image with its top-left at
@@ -290,15 +371,16 @@ fn blend_pixel(dst: &mut [u8], r: u8, g: u8, b: u8, a: u8) {
 /// The result may go negative near the frame edges, which `overlay_cursor` clips per pixel to match
 /// the server's own edge clipping.
 #[inline]
-fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
+pub(crate) fn cursor_image_origin(x: i16, y: i16, xhot: u16, yhot: u16, cap_x: i32, cap_y: i32) -> (i32, i32) {
     (x as i32 - xhot as i32 - cap_x, y as i32 - yhot as i32 - cap_y)
 }
 
-/// Composite the XFixes cursor (ARGB `u32` per pixel) onto the BGRA frame with its top-left
-/// at `(img_x, img_y)`, blending each pixel through `blend_pixel` with per-pixel bounds clipping so
-/// an image straddling a frame edge writes only its in-frame portion.
+/// Composite the XFixes cursor (ARGB `u32` per pixel, premultiplied by the XFixes
+/// format definition) onto the BGRA frame with its top-left at `(img_x, img_y)`,
+/// blending each pixel through `blend_pixel_premultiplied` with per-pixel bounds
+/// clipping so an image straddling a frame edge writes only its in-frame portion.
 #[allow(clippy::too_many_arguments)]
-fn overlay_cursor(
+pub(crate) fn overlay_cursor(
     frame: &mut [u8],
     stride: usize,
     frame_w: i32,
@@ -325,148 +407,7 @@ fn overlay_cursor(
             let g = ((px >> 8) & 0xFF) as u8;
             let b = (px & 0xFF) as u8;
             let off = ty as usize * stride + tx as usize * 4;
-            blend_pixel(&mut frame[off..off + 4], r, g, b, a);
-        }
-    }
-}
-
-/// CPU watermark: the raw RGBA pixels (row-major, `w*h*4`) in host memory plus the
-/// placement / animation state, blended directly into the captured BGRA frame.
-///
-/// The blend is on the CPU because the frame is already sitting in host shm memory before it reaches
-/// any encoder, so stamping the overlay there is both the cheapest place to do it and the one place
-/// it applies identically regardless of which encoder (hardware or software) runs downstream. The
-/// pixels are kept as RGBA straight from `image`'s decode and converted per pixel as they are blended.
-struct X11Watermark {
-    pixels: Vec<u8>,
-    w: i32,
-    h: i32,
-    pos_x: i32,
-    pos_y: i32,
-    sub_x: f64,
-    sub_y: f64,
-    vel_x: f64,
-    vel_y: f64,
-    loaded: bool,
-}
-
-impl X11Watermark {
-    /// Load the watermark image at `path` into host RGBA, or return an unloaded stub.
-    ///
-    /// An empty path or any decode failure yields `loaded == false`, which every method treats as a
-    /// no-op, so a missing or broken watermark simply disables the overlay. The bouncing-animation
-    /// velocities are seeded here.
-    fn load(path: &str) -> Self {
-        let mut wm = Self {
-            pixels: Vec::new(),
-            w: 0,
-            h: 0,
-            pos_x: 0,
-            pos_y: 0,
-            sub_x: 0.0,
-            sub_y: 0.0,
-            vel_x: 2.0,
-            vel_y: 2.0,
-            loaded: false,
-        };
-        if path.is_empty() {
-            return wm;
-        }
-        if let Ok(img) = image::open(std::path::Path::new(path)) {
-            let rgba = img.to_rgba8();
-            wm.w = rgba.width() as i32;
-            wm.h = rgba.height() as i32;
-            wm.pixels = rgba.into_vec();
-            wm.loaded = wm.w > 0 && wm.h > 0;
-        }
-        wm
-    }
-
-    /// Set the watermark's top-left placement for this frame from the location enum; a stub
-    /// (unloaded) watermark returns immediately.
-    ///
-    /// The fixed corners and center are direct arithmetic. The animated mode advances a bouncing
-    /// position and reflects velocity off each frame edge, accumulating in the fractional `sub_x` /
-    /// `sub_y` rather than the integer `pos_x` / `pos_y`: a sub-pixel-per-frame velocity has to
-    /// survive between frames or the motion would either stall or snap by whole pixels, so the float
-    /// carries the remainder and `pos_x` / `pos_y` take its floor for the actual blit.
-    fn update_position(&mut self, frame_w: i32, frame_h: i32, loc_enum: i32) {
-        if !self.loaded {
-            return;
-        }
-        match WatermarkLocation::from(loc_enum) {
-            WatermarkLocation::TL => {
-                self.pos_x = 0;
-                self.pos_y = 0;
-            }
-            WatermarkLocation::TR => {
-                self.pos_x = frame_w - self.w;
-                self.pos_y = 0;
-            }
-            WatermarkLocation::BL => {
-                self.pos_x = 0;
-                self.pos_y = frame_h - self.h;
-            }
-            WatermarkLocation::BR => {
-                self.pos_x = frame_w - self.w;
-                self.pos_y = frame_h - self.h;
-            }
-            WatermarkLocation::MI => {
-                self.pos_x = (frame_w - self.w) / 2;
-                self.pos_y = (frame_h - self.h) / 2;
-            }
-            WatermarkLocation::AN => {
-                self.sub_x += self.vel_x;
-                self.sub_y += self.vel_y;
-                if self.sub_x <= 0.0 {
-                    self.sub_x = 0.0;
-                    self.vel_x = self.vel_x.abs();
-                } else if self.sub_x + self.w as f64 >= frame_w as f64 {
-                    self.sub_x = (frame_w - self.w) as f64;
-                    self.vel_x = -self.vel_x.abs();
-                }
-                if self.sub_y <= 0.0 {
-                    self.sub_y = 0.0;
-                    self.vel_y = self.vel_y.abs();
-                } else if self.sub_y + self.h as f64 >= frame_h as f64 {
-                    self.sub_y = (frame_h - self.h) as f64;
-                    self.vel_y = -self.vel_y.abs();
-                }
-                self.pos_x = self.sub_x as i32;
-                self.pos_y = self.sub_y as i32;
-            }
-            WatermarkLocation::None => (),
-        }
-    }
-
-    /// Alpha-blend the loaded watermark into the BGRA frame at its current position; a no-op
-    /// when unloaded. Clips per pixel at the frame bounds because the animated position — or a
-    /// watermark larger than the capture — can leave part of the image off-frame, and only the
-    /// in-frame portion may be written.
-    fn blend_into(&self, frame: &mut [u8], stride: usize, frame_w: i32, frame_h: i32) {
-        if !self.loaded {
-            return;
-        }
-        for y in 0..self.h {
-            let ty = self.pos_y + y;
-            if ty < 0 || ty >= frame_h {
-                continue;
-            }
-            for x in 0..self.w {
-                let tx = self.pos_x + x;
-                if tx < 0 || tx >= frame_w {
-                    continue;
-                }
-                let src = ((y * self.w + x) * 4) as usize;
-                let (r, g, b, a) = (
-                    self.pixels[src],
-                    self.pixels[src + 1],
-                    self.pixels[src + 2],
-                    self.pixels[src + 3],
-                );
-                let off = ty as usize * stride + tx as usize * 4;
-                blend_pixel(&mut frame[off..off + 4], r, g, b, a);
-            }
+            blend_pixel_premultiplied(&mut frame[off..off + 4], r, g, b, a);
         }
     }
 }
@@ -719,7 +660,7 @@ where
                 .is_some_and(|pl| pl.reshape(&psettings, size_changed));
             if !reshaped {
                 drop(pipeline.take());
-                pipeline = Some(X11Pipeline::new(psettings.clone(), recording_sink.clone()));
+                pipeline = Some(X11Pipeline::new(psettings.clone()));
                 if let Some(pl) = &pipeline {
                     let enc_name = pl.encoder_name();
                     let mut log_msg = format!(
@@ -729,7 +670,14 @@ where
                     if psettings.output_mode == 0 {
                         log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", psettings.jpeg_quality));
                     } else {
-                        log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                        if psettings.video_cbr_mode {
+                            log_msg.push_str(&format!(" | Mode: H264 CBR {}", psettings.video_bitrate_kbps));
+                        } else {
+                            log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                            if psettings.video_bitrate_kbps > 0 {
+                                log_msg.push_str(&format!(" | VBV: {} kbps", psettings.video_bitrate_kbps));
+                            }
+                        }
                         if psettings.video_fullcolor {
                             log_msg.push_str(" | Colorspace: I444 (Full Range)");
                         } else {
@@ -749,7 +697,13 @@ where
         }
         let pl = pipeline.as_mut().unwrap();
 
-        if controls.force_idr.swap(false, Ordering::Relaxed) {
+        // A recorder connecting to the socket sink needs a fresh decode entry point; it is
+        // folded into the same standard request-IDR path as a client-driven force_idr.
+        let sink_idr = recording_sink
+            .as_ref()
+            .map(|s| s.should_force_idr())
+            .unwrap_or(false);
+        if controls.force_idr.swap(false, Ordering::Relaxed) || sink_idr {
             pl.request_idr();
         }
         if controls.rate_dirty.swap(false, Ordering::Acquire) {
@@ -771,13 +725,9 @@ where
         if !stripes.is_empty() {
             frame_count += 1;
             stripe_count += stripes.len() as u64;
+            // IDR arming is consumed inside X11Pipeline::process; this tap only fans out.
             if let Some(ref socket) = recording_sink {
-                for stripe in &stripes {
-                    let _ = socket.write_encoded_frame(stripe);
-                }
-                if socket.should_force_idr() {
-                    controls.force_idr.store(true, Ordering::Relaxed);
-                }
+                socket.write_frame(&stripes, psettings.height);
             }
             on_frame(stripes);
         }
@@ -849,23 +799,10 @@ pub fn run_capture<F>(
 where
     F: FnMut(Vec<EncodedStripe>) + Send + 'static,
 {
-    let (conn, screen_num) =
+    let (mut conn, screen_num) =
         x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
-    let root = conn.setup().roots[screen_num].root;
-    let root_depth = conn.setup().roots[screen_num].root_depth;
-
-    let bpp = conn
-        .setup()
-        .pixmap_formats
-        .iter()
-        .find(|f| f.depth == root_depth)
-        .map(|f| f.bits_per_pixel)
-        .unwrap_or(32);
-    if bpp != 32 {
-        return Err(format!(
-            "unsupported root depth {root_depth} ({bpp} bpp); only 32-bpp BGRA is supported"
-        ));
-    }
+    let mut root = conn.setup().roots[screen_num].root;
+    require_32bpp(&conn, screen_num)?;
 
     conn.shm_query_version()
         .map_err(|e| format!("shm_query_version: {e}"))?
@@ -884,26 +821,53 @@ where
 
     let mut rsettings = settings.clone();
     let (mut cap_w, mut cap_h) = resolve_dims(geo.width, geo.height, &rsettings);
-    let mut cap_x = rsettings.capture_x.max(0) as i16;
-    let mut cap_y = rsettings.capture_y.max(0) as i16;
+    let mut cap_x = clamp_offset(rsettings.capture_x, geo.width);
+    let mut cap_y = clamp_offset(rsettings.capture_y, geo.height);
+    // Last root size seen. A live pan has to clamp against something even when the geometry
+    // round-trip fails, or the requested origin would be dropped instead of applied.
+    let (mut root_w, mut root_h) = (geo.width, geo.height);
 
     const POOL_N: usize = 3;
     let mut surfaces: Vec<ShmSurface> = Vec::with_capacity(POOL_N);
     for _ in 0..POOL_N {
         surfaces.push(ShmSurface::create(&conn, cap_w, cap_h)?);
     }
+    // Consecutive channel rebuilds without one good grab in between: geometry
+    // errors can burn out the grab budget repeatedly under a dead region, so
+    // recovery only gets a bounded number of channel rebuilds.
+    let mut reconnect_streak = 0u32;
     let pool = Arc::new(FramePool::new(POOL_N));
 
-    let mut watermark = X11Watermark::load(&settings.watermark_path);
+    let mut watermark = crate::encoders::overlay::OverlayState::default();
+    if !settings.watermark_path.is_empty() {
+        watermark.load_watermark(&settings.watermark_path, 1.0);
+    }
 
     let enc_pool = pool.clone();
     let enc_controls = controls.clone();
     let enc_settings = settings.clone();
+    let encode_panicked = Arc::new(AtomicBool::new(false));
+    let guard_panicked = encode_panicked.clone();
     let encode_thread = thread::spawn(move || {
         crate::boost_thread_priority(-10);
         let _ = encode_tid_tx.send(thread::current().id());
         let mut on_frame = on_frame;
-        encode_loop(&enc_pool, &enc_controls, &enc_settings, &mut on_frame);
+        // An encoder panic must never wedge the capture: without the pool shutdown
+        // the capture thread would block in publish forever while is_capturing still
+        // reports true on this thread's handle. Shutting the pool unblocks it through
+        // the same path a clean stop takes, so the panic is also recorded — otherwise
+        // the capture would return Ok and Python could not tell the two apart.
+        let guard_pool = enc_pool.clone();
+        let guard_controls = enc_controls.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode_loop(&enc_pool, &enc_controls, &enc_settings, &mut on_frame);
+        }));
+        if result.is_err() {
+            eprintln!("[pixelflux x11] encode thread panicked; shutting the pool to fail the capture");
+            guard_panicked.store(true, Ordering::Release);
+            guard_pool.shutdown();
+            guard_controls.stop.store(true, Ordering::Relaxed);
+        }
     });
 
     let mut next_frame = Instant::now();
@@ -941,9 +905,13 @@ where
                 // settings) would glue resolve_dims back to the ROOT size, undoing the
                 // re-target on the next geometry poll. w/h <= 0 keep following the root.
                 rsettings.auto_adjust_screen_capture_size = nw <= 0 || nh <= 0;
-                cap_x = nx.max(0) as i16;
-                cap_y = ny.max(0) as i16;
+                cap_x = clamp_offset(nx, root_w);
+                cap_y = clamp_offset(ny, root_h);
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
+                    root_w = g.width;
+                    root_h = g.height;
+                    cap_x = clamp_offset(nx, root_w);
+                    cap_y = clamp_offset(ny, root_h);
                     let (fw, fh) = resolve_dims(g.width, g.height, &rsettings);
                     if fw != cap_w || fh != cap_h {
                         if !pool.drain_for_resize(POOL_N, &controls.stop) {
@@ -973,6 +941,12 @@ where
             if (settings.auto_adjust_screen_capture_size || grab_failures > 0) && geometry_check <= 0 {
                 geometry_check = GEOMETRY_POLL_FRAMES;
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
+                    // A root shrink can strand even a previously-valid offset past
+                    // the new edge; re-clamp it against the live root.
+                    root_w = g.width;
+                    root_h = g.height;
+                    cap_x = clamp_offset(rsettings.capture_x, root_w);
+                    cap_y = clamp_offset(rsettings.capture_y, root_h);
                     let (nw, nh) = resolve_dims(g.width, g.height, &rsettings);
                     if nw != cap_w || nh != cap_h {
                         if !pool.drain_for_resize(POOL_N, &controls.stop) {
@@ -1004,8 +978,11 @@ where
                 Some(i) => i,
                 None => break,
             };
-            let surface = &mut surfaces[idx];
-            if let Err(e) = grab_frame(&conn, root, surface, cap_x, cap_y, cap_w, cap_h) {
+            let grab_result = {
+                let surface = &mut surfaces[idx];
+                grab_frame(&conn, root, surface, cap_x, cap_y, cap_w, cap_h)
+            };
+            if let Err(e) = grab_result {
                 // Most likely an external root resize between geometry polls made
                 // the grab run past the root edge: return the surface, re-poll
                 // geometry immediately, and only give up if it never recovers.
@@ -1013,11 +990,45 @@ where
                 grab_failures += 1;
                 geometry_check = 0;
                 if grab_failures > 120 {
-                    return Err(e);
+                    // A burn-out usually means the X connection itself is gone
+                    // (Xorg restart, VT switch): every request fails until the
+                    // server is back. Rebuild the channel a few times before
+                    // declaring the capture dead — a recovered server resumes the
+                    // stream where a dead thread would leave a black screen until
+                    // the Python watchdog restarts everything.
+                    let mut recovered = false;
+                    for _attempt in 0..5 {
+                        if controls.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                        match try_rebuild_channel(
+                            &mut conn, &mut root, &rsettings,
+                            &mut cap_x, &mut cap_y, &mut cap_w, &mut cap_h,
+                            &mut root_w, &mut root_h,
+                            POOL_N, &pool, &mut surfaces, &controls.stop,
+                        ) {
+                            Ok(()) => { recovered = true; break; }
+                            Err(re) => {
+                                eprintln!("[pixelflux x11] reconnect attempt failed: {re}");
+                            }
+                        }
+                    }
+                    if !recovered {
+                        return Err(format!("capture could not recover: {e}"));
+                    }
+                    grab_failures = 0;
+                    geometry_check = 0;
+                    reconnect_streak += 1;
+                    if reconnect_streak >= 4 {
+                        return Err("capture recovered its channel but the region never grabbed again".to_string());
+                    }
                 }
                 continue;
             }
             grab_failures = 0;
+            reconnect_streak = 0;
+            let surface = &mut surfaces[idx];
 
             let frame_w = cap_w as i32;
             let frame_h = cap_h as i32;
@@ -1058,9 +1069,9 @@ where
                 }
             }
 
-            if watermark.loaded {
+            if watermark.is_active() {
                 watermark.update_position(frame_w, frame_h, settings.watermark_location_enum);
-                watermark.blend_into(buf, stride, frame_w, frame_h);
+                watermark.blend_bgra(buf, stride, frame_w, frame_h);
             }
 
             let published = pool.publish(
@@ -1087,7 +1098,12 @@ where
     for s in surfaces.iter_mut() {
         s.destroy(&conn);
     }
-    result
+    match result {
+        // A real capture error is the more specific diagnosis, so it outranks the panic flag.
+        Err(e) => Err(e),
+        Ok(()) if encode_panicked.load(Ordering::Acquire) => Err("encode thread panicked".into()),
+        Ok(()) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -1269,6 +1285,46 @@ mod cursor_tests {
         assert_eq!(px(4, 4), 255);
         assert_eq!(px(2, 2), 0);
         assert_eq!(px(5, 5), 0, "no pixel at the un-offset (hotspot) corner");
+    }
+
+    #[test]
+    fn offset_clamps_into_root() {
+        assert_eq!(clamp_offset(100, 1920), 100);
+        assert_eq!(clamp_offset(-50, 1920), 0);
+        // Past-end offsets keep one root pixel instead of failing forever.
+        assert_eq!(clamp_offset(100000, 1920), 1919);
+        // A protocol-max root still maps into i16 X coordinates.
+        assert_eq!(clamp_offset(40000, u16::MAX), 32766);
+    }
+
+    #[test]
+    fn resolve_dims_survives_past_end_offset() {
+        let s = RustCaptureSettings {
+            capture_x: 100000,
+            capture_y: 100000,
+            width: 1920,
+            height: 1080,
+            output_mode: 1,
+            ..Default::default()
+        };
+        let (w, h) = resolve_dims(1920, 1080, &s);
+        assert!(w >= 2 && h >= 2, "a past-end offset now degrades to a small grab, not death");
+        assert_eq!(w % 2, 0);
+        assert_eq!(h % 2, 0);
+    }
+
+    /// `overlay_cursor` treats XFixes pixels as premultiplied: half-alpha at half
+    /// intensity stays at that intensity over black (the straight-alpha formula
+    /// would multiply alpha twice and darken it).
+    #[test]
+    fn overlay_blends_premultiplied_pixels() {
+        let stride = 4 * 4;
+        let mut frame = vec![0u8; stride * 4];
+        // a=128, g=128 (premultiplied half-intensity), b=64.
+        let pixels = [0x8000_8040u32; 4];
+        overlay_cursor(&mut frame, stride, 4, 4, 2, 2, &pixels, 0, 0);
+        assert_eq!(frame[0], 64, "blue channel: dst = 64 over black");
+        assert_eq!(frame[1], 128, "premultiplied half-alpha stays 128, not darkened to 64");
     }
 
     /// `overlay_cursor` clips a negative origin at the frame edge: with the origin at (-1,-1)

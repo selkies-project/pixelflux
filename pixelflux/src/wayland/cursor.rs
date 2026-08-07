@@ -8,7 +8,10 @@
 //! suitable for the Python cursor callback. Uses `xcursor` to load the system cursor theme
 //! and render the appropriate frame at the current scale.
 
-use image::{ImageBuffer, Rgba};
+use image::{ImageBuffer, Rgba, RgbaImage};
+use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use std::collections::HashMap;
 use std::io::Cursor as IoCursor;
 use std::io::Read;
 use std::time::Duration;
@@ -16,6 +19,278 @@ use xcursor::{
     parser::{parse_xcursor, Image},
     CursorTheme,
 };
+
+/// One unit of cursor-callback work handed from the calloop thread to the `wl-cursor`
+/// worker. The calloop resolves everything renderer/surface-affine (SHM copies, dmabuf
+/// readbacks, hotspots); the worker does the PNG encode, the cache, and the GIL-bound Python
+/// call so none of that latency lands on the input/render thread. One channel keeps cursor
+/// updates ordered with callback (re)registration.
+pub enum CursorJob {
+    SetCallback(Py<PyAny>),
+    /// Reload the worker's theme handle at a new pixel size; later `Named` jobs render at it.
+    SetSize(i32),
+    /// Cap the longest delivered cursor edge in pixels; larger sprites are downscaled with
+    /// the hotspot. `<= 0` delivers them uncapped.
+    SetSizeCap(i32),
+    Named { name: &'static str },
+    Hide,
+    /// wl_shm cursor sprite: raw pool bytes plus the sub-image descriptor.
+    Shm {
+        hash: u64,
+        width: i32,
+        height: i32,
+        stride: i32,
+        offset: i32,
+        opaque: bool,
+        bytes: Vec<u8>,
+        hot_x: i32,
+        hot_y: i32,
+    },
+    /// dmabuf cursor sprite already read back to tightly-mapped RGBA on the calloop.
+    Gles {
+        hash: u64,
+        width: i32,
+        height: i32,
+        bytes: Vec<u8>,
+        hot_x: i32,
+        hot_y: i32,
+    },
+}
+
+/// Spawn the cursor delivery worker; returns its job channel. The worker owns its own
+/// theme handle, the PNG cache, and the Python callback for the life of the process (like the
+/// compositor thread itself); `PY_SHUTDOWN` gates every Python call.
+pub fn spawn_cursor_worker(cursor_size: i32, size_cap: i32) -> std::sync::mpsc::Sender<CursorJob> {
+    let (tx, rx) = std::sync::mpsc::channel::<CursorJob>();
+    let _ = std::thread::Builder::new().name("wl-cursor".into()).spawn(move || {
+        let mut helper = Cursor::load(cursor_size);
+        let mut cap = size_cap;
+        let mut cache: HashMap<(u64, i32), CappedSprite> = HashMap::new();
+        let mut callback: Option<Py<PyAny>> = None;
+        while let Ok(job) = rx.recv() {
+            let (msg_type, data, hot_x, hot_y): (&str, Vec<u8>, i32, i32) = match job {
+                CursorJob::SetCallback(cb) => {
+                    callback = Some(cb);
+                    continue;
+                }
+                CursorJob::SetSize(size) => {
+                    helper = Cursor::load(size);
+                    continue;
+                }
+                CursorJob::SetSizeCap(c) => {
+                    cap = c;
+                    continue;
+                }
+                CursorJob::Named { name } => match helper.get_sprite(name) {
+                    Some((img, x, y)) => match cap_and_encode(img, cap) {
+                        Some(sprite) => {
+                            let (sx, sy) = scaled_hotspot(&sprite, x as i32, y as i32);
+                            ("png", sprite.png, sx, sy)
+                        }
+                        None => ("error", Vec::new(), 0, 0),
+                    },
+                    None => ("error", Vec::new(), 0, 0),
+                },
+                CursorJob::Hide => ("hide", Vec::new(), 0, 0),
+                CursorJob::Shm {
+                    hash,
+                    width,
+                    height,
+                    stride,
+                    offset,
+                    opaque,
+                    bytes,
+                    hot_x,
+                    hot_y,
+                } => capped_job(
+                    &mut cache,
+                    hash,
+                    cap,
+                    hot_x,
+                    hot_y,
+                    || decode_shm_cursor(width, height, stride, offset, opaque, &bytes),
+                ),
+                CursorJob::Gles { hash, width, height, bytes, hot_x, hot_y } => capped_job(
+                    &mut cache,
+                    hash,
+                    cap,
+                    hot_x,
+                    hot_y,
+                    || decode_gles_cursor(width, height, &bytes),
+                ),
+            };
+            // A sprite whose pixels could not be read yields empty data; suppressing it
+            // preserves the consumer's last cursor instead of blanking it (only an
+            // intentional hide passes with no payload).
+            if data.is_empty() && msg_type != "hide" {
+                continue;
+            }
+            if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(ref cb) = callback {
+                Python::attach(|py| {
+                    let py_bytes = PyBytes::new(py, &data);
+                    let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
+                });
+            }
+        }
+    });
+    tx
+}
+
+/// A cursor sprite encoded at its delivered size: the straight-alpha PNG, the factor the
+/// source was scaled by, and the payload's dimensions. Hotspots are per-job rather than a
+/// property of the pixels, so they are scaled against `scale` instead of being stored here.
+struct CappedSprite {
+    png: Vec<u8>,
+    scale: f64,
+    width: u32,
+    height: u32,
+}
+
+/// Sprites retained before arbitrary eviction; an evicted sprite re-encodes on next appearance.
+const SPRITE_CACHE_MAX: usize = 100;
+
+/// Apply the size cap to a **premultiplied** sprite and encode it as a straight-alpha PNG.
+///
+/// `cap <= 0`, or a sprite already within it, is encoded at its source size. Resizing happens
+/// while the pixels are still premultiplied — filtering straight alpha pulls the (zero) colour
+/// of transparent texels into the edges and leaves a dark fringe, and Lanczos3 overshoot has no
+/// headroom to land in — which is the order the X11 XFixes path uses.
+fn cap_and_encode(mut img: RgbaImage, cap: i32) -> Option<CappedSprite> {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let longest = w.max(h);
+    let mut scale = 1.0;
+    if cap > 0 && longest > cap as u32 {
+        scale = cap as f64 / longest as f64;
+        let nw = ((w as f64 * scale).round() as u32).max(1);
+        let nh = ((h as f64 * scale).round() as u32).max(1);
+        img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
+    }
+    crate::unpremultiply_rgba(&mut img);
+    let mut png = Vec::new();
+    img.write_to(&mut IoCursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(CappedSprite { png, scale, width: img.width(), height: img.height() })
+}
+
+/// Scale a source hotspot onto a delivered sprite. Consumers treat the hotspot as an offset
+/// INTO the bitmap, so the rounded coordinate is clamped to the payload rather than allowed to
+/// land one pixel past its right or bottom edge.
+fn scaled_hotspot(sprite: &CappedSprite, hot_x: i32, hot_y: i32) -> (i32, i32) {
+    (
+        ((hot_x as f64 * sprite.scale).round() as i32).clamp(0, sprite.width as i32 - 1),
+        ((hot_y as f64 * sprite.scale).round() as i32).clamp(0, sprite.height as i32 - 1),
+    )
+}
+
+/// Cache wrapper for sprite jobs, keyed by `(sprite hash, cap)` so a repeat of a sprite already
+/// delivered under the same cap is a plain clone of its PNG; a miss decodes the sprite, caps it
+/// and encodes it once. Keying on the cap keeps a live `SetSizeCap` from serving stale sizes.
+fn capped_job(
+    cache: &mut HashMap<(u64, i32), CappedSprite>,
+    hash: u64,
+    cap: i32,
+    hot_x: i32,
+    hot_y: i32,
+    decode: impl FnOnce() -> Option<RgbaImage>,
+) -> (&'static str, Vec<u8>, i32, i32) {
+    use std::collections::hash_map::Entry;
+    let key = (hash, cap);
+    if cache.len() >= SPRITE_CACHE_MAX && !cache.contains_key(&key) {
+        if let Some(&evict) = cache.keys().next() {
+            cache.remove(&evict);
+        }
+    }
+    let sprite = match cache.entry(key) {
+        Entry::Occupied(e) => e.into_mut(),
+        // An unreadable sprite yields an empty payload, which the worker suppresses so the
+        // consumer keeps the cursor it already has.
+        Entry::Vacant(e) => match decode().and_then(|img| cap_and_encode(img, cap)) {
+            Some(sprite) => e.insert(sprite),
+            None => return ("png", Vec::new(), 0, 0),
+        },
+    };
+    let (sx, sy) = scaled_hotspot(sprite, hot_x, hot_y);
+    ("png", sprite.png.clone(), sx, sy)
+}
+
+/// Read a wl_shm BGRA/XRGB sprite sub-image into a premultiplied RGBA image, the form
+/// `cap_and_encode` must resize before it unpremultiplies. Stride/offset are clamped
+/// non-negative with checked arithmetic so a garbage descriptor skips pixels instead of
+/// panicking; sprites larger than 128x128 are ignored (never a hardware cursor).
+fn decode_shm_cursor(
+    width: i32,
+    height: i32,
+    stride: i32,
+    offset: i32,
+    opaque: bool,
+    raw_bytes: &[u8],
+) -> Option<RgbaImage> {
+    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+        return None;
+    }
+    let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+    let stride_usize = stride.max(0) as usize;
+    let base_offset = offset.max(0) as usize;
+    for y in 0..(height as u32) {
+        for x in 0..(width as u32) {
+            let offset = (y as usize)
+                .checked_mul(stride_usize)
+                .and_then(|row| base_offset.checked_add(row))
+                .and_then(|o| o.checked_add((x as usize) * 4));
+            let offset = match offset {
+                Some(o) => o,
+                None => continue,
+            };
+            if offset.checked_add(4).is_some_and(|end| end <= raw_bytes.len()) {
+                let alpha = if opaque { 255 } else { raw_bytes[offset + 3] };
+                img_buf.put_pixel(
+                    x,
+                    y,
+                    Rgba([raw_bytes[offset + 2], raw_bytes[offset + 1], raw_bytes[offset], alpha]),
+                );
+            }
+        }
+    }
+    Some(img_buf)
+}
+
+/// Read a dmabuf sprite's RGBA readback (stride recovered from the mapping length) into a
+/// premultiplied RGBA image.
+fn decode_gles_cursor(width: i32, height: i32, raw_bytes: &[u8]) -> Option<RgbaImage> {
+    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+        return None;
+    }
+    let stride = super::frontend::rgba_readback_stride(
+        raw_bytes.len(),
+        height as usize,
+        width as usize,
+    );
+    let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
+    for y in 0..(height as u32) {
+        for x in 0..(width as u32) {
+            let offset = (y as usize * stride) + (x as usize * 4);
+            if offset + 4 <= raw_bytes.len() {
+                img_buf.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        raw_bytes[offset],
+                        raw_bytes[offset + 1],
+                        raw_bytes[offset + 2],
+                        raw_bytes[offset + 3],
+                    ]),
+                );
+            }
+        }
+    }
+    Some(img_buf)
+}
 
 /// The loaded XCursor theme, held for the whole capture so cursor lookups stay cheap.
 ///
@@ -74,27 +349,21 @@ impl Cursor {
         Some(frame(time.as_millis() as u32, size, &icons))
     }
 
-    /// A named cursor icon as PNG bytes plus its hotspot (x, y), for web clients.
-    /// Xcursor stores premultiplied color; the PNG carries straight alpha. The
-    /// compositing paths (`get_image*`) keep the premultiplied pixels blending needs.
-    pub fn get_png_data(&self, name: &str) -> Option<(Vec<u8>, u32, u32)> {
+    /// A named cursor icon as a premultiplied RGBA image plus its hotspot (x, y), ready for
+    /// `cap_and_encode` to size and convert to the straight alpha web clients want. Xcursor
+    /// stores premultiplied colour, which is also what the compositing paths (`get_image*`)
+    /// need for blending, so it is carried through unconverted.
+    pub fn get_sprite(&self, name: &str) -> Option<(RgbaImage, u32, u32)> {
         let icons = load_icon(&self.theme, name).ok()?;
         let image_data = nearest_images(self.size, &icons).next()?;
 
-        let mut img_buf: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::from_raw(
+        let img_buf: RgbaImage = ImageBuffer::from_raw(
             image_data.width,
             image_data.height,
             image_data.pixels_rgba.clone(),
         )?;
-        crate::unpremultiply_rgba(&mut img_buf);
 
-        let mut bytes: Vec<u8> = Vec::new();
-        let mut cursor = IoCursor::new(&mut bytes);
-        img_buf
-            .write_to(&mut cursor, image::ImageFormat::Png)
-            .ok()?;
-
-        Some((bytes, image_data.xhot, image_data.yhot))
+        Some((img_buf, image_data.xhot, image_data.yhot))
     }
 }
 

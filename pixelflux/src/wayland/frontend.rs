@@ -20,11 +20,9 @@
 
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::Cursor as IoCursor;
 use std::time::Instant;
 
 use gbm::{BufferObject, Device as RawGbmDevice};
-use image::{ImageBuffer, ImageFormat, Rgba};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Mutex;
@@ -33,12 +31,19 @@ use std::hash::{Hash, Hasher};
 use smithay::backend::renderer::utils::RendererSurfaceState;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{ Buffer, Fourcc};
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::{
     Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
 };
 use smithay::input::dnd::{DndFocus, Source};
 use std::sync::Arc;
-use crate::wayland::cursor::Cursor;
+use crate::wayland::cursor::{Cursor, CursorJob};
+use crate::wayland::keymap::KeymapPolicy;
+use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::{
+    zwp_virtual_keyboard_manager_v1::{self, ZwpVirtualKeyboardManagerV1},
+    zwp_virtual_keyboard_v1::{self, ZwpVirtualKeyboardV1},
+};
+use smithay::reexports::wayland_server::{DataInit, Dispatch, GlobalDispatch, New};
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::delegate_viewporter;
 use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
@@ -78,8 +83,8 @@ use smithay::delegate_primary_selection;
 
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_output, delegate_seat, delegate_shm, delegate_virtual_keyboard_manager,
-    delegate_xdg_shell, delegate_relative_pointer, delegate_pointer_warp, 
+    delegate_output, delegate_seat, delegate_shm,
+    delegate_xdg_shell, delegate_relative_pointer, delegate_pointer_warp,
     delegate_pointer_constraints,
     desktop::{Space, Window},
     input::{
@@ -97,7 +102,7 @@ use smithay::{
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
         wayland_server::{
-            backend::{ClientData, ClientId, DisconnectReason, ObjectId},
+            backend::{ClientData, ClientId, DisconnectReason, GlobalId, ObjectId},
             protocol::{wl_buffer::WlBuffer, wl_surface::WlSurface},
             Client, DisplayHandle, Resource,
         },
@@ -115,8 +120,8 @@ use smithay::{
         seat::WaylandFocus,
         selection::{
             data_device::{
-                request_data_device_client_selection, DataDeviceHandler, DataDeviceState,
-                WaylandDndGrabHandler,
+                request_data_device_client_selection, set_data_device_focus, DataDeviceHandler,
+                DataDeviceState, WaylandDndGrabHandler,
             },
             SelectionHandler, SelectionSource, SelectionTarget,
         },
@@ -125,7 +130,6 @@ use smithay::{
             XdgToplevelSurfaceData,
         },
         shm::{with_buffer_contents, ShmHandler, ShmState, BufferAccessError},
-        virtual_keyboard::VirtualKeyboardManagerState,
     },
 };
 
@@ -134,7 +138,7 @@ use crate::encoders::vaapi::VaapiEncoder;
 use crate::nvenc::NvencEncoder;
 use crate::{RustCaptureSettings, StripeState};
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -193,14 +197,151 @@ pub enum GpuEncoder {
     Nvenc(NvencEncoder),
 }
 
+/// One capture pipeline bound to one output (display id): its settings, encoder set,
+/// frame pools, delivery thread, and per-stream bookkeeping. Exactly one capture may run per
+/// output; all fields mirror the pipeline strategy documented on [`AppState`], instantiated
+/// per display.
+pub struct WlCapture {
+    pub settings: RustCaptureSettings,
+    /// Zero-copy GPU session (GLES render + same-GPU dmabuf encode), calloop-affine;
+    /// `None` whenever a readback path is active for this display.
+    pub video_encoder: Option<GpuEncoder>,
+    pub vaapi_state: StripeState,
+    pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
+    pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
+    pub deliver_join: Option<std::thread::JoinHandle<()>>,
+    pub pending_hw_delivery: Option<Vec<crate::encoders::software::EncodedStripe>>,
+    pub pending_hw_damage: bool,
+    pub encode_pool: Option<Arc<crate::WlFramePool>>,
+    pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    pub encode_controls: Arc<crate::WlEncodeControls>,
+    pub encode_stats: Arc<crate::WlEncodeStats>,
+    pub pool_last_render: Vec<u64>,
+    pub render_seq: u64,
+    pub pool_content_gen: Vec<u64>,
+    pub content_gen: u64,
+    pub frame_counter: u16,
+    pub pending_force_idr: bool,
+    pub needs_full_render: bool,
+    /// Last tick this capture actually rendered; paces per-display fps under the one
+    /// shared render timer (which fires at the fastest active capture's rate).
+    pub last_tick: Option<Instant>,
+    /// Consecutive zero-copy encode failures; reset by any frame that encodes cleanly.
+    /// Reaching `HW_ERROR_RECOVERY_THRESHOLD` triggers recovery.
+    pub hw_error_streak: u32,
+    /// Whether the zero-copy session has already been rebuilt without a clean frame since.
+    /// Recovery rebuilds once and demotes to readback on the next streak, so a session that
+    /// constructs but never encodes cannot loop rebuilding forever.
+    pub hw_rebuilt: bool,
+}
+
+impl WlCapture {
+    /// Arm a keyframe on whichever path is live, plus a full render so a static
+    /// screen still produces the frame. Exactly ONE flag is set: the pool encode
+    /// loop consumes the atomic, every other path consumes `pending_force_idr` —
+    /// setting both would leave one armed forever (the host-mode idle gate polls
+    /// them every tick, so a stuck flag disables idle skipping for the session).
+    pub fn request_idr(&mut self) {
+        if self.encode_pool.is_some() {
+            self.encode_controls.force_idr.store(true, Ordering::Relaxed);
+        } else {
+            self.pending_force_idr = true;
+        }
+        self.needs_full_render = true;
+    }
+}
+
+/// One virtual output and everything sized to it: the Smithay `Output` + its advertised
+/// global, its layout position, the damage tracker, render targets, and the (at most one)
+/// capture bound to it. `id` is the Python-facing display key; id 0 is the primary
+/// HEADLESS-1 output, which is never destroyed.
+pub struct OutputNode {
+    pub id: u32,
+    pub output: Output,
+    pub global: GlobalId,
+    /// Layout offset: the output's logical position in the Space AND its physical offset
+    /// for absolute input injection. The two coincide at scale 1; with mixed scales the
+    /// caller must place outputs so neither the logical nor the physical rectangles
+    /// overlap.
+    pub pos: (i32, i32),
+    pub damage_tracker: OutputDamageTracker,
+    /// Host-side scratch target: pixman throttle path renders here, GLES screenshots read
+    /// back here.
+    pub frame_buffer: Vec<u8>,
+    /// GPU render target for this output (GLES mode): the GBM BO and its dmabuf export.
+    pub offscreen_buffer: Option<(BufferObject<()>, Dmabuf)>,
+    /// Watermark overlay for THIS output: loaded at the output's scale, positioned (and,
+    /// for the bouncing anchor, animated) against the output's own frame dimensions.
+    pub overlay_state: OverlayState,
+    pub capture: Option<WlCapture>,
+}
+
+impl OutputNode {
+    /// The output's logical geometry in layout coordinates: origin plus mode/scale-derived
+    /// logical size.
+    pub fn logical_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let mode = self.output.current_mode()?;
+        let scale = self.output.current_scale().fractional_scale();
+        Some(Rectangle::new(
+            Point::from(self.pos),
+            (
+                (mode.size.w as f64 / scale).round() as i32,
+                (mode.size.h as f64 / scale).round() as i32,
+            )
+                .into(),
+        ))
+    }
+}
+
+static NEXT_WINDOW_ID: AtomicU32 = AtomicU32::new(1);
+
+/// Per-window bookkeeping carried in the window's user-data map: a stable numeric id the
+/// Python side addresses the window by, the display id of the output it is placed on, and
+/// whether that output has been chosen yet.
+pub struct WindowMeta {
+    pub id: u32,
+    pub output: AtomicU32,
+    /// Set once the first commit has picked the window's output. The choice cannot key off
+    /// xdg's `initial_configure_sent`: a client that negotiates xdg-decoration (every
+    /// wlroots-based nested compositor, GTK and Qt) is answered with a configure before it
+    /// ever commits, which would leave every window on the pointer's output.
+    pub placed: AtomicBool,
+    /// Set while the window is mapped outside every output, tagged to the output it will
+    /// take once one exists. See `park_window`.
+    pub parked: AtomicBool,
+}
+
+/// Where a parked window is mapped: clear of every output, so it is composited into none of
+/// them. Layout offsets are non-negative — the union layout Selkies computes re-anchors at
+/// the origin — so far negative coordinates can never collide with a real output.
+pub const PARKED_POS: (i32, i32) = (-(1 << 20), -(1 << 20));
+
+/// The window's meta, inserted at `new_toplevel`; windows created before that (none in
+/// practice) read as id 0 / primary output.
+pub fn window_meta(window: &Window) -> Option<&WindowMeta> {
+    window.user_data().get::<WindowMeta>()
+}
+
+/// The display id of the output this window is placed on (primary when untagged).
+pub fn window_output_id(window: &Window) -> u32 {
+    window_meta(window).map(|m| m.output.load(Ordering::Relaxed)).unwrap_or(0)
+}
+
+/// A queued computer-use screenshot as `(display id, reply)`; the reply carries the
+/// encoded image or the reason it could not be produced.
+pub type ScreenshotRequest = (u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>);
+
 /// Central context threaded through every Smithay handler; owns the Wayland globals, the
 /// GBM/EGL (or pixman) renderer state, and the capture/encode pipeline state.
 ///
 /// A single `AppState` lives for the whole compositor thread and is mutated in place by the
-/// calloop event sources (client dispatch, input injection, the capture timer). The non-obvious
-/// fields encode the pipeline's threading and buffer strategy:
+/// calloop event sources (client dispatch, input injection, the capture timer). The frame
+/// pipeline is instantiated PER DISPLAY: each `OutputNode` in `output_nodes` owns its output,
+/// damage tracker, and render targets, and its optional `WlCapture` owns that display's
+/// encoder set and delivery. The non-obvious `WlCapture`/`OutputNode` fields encode the
+/// pipeline's threading and buffer strategy:
 ///
-/// 1. **Render / encode targets**:
+/// 1. **Render / encode targets** (per display):
 ///    - **`video_encoder`**: the zero-copy GPU session only (GLES render + same-GPU dmabuf
 ///      encode). Its EGL/dmabuf handles are calloop-affine, so this encoder runs inline on the
 ///      calloop thread; it is `None` whenever a readback path is active.
@@ -255,7 +396,9 @@ pub struct AppState {
     pub dh: DisplayHandle,
     #[allow(dead_code)]
     pub seat: Seat<AppState>,
-    pub outputs: Vec<Output>,
+    /// Every live output with its per-display render/capture state; index 0 is the
+    /// primary (display id 0), which is never destroyed.
+    pub output_nodes: Vec<OutputNode>,
     pub pending_windows: Vec<Window>,
 
     pub foreign_toplevel_list: ForeignToplevelListState,
@@ -263,69 +406,57 @@ pub struct AppState {
     pub xdg_activation_state: XdgActivationState,
     pub primary_selection_state: PrimarySelectionState,
     pub popups: PopupManager,
-    pub frame_buffer: Vec<u8>,
 
     pub gles_renderer: Option<GlesRenderer>,
     pub pixman_renderer: Option<PixmanRenderer>,
 
     pub gbm_device: Option<RawGbmDevice<File>>,
-    pub offscreen_buffer: Option<(BufferObject<()>, Dmabuf)>,
 
-    pub is_capturing: bool,
+    /// Mirror of the PRIMARY display's capture settings (geometry fallbacks, computer-use
+    /// info); per-display settings live on each capture.
     pub settings: RustCaptureSettings,
-    pub callback: Option<Py<PyAny>>,
-    pub cursor_callback: Option<Py<PyAny>>,
+    /// A cursor callback is registered on the `wl-cursor` worker (which owns the actual
+    /// `Py` object); tracked here so sprite resolution is skipped while nobody listens.
+    pub cursor_callback_set: bool,
+    /// Cursor delivery jobs to the `wl-cursor` worker (PNG encode + Python call off-thread).
+    pub cursor_tx: std::sync::mpsc::Sender<CursorJob>,
     pub clipboard_callback: Option<Py<PyAny>>,
     pub pending_clipboard_read: Option<String>,
+    /// Preferred mime of the current CLIENT-owned clipboard selection, recorded even while
+    /// no callback is registered so `SetClipboardCallback` can re-stage a read of a copy made
+    /// in the gap; `None` when the selection is cleared or compositor-owned.
+    pub current_selection_mime: Option<String>,
 
     pub last_log_time: Instant,
     pub start_time: Instant,
     pub clock: Clock<Monotonic>,
 
-    pub frame_counter: u16,
-    pub pending_force_idr: bool,
-    pub needs_full_render: bool,
     pub use_gpu: bool,
 
-    pub video_encoder: Option<GpuEncoder>,
-    pub vaapi_state: StripeState,
     pub cursor_helper: Cursor,
 
-    pub overlay_state: OverlayState,
-
-    pub virtual_keyboard_state: VirtualKeyboardManagerState,
+    /// Seat keymap owner: base layout plus batched overlay binds. Every seat keymap swap
+    /// flows through this policy, so keymap identity has exactly one writer.
+    pub keymap_policy: KeymapPolicy,
+    /// Host-capture session when pixelflux captures an EXTERNAL compositor:
+    /// frames arrive by screencopy and input routes to its virtual devices.
+    pub host: Option<crate::wayland::host::HostSession>,
 
     pub current_cursor_icon: Option<CursorImageStatus>,
     pub cursor_buffer: Option<WlBuffer>,
-    pub cursor_cache: std::collections::HashMap<u64, Vec<u8>>,
     pub render_cursor_on_framebuffer: bool,
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
     pub auto_gpu_selected: bool,
-    pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
-    pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
-    pub deliver_join: Option<std::thread::JoinHandle<()>>,
-    /// Zero-copy frame parked after a full delivery channel. The hardware encode and
-    /// its delivery both run on the calloop thread, and a blocking send there would
-    /// freeze input/command/Wayland dispatch for as long as the Python consumer
-    /// stalls. An encoded frame is part of the H.264 reference chain and can never
-    /// be dropped, so it parks here instead, and new encodes pause until it leaves.
-    pub pending_hw_delivery: Option<Vec<crate::encoders::software::EncodedStripe>>,
-    /// Damage seen on ticks skipped while `pending_hw_delivery` was parked, folded
-    /// into the next encode's change detection so a change that happened during the
-    /// pause is never lost (each tick's damage list is otherwise discarded).
-    pub pending_hw_damage: bool,
-    pub encode_pool: Option<Arc<crate::WlFramePool>>,
-    pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
-    pub encode_controls: Arc<crate::WlEncodeControls>,
-    pub encode_stats: Arc<crate::WlEncodeStats>,
-    pub pool_last_render: Vec<u64>,
-    pub render_seq: u64,
-    pub pool_content_gen: Vec<u64>,
-    pub content_gen: u64,
-    pub pending_screenshot: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    /// Computer-use screenshot request; served from that output's next render (the id
+    /// was validated live when the request was queued).
+    pub pending_screenshot: Option<ScreenshotRequest>,
+    /// The command channel, drained in place (wakeups arrive on a separate ping channel) so
+    /// the render tick can apply every queued command BEFORE starting a long render/encode —
+    /// queued input is never starved behind the tick it arrived during.
+    pub command_rx: Option<smithay::reexports::calloop::channel::Channel<crate::ThreadCommand>>,
 }
 
 /// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
@@ -440,9 +571,9 @@ impl WlrLayerShellHandler for AppState {
         namespace: String,
     ) {
         let smithay_output = if let Some(wlo) = output.as_ref() {
-            self.outputs.iter().find(|o| o.owns(wlo))
+            self.output_nodes.iter().map(|n| &n.output).find(|o| o.owns(wlo))
         } else {
-            self.outputs.first()
+            self.primary_output()
         };
 
         if let Some(output) = smithay_output {
@@ -505,17 +636,12 @@ impl CompositorHandler for AppState {
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
 
-        if let Some(output) = self.outputs.first() {
-            let mut layer_map = layer_map_for_output(output);
-            let mut found = false;
-            for layer in layer_map.layers() {
-                if layer.wl_surface() == surface {
-                    found = true;
-                    break;
-                }
-            }
+        for node in &self.output_nodes {
+            let mut layer_map = layer_map_for_output(&node.output);
+            let found = layer_map.layers().any(|layer| layer.wl_surface() == surface);
             if found {
                 layer_map.arrange();
+                break;
             }
         }
 
@@ -541,12 +667,26 @@ impl CompositorHandler for AppState {
              }
         }
 
-        if let Some(window) = self
+        let mapped = self
             .space
             .elements()
             .find(|w| w.toplevel().map(|tl| tl.wl_surface() == surface).unwrap_or(false))
-        {
+            .cloned();
+        if let Some(window) = mapped {
             window.on_commit();
+            // A null-buffer commit unmaps the toplevel (xdg-shell): purge it from the
+            // space so it no longer lists or renders, and re-queue it so a client that
+            // maps again goes back through the configure handshake.
+            let has_buffer = smithay::backend::renderer::utils::with_renderer_surface_state(
+                surface,
+                |s| s.buffer().is_some(),
+            )
+            .unwrap_or(false);
+            if !has_buffer {
+                self.space.unmap_elem(&window);
+                self.pending_windows.push(window);
+                return;
+            }
         }
 
         if let Some(idx) = self.pending_windows.iter().position(|w| {
@@ -555,31 +695,52 @@ impl CompositorHandler for AppState {
             let window = self.pending_windows.remove(idx);
             let toplevel = window.toplevel().unwrap();
 
-            let initial_configure_sent = with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .initial_configure_sent
-            });
+            // Whether this window still needs an output. Deliberately not xdg's
+            // `initial_configure_sent`: the decoration handshake answers with a configure
+            // before the client's first commit, which would skip the choice below for
+            // every client that negotiates decorations.
+            let needs_placement = window_meta(&window)
+                .map(|meta| !meta.placed.swap(true, Ordering::Relaxed))
+                .unwrap_or(false);
 
-            if !initial_configure_sent {
-                let (logical_width, logical_height) = if let Some(output) = self.outputs.first() {
-                    let mode = output.current_mode().unwrap();
-                    let scale = output.current_scale().fractional_scale();
-                    (
-                        (mode.size.w as f64 / scale).round() as i32,
-                        (mode.size.h as f64 / scale).round() as i32,
-                    )
-                } else {
-                    let scale = self.settings.scale.max(0.1);
-                    (
-                        (self.settings.width as f64 / scale).round() as i32,
-                        (self.settings.height as f64 / scale).round() as i32,
-                    )
-                };
+            if needs_placement {
+                // A new toplevel opens fullscreened on the output the pointer is on
+                // (primary when indeterminate); the choice is pinned on the window's
+                // meta so the acked commit maps to the same output.
+                let mut target_id = self.pointer_display();
+                // A second fullscreen surface from a client that already owns one on
+                // the target output is screen-like (a nested compositor opens one
+                // host toplevel per screen): give it an empty output when one exists,
+                // and park it otherwise rather than let it cover the screen already
+                // there. `create_output` hands it the output it is waiting for.
+                let mut park = false;
+                if self.would_cover_screen(&window, target_id) {
+                    let empty = self.output_nodes.iter().map(|n| n.id).find(|oid| {
+                        !self
+                            .space
+                            .elements()
+                            .chain(self.pending_windows.iter())
+                            .any(|w| window_output_id(w) == *oid)
+                    });
+                    match empty {
+                        Some(oid) => target_id = oid,
+                        None => park = true,
+                    }
+                }
+                if let Some(meta) = window_meta(&window) {
+                    meta.output.store(target_id, Ordering::Relaxed);
+                    meta.parked.store(park, Ordering::Relaxed);
+                }
+                let (logical_width, logical_height) =
+                    if let Some(size) = self.logical_size_of(target_id) {
+                        size
+                    } else {
+                        let scale = self.settings.scale.max(0.1);
+                        (
+                            (self.settings.width as f64 / scale).round() as i32,
+                            (self.settings.height as f64 / scale).round() as i32,
+                        )
+                    };
 
                 toplevel.with_pending_state(|state| {
                     state.states.set(XdgState::Activated);
@@ -589,35 +750,68 @@ impl CompositorHandler for AppState {
                 toplevel.send_configure();
 
                 self.pending_windows.push(window);
+            } else if smithay::backend::renderer::utils::with_renderer_surface_state(
+                surface,
+                |s| s.buffer().is_none(),
+            )
+            .unwrap_or(true)
+            {
+                // Configured but still buffer-less (a decoration-triggered configure, an
+                // ack-only commit, or a remap after a null-buffer unmap — xdg
+                // initial_configure_sent stays true there): keep waiting; mapping now would
+                // list and hit-test a phantom window. Answer with the forced-fullscreen
+                // configure so the client draws its first buffer at the right geometry.
+                let tl = toplevel.clone();
+                self.pending_windows.push(window);
+                self.send_forced_fullscreen_configure(&tl);
             } else {
-                self.space.map_element(window.clone(), (0, 0), true);
+                let target_id = window_output_id(&window);
+                let parked = window_meta(&window)
+                    .map(|meta| meta.parked.load(Ordering::Relaxed))
+                    .unwrap_or(false);
+                let node_idx = self.node_idx_for_id(target_id).unwrap_or(0);
+                let (target_output, pos) = {
+                    let node = &self.output_nodes[node_idx];
+                    (node.output.clone(), node.pos)
+                };
+                // A parked window enters no output and takes no focus: it is waiting for
+                // an output of its own, and holds its size until one arrives.
+                self.space.map_element(
+                    window.clone(),
+                    if parked { PARKED_POS } else { pos },
+                    !parked,
+                );
                 window.on_commit();
 
-                if let Some(output) = self.outputs.first() {
-                    output.enter(surface);
-
-                    let mode = output.current_mode().unwrap();
-                    let scale = output.current_scale().fractional_scale();
-                    let (expected_w, expected_h) = (
-                        (mode.size.w as f64 / scale).round() as i32,
-                        (mode.size.h as f64 / scale).round() as i32,
-                    );
-                    
-                    let geo = window.geometry();
-                    if (geo.size.w - expected_w).abs() > 1 || (geo.size.h - expected_h).abs() > 1 {
-                        toplevel.with_pending_state(|state| {
-                            state.states.set(XdgState::Activated);
-                            state.states.set(XdgState::Fullscreen);
-                            state.size = Some((expected_w, expected_h).into());
+                if !parked {
+                    target_output.enter(surface);
+                    let scale = target_output.current_scale().fractional_scale();
+                    with_states(surface, |states| {
+                        smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                            fs.set_preferred_scale(scale);
                         });
-                        toplevel.send_configure();
-                    }
-                }
+                    });
 
-                let serial = next_serial();
-                let target = FocusTarget::Window(window.clone());
-                if let Some(keyboard) = self.seat.get_keyboard() {
-                    keyboard.set_focus(self, Some(target.clone()), serial);
+                    if let Some(geo_out) = self.output_nodes[node_idx].logical_geometry() {
+                        let (expected_w, expected_h) = (geo_out.size.w, geo_out.size.h);
+                        let geo = window.geometry();
+                        if (geo.size.w - expected_w).abs() > 1
+                            || (geo.size.h - expected_h).abs() > 1
+                        {
+                            toplevel.with_pending_state(|state| {
+                                state.states.set(XdgState::Activated);
+                                state.states.set(XdgState::Fullscreen);
+                                state.size = Some((expected_w, expected_h).into());
+                            });
+                            toplevel.send_configure();
+                        }
+                    }
+
+                    let serial = next_serial();
+                    let target = FocusTarget::Window(window.clone());
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Some(target.clone()), serial);
+                    }
                 }
             }
         }
@@ -626,18 +820,179 @@ impl CompositorHandler for AppState {
 
 
 impl AppState {
+    /// The primary (display id 0) output.
+    pub(crate) fn primary_output(&self) -> Option<&Output> {
+        self.output_nodes.first().map(|n| &n.output)
+    }
+
+    pub(crate) fn node_idx_for_id(&self, id: u32) -> Option<usize> {
+        self.output_nodes.iter().position(|n| n.id == id)
+    }
+
+    /// Index of the node whose LOGICAL rect contains `p`.
+    pub(crate) fn node_idx_under(&self, p: Point<f64, Logical>) -> Option<usize> {
+        self.output_nodes.iter().position(|n| {
+            n.logical_geometry()
+                .map(|g| g.to_f64().contains(p))
+                .unwrap_or(false)
+        })
+    }
+
+    /// Map absolute PHYSICAL union-layout coordinates to a logical layout point: each
+    /// output occupies the physical rectangle at its layout offset sized by its mode; the
+    /// point is clamped into the nearest output when it falls outside all of them, so the
+    /// pointer can never leave the layout.
+    pub(crate) fn layout_physical_to_logical(&self, x: f64, y: f64) -> Point<f64, Logical> {
+        let mut best: Option<(f64, Point<f64, Logical>)> = None;
+        for node in &self.output_nodes {
+            let Some(mode) = node.output.current_mode() else { continue };
+            let scale = node.output.current_scale().fractional_scale();
+            let (px, py) = (node.pos.0 as f64, node.pos.1 as f64);
+            let cx = x.max(px).min(px + mode.size.w as f64 - 1.0);
+            let cy = y.max(py).min(py + mode.size.h as f64 - 1.0);
+            let d2 = (x - cx).powi(2) + (y - cy).powi(2);
+            let logical = Point::from((
+                node.pos.0 as f64 + (cx - px) / scale,
+                node.pos.1 as f64 + (cy - py) / scale,
+            ));
+            if best.as_ref().map(|(bd, _)| d2 < *bd).unwrap_or(true) {
+                best = Some((d2, logical));
+            }
+        }
+        best.map(|(_, p)| p).unwrap_or_else(|| (0.0, 0.0).into())
+    }
+
+    /// Clamp a logical layout point into the nearest output's logical rectangle.
+    pub(crate) fn clamp_logical(&self, p: Point<f64, Logical>) -> Point<f64, Logical> {
+        let mut best: Option<(f64, Point<f64, Logical>)> = None;
+        for node in &self.output_nodes {
+            let Some(geo) = node.logical_geometry() else { continue };
+            let scale = node.output.current_scale().fractional_scale();
+            let g = geo.to_f64();
+            let margin = 1.0 / scale.max(0.1);
+            let cx = p.x.max(g.loc.x).min(g.loc.x + g.size.w - margin);
+            let cy = p.y.max(g.loc.y).min(g.loc.y + g.size.h - margin);
+            let d2 = (p.x - cx).powi(2) + (p.y - cy).powi(2);
+            if best.as_ref().map(|(bd, _)| d2 < *bd).unwrap_or(true) {
+                best = Some((d2, (cx, cy).into()));
+            }
+        }
+        best.map(|(_, p)| p).unwrap_or(p)
+    }
+
+    /// Logical layout point -> physical union-layout coordinates (inverse of
+    /// `layout_physical_to_logical` for in-bounds points; primary-relative otherwise).
+    pub(crate) fn layout_logical_to_physical(&self, p: Point<f64, Logical>) -> (f64, f64) {
+        let idx = self.node_idx_under(p).unwrap_or(0);
+        let Some(node) = self.output_nodes.get(idx) else { return (p.x, p.y) };
+        let scale = node.output.current_scale().fractional_scale();
+        (
+            node.pos.0 as f64 + (p.x - node.pos.0 as f64) * scale,
+            node.pos.1 as f64 + (p.y - node.pos.1 as f64) * scale,
+        )
+    }
+
+    /// Logical size of the given display's output.
+    pub(crate) fn logical_size_of(&self, id: u32) -> Option<(i32, i32)> {
+        let idx = self.node_idx_for_id(id)?;
+        let geo = self.output_nodes[idx].logical_geometry()?;
+        Some((geo.size.w, geo.size.h))
+    }
+
+    /// The display id under the pointer (primary when indeterminate).
+    pub(crate) fn pointer_display(&self) -> u32 {
+        self.seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .and_then(|pos| self.node_idx_under(pos))
+            .map(|idx| self.output_nodes[idx].id)
+            .unwrap_or(0)
+    }
+
+    /// Whether `window` would land on top of a screen another window from the same client
+    /// already occupies. A nested session opens one host toplevel per screen, and a second
+    /// one covering the first would replace what the display shows rather than add to it.
+    pub(crate) fn would_cover_screen(&self, window: &Window, id: u32) -> bool {
+        let Some(client) = window.wl_surface().and_then(|s| s.client()) else { return false };
+        self.space
+            .elements()
+            .chain(self.pending_windows.iter())
+            .filter(|w| !std::ptr::eq(*w, window) && w.wl_surface() != window.wl_surface())
+            .any(|w| {
+                window_output_id(w) == id
+                    && !window_meta(w).map(|m| m.parked.load(Ordering::Relaxed)).unwrap_or(false)
+                    && w.wl_surface()
+                        .and_then(|s| s.client())
+                        .is_some_and(|c| c.id() == client.id())
+            })
+    }
+
+    /// Map `window` clear of every output while keeping it tagged for `id`, so it holds its
+    /// size and its place in the window list without being composited anywhere. A nested
+    /// session's spare screens wait here until `create_output` gives them one.
+    pub(crate) fn park_window(&mut self, window: &Window, id: u32) {
+        let old_id = window_output_id(window);
+        if let Some(meta) = window_meta(window) {
+            meta.output.store(id, Ordering::Relaxed);
+            meta.parked.store(true, Ordering::Relaxed);
+        }
+        if let (Some(surface), Some(idx)) = (window.wl_surface(), self.node_idx_for_id(old_id)) {
+            self.output_nodes[idx].output.leave(&surface);
+        }
+        self.space.map_element(window.clone(), PARKED_POS, false);
+    }
+
+    /// Place `window` on output `id`: retag its meta, remap it at the output's layout
+    /// origin, move output enter/leave, push the output's fractional scale, and send the
+    /// forced-fullscreen configure at that output's logical size.
+    pub(crate) fn place_window_on_output(&mut self, window: &Window, id: u32) -> bool {
+        let Some(idx) = self.node_idx_for_id(id) else { return false };
+        let old_id = window_output_id(window);
+        let (new_output, pos) = {
+            let node = &self.output_nodes[idx];
+            (node.output.clone(), node.pos)
+        };
+        let old_output = self
+            .node_idx_for_id(old_id)
+            .map(|i| self.output_nodes[i].output.clone());
+        if let Some(meta) = window_meta(window) {
+            meta.output.store(id, Ordering::Relaxed);
+            meta.parked.store(false, Ordering::Relaxed);
+        }
+        self.space.map_element(window.clone(), pos, true);
+        if let Some(surface) = window.wl_surface() {
+            if let Some(old) = old_output {
+                if old_id != id {
+                    old.leave(&surface);
+                }
+            }
+            new_output.enter(&surface);
+            let scale = new_output.current_scale().fractional_scale();
+            with_states(&surface, |states| {
+                smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                    fs.set_preferred_scale(scale);
+                });
+            });
+        }
+        if let Some(toplevel) = window.toplevel() {
+            let toplevel = toplevel.clone();
+            self.send_forced_fullscreen_configure(&toplevel);
+        }
+        true
+    }
+
     /// Drain a clipboard read staged by `new_selection` and hand `(mime, bytes)` to the
     /// Python callback off-thread.
     ///
     /// Runs from the loop *after* the dispatch that stored the new client source, so the request
     /// targets the current selection rather than the previous one. It clones the callback, opens a
     /// pipe, and asks the owning client source to write the chosen mime into the pipe's writer. A
-    /// spawned reader thread then reads the response — capped at 64 MiB so a hostile client cannot
-    /// balloon memory, and bounded by a 10 s poll deadline so a client that takes the selection but
-    /// never writes nor closes its fd cannot pin the thread forever (each clipboard change would
-    /// otherwise leak one zombie thread + pipe) — and, unless the interpreter is finalizing,
-    /// delivers the bytes to Python. The `PY_SHUTDOWN` checks keep this off a shutting-down
-    /// interpreter.
+    /// spawned reader thread then reads the response. The overall bound is by SIZE (64 MiB, then
+    /// delivered truncated) so a hostile client cannot balloon memory; time only bounds
+    /// INACTIVITY — a producer that keeps bytes flowing may take as long as it needs (a large
+    /// transfer from a slow source still delivers), while one that goes silent for 10 s without
+    /// closing its fd is dropped so each clipboard change cannot leak a pinned thread + pipe.
+    /// The `PY_SHUTDOWN` checks keep this off a shutting-down interpreter.
     pub(crate) fn process_pending_clipboard_read(&mut self) {
         let Some(mime) = self.pending_clipboard_read.take() else { return };
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -660,12 +1015,14 @@ impl AppState {
             use std::io::Read;
             use std::os::fd::AsRawFd;
             const CAP: usize = 64 * 1024 * 1024;
-            const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-            let start = Instant::now();
+            const IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+            let mut last_data = Instant::now();
             let mut buf = Vec::new();
             let mut chunk = [0u8; 65536];
             loop {
-                let Some(remaining) = DEADLINE.checked_sub(start.elapsed()) else { return };
+                let Some(remaining) = IDLE_DEADLINE.checked_sub(last_data.elapsed()) else {
+                    return;
+                };
                 let mut pfd = libc::pollfd {
                     fd: reader.as_raw_fd(),
                     events: libc::POLLIN,
@@ -680,11 +1037,12 @@ impl AppState {
                     return;
                 }
                 if ready == 0 {
-                    return;
+                    continue;
                 }
                 match (&reader).read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
+                        last_data = Instant::now();
                         let room = CAP - buf.len();
                         let take_n = n.min(room);
                         buf.extend_from_slice(&chunk[..take_n]);
@@ -711,252 +1069,243 @@ impl AppState {
     }
 
 
-    /// Resolve a `CursorImageStatus` to PNG bytes plus hotspot and invoke the Python cursor
-    /// callback. Also re-invoked from the calloop command handlers to replay the retained cursor
-    /// when a callback re-registers or a capture restarts.
+    /// Resolve a `CursorImageStatus` into a job for the `wl-cursor` worker, which does the
+    /// PNG encode, caching, and the GIL-bound Python call off the calloop thread. Also re-invoked
+    /// from the calloop command handlers to replay the retained cursor when a callback
+    /// (re)registers or a capture restarts.
     ///
-    /// Dispatches on the cursor status:
+    /// Only the renderer/surface-affine work happens here:
     ///
-    /// 1. **Named**: look the themed cursor up by CSS name and emit its cached PNG (`"png"`), or
-    ///    `"error"` if the theme lacks it.
-    /// 2. **Hidden**: emit `"hide"` — the only message allowed through with empty data, since an
-    ///    intentional pointer hide must blank the consumer's cursor.
-    /// 3. **Surface** (a client-supplied cursor sprite): ignore any surface without the
+    /// 1. **Named** / **Hidden**: forwarded as-is (the worker owns its own theme handle).
+    /// 2. **Surface** (a client-supplied cursor sprite): ignore any surface without the
     ///    `cursor_image` role, read the hotspot, then read the backing buffer by one of two paths:
     ///    - **SHM**: hash only the sprite's sub-region — width/height/stride/offset/format plus the
     ///      pixel span — because many sprites share one pool and differ only by `offset`, so hashing
-    ///      the whole pool would collide. On a cache miss (and only when ≤128×128) convert the
-    ///      BGRA/XRGB pixels to RGBA, un-premultiply (wl_shm cursor content is premultiplied by
-    ///      convention; PNG carries straight alpha), and PNG-encode; `Xrgb8888` has no alpha so
-    ///      byte 3 is forced opaque, and stride/offset are clamped non-negative with checked
-    ///      arithmetic so a garbage descriptor skips pixels instead of panicking.
+    ///      the whole pool would collide; ship the raw pool bytes plus descriptor to the worker.
     ///    - **dmabuf** (`NotManaged`): bind it to the GLES renderer, copy the framebuffer to
-    ///      `Abgr8888`, map it back, un-premultiply, and PNG-encode using the derived readback
-    ///      stride.
-    ///    The PNG cache is bounded at 100 entries by arbitrary eviction; content-hashing means an
-    ///    evicted sprite simply re-inserts on the next render.
+    ///      `Abgr8888`, map it back (calloop-affine), and ship the raw RGBA readback.
     ///
-    /// A surface whose buffer could not be read yields `("surface", empty)`, which the final gate
-    /// suppresses — Python is called only for non-empty data or `"hide"` — so a transient read miss
-    /// (common during a stop/start replay) preserves the consumer's last cursor instead of blanking
-    /// it. `PY_SHUTDOWN` gates the whole call off a finalizing interpreter.
+    ///    A sprite whose buffer could not be read is dropped by the worker, preserving the
+    ///    consumer's last cursor instead of blanking it (only "hide" carries empty data).
     pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
-        if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.cursor_callback_set {
             return;
         }
-        if let Some(ref cb) = self.cursor_callback {
-            let (msg_type, data, hot_x, hot_y) = match image {
-                CursorImageStatus::Named(icon) => {
-                    self.cursor_buffer = None;
-                    let name = cursor_icon_to_str(icon);
-                    if let Some((png_bytes, x, y)) = self.cursor_helper.get_png_data(name) {
-                        ("png", png_bytes, x as i32, y as i32)
-                    } else {
-                        ("error", Vec::new(), 0, 0)
+        let job = match image {
+            CursorImageStatus::Named(icon) => {
+                self.cursor_buffer = None;
+                CursorJob::Named { name: cursor_icon_to_str(icon) }
+            }
+            CursorImageStatus::Hidden => {
+                self.cursor_buffer = None;
+                CursorJob::Hide
+            }
+            CursorImageStatus::Surface(ref surface) => {
+                let mut hot_x = 0;
+                let mut hot_y = 0;
+                let mut is_cursor_role = false;
+
+                with_states(surface, |states| {
+                    if states.role == Some("cursor_image") {
+                        is_cursor_role = true;
                     }
-                }
-                CursorImageStatus::Hidden => {
-                    self.cursor_buffer = None;
-                    ("hide", Vec::new(), 0, 0)
-                },
-                CursorImageStatus::Surface(ref surface) => {
-                    let mut final_png = Vec::new();
-                    let mut hot_x = 0;
-                    let mut hot_y = 0;
-                    let mut is_cursor_role = false;
-
-                    with_states(surface, |states| {
-                        if states.role == Some("cursor_image") {
-                            is_cursor_role = true;
+                    if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>() {
+                        if let Ok(guard) = attributes.lock() {
+                            hot_x = guard.hotspot.x;
+                            hot_y = guard.hotspot.y;
                         }
-                        if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>() {
-                            if let Ok(guard) = attributes.lock() {
-                                hot_x = guard.hotspot.x;
-                                hot_y = guard.hotspot.y;
-                            }
-                        }
-                    });
-
-                    if !is_cursor_role {
-                        return;
                     }
-
-                    let buffer_found = with_states(surface, |states| {
-                        let mut attrs = states.cached_state.get::<SurfaceAttributes>();
-                        
-                        if let Some(BufferAssignment::NewBuffer(b)) = &attrs.current().buffer {
-                            return Some(b.clone());
-                        }
-
-                        if let Some(mutex) = states.data_map.get::<Mutex<RendererSurfaceState>>() {
-                            if let Ok(renderer_state) = mutex.try_lock() {
-                                if let Some(b) = renderer_state.buffer() {
-                                    let wl_buffer: &wayland_server::protocol::wl_buffer::WlBuffer = b;
-                                    return Some(wl_buffer.clone());
-                                }
-                            }
-                        }
-                        None
-                    });
-
-                    if let Some(buffer) = buffer_found {
-                        let shm_result = with_buffer_contents(&buffer, |ptr, len, spec| {
-                            let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-                            let mut hasher = DefaultHasher::new();
-                            spec.width.hash(&mut hasher);
-                            spec.height.hash(&mut hasher);
-                            spec.stride.hash(&mut hasher);
-                            spec.offset.hash(&mut hasher);
-                            spec.format.hash(&mut hasher);
-                            let start = (spec.offset.max(0) as usize).min(len);
-                            let span = (spec.stride.max(0) as usize)
-                                .saturating_mul(spec.height.max(0) as usize);
-                            let end = start.saturating_add(span).min(len);
-                            slice[start..end].hash(&mut hasher);
-                            let hash = hasher.finish();
-                            (hash, spec.width, spec.height, spec.stride, spec.format, spec.offset, slice.to_vec())
-                        });
-
-                        match shm_result {
-                            Ok((hash, width, height, stride, format, buf_offset, raw_bytes)) => {
-                                if let Some(cached_png) = self.cursor_cache.get(&hash) {
-                                    final_png = cached_png.clone();
-                                } else {
-                                    if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
-                                        let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
-                                        let stride_usize = stride.max(0) as usize;
-                                        let base_offset = buf_offset.max(0) as usize;
-
-                                        for y in 0..(height as u32) {
-                                            for x in 0..(width as u32) {
-                                                let offset = (y as usize)
-                                                    .checked_mul(stride_usize)
-                                                    .and_then(|row| base_offset.checked_add(row))
-                                                    .and_then(|o| o.checked_add((x as usize) * 4));
-                                                let offset = match offset {
-                                                    Some(o) => o,
-                                                    None => continue,
-                                                };
-                                                if offset.checked_add(4).is_some_and(|end| end <= raw_bytes.len()) {
-                                                    let alpha = if format == wl_shm::Format::Xrgb8888 {
-                                                        255
-                                                    } else {
-                                                        raw_bytes[offset + 3]
-                                                    };
-                                                    img_buf.put_pixel(x, y, Rgba([
-                                                        raw_bytes[offset + 2],
-                                                        raw_bytes[offset + 1],
-                                                        raw_bytes[offset],
-                                                        alpha
-                                                    ]));
-                                                }
-                                            }
-                                        }
-
-                                        crate::unpremultiply_rgba(&mut img_buf);
-                                        let mut bytes = Vec::new();
-                                        if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
-                                            self.cursor_cache.insert(hash, bytes.clone());
-                                            final_png = bytes;
-                                            if self.cursor_cache.len() > 100 {
-                                                let evict = *self.cursor_cache.keys().next().unwrap();
-                                                self.cursor_cache.remove(&evict);
-                                            }
-                                        }
-                                    }
-                                }
-                            },
-                            Err(BufferAccessError::NotManaged) => {
-                                let mut gles_data: Option<(u64, i32, i32, Vec<u8>)> = None;
-
-                                let dmabuf_opt = get_dmabuf(&buffer).ok().cloned();
-
-                                if let Some(mut dmabuf) = dmabuf_opt {
-                                    if let Some(renderer) = self.gles_renderer.as_mut() {
-                                        let width = dmabuf.width() as i32;
-                                        let height = dmabuf.height() as i32;
-
-                                        match renderer.bind(&mut dmabuf) {
-                                            Ok(frame) => {
-                                                let rect = Rectangle::new((0, 0).into(), (width, height).into());
-                                                
-                                                match renderer.copy_framebuffer(&frame, rect, Fourcc::Abgr8888) {
-                                                    Ok(mapping) => {
-                                                        match renderer.map_texture(&mapping) {
-                                                            Ok(data) => {
-                                                                let mut hasher = DefaultHasher::new();
-                                                                data.hash(&mut hasher);
-                                                                let hash = hasher.finish();
-                                                                gles_data = Some((hash, width, height, data.to_vec()));
-                                                            },
-                                                            Err(e) => eprintln!("Failed to map texture: {:?}", e)
-                                                        }
-                                                    },
-                                                    Err(e) => eprintln!("Failed to copy framebuffer: {:?}", e)
-                                                }
-                                            },
-                                            Err(e) => eprintln!("Failed to bind dmabuf to renderer: {:?}", e)
-                                        }
-                                    }
-                                }
-
-                                if let Some((hash, width, height, raw_bytes)) = gles_data {
-                                     if let Some(cached_png) = self.cursor_cache.get(&hash) {
-                                         final_png = cached_png.clone();
-                                     } else {
-                                         if width <= 128 && height <= 128 && !raw_bytes.is_empty() {
-                                             let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
-                                             let stride_usize = rgba_readback_stride(raw_bytes.len(), height as usize, width as usize);
-                                             
-                                             for y in 0..(height as u32) {
-                                                 for x in 0..(width as u32) {
-                                                     let offset = (y as usize * stride_usize) + (x as usize * 4);
-                                                     if offset + 4 <= raw_bytes.len() {
-                                                         img_buf.put_pixel(x, y, Rgba([
-                                                             raw_bytes[offset],
-                                                             raw_bytes[offset + 1],
-                                                             raw_bytes[offset + 2],
-                                                             raw_bytes[offset + 3]
-                                                         ]));
-                                                     }
-                                                 }
-                                             }
-
-                                             crate::unpremultiply_rgba(&mut img_buf);
-                                             let mut bytes = Vec::new();
-                                             if img_buf.write_to(&mut IoCursor::new(&mut bytes), ImageFormat::Png).is_ok() {
-                                                 self.cursor_cache.insert(hash, bytes.clone());
-                                                 final_png = bytes;
-                                                 if self.cursor_cache.len() > 100 {
-                                                     let evict = *self.cursor_cache.keys().next().unwrap();
-                                                     self.cursor_cache.remove(&evict);
-                                                 }
-                                             }
-                                         }
-                                     }
-                                }
-                            },
-                            Err(_) => {}
-                        }
-                        
-                        self.cursor_buffer = Some(buffer);
-                    }
-
-                    if !final_png.is_empty() {
-                        ("png", final_png, hot_x, hot_y)
-                    } else {
-                        ("surface", Vec::new(), 0, 0)
-                    }
-                }
-            };
-
-            if !data.is_empty() || msg_type == "hide" {
-                Python::attach(|py| {
-                    let py_bytes = PyBytes::new(py, &data);
-                    let _ = cb.call1(py, (msg_type, py_bytes, hot_x, hot_y));
                 });
+
+                if !is_cursor_role {
+                    return;
+                }
+
+                let buffer_found = with_states(surface, |states| {
+                    let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+
+                    if let Some(BufferAssignment::NewBuffer(b)) = &attrs.current().buffer {
+                        return Some(b.clone());
+                    }
+
+                    if let Some(mutex) = states.data_map.get::<Mutex<RendererSurfaceState>>() {
+                        if let Ok(renderer_state) = mutex.try_lock() {
+                            if let Some(b) = renderer_state.buffer() {
+                                let wl_buffer: &wayland_server::protocol::wl_buffer::WlBuffer = b;
+                                return Some(wl_buffer.clone());
+                            }
+                        }
+                    }
+                    None
+                });
+
+                let Some(buffer) = buffer_found else { return };
+
+                let shm_result = with_buffer_contents(&buffer, |ptr, len, spec| {
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+                    let mut hasher = DefaultHasher::new();
+                    spec.width.hash(&mut hasher);
+                    spec.height.hash(&mut hasher);
+                    spec.stride.hash(&mut hasher);
+                    spec.offset.hash(&mut hasher);
+                    spec.format.hash(&mut hasher);
+                    let start = (spec.offset.max(0) as usize).min(len);
+                    let span = (spec.stride.max(0) as usize)
+                        .saturating_mul(spec.height.max(0) as usize);
+                    let end = start.saturating_add(span).min(len);
+                    slice[start..end].hash(&mut hasher);
+                    let hash = hasher.finish();
+                    (hash, spec.width, spec.height, spec.stride, spec.format, spec.offset, slice.to_vec())
+                });
+
+                let job = match shm_result {
+                    Ok((hash, width, height, stride, format, buf_offset, raw_bytes)) => {
+                        Some(CursorJob::Shm {
+                            hash,
+                            width,
+                            height,
+                            stride,
+                            offset: buf_offset,
+                            opaque: format == wl_shm::Format::Xrgb8888,
+                            bytes: raw_bytes,
+                            hot_x,
+                            hot_y,
+                        })
+                    }
+                    Err(BufferAccessError::NotManaged) => {
+                        let mut gles_job = None;
+                        let dmabuf_opt = get_dmabuf(&buffer).ok().cloned();
+                        if let Some(mut dmabuf) = dmabuf_opt {
+                            if let Some(renderer) = self.gles_renderer.as_mut() {
+                                let width = dmabuf.width() as i32;
+                                let height = dmabuf.height() as i32;
+
+                                match renderer.bind(&mut dmabuf) {
+                                    Ok(frame) => {
+                                        let rect = Rectangle::new((0, 0).into(), (width, height).into());
+                                        match renderer.copy_framebuffer(&frame, rect, Fourcc::Abgr8888) {
+                                            Ok(mapping) => match renderer.map_texture(&mapping) {
+                                                Ok(data) => {
+                                                    let mut hasher = DefaultHasher::new();
+                                                    data.hash(&mut hasher);
+                                                    gles_job = Some(CursorJob::Gles {
+                                                        hash: hasher.finish(),
+                                                        width,
+                                                        height,
+                                                        bytes: data.to_vec(),
+                                                        hot_x,
+                                                        hot_y,
+                                                    });
+                                                }
+                                                Err(e) => eprintln!("Failed to map texture: {:?}", e),
+                                            },
+                                            Err(e) => eprintln!("Failed to copy framebuffer: {:?}", e),
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to bind dmabuf to renderer: {:?}", e),
+                                }
+                            }
+                        }
+                        gles_job
+                    }
+                    Err(_) => None,
+                };
+
+                self.cursor_buffer = Some(buffer);
+                let Some(job) = job else { return };
+                job
+            }
+        };
+        let _ = self.cursor_tx.send(job);
+    }
+
+    /// Re-apply the policy's keymap (base + overlays) to the seat keyboard, broadcasting to
+    /// clients only when the content actually changed (smithay dedupes by content hash).
+    pub(crate) fn apply_keymap_policy(&mut self) {
+        let text = self.keymap_policy.keymap_text();
+        self.apply_keymap_text(text);
+    }
+
+    /// Deliver `text` as the seat keymap (and the host virtual keyboard's, in
+    /// host-capture mode). Empty text is ignored.
+    pub(crate) fn apply_keymap_text(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        // Host-capture mode: the same managed keymap rides on the virtual
+        // keyboard, so the host compositor translates injected keycodes with
+        // selkies' keymap (overlay binds included) instead of its own.
+        if let Some(host) = &self.host {
+            host.set_keymap(&text);
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            if let Err(e) = keyboard.set_keymap_from_string(self, text) {
+                eprintln!("[Wayland] keymap swap failed: {e:?}");
             }
         }
+    }
+
+    /// Resolve `keysyms` to `(keycode, level)` pairs, overlay-binding whatever the base
+    /// cannot produce — at most ONE keymap swap for the whole batch, and never rebinding a
+    /// keycode that is currently held down. Serves computer-use; the interactive input path
+    /// resolves keysyms in selkies and injects plain keycodes.
+    pub(crate) fn bind_keysyms(&mut self, keysyms: &[u32]) -> Vec<(u32, u32)> {
+        let pressed: std::collections::HashSet<u32> = self
+            .seat
+            .get_keyboard()
+            .map(|k| k.pressed_keys().iter().map(|c| c.raw()).collect())
+            .unwrap_or_default();
+        let (out, changed) = self.keymap_policy.bind_many(keysyms, &pressed);
+        if changed {
+            self.apply_keymap_policy();
+        }
+        out
+    }
+
+    /// `bind_keysyms` restricted to level-0 resolutions (see
+    /// [`KeymapPolicy::bind_many_plain`]); used by the virtual-keyboard translation path, which
+    /// cannot synthesize modifiers.
+    pub(crate) fn bind_keysyms_plain(&mut self, keysyms: &[u32]) -> Vec<u32> {
+        let pressed: std::collections::HashSet<u32> = self
+            .seat
+            .get_keyboard()
+            .map(|k| k.pressed_keys().iter().map(|c| c.raw()).collect())
+            .unwrap_or_default();
+        let (out, changed) = self.keymap_policy.bind_many_plain(keysyms, &pressed);
+        if changed {
+            self.apply_keymap_policy();
+        }
+        out
+    }
+
+    /// Answer any client fullscreen/maximize (un)set request with the compositor's forced
+    /// policy: every toplevel is Fullscreen+Activated at the CURRENT logical size of the
+    /// output the window is placed on. The configure is always sent, so an app toggling
+    /// fullscreen gets an explicit, current-geometry answer instead of silence or stale
+    /// pending state.
+    pub(crate) fn send_forced_fullscreen_configure(&mut self, toplevel: &ToplevelSurface) {
+        let output_id = self
+            .space
+            .elements()
+            .chain(self.pending_windows.iter())
+            .find(|w| w.toplevel().map(|t| t == toplevel).unwrap_or(false))
+            .map(window_output_id)
+            .unwrap_or(0);
+        let (logical_width, logical_height) = if let Some(size) = self.logical_size_of(output_id) {
+            size
+        } else {
+            let scale = self.settings.scale.max(0.1);
+            (
+                (self.settings.width as f64 / scale).round() as i32,
+                (self.settings.height as f64 / scale).round() as i32,
+            )
+        };
+        toplevel.with_pending_state(|state| {
+            state.states.set(XdgState::Fullscreen);
+            state.states.set(XdgState::Activated);
+            state.size = Some((logical_width, logical_height).into());
+        });
+        toplevel.send_configure();
     }
 }
 
@@ -967,6 +1316,8 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "image/jpeg",
     "image/webp",
     "image/bmp",
+    "image/svg+xml",
+    "image/svg",
     "text/plain;charset=utf-8",
     "UTF8_STRING",
     "text/plain",
@@ -997,27 +1348,32 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
+        let Some(source) = source else {
+            self.current_selection_mime = None;
+            return;
+        };
+        let mimes = source.mime_types();
+        let mime = CLIPBOARD_MIME_PREFERENCE
+            .iter()
+            .find(|want| mimes.iter().any(|m| m == *want))
+            .map(|s| s.to_string());
+        // Recorded even with no callback armed, so SetClipboardCallback can re-stage a
+        // read of a copy made while nobody was listening.
+        self.current_selection_mime = mime.clone();
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         if self.clipboard_callback.is_none() {
             return;
         }
-        let Some(source) = source else { return };
-        let mimes = source.mime_types();
-        let Some(mime) = CLIPBOARD_MIME_PREFERENCE
-            .iter()
-            .find(|want| mimes.iter().any(|m| m == *want))
-            .map(|s| s.to_string())
-        else {
-            return;
-        };
+        let Some(mime) = mime else { return };
         self.pending_clipboard_read = Some(mime);
         let _ = seat;
     }
 
     /// A client pastes the Python-owned selection: stream the stored bytes into the client's
-    /// fd on a spawned thread, since the receiving pipe may backpressure.
+    /// fd on a spawned thread, since the receiving pipe may backpressure. Bounded by an
+    /// idle deadline: a client that never reads its paste fd must not pin the thread.
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
@@ -1026,14 +1382,16 @@ impl SelectionHandler for AppState {
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
-        if ty != SelectionTarget::Clipboard {
+        if ty != SelectionTarget::Clipboard && ty != SelectionTarget::Primary {
             return;
         }
         let payload = user_data.clone();
         std::thread::spawn(move || {
-            use std::io::Write;
-            let mut f = std::fs::File::from(fd);
-            let _ = f.write_all(&payload.1);
+            let _ = crate::wayland::wlclient::write_fd_all(
+                &fd,
+                &payload.1,
+                crate::wayland::wlclient::IO_TIMEOUT,
+            );
         });
     }
 }
@@ -1102,7 +1460,7 @@ impl FractionalScaleHandler for AppState {
         &mut self,
         surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     ) {
-        if let Some(output) = self.outputs.first() {
+        if let Some(output) = self.primary_output() {
             let scale = output.current_scale().fractional_scale();
             with_states(&surface, |states| {
                 smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
@@ -1613,17 +1971,17 @@ impl SeatHandler for AppState {
         self.send_cursor_image(&image);
     }
 
-    /// Keep the primary selection's focus following keyboard focus, so middle-click paste
-    /// targets the currently focused client (or clears it when nothing is focused).
+    /// Keep BOTH selections' focus following keyboard focus: without the data-device half,
+    /// the focused client never receives wl_data_offer events and Ctrl+V paste is a silent
+    /// no-op even while the compositor-side selection is correct (primary covers only
+    /// middle-click paste).
     fn focus_changed(&mut self, seat: &Seat<AppState>, focus: Option<&Self::KeyboardFocus>) {
-        if let Some(focus_target) = focus {
-            let dh = &self.dh;
-            let client = focus_target.wl_surface().and_then(|s| dh.get_client(s.id()).ok());
-            set_primary_focus(dh, seat, client);
-        } else {
-            let dh = &self.dh;
-            set_primary_focus(dh, seat, None);
-        }
+        let dh = &self.dh;
+        let client = focus
+            .and_then(|t| t.wl_surface())
+            .and_then(|s| dh.get_client(s.id()).ok());
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
     }
 }
 
@@ -1679,8 +2037,18 @@ impl XdgShellHandler for AppState {
     }
     /// A new toplevel appears: wrap it in a `Window`, queue it for mapping, and register a
     /// foreign-toplevel handle (seeded with title / app-id) stored on the surface for later updates.
+    /// The window is pinned to the pointer's output HERE — the first commit can't be relied on
+    /// for that, because a decoration-negotiating client (foot) has its initial configure sent
+    /// by `new_decoration` before it ever commits, skipping the pre-configure commit branch.
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        let target_id = self.pointer_display();
         let window = Window::new_wayland_window(surface.clone());
+        window.user_data().insert_if_missing_threadsafe(|| WindowMeta {
+            id: NEXT_WINDOW_ID.fetch_add(1, Ordering::Relaxed),
+            output: AtomicU32::new(target_id),
+            placed: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
+        });
         self.pending_windows.push(window);
         let (title, app_id) = with_states(surface.wl_surface(), |states| {
             let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap();
@@ -1729,15 +2097,257 @@ impl XdgShellHandler for AppState {
         }
         let _ = surface.send_repositioned(token);
     }
+    /// Client fullscreen request: always granted at the compositor's forced-fullscreen
+    /// geometry (the CURRENT logical size), so the toggle gets a definite answer. A request
+    /// naming an output moves the window there, which is how a nested compositor puts each
+    /// of its screens on a monitor of its choosing.
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        if let Some(id) = output
+            .as_ref()
+            .and_then(|wlo| self.output_nodes.iter().find(|n| n.output.owns(wlo)).map(|n| n.id))
+        {
+            let mapped = self
+                .space
+                .elements()
+                .find(|w| w.toplevel().map(|tl| *tl == surface).unwrap_or(false))
+                .cloned();
+            if let Some(window) = mapped {
+                if self.place_window_on_output(&window, id) {
+                    return;
+                }
+            } else if let Some(meta) = self
+                .pending_windows
+                .iter()
+                .find(|w| w.toplevel().map(|tl| *tl == surface).unwrap_or(false))
+                .and_then(window_meta)
+            {
+                // Still waiting for its first buffer: record the output instead of mapping
+                // it, so nothing renders or hit-tests before the client has drawn. The
+                // configure below then carries that output's geometry.
+                meta.output.store(id, Ordering::Relaxed);
+                meta.placed.store(true, Ordering::Relaxed);
+            }
+        }
+        self.send_forced_fullscreen_configure(&surface);
+    }
+    /// Client unfullscreen request: the forced-fullscreen policy stands, but the client
+    /// still receives an explicit configure at the current geometry (the Smithay default sends
+    /// NOTHING here, leaving the app waiting on a toggle that never answers).
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.send_forced_fullscreen_configure(&surface);
+    }
+    /// Maximize request: answered with the forced-fullscreen configure (same geometry).
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.send_forced_fullscreen_configure(&surface);
+    }
+    /// Unmaximize request: explicit current-geometry configure, policy unchanged.
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        self.send_forced_fullscreen_configure(&surface);
+    }
     /// A toplevel closed: drop it from the pending-window queue so a window that never
-    /// finished mapping can't linger there, and remove its foreign-toplevel handle so taskbar-style
-    /// clients stop listing a window that is gone.
+    /// finished mapping can't linger there, unmap it from the space at once so `list_windows`
+    /// and hit-testing never see a husk (the periodic `space.refresh` would only reap it
+    /// later), and remove its foreign-toplevel handle so taskbar-style clients stop listing a
+    /// window that is gone.
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         if let Some(idx) = self.pending_windows.iter().position(|w| w.toplevel().map(|t| *t == surface).unwrap_or(false)) {
             self.pending_windows.remove(idx);
         }
+        let mapped = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().map(|t| *t == surface).unwrap_or(false))
+            .cloned();
+        if let Some(window) = mapped {
+            self.space.unmap_elem(&window);
+        }
         if let Some(handle) = with_states(surface.wl_surface(), |states| states.data_map.get::<ForeignToplevelHandle>().cloned()) {
              self.foreign_toplevel_list.remove_toplevel(&handle);
+        }
+    }
+}
+
+/// In-house `zwp_virtual_keyboard_v1` implementation. Smithay's manager swaps the
+/// client-visible seat keymap to the virtual keyboard's keymap on every VK event and never
+/// restores it, leaving every client holding a foreign keymap (and killing the compositor's
+/// overlay keycodes) after any VK use. Here VK key events are TRANSLATED instead: each keycode
+/// resolves to its level-0 keysym under the VK client's own uploaded keymap, maps onto the seat
+/// keymap (overlay-binding on demand, batched at keymap upload), and injects through the seat's
+/// regular input path — the seat keymap identity never changes and modifier/pressed-key state
+/// stays coherent with server-side injection. VK `modifiers` requests are ignored: applying a
+/// foreign modifier mask would corrupt the seat's own tracked state, and the supported VK
+/// client (selkies' wayland_typer) binds every keysym at level 0 and never sends them.
+pub struct PfVirtualKeyboard {
+    inner: Mutex<PfVkState>,
+}
+
+#[derive(Default)]
+struct PfVkState {
+    /// Level-0 keysym per xkb keycode of the client's uploaded keymap.
+    syms: Option<std::collections::HashMap<u32, u32>>,
+    /// VK xkb keycode -> injected seat keycode, so a release always matches its press even
+    /// across policy rebinds.
+    pressed: std::collections::HashMap<u32, u32>,
+}
+
+impl GlobalDispatch<ZwpVirtualKeyboardManagerV1, ()> for AppState {
+    fn bind(
+        _state: &mut Self,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<ZwpVirtualKeyboardManagerV1>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for AppState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &ZwpVirtualKeyboardManagerV1,
+        request: zwp_virtual_keyboard_manager_v1::Request,
+        _data: &(),
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let zwp_virtual_keyboard_manager_v1::Request::CreateVirtualKeyboard { seat: _, id } =
+            request
+        {
+            data_init.init(id, PfVirtualKeyboard { inner: Mutex::new(PfVkState::default()) });
+        }
+    }
+}
+
+impl Dispatch<ZwpVirtualKeyboardV1, PfVirtualKeyboard> for AppState {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        resource: &ZwpVirtualKeyboardV1,
+        request: zwp_virtual_keyboard_v1::Request,
+        data: &PfVirtualKeyboard,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        use smithay::input::keyboard::xkb;
+        match request {
+            zwp_virtual_keyboard_v1::Request::Keymap { format, fd, size } => {
+                if format != 1 {
+                    return;
+                }
+                let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+                let keymap = unsafe {
+                    xkb::Keymap::new_from_fd(
+                        &ctx,
+                        fd,
+                        size as usize,
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS,
+                    )
+                };
+                let Ok(Some(keymap)) = keymap else {
+                    eprintln!("[Wayland] virtual-keyboard keymap failed to compile; ignoring.");
+                    return;
+                };
+                let syms = crate::wayland::keymap::level0_syms(&keymap);
+                // Pre-bind everything this keymap can type that the seat cannot, in ONE
+                // seat keymap swap, so the following key events bind nothing.
+                let missing: Vec<u32> = syms
+                    .values()
+                    .copied()
+                    .filter(|&s| !state.keymap_policy.resolves_plain(s))
+                    .collect();
+                if !missing.is_empty() {
+                    let _ = state.bind_keysyms_plain(&missing);
+                }
+                data.inner.lock().unwrap().syms = Some(syms);
+            }
+            zwp_virtual_keyboard_v1::Request::Key { time: _, key, state: key_state } => {
+                let mut vk = data.inner.lock().unwrap();
+                if vk.syms.is_none() {
+                    drop(vk);
+                    resource.post_error(
+                        zwp_virtual_keyboard_v1::Error::NoKeymap,
+                        "`key` sent before keymap.",
+                    );
+                    return;
+                }
+                let vk_kc = key.wrapping_add(8);
+                let seat_kc = if key_state == 1 {
+                    let sym = vk.syms.as_ref().and_then(|m| m.get(&vk_kc)).copied();
+                    // Translate through the seat keymap; an untranslatable keycode
+                    // passes through raw (base sections of both keymaps agree for
+                    // ordinary pc keycodes).
+                    let kc = match sym {
+                        Some(sym) => {
+                            let bound = state.bind_keysyms_plain(&[sym])[0];
+                            if bound != 0 { bound } else { vk_kc }
+                        }
+                        None => vk_kc,
+                    };
+                    vk.pressed.insert(vk_kc, kc);
+                    kc
+                } else {
+                    vk.pressed.remove(&vk_kc).unwrap_or(vk_kc)
+                };
+                drop(vk);
+                let pressed = key_state == 1;
+                if let Some(keyboard) = state.seat.get_keyboard() {
+                    let keyboard = keyboard.clone();
+                    let serial = next_serial();
+                    let time = wayland_time();
+                    keyboard.input(
+                        state,
+                        smithay::backend::input::Keycode::new(seat_kc),
+                        if pressed {
+                            smithay::backend::input::KeyState::Pressed
+                        } else {
+                            smithay::backend::input::KeyState::Released
+                        },
+                        serial,
+                        time,
+                        |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
+                    );
+                }
+            }
+            zwp_virtual_keyboard_v1::Request::Modifiers { .. } => {}
+            zwp_virtual_keyboard_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    /// Release every seat key this virtual keyboard still holds, so a VK client that
+    /// disconnects mid-press cannot leave keys logically stuck.
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &ZwpVirtualKeyboardV1,
+        data: &PfVirtualKeyboard,
+    ) {
+        let held: Vec<u32> = data.inner.lock().unwrap().pressed.drain().map(|(_, kc)| kc).collect();
+        if held.is_empty() {
+            return;
+        }
+        if let Some(keyboard) = state.seat.get_keyboard() {
+            let keyboard = keyboard.clone();
+            for kc in held {
+                let serial = next_serial();
+                let time = wayland_time();
+                keyboard.input(
+                    state,
+                    smithay::backend::input::Keycode::new(kc),
+                    smithay::backend::input::KeyState::Released,
+                    serial,
+                    time,
+                    |_, _, _| smithay::input::keyboard::FilterResult::<()>::Forward,
+                );
+            }
         }
     }
 }
@@ -1761,7 +2371,6 @@ delegate_seat!(AppState);
 delegate_xdg_shell!(AppState);
 delegate_dmabuf!(AppState);
 delegate_fractional_scale!(AppState);
-delegate_virtual_keyboard_manager!(AppState);
 delegate_data_device!(AppState);
 delegate_data_control!(AppState);
 delegate_pointer_warp!(AppState);
@@ -1782,7 +2391,7 @@ delegate_primary_selection!(AppState);
 /// Dividing the buffer length by the height recovers a padded stride, so a padded readback cannot
 /// skew the cursor image; the result never drops below one full `width*4` row, and a zero height
 /// short-circuits to one row to avoid dividing by zero.
-fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
+pub(crate) fn rgba_readback_stride(buf_len: usize, height: usize, width: usize) -> usize {
     let row = width.saturating_mul(4);
     if height == 0 {
         return row;

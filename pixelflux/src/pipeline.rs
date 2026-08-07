@@ -14,7 +14,6 @@ use crate::encoders::nvenc::NvencEncoder;
 use crate::encoders::oh264::Openh264Encoder;
 use crate::encoders::software::{encode_cpu, EncodedStripe, StripeState};
 use crate::encoders::vaapi::VaapiEncoder;
-use crate::recording_sink::RecordingSink;
 use crate::RustCaptureSettings;
 use std::sync::Arc;
 
@@ -156,6 +155,31 @@ enum X11Encoder {
     Openh264(Openh264Encoder),
 }
 
+/// Software H.264 encoder used when hardware encoders are unavailable or the CPU is forced.
+/// With GPL components this is the striped x264 path (its state lives per-stripe inside
+/// `encode_cpu`, so no persistent object exists here); without them (the crate built with the
+/// `gpl` feature disabled) the BSD-licensed OpenH264 full-frame encoder is substituted instead.
+#[cfg(feature = "gpl")]
+fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
+    let _ = settings;
+    X11Encoder::None
+}
+
+#[cfg(not(feature = "gpl"))]
+fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
+    if settings.output_mode != 1 {
+        return X11Encoder::None;
+    }
+    println!("[x11] pixelflux was built without GPL components (libx264 disabled); substituting the BSD-licensed OpenH264 software encoder.");
+    match Openh264Encoder::new(settings) {
+        Some(e) => X11Encoder::Openh264(e),
+        None => {
+            eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
+            X11Encoder::None
+        }
+    }
+}
+
 /// Everything the X11 host-ARGB path has to remember between frames.
 ///
 /// Unlike the Wayland backend, X11 capture has no compositor to report what changed, so this
@@ -164,7 +188,8 @@ enum X11Encoder {
 /// content frame-to-frame. Full-frame H.264 runs through `decide_hw_fullframe`; striped JPEG/x264
 /// runs through `encode_cpu` with `hash_damage=true`.
 ///
-/// Recording sink fan-out is handled at the delivery layer.
+/// Recording fan-out (socket sink and MP4 recorder) is handled at the delivery layer; a
+/// consumer needing a keyframe goes through [`X11Pipeline::request_idr`] like everyone else.
 pub struct X11Pipeline {
     settings: RustCaptureSettings,
     stripes: Vec<StripeState>,
@@ -172,7 +197,6 @@ pub struct X11Pipeline {
     hw_state: StripeState,
     frame_counter: u16,
     pending_force_idr: bool,
-    recording_sink: Option<Arc<RecordingSink>>,
 }
 
 impl X11Pipeline {
@@ -182,22 +206,26 @@ impl X11Pipeline {
     ///
     /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`,
     ///   `encode_node_index`, and `video_fullcolor` fields drive encoder selection.
-    /// * `recording_sink` - Optional Unix-socket H.264 fan-out. Owned by the caller; not
-    ///   rebound on auto-adjust resizes to avoid tearing down the socket listener.
     ///
     /// # Encoder selection
     ///
     /// 1. **OpenH264** — when `use_openh264` is set (explicit opt-in, full-frame software).
     /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
-    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls to x264).
-    /// 4. **Software** (`X11Encoder::None`) — on any hardware init failure or explicit software.
-    pub fn new(settings: RustCaptureSettings, recording_sink: Option<Arc<RecordingSink>>) -> Self {
+    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls back to the
+    ///    software path).
+    /// 4. **Software** — `software_h264_encoder`: `X11Encoder::None`, meaning the striped x264
+    ///    inside `encode_cpu`, in a GPL build; the full-frame OpenH264 encoder when the `gpl`
+    ///    feature is disabled.
+    pub fn new(settings: RustCaptureSettings) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");
             match Openh264Encoder::new(&settings) {
                 Some(e) => X11Encoder::Openh264(e),
                 None => {
+                    #[cfg(feature = "gpl")]
                     eprintln!("[x11] OpenH264 init failed; falling back to software x264");
+                    #[cfg(not(feature = "gpl"))]
+                    eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
                     X11Encoder::None
                 }
             }
@@ -208,7 +236,7 @@ impl X11Pipeline {
             if !encode_driver.is_empty() && !encode_driver.contains("nvidia") {
                 if settings.video_fullcolor {
                     println!("[x11] 4:4:4 full-color requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-                    X11Encoder::None
+                    software_h264_encoder(&settings)
                 } else {
                     println!("[x11] Initializing Unified VAAPI Encoder...");
                     match VaapiEncoder::new_host(&settings) {
@@ -218,7 +246,7 @@ impl X11Pipeline {
                         }
                         Err(err) => {
                             eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
-                            X11Encoder::None
+                            software_h264_encoder(&settings)
                         }
                     }
                 }
@@ -231,7 +259,7 @@ impl X11Pipeline {
                     }
                     Err(err) => {
                         eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU.");
-                        X11Encoder::None
+                        software_h264_encoder(&settings)
                     }
                 }
             }
@@ -239,7 +267,7 @@ impl X11Pipeline {
             if settings.output_mode == 1 {
                 println!("[x11] No GPU Encoder available -> Using CPU Software Encoding.");
             }
-            X11Encoder::None
+            software_h264_encoder(&settings)
         };
         Self {
             settings,
@@ -248,7 +276,6 @@ impl X11Pipeline {
             hw_state: StripeState::default(),
             frame_counter: 0,
             pending_force_idr: false,
-            recording_sink,
         }
     }
 
@@ -360,8 +387,7 @@ impl X11Pipeline {
             );
             if d.send {
                 let fc = self.frame_counter as u64;
-                let force_idr = d.force_idr
-                    || self.recording_sink.as_ref().map(|s| s.should_force_idr()).unwrap_or(false);
+                let force_idr = d.force_idr;
                 let res = match &mut self.hw {
                     X11Encoder::Nvenc(enc) => {
                         enc.encode_cpu_argb(argb, stride, fc, d.target_qp, force_idr)
@@ -377,7 +403,7 @@ impl X11Pipeline {
                 match res {
                     Ok(data) if !data.is_empty() => {
                         vec![EncodedStripe {
-                            data,
+                            data: Arc::new(data),
                             data_type: 2,
                             stripe_y_start: 0,
                             stripe_height: height,
@@ -416,7 +442,10 @@ impl X11Pipeline {
             )
         };
 
-        self.pending_force_idr = false;
+        // An unserved request stays armed: on an infinite GOP an IDR lost to an encode
+        // error or skip would never self-heal, leaving a joining consumer with an
+        // undecodable stream.
+        self.pending_force_idr = requested && out.is_empty();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         out
     }
@@ -441,7 +470,7 @@ mod tests {
             use_paint_over_quality: false,
             ..Default::default()
         };
-        let mut p = X11Pipeline::new(s, None);
+        let mut p = X11Pipeline::new(s);
         let stride = 128 * 4;
         let frame_a = vec![10u8; stride * 128];
         let mut frame_b = frame_a.clone();
@@ -474,7 +503,7 @@ mod tests {
             target_fps: 60.0,
             ..Default::default()
         };
-        let mut p = X11Pipeline::new(s, None);
+        let mut p = X11Pipeline::new(s);
         let stride = 128 * 4;
         let frame = vec![10u8; stride * 128];
         assert!(!p.process(&frame, stride).is_empty(), "first frame emits");

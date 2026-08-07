@@ -10,12 +10,18 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 wayland-server = { version = "0.31.10", features = ["dlopen"] }
-wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+memmap2 = "0.9"
 crossbeam-channel = "0.5"
 calloop = "0.14"
 turbojpeg = "1.3" 
 rayon = "1.10"
-x264-sys = "0.2.2"
+# Striped software H.264 (GPL-2.0+ libx264). Optional, enabled by the default `gpl`
+# feature; build with `--no-default-features` (or PIXELFLUX_ENABLE_GPL=0) to exclude it.
+x264-sys = { version = "0.2.2", optional = true }
 # BSD-licensed Cisco OpenH264 as an alternative software H.264 encoder; builds the
 # vendored C source (needs a C toolchain + nasm), no runtime download. openh264-sys2
 # is used for the raw set_option live-bitrate path the safe wrapper doesn't expose.
@@ -31,7 +37,7 @@ libloading = "0.9"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image. Pure-Rust XCB; links the system libxcb.
-x11rb = { version = "0.13", features = ["shm", "xfixes"] }
+x11rb = { version = "0.13", features = ["shm", "xfixes", "xtest", "randr"] }
 image = "=0.25.9"
 # The crate's build.rs probes the FFmpeg found via pkg-config and emits
 # per-version cfgs; one crate version supports FFmpeg 3.0 UP TO the release it
@@ -45,10 +51,16 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
+cfg-if = "1"
 
 [dependencies.nvcodec-sys]
 path = "nvcodec-sys"
 features = ["cuda"]
+
+[features]
+default = ["gpl"]
+## GPL-licensed components (GPL-2.0+ libx264 for striped software H.264).
+gpl = ["dep:x264-sys"]
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"

@@ -210,9 +210,18 @@ fn monitor_thread(stop: Arc<AtomicBool>, wake_win: Arc<AtomicU32>) {
     }
     let mut last: Option<Payload> = fetch_payload(&conn);
     deliver(last.as_ref());
-    // A registration that raced setup may have requested a replay before the wake window
-    // existed; the current cursor was just delivered, so the request is satisfied.
-    REPLAY.store(false, Ordering::Release);
+    // A registration that raced setup may have requested a replay before the wake
+    // window existed (its wake was skipped). The deliver above satisfied it only if
+    // the callback was already visible and the fetch produced a payload, so consume
+    // the flag and re-deliver rather than assume: an unconditional clear leaves that
+    // callback cursor-less until the next real cursor change. From here on the wake
+    // window exists, so later requests always reach the loop below.
+    if REPLAY.swap(false, Ordering::AcqRel) {
+        if last.is_none() {
+            last = fetch_payload(&conn);
+        }
+        deliver(last.as_ref());
+    }
     loop {
         let event = match conn.wait_for_event() {
             Ok(ev) => ev,
@@ -315,7 +324,9 @@ fn deliver(payload: Option<&Payload>) {
         };
         if let Some(cb) = cb {
             let py_bytes = PyBytes::new(py, png);
-            let _ = cb.call1(py, (*msg_type, py_bytes, *hot_x, *hot_y));
+            if let Err(e) = cb.call1(py, (*msg_type, py_bytes, *hot_x, *hot_y)) {
+                e.print(py);
+            }
         }
     });
 }
@@ -369,6 +380,12 @@ fn cursor_to_png(img: &GetCursorImageReply, cap: i32) -> (&'static str, Vec<u8>,
         hot_y = (hot_y as f32 * scale) as i32;
     }
     crate::unpremultiply_rgba(&mut image);
+    // A hotspot can lie outside the visible bbox (its neighborhood was cropped as
+    // fully transparent). Consumers treat the hotspot as an offset INTO the
+    // bitmap, so clamp to the cropped bounds instead of emitting off-image
+    // coordinates.
+    let hot_x = hot_x.clamp(0, image.width() as i32 - 1);
+    let hot_y = hot_y.clamp(0, image.height() as i32 - 1);
     let mut png = Vec::new();
     match image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
         Ok(()) => ("png", png, hot_x, hot_y),
@@ -406,16 +423,36 @@ mod tests {
         assert_eq!(t, "hide");
     }
 
-    /// The image is cropped to its visible bbox and the hotspot re-based to the crop: one
-    /// opaque pixel at (2,1) with hotspot (3,3) yields a 1x1 PNG with hotspot (1,2).
+    /// The image is cropped to its visible bbox and the hotspot re-based to the crop:
+    /// a 2x2 visible block at (1,1)..(2,2) with hotspot (2,2) yields a 2x2 PNG with
+    /// hotspot (1,1).
     #[test]
     fn crop_rebases_hotspot() {
         let mut px = vec![0u32; 16];
-        px[1 * 4 + 2] = 0xFF00_0000;
-        let (t, data, hx, hy) = cursor_to_png(&reply(4, 4, 3, 3, px), 32);
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            px[y * 4 + x] = 0xFF00_0000;
+        }
+        let (t, data, hx, hy) = cursor_to_png(&reply(4, 4, 2, 2, px), 32);
         assert_eq!(t, "png");
         assert!(!data.is_empty());
-        assert_eq!((hx, hy), (1, 2));
+        assert_eq!((hx, hy), (1, 1));
+    }
+
+    /// A hotspot whose neighborhood was cropped away as transparent is clamped into
+    /// the emitted bitmap — consumers use it as an offset INTO the image, and the
+    /// Wayland path never emits out-of-bounds hotspots either.
+    #[test]
+    fn out_of_bbox_hotspot_clamped() {
+        let mut px = vec![0u32; 16];
+        let (x, y) = (2usize, 1usize);
+        px[y * 4 + x] = 0xFF00_0000;
+        // Visible pixel at (2,1) only. Hotspot (0,0): rebased (-2,-1) -> (0,0).
+        let (t, _, hx, hy) = cursor_to_png(&reply(4, 4, 0, 0, px.clone()), 32);
+        assert_eq!(t, "png");
+        assert_eq!((hx, hy), (0, 0));
+        // Hotspot (3,3): rebased (1,2) past the 1x1 crop -> clamps to (0,0).
+        let (_, _, hx, hy) = cursor_to_png(&reply(4, 4, 3, 3, px), 32);
+        assert_eq!((hx, hy), (0, 0));
     }
 
     /// Premultiplied color becomes straight alpha in the PNG: a half-alpha pixel stored

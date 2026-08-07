@@ -9,14 +9,16 @@
 //! Frames are split into horizontal stripes processed in parallel via rayon. Each stripe is
 //! independently hashed against the previous frame for change detection, and only dirty stripes
 //! are encoded. The x264 path maintains per-stripe encoder state across frames for inter-prediction;
-//! the JPEG path is stateless. An optional recording sink receives the H.264 NAL units for
-//! muxing into a file or socket stream.
+//! the JPEG path is stateless.
 
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
+#[cfg(feature = "gpl")]
 use std::ffi::CString;
+#[cfg(feature = "gpl")]
 use std::ptr;
+use std::sync::Arc;
 use yuv::{BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange, YuvStandardMatrix};
 
 /// Upper bound on the horizontal stripes the CPU encoder splits a frame into, so the
@@ -152,6 +154,7 @@ thread_local! {
 /// state and corrupt the heap. The lock is deliberately held only around open and close, never
 /// around `x264_encoder_encode`, so serializing setup costs nothing in the hot per-stripe encode
 /// path where the real parallelism lives.
+#[cfg(feature = "gpl")]
 static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One long-lived libx264 session for a stripe, holding the raw `x264_t` handle alongside a
@@ -165,6 +168,7 @@ static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// chosen at open and gates which of the live reconfigures apply. The manual `Send` impl exists only
 /// because a raw pointer is not `Send` by default and the handle must move onto the rayon stripe
 /// workers; `Drop` closes it under the global open/close lock for the same reason that lock exists.
+#[cfg(feature = "gpl")]
 pub struct H264EncoderWrapper {
     encoder: *mut x264_sys::x264_t,
     pub width: i32,
@@ -179,8 +183,10 @@ pub struct H264EncoderWrapper {
     full_range: bool,
 }
 
+#[cfg(feature = "gpl")]
 unsafe impl Send for H264EncoderWrapper {}
 
+#[cfg(feature = "gpl")]
 impl Drop for H264EncoderWrapper {
     fn drop(&mut self) {
         if !self.encoder.is_null() {
@@ -191,6 +197,7 @@ impl Drop for H264EncoderWrapper {
     }
 }
 
+#[cfg(feature = "gpl")]
 impl H264EncoderWrapper {
     /// Open an x264 encoder tuned for real-time screen streaming, or `None` on failure.
     ///
@@ -370,10 +377,9 @@ impl H264EncoderWrapper {
     ///
     /// The boolean return is load-bearing: `x264_encoder_encode` can legitimately produce nothing on
     /// a given call, and the caller must forward a stripe only when real bytes exist — never an empty
-    /// or header-only packet. The output also serves two consumers at once, which is why framing is
-    /// conditional: the transport needs the pipeline's small wire header to route the stripe, while
-    /// the optional recording sink needs the *bare* Annex-B elementary stream with no wire header so
-    /// it can be muxed directly.
+    /// or header-only packet. Framing is conditional because the transport needs the pipeline's small
+    /// wire header to route the stripe, while `omit_headers` consumers take the bare Annex-B
+    /// elementary stream.
     ///
     /// 1. **Picture setup**: wraps the borrowed Y/U/V planes and their strides in an
     ///    `x264_picture_t` with the encoder's CSP, stamps the presentation timestamp with `frame_id`,
@@ -386,9 +392,8 @@ impl H264EncoderWrapper {
     ///    the client keys its decode-recovery on the frame type it truly received (IDR = `0x01`,
     ///    I = `0x02`, else `0x00`), then the caller's `fixed_header` (frame number, y-start, width,
     ///    height). With `omit_headers` the output is bare Annex-B.
-    /// 4. **Payload + recording**: every NAL payload is appended to `output_buf`, and each is also
-    ///    forwarded to the recording sink when one is attached — giving the sink raw Annex-B without
-    ///    the wire header.
+    /// 4. **Payload**: every NAL payload is appended to `output_buf` after the optional header,
+    ///    so the bytes past the wire header are always a contiguous Annex-B access unit.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_with_headers(
         &mut self,
@@ -493,10 +498,14 @@ impl H264EncoderWrapper {
 pub struct StripeState {
     pub no_motion_frame_count: u32,
     pub paint_over_sent: bool,
+    #[cfg(feature = "gpl")]
     pub h264_encoder: Option<H264EncoderWrapper>,
     pub h264_burst_frames_remaining: i32,
+    #[cfg(feature = "gpl")]
     pub y_buf: Vec<u8>,
+    #[cfg(feature = "gpl")]
     pub u_buf: Vec<u8>,
+    #[cfg(feature = "gpl")]
     pub v_buf: Vec<u8>,
     pub packet_buf: Vec<u8>,
     pub last_hash: u64,
@@ -580,13 +589,14 @@ impl StripeState {
 ///
 /// # Fields
 ///
-/// * `data` - Compressed payload (JPEG or H.264 NAL units).
+/// * `data` - Compressed payload (JPEG or H.264 NAL units). `Arc`-shared so every
+///   delivery-layer consumer can retain the frame without copying the bytes.
 /// * `data_type` - Codec tag: **1 = JPEG**, **2 = H.264**.
 /// * `stripe_y_start` - Y pixel coordinate of the stripe's top edge within the frame.
 /// * `stripe_height` - Height of the stripe in pixels.
 /// * `frame_id` - Frame sequence number this stripe belongs to.
 pub struct EncodedStripe {
-    pub data: Vec<u8>,
+    pub data: Arc<Vec<u8>>,
     pub data_type: i32,
     pub stripe_y_start: i32,
     pub stripe_height: i32,
@@ -601,8 +611,7 @@ pub struct EncodedStripe {
 /// parallel stripes; bandwidth is precious, so unchanged stripes are skipped. Each stripe is
 /// independently hashed against the previous frame for change detection, and only dirty stripes
 /// are encoded. The x264 path maintains per-stripe encoder state across frames for
-/// inter-prediction; the JPEG path is stateless. The recording sink is attached only in
-/// single-stripe mode because several independent sub-frame bitstreams cannot be muxed.
+/// inter-prediction; the JPEG path is stateless.
 ///
 /// # Arguments
 ///
@@ -674,10 +683,10 @@ pub struct EncodedStripe {
 ///    OpenH264 encoder — one fewer than the available cores, clamped to `[1, 4]`. The slice threads
 ///    keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
 ///    because `zerolatency` makes x264 slice-threaded and more than four slices trips decode
-///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread. Multiple stripes instead run across the
-///    rayon pool with a single x264 thread and one conversion band each, since the parallelism there
-///    already comes from encoding the stripes concurrently. The recording sink is attached only in single-stripe mode, because the several
-///    independent sub-frame bitstreams of striped mode cannot be muxed into one recording.
+///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread.
+///    Multiple stripes instead run across the rayon pool with a single x264 thread and one
+///    conversion band each, since the parallelism there already comes from encoding the stripes
+///    concurrently.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
@@ -788,6 +797,7 @@ pub fn encode_cpu(
     let video_crf = settings.video_crf;
     let video_po_crf = settings.video_paintover_crf;
     let video_burst = settings.video_paintover_burst_frames;
+    #[cfg(feature = "gpl")]
     let video_fullcolor = settings.video_fullcolor;
     let video_streaming = settings.video_streaming_mode;
     let jpeg_q = settings.jpeg_quality;
@@ -795,12 +805,16 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let burst_crf = if use_paint_over && video_po_crf < video_crf { video_po_crf } else { video_crf };
+    #[cfg(feature = "gpl")]
     let target_fps = settings.target_fps;
     let omit_headers = settings.omit_stripe_headers;
     let damage_block_threshold = settings.damage_block_threshold;
     let damage_block_duration = settings.damage_block_duration as i32;
+    #[cfg(feature = "gpl")]
     let video_cbr = settings.video_cbr_mode;
+    #[cfg(feature = "gpl")]
     let video_bitrate = settings.video_bitrate_kbps;
+    #[cfg(feature = "gpl")]
     let video_vbv = (crate::encoders::vbv_bits(
         (video_bitrate.max(0) as u32).saturating_mul(1000),
         target_fps,
@@ -811,11 +825,13 @@ pub fn encode_cpu(
     // Full-frame x264 threads follow the same policy as the OpenH264 encoder:
     // one fewer than the cores (headroom for the capture thread), clamped to
     // [1, 4] to match the four-slice ceiling below.
+    #[cfg(feature = "gpl")]
     let h264_threads = if n_processing_stripes == 1 {
         num_cores.saturating_sub(1).clamp(1, 4) as i32
     } else {
         1
     };
+    #[cfg(feature = "gpl")]
     let csc_bands = 1;
 
     let stripe_body = |(i, stripe_state): (usize, &mut StripeState)| -> Option<EncodedStripe> {
@@ -829,6 +845,9 @@ pub fn encode_cpu(
 
             let mut send_this_stripe = false;
             let mut quality_or_crf = if output_mode == 0 { jpeg_q } else { video_crf };
+            // Only the x264 stripe encoder consumes this; without `gpl` there is no
+            // consumer, so the flag and its sites go away with it.
+            #[cfg(feature = "gpl")]
             let mut force_idr = false;
             let is_dirty = if !hash_damage {
                 stripe_is_dirty[i]
@@ -875,7 +894,10 @@ pub fn encode_cpu(
                         send_this_stripe = true;
                         stripe_state.paint_over_sent = true;
                         quality_or_crf = video_po_crf;
-                        force_idr = true;
+                        #[cfg(feature = "gpl")]
+                        {
+                            force_idr = true;
+                        }
                         stripe_state.h264_burst_frames_remaining = video_burst - 1;
                     }
                 }
@@ -884,7 +906,10 @@ pub fn encode_cpu(
             if force_idr_all {
                 send_this_stripe = true;
                 if output_mode == 1 {
-                    force_idr = true;
+                    #[cfg(feature = "gpl")]
+                    {
+                        force_idr = true;
+                    }
                     if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
                         stripe_state.paint_over_sent = true;
                         stripe_state.h264_burst_frames_remaining = video_burst;
@@ -932,7 +957,7 @@ pub fn encode_cpu(
                             std::mem::take(&mut stripe_state.packet_buf)
                         };
                         Some(EncodedStripe {
-                            data,
+                            data: Arc::new(data),
                             data_type: 1,
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
@@ -940,6 +965,8 @@ pub fn encode_cpu(
                         })
                     })
                 } else {
+                    cfg_if::cfg_if! {
+                        if #[cfg(feature = "gpl")] {
                     let needs_reinit = if let Some(ref enc) = stripe_state.h264_encoder {
                         enc.width != width_usize as i32
                             || enc.height != actual_height as i32
@@ -1025,7 +1052,7 @@ pub fn encode_cpu(
                             &mut stripe_state.packet_buf,
                         ) {
                             Some(EncodedStripe {
-                                data: std::mem::take(&mut stripe_state.packet_buf),
+                                data: Arc::new(std::mem::take(&mut stripe_state.packet_buf)),
                                 data_type: 2,
                                 stripe_y_start: y_start as i32,
                                 stripe_height: actual_height as i32,
@@ -1036,6 +1063,15 @@ pub fn encode_cpu(
                         }
                     } else {
                         None
+                    }
+                        } else {
+                            static GPL_OFF_LOGGED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !GPL_OFF_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("[software] software H.264 encoding unavailable: pixelflux was built without GPL components (libx264 disabled). Use JPEG, OpenH264 (`use_openh264 = true`), or a hardware encoder.");
+                            }
+                            None
+                        }
                     }
                 }
             } else {
@@ -1132,14 +1168,14 @@ mod tests {
             (w, h).into(),
         )];
         let dirty = super::encode_cpu(
-            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, None, false,
+            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, false,
         );
         assert!(!dirty.is_empty(), "damaged frame must encode");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, None, false,
+                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once");
@@ -1177,14 +1213,14 @@ mod tests {
         };
         let mut stripes = Vec::new();
         let first = super::encode_cpu(
-            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, None, false,
+            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, false,
         );
         assert!(!first.is_empty(), "first frame hashes as changed and encodes");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, None, false,
+                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once while static");
@@ -1194,7 +1230,7 @@ mod tests {
         assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
 
         let woke = super::encode_cpu(
-            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, None, false,
+            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, false,
         );
         assert!(!woke.is_empty(), "content change after idle must encode");
     }
@@ -1252,8 +1288,9 @@ mod qp_bound_sweep {
     //! Invariants under test: the CBR QP clamp reaches libx264/OpenH264 (a max clamp must
     //! raise worst-case fidelity on rate-starved text at the cost of bitrate overshoot;
     //! a min clamp must cut spend on over-budgeted content) and defaults (0) leave the
-    //! encoders' own behavior untouched. The printed table is the measurement behind the
-    //! shipped guidance for video_min_qp/video_max_qp.
+    //! encoders' own behavior untouched. Each encoder is swept separately so the OpenH264
+    //! sweep still runs without the `gpl` feature, where it is the only software H.264 path.
+    #[cfg(feature = "gpl")]
     use super::H264EncoderWrapper;
     use crate::encoders::oh264::Openh264Encoder;
     use crate::RustCaptureSettings;
@@ -1300,6 +1337,7 @@ mod qp_bound_sweep {
 
     /// Encode `FRAMES` scrolling-text luma frames through the x264 stripe encoder at the
     /// given rate-control settings (constant grey chroma), returning each frame's raw bitstream.
+    #[cfg(feature = "gpl")]
     fn encode_x264(cbr: bool, kbps: i32, crf: i32, min_qp: i32, max_qp: i32) -> Vec<Vec<u8>> {
         let mut enc = H264EncoderWrapper::new(
             W as i32, H as i32, crf, false, 60.0, 4, cbr, kbps, 50, min_qp, max_qp,
@@ -1313,7 +1351,7 @@ mod qp_bound_sweep {
                 let mut out = Vec::new();
                 enc.encode_with_headers(
                     &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
-                    i as i64, i == 0, &[], true, &mut out, None,
+                    i as i64, i == 0, &[], true, &mut out,
                 );
                 out
             })
@@ -1336,7 +1374,7 @@ mod qp_bound_sweep {
             video_max_qp: max_qp,
             ..Default::default()
         };
-        let mut enc = Openh264Encoder::new(&s, None).expect("oh264 init");
+        let mut enc = Openh264Encoder::new(&s).expect("oh264 init");
         (0..FRAMES)
             .map(|i| {
                 let y = text_luma(i);
@@ -1401,53 +1439,67 @@ mod qp_bound_sweep {
             / 1000.0
     }
 
-    /// Diagnostic that the CBR QP clamp is actually plumbed through to both x264 and
-    /// OpenH264, printing a bitrate/PSNR table on scrolling text and asserting the effect.
+    /// Diagnostic that the CBR QP clamp is actually plumbed through to x264, printing a
+    /// bitrate/PSNR table on scrolling text and asserting the effect.
     ///
     /// Encodes worst-case scrolling text at 2 Mbps CBR across a sweep of `max_qp` values (plus a
     /// separate `min_qp` sweep on an over-provisioned 12 Mbps budget), measuring luma PSNR against a
-    /// per-encoder near-lossless CRF/QP-12 reference so colour-conversion differences cancel out. It
-    /// asserts that capping `max_qp` at 30 on rate-starved content lifts fidelity by more than
-    /// 0.5 dB over the unclamped run on both encoders — proving the clamp reaches the encoder rather
-    /// than being silently dropped (paid for in bitrate overshoot).
+    /// near-lossless CRF-12 reference from the same encoder so colour-conversion differences cancel
+    /// out. Capping `max_qp` at 30 on rate-starved content must lift fidelity by more than 0.5 dB
+    /// over the unclamped run — proving the clamp reaches the encoder rather than being silently
+    /// dropped (paid for in bitrate overshoot).
+    #[cfg(feature = "gpl")]
     #[test]
-    fn cbr_qp_bound_sweep_diagnostic() {
-        let ref_x264 = decode_luma(&encode_x264(false, 0, 12, 0, 0));
-        let ref_oh264 = decode_luma(&encode_oh264(false, 0, 12, 0, 0));
+    fn cbr_qp_bound_sweep_x264() {
+        let reference = decode_luma(&encode_x264(false, 0, 12, 0, 0));
 
-        println!("scrolling-text 720p60 @ 2 Mbps CBR (PSNR vs own CRF/QP-12 decode):");
+        println!("scrolling-text 720p60 @ 2 Mbps CBR, x264 (PSNR vs own CRF-12 decode):");
         let mut rows = Vec::new();
         for &max_qp in &[0i32, 45, 40, 35, 30] {
             let x = encode_x264(true, 2000, 25, 0, max_qp);
-            let o = encode_oh264(true, 2000, 25, 0, max_qp);
-            let px = mean_psnr(&decode_luma(&x), &ref_x264);
-            let po = mean_psnr(&decode_luma(&o), &ref_oh264);
-            println!(
-                "  max_qp {:>2}: x264 {:>8.1} kbps / {:>5.2} dB | oh264 {:>8.1} kbps / {:>5.2} dB",
-                max_qp, kbps(&x), px, kbps(&o), po
-            );
-            rows.push((max_qp, kbps(&x), px, kbps(&o), po));
+            let psnr = mean_psnr(&decode_luma(&x), &reference);
+            println!("  max_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", max_qp, kbps(&x), psnr);
+            rows.push((max_qp, psnr));
         }
-        println!("scrolling-text 720p60 @ 12 Mbps CBR, min-QP sweep:");
+        println!("scrolling-text 720p60 @ 12 Mbps CBR, x264 min-QP sweep:");
         for &min_qp in &[0i32, 10, 15] {
             let x = encode_x264(true, 12000, 25, min_qp, 0);
-            let px = mean_psnr(&decode_luma(&x), &ref_x264);
-            println!("  min_qp {:>2}: x264 {:>8.1} kbps / {:>5.2} dB", min_qp, kbps(&x), px);
+            let psnr = mean_psnr(&decode_luma(&x), &reference);
+            println!("  min_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", min_qp, kbps(&x), psnr);
         }
 
-        let base = &rows[0];
-        let capped = rows.last().unwrap();
+        let base = rows[0].1;
+        let capped = rows.last().unwrap().1;
         assert!(
-            capped.2 > base.2 + 0.5,
-            "x264 max-QP clamp had no effect: {:.2} vs {:.2} dB",
-            capped.2,
-            base.2
+            capped > base + 0.5,
+            "x264 max-QP clamp had no effect: {capped:.2} vs {base:.2} dB"
         );
+    }
+
+    /// The OpenH264 counterpart of [`cbr_qp_bound_sweep_x264`], and the only software H.264
+    /// sweep that runs in a build without the `gpl` feature.
+    ///
+    /// Same scrolling-text workload and 2 Mbps CBR `max_qp` sweep, with luma PSNR measured against
+    /// this encoder's own near-lossless QP-12 reference. Capping `max_qp` at 30 must lift fidelity
+    /// by more than 0.5 dB over the unclamped run.
+    #[test]
+    fn cbr_qp_bound_sweep_openh264() {
+        let reference = decode_luma(&encode_oh264(false, 0, 12, 0, 0));
+
+        println!("scrolling-text 720p60 @ 2 Mbps CBR, oh264 (PSNR vs own QP-12 decode):");
+        let mut rows = Vec::new();
+        for &max_qp in &[0i32, 45, 40, 35, 30] {
+            let o = encode_oh264(true, 2000, 25, 0, max_qp);
+            let psnr = mean_psnr(&decode_luma(&o), &reference);
+            println!("  max_qp {:>2}: {:>8.1} kbps / {:>5.2} dB", max_qp, kbps(&o), psnr);
+            rows.push((max_qp, psnr));
+        }
+
+        let base = rows[0].1;
+        let capped = rows.last().unwrap().1;
         assert!(
-            capped.4 > base.4 + 0.5,
-            "oh264 max-QP clamp had no effect: {:.2} vs {:.2} dB",
-            capped.4,
-            base.4
+            capped > base + 0.5,
+            "oh264 max-QP clamp had no effect: {capped:.2} vs {base:.2} dB"
         );
     }
 }

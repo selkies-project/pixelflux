@@ -1,16 +1,25 @@
 name: Docs
 
 on:
+  workflow_dispatch:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+  build:
+    name: Build documentation
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,28 +38,47 @@ jobs:
         run: |
           curl -L -o /tmp/miniforge.sh \
             "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-          bash /tmp/miniforge.sh -b -p $HOME/miniforge3
-          source $HOME/miniforge3/etc/profile.d/conda.sh
+          bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
+          source "$HOME/miniforge3/etc/profile.d/conda.sh"
           conda create -y -n pixelflux-docs -c conda-forge "ffmpeg=8.1"
           conda activate pixelflux-docs
-          echo "PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Build docs
         run: cargo doc --no-deps
         working-directory: pixelflux
 
       - name: Prepare site
+        # rustdoc writes the crate under its own directory and leaves a build
+        # lock behind; the site root redirects into it and the lock is dropped.
         run: |
-          touch pixelflux/target/doc/.nojekyll
+          rm -f pixelflux/target/doc/.lock
           cat > pixelflux/target/doc/index.html << 'EOF'
           <!DOCTYPE html>
           <meta http-equiv="refresh" content="0; url=pixelflux/index.html">
           <a href="pixelflux/index.html">Redirecting...</a>
           EOF
 
-      - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload rustdoc artifacts
+        uses: actions/upload-pages-artifact@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: pixelflux/target/doc
-          keep_files: true
+          path: pixelflux/target/doc
+          retention-days: 1
+
+  publish:
+    name: Publish documentation
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # deploy-pages resolves the artifact through the Actions API
+      actions: read
+      pages: write
+      id-token: write
+    if: ${{ github.event_name != 'pull_request' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
