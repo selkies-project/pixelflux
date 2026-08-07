@@ -44,7 +44,7 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="MPL-2.0",
-    url="https://github.com/linuxserver/pixelflux",
+    url="https://github.com/selkies-project/pixelflux",
 
     # Single self-contained Rust extension: the top-level `pixelflux` module does X11 (XShm)
     # and Wayland capture plus all encoding/conversion. No C/C++ sources, no Python package
