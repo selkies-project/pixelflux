@@ -234,6 +234,34 @@ impl Drop for RecordingSink {
     }
 }
 
+/// Write one whole frame to a recorder's socket, resuming across the soft timeouts a slow reader
+/// induces so a partial Annex-B NAL is never left behind. Aborts if `stop` is set (the client was
+/// dropped by [`RecordingSink::write_encoded_frame`]) or a hard error occurs.
+fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> std::io::Result<()> {
+    let mut written = 0usize;
+    while written < buf.len() {
+        if stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("writer stopped (client dropped)"));
+        }
+        match stream.write(&buf[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write whole frame",
+                ));
+            }
+            Ok(n) => written += n,
+            Err(ref e) if e.kind() == ErrorKind::TimedOut => {}
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod cost_tests {
     //! The sink's isolation contract, measured: feeding a frame must cost nothing when no
@@ -313,32 +341,4 @@ mod cost_tests {
             "a stalled recorder must never block the tap >10ms, was {stalled_max:.3}us"
         );
     }
-}
-
-/// Write one whole frame to a recorder's socket, resuming across the soft timeouts a slow reader
-/// induces so a partial Annex-B NAL is never left behind. Aborts if `stop` is set (the client was
-/// dropped by [`RecordingSink::write_encoded_frame`]) or a hard error occurs.
-fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> std::io::Result<()> {
-    let mut written = 0usize;
-    while written < buf.len() {
-        if stop.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("writer stopped (client dropped)"));
-        }
-        match stream.write(&buf[written..]) {
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "failed to write whole frame",
-                ));
-            }
-            Ok(n) => written += n,
-            Err(ref e) if e.kind() == ErrorKind::TimedOut => {}
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
 }

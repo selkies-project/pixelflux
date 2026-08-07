@@ -511,8 +511,10 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         .and_then(|x| x.extract().ok())
         .unwrap_or(1.0);
 
-    // NaN/inf from Python would otherwise reach Duration::from_secs_f64 (which
-    // panics) or own_allocations; clamp every untrusted float/dimension here.
+    // These fields are public attributes any caller can set to anything an i32 or f64
+    // holds. Clamping here keeps a dimension from sizing an absurd frame buffer, and a
+    // quality outside turbojpeg's 1..=100 from failing set_quality on every stripe, which
+    // would emit no JPEG at all.
     let sanitize_dim = |v: i32| -> i32 {
         if v <= 0 { 0 } else { v.min(MAX_CAPTURE_DIM) }
     };
@@ -604,6 +606,14 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
     })
 }
 
+/// One live output as `(id, x, y, width, height, scale, capturing)`. Sizes are physical
+/// pixels and `(x, y)` is the layout offset.
+pub type OutputDesc = (u32, i32, i32, i32, i32, f64, bool);
+
+/// One mapped window as `(window_id, title, app_id, output_id, parked)`. A parked window
+/// has no output yet — a nested session's spare screens.
+pub type WindowDesc = (u32, String, String, u32, bool);
+
 /// Control messages sent from the Python-facing methods to the capture thread.
 ///
 /// Every interaction with a running capture crosses the thread boundary as one of these variants
@@ -638,17 +648,21 @@ pub enum ThreadCommand {
     /// the next frames render correctly. Replies false for an unknown id.
     RepositionOutput { id: u32, x: i32, y: i32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every live output as `(id, x, y, width, height, scale, capturing)`.
-    ListOutputs { reply: std::sync::mpsc::Sender<Vec<(u32, i32, i32, i32, i32, f64, bool)>> },
+    ListOutputs { reply: std::sync::mpsc::Sender<Vec<OutputDesc>> },
     /// Move the window with the given id onto output `output_id` (fullscreened there).
     MoveWindowToOutput { window_id: u32, output_id: u32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every mapped window as `(window_id, title, app_id, output_id)`.
-    ListWindows { reply: std::sync::mpsc::Sender<Vec<(u32, String, String, u32, bool)>> },
+    ListWindows { reply: std::sync::mpsc::Sender<Vec<WindowDesc>> },
     SetCursorCallback(Py<PyAny>),
     SetClipboardCallback(Py<PyAny>),
     /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
     /// `mime` (plus text aliases) to pasting clients.
     SetClipboard { mime: String, data: Vec<u8> },
     KeyboardKey { scancode: u32, state: u32 },
+    /// A whole ordered run of key events in one message. Typing a paste one event at a
+    /// time costs a channel send and a calloop wake per event, which competes with the
+    /// render loop on the same thread; the caller still decides the sequence.
+    KeyboardKeys { events: Vec<(u32, u32)> },
     /// Set the seat's BASE keymap from a full XKB_KEYMAP_FORMAT_TEXT_V1 string. The
     /// compositor's keymap policy rebuilds on top: overlay binds are re-spliced onto the new
     /// base (same keycodes) and the combined keymap is applied in one swap.
@@ -666,11 +680,18 @@ pub enum ThreadCommand {
     },
     /// Resolve keysyms to `(keycode, level)` against the seat keymap, overlay-binding every
     /// keysym the base cannot produce — ONE keymap swap for the whole batch, and a keycode that
-    /// is currently pressed is never recycled. `(0, 0)` marks an unbindable keysym.
+    /// is currently pressed is never recycled. `(0, 0)` marks an unbindable keysym. Serves
+    /// computer-use only; selkies resolves its own keysyms and injects plain keycodes.
     BindKeysyms {
         keysyms: Vec<u32>,
         reply: std::sync::mpsc::Sender<Vec<(u32, u32)>>,
     },
+    /// Bind explicit `(keycode, keysym)` pairs onto the CURRENT base keymap and deliver it,
+    /// in one swap. The caller decides the assignment; this only assembles and applies, so the
+    /// base is neither re-sent nor recompiled and its reverse map is not rebuilt. Ordered with
+    /// key events on the one command channel, so the keys that need the new binds cannot
+    /// overtake it — no reply is awaited, and the caller's loop is never blocked on the swap.
+    SetKeymapOverlay { binds: Vec<(u32, u32)> },
     /// Debug/verification readback: currently pressed xkb keycodes plus the modifier state
     /// bitmask (1 ctrl, 2 shift, 4 alt, 8 logo, 16 caps, 32 num, 64 altgr, 128 level5).
     GetKeyboardState {
@@ -1326,6 +1347,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                     GpuEncoder::Nvenc(_) => YuvStandardMatrix::Bt601,
                     GpuEncoder::Vaapi(_) => YuvStandardMatrix::Bt709,
                 };
+                // Limited range suits both: NVENC's ARGB CSC emits limited whatever the
+                // chroma format, so its session declares limited, and VA-API's own
+                // convert targets tv range as well.
+                let range = YuvRange::Limited;
                 if settings.video_fullcolor {
                     let y_size = (w * h) as usize;
                     let (y_plane, rest) = nv12_buffer.split_at_mut(y_size);
@@ -1341,9 +1366,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         height: h,
                     };
                     let _ = if cfg.use_gpu {
-                        yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, matrix, YuvConversionMode::Fast)
+                        yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     } else {
-                        yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, YuvRange::Full, matrix, YuvConversionMode::Fast)
+                        yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     };
                 } else {
                     let y_size = (w * h) as usize;
@@ -1357,9 +1382,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         height: h,
                     };
                     let csc = if cfg.use_gpu {
-                        yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, matrix, YuvConversionMode::Fast)
+                        yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     } else {
-                        yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, YuvRange::Limited, matrix, YuvConversionMode::Fast)
+                        yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     };
                     if let Err(e) = csc {
                         eprintln!("[wl-encode] NV12 CSC failed: {e:?}");
@@ -1488,7 +1513,9 @@ fn encoder_desc(
             None => settings.video_fullcolor,
         };
     let cs_str = if is_444 { "CS_IN:I444" } else { "CS_IN:I420" };
-    let range_str = if is_444 { "FR" } else { "LR" };
+    // Only the software encoder carries 4:4:4 at full range; NVENC's hardware CSC is
+    // limited-range whatever the chroma format.
+    let range_str = if is_444 && video_encoder.is_none() { "FR" } else { "LR" };
     let frame_str = if video_encoder.is_some() || openh264 || settings.video_fullframe {
         "FF"
     } else {
@@ -1592,10 +1619,10 @@ fn log_stream_settings(
             }
         };
 
-        let range_str = if is_actually_444 {
-            "I444 (Full Range)"
-        } else {
-            "I420 (Limited Range)"
+        let range_str = match (is_actually_444, video_encoder.is_none()) {
+            (true, true) => "I444 (Full Range)",
+            (true, false) => "I444 (Limited Range)",
+            _ => "I420 (Limited Range)",
         };
         log_msg.push_str(&format!(" | Colorspace: {}", range_str));
     }
@@ -2630,7 +2657,7 @@ fn render_node_tick(
                             },
                             Err(e) => eprintln!("Render error: {:?}", e)
                         }
-                        if let Some(c) = cap.as_deref_mut() {
+                        if let Some(c) = cap {
                             if !damage_rects.is_empty() {
                                 c.content_gen += 1;
                             }
@@ -2826,7 +2853,7 @@ fn render_node_tick(
                         },
                         Err(e) => eprintln!("Render error: {:?}", e)
                     }
-                    if let Some(c) = cap.as_deref_mut() {
+                    if let Some(c) = cap {
                         c.render_seq += 1;
                         if render_success {
                             if let Some((id, _)) = pool_slot {
@@ -2855,8 +2882,7 @@ fn render_node_tick(
                 let prior = cap
                     .encode_join
                     .take()
-                    .map(|j| j.join().ok().flatten())
-                    .flatten();
+                    .and_then(|j| j.join().ok().flatten());
                 if let Some(pool) = cap.encode_pool.take() {
                     pool.shutdown();
                 }
@@ -3083,8 +3109,12 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
         && ay < by + bh && by < ay + ah
 }
 
+/// An overlapping output as `(id, flavor, rect)`, where flavor names which rectangle
+/// pair matched and rect is `(x, y, width, height)`.
+type OutputOverlap = (u32, &'static str, (i32, i32, i32, i32));
+
 /// The first live output (excluding `skip_id`) whose rectangle overlaps a candidate
-/// placement, as `(id, flavor, rect)`. Both rectangle flavors are checked — logical
+/// placement. Both rectangle flavors are checked — logical
 /// (Space layout, scale-divided) and physical (mode pixels at the same origin) — because
 /// input injection and cursor compositing key off the physical rects while window layout
 /// keys off the logical ones, and neither may overlap.
@@ -3093,7 +3123,7 @@ fn find_output_overlap(
     skip_id: Option<u32>,
     logical: (i32, i32, i32, i32),
     physical: (i32, i32, i32, i32),
-) -> Option<(u32, &'static str, (i32, i32, i32, i32))> {
+) -> Option<OutputOverlap> {
     for n in nodes {
         if Some(n.id) == skip_id {
             continue;
@@ -3347,6 +3377,19 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     );
     true
 }
+/// Startup inputs for the compositor thread: its two calloop channels, the sender it hands
+/// to computer-use, the initial geometry, and the GPU / cursor policy.
+struct WaylandThreadConfig {
+    command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
+    wake_rx: smithay::reexports::calloop::channel::Channel<()>,
+    command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+    initial_width: i32,
+    initial_height: i32,
+    explicit_dri_node: String,
+    auto_gpu_selected: bool,
+    cursor_size: i32,
+}
+
 
 /// The main execution loop of the Wayland backend.
 ///
@@ -3390,16 +3433,17 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
 ///    delivery thread — it feeds the delivery sender and must be gone first — and the retained
 ///    callbacks are dropped and gated by a process-shutdown flag so nothing fires into a finalizing
 ///    interpreter.
-fn run_wayland_thread(
-    command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
-    wake_rx: smithay::reexports::calloop::channel::Channel<()>,
-    command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
-    initial_width: i32,
-    initial_height: i32,
-    explicit_dri_node: String,
-    auto_gpu_selected: bool,
-    cursor_size: i32,
-) {
+fn run_wayland_thread(cfg: WaylandThreadConfig) {
+    let WaylandThreadConfig {
+        command_rx,
+        wake_rx,
+        command_tx,
+        initial_width,
+        initial_height,
+        explicit_dri_node,
+        auto_gpu_selected,
+        cursor_size,
+    } = cfg;
     let width: i32 = if initial_width > 0 { initial_width } else { 1024 };
     let height: i32 = if initial_height > 0 { initial_height } else { 768 };
 
@@ -3807,6 +3851,31 @@ fn run_wayland_thread(
                         state.send_cursor_image(&CursorImageStatus::Named(Default::default()));
                     }
                 }
+                ThreadCommand::KeyboardKeys { events } => {
+                    for (scancode, key_state_val) in events {
+                        if let Some(host) = state.host.as_ref() {
+                            host.key(scancode, key_state_val > 0);
+                            continue;
+                        }
+                        let key_state = if key_state_val > 0 {
+                            KeyState::Pressed
+                        } else {
+                            KeyState::Released
+                        };
+                        let serial = next_serial();
+                        let time = wayland_time();
+                        if let Some(keyboard) = state.seat.get_keyboard() {
+                            keyboard.input(
+                                state,
+                                Keycode::new(scancode),
+                                key_state,
+                                serial,
+                                time,
+                                |_, _, _| FilterResult::<()>::Forward,
+                            );
+                        }
+                    }
+                }
                 ThreadCommand::KeyboardKey { scancode, state: key_state_val } => {
                     if let Some(host) = state.host.as_ref() {
                         host.key(scancode, key_state_val > 0);
@@ -3822,13 +3891,12 @@ fn run_wayland_thread(
                     }
                 }
                 ThreadCommand::SetKeymapString(text) => {
-                    // Validate before mutating the policy so a bad string leaves the seat
-                    // keymap untouched.
-                    if crate::wayland::keymap::compile_keymap(&text).is_none() {
-                        eprintln!("[Wayland] set_keymap_string: keymap failed to compile; keeping current keymap.");
-                    } else {
-                        state.keymap_policy.rebuild_base(text);
+                    // rebuild_base rejects a string that will not compile without touching
+                    // the policy, so the seat keymap survives a bad one either way.
+                    if state.keymap_policy.rebuild_base(text) {
                         state.apply_keymap_policy();
+                    } else {
+                        eprintln!("[Wayland] set_keymap_string: keymap failed to compile; keeping current keymap.");
                     }
                 }
                 ThreadCommand::SetXkbLayout { rules, model, layout, variant, options, reply } => {
@@ -3846,6 +3914,14 @@ fn run_wayland_thread(
                 }
                 ThreadCommand::BindKeysyms { keysyms, reply } => {
                     let _ = reply.send(state.bind_keysyms(&keysyms));
+                }
+                ThreadCommand::SetKeymapOverlay { binds } => {
+                    match state.keymap_policy.overlay_text_for(&binds) {
+                        Some(text) => state.apply_keymap_text(text),
+                        None => eprintln!(
+                            "[Wayland] set_keymap_overlay: no base keymap to splice onto."
+                        ),
+                    }
                 }
                 ThreadCommand::GetKeyboardState { reply } => {
                     let (pressed, mods) = state
@@ -4426,7 +4502,16 @@ impl WaylandBackend {
         let cu_tx = tx.clone();
         thread::spawn(move || {
             crate::boost_thread_priority(-15);
-            run_wayland_thread(rx, wake_rx, cu_tx, width, height, dri_node, auto_gpu_selected, cursor_size);
+            run_wayland_thread(WaylandThreadConfig {
+                command_rx: rx,
+                wake_rx,
+                command_tx: cu_tx,
+                initial_width: width,
+                initial_height: height,
+                explicit_dri_node: dri_node,
+                auto_gpu_selected,
+                cursor_size,
+            });
         });
         WaylandBackend { tx, wake_tx }
     }
@@ -4461,6 +4546,8 @@ impl WaylandBackend {
     /// live output, or the GPU render target cannot be allocated. Capture reconfigures
     /// (`start_capture` on an existing output) resize without this validation, so a
     /// multi-step relayout must stay overlap-free at every step by caller ordering.
+    // The parameter list is the Python signature; grouping it would change the ABI.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, width, height, x = 0, y = 0, scale = 1.0))]
     fn create_output(
         &self,
@@ -4507,7 +4594,7 @@ impl WaylandBackend {
 
     /// Every live output as `(id, x, y, width, height, scale, capturing)` — width/height in
     /// physical pixels, `(x, y)` the layout offset.
-    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<(u32, i32, i32, i32, i32, f64, bool)>> {
+    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<OutputDesc>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.send(ThreadCommand::ListOutputs { reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to list outputs: {}", e)))?;
@@ -4530,7 +4617,7 @@ impl WaylandBackend {
     /// Every mapped window as `(window_id, title, app_id, output_id, waiting)`. A waiting
     /// window is tagged for that output but mapped clear of every one of them, holding its
     /// size until an output exists for it — a nested session's spare screens.
-    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32, bool)>> {
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<WindowDesc>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.send(ThreadCommand::ListWindows { reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to list windows: {}", e)))?;
@@ -4577,9 +4664,32 @@ impl WaylandBackend {
         Ok(())
     }
 
+    /// Inject an ordered run of `(keycode, state)` events as one message, so a paste
+    /// costs one channel send and one wake instead of one per event.
+    fn inject_keys(&self, events: Vec<(u32, u32)>) -> PyResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.send(ThreadCommand::KeyboardKeys { events })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject keys: {}", e)))?;
+        Ok(())
+    }
+
     /// Swap the seat keyboard's xkb keymap (XKB_KEYMAP_FORMAT_TEXT_V1 text). The caller
     /// owns keysym-to-keycode policy: define keycodes here, then press them via
     /// `inject_key`. Ordered with key events on the one compositor channel.
+    /// Bind explicit `(keycode, keysym)` pairs onto the current base keymap in ONE swap.
+    ///
+    /// The caller owns the assignment — which keysym goes to which keycode, and when to
+    /// recycle one — because that tracks layouts and user reports. This end only assembles
+    /// the xkb text and delivers it, reusing the installed base rather than recompiling a
+    /// re-supplied one. False when no base keymap is installed yet.
+    fn set_keymap_overlay(&self, binds: Vec<(u32, u32)>) -> PyResult<()> {
+        self.send(ThreadCommand::SetKeymapOverlay { binds })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set overlay: {}", e)))?;
+        Ok(())
+    }
+
     fn set_keymap_string(&self, text: String) -> PyResult<()> {
         self.send(ThreadCommand::SetKeymapString(text))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set keymap: {}", e)))?;
@@ -4672,19 +4782,6 @@ impl WaylandBackend {
         Ok(py
             .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
             .unwrap_or(false))
-    }
-
-    /// Resolve `keysyms` to `(keycode, level)` pairs against the seat keymap, overlay-binding
-    /// every keysym the base cannot produce. Binding N new keysyms costs ONE keymap swap, and a
-    /// keycode currently held down is never rebound. `(0, 0)` marks an unbindable keysym.
-    fn bind_keysyms(&self, py: Python<'_>, keysyms: Vec<u32>) -> PyResult<Vec<(u32, u32)>> {
-        let n = keysyms.len();
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Vec<(u32, u32)>>();
-        self.send(ThreadCommand::BindKeysyms { keysyms, reply: reply_tx })
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to bind keysyms: {}", e)))?;
-        Ok(py
-            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
-            .unwrap_or_else(|_| vec![(0, 0); n]))
     }
 
     /// Debug/verification readback of the seat keyboard: `(pressed_keycodes, modifier_mask)`
@@ -5554,8 +5651,19 @@ impl ScreenCapture {
     fn inject_key(&self, py: Python<'_>, scancode: u32, state: u32) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_key(scancode, state))
     }
+    /// Inject an ordered run of `(keycode, state)` events in one message.
+    fn inject_keys(&self, py: Python<'_>, events: Vec<(u32, u32)>) -> PyResult<()> {
+        wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().inject_keys(events))
+    }
     fn set_keymap_string(&self, py: Python<'_>, text: String) -> PyResult<()> {
         wayland_backend_running(py).map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_string(text))
+    }
+    /// Bind explicit `(keycode, keysym)` pairs onto the current base keymap in one swap;
+    /// false when no backend runs or no base keymap is installed. See the backend method
+    /// for the split of responsibility.
+    fn set_keymap_overlay(&self, py: Python<'_>, binds: Vec<(u32, u32)>) -> PyResult<()> {
+        wayland_backend_running(py)
+            .map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_overlay(binds))
     }
     /// Compositor apps run under (a nested labwc/kwin session pixelflux captures),
     /// the target for Computer-Use text injection; selkies resolves it and hands it
@@ -5723,13 +5831,6 @@ impl ScreenCapture {
             be.bind(py).borrow().set_xkb_layout(py, layout, variant, options, model, rules)
         })
     }
-    /// Resolve keysyms to `(keycode, level)` with batched overlay binding (one keymap swap
-    /// per call, held keycodes never rebound); all `(0, 0)` when no backend runs.
-    fn bind_keysyms(&self, py: Python<'_>, keysyms: Vec<u32>) -> PyResult<Vec<(u32, u32)>> {
-        let n = keysyms.len();
-        wayland_backend_running(py)
-            .map_or(Ok(vec![(0, 0); n]), |be| be.bind(py).borrow().bind_keysyms(py, keysyms))
-    }
     /// Seat keyboard readback: `(pressed_keycodes, modifier_mask)`; empty when no backend runs.
     fn get_keyboard_state(&self, py: Python<'_>) -> PyResult<(Vec<u32>, u32)> {
         wayland_backend_running(py)
@@ -5744,6 +5845,8 @@ impl ScreenCapture {
     }
     /// Create an additional Wayland output (see `WaylandBackend.create_output`); false when
     /// no backend runs.
+    // The parameter list is the Python signature; grouping it would change the ABI.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, width, height, x = 0, y = 0, scale = 1.0))]
     fn create_output(
         &self,
@@ -5778,7 +5881,7 @@ impl ScreenCapture {
     }
     /// Every live Wayland output as `(id, x, y, width, height, scale, capturing)`; empty
     /// when no backend runs.
-    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<(u32, i32, i32, i32, i32, f64, bool)>> {
+    fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<OutputDesc>> {
         wayland_backend_running(py)
             .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_outputs(py))
     }
@@ -5790,7 +5893,7 @@ impl ScreenCapture {
     }
     /// Every mapped window as `(window_id, title, app_id, output_id, waiting)`; empty when
     /// no backend runs.
-    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<(u32, String, String, u32, bool)>> {
+    fn list_windows(&self, py: Python<'_>) -> PyResult<Vec<WindowDesc>> {
         wayland_backend_running(py)
             .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_windows(py))
     }

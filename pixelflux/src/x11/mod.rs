@@ -1299,12 +1299,14 @@ mod cursor_tests {
 
     #[test]
     fn resolve_dims_survives_past_end_offset() {
-        let mut s = RustCaptureSettings::default();
-        s.capture_x = 100000;
-        s.capture_y = 100000;
-        s.width = 1920;
-        s.height = 1080;
-        s.output_mode = 1;
+        let s = RustCaptureSettings {
+            capture_x: 100000,
+            capture_y: 100000,
+            width: 1920,
+            height: 1080,
+            output_mode: 1,
+            ..Default::default()
+        };
         let (w, h) = resolve_dims(1920, 1080, &s);
         assert!(w >= 2 && h >= 2, "a past-end offset now degrades to a small grab, not death");
         assert_eq!(w % 2, 0);

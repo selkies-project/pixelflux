@@ -563,13 +563,14 @@ impl H264SampleBuilder {
         let pps = self.pps.as_deref()?;
         let (width, height) = parse_sps_dimensions(sps)?;
 
-        let mut avcc_p = Vec::new();
-        avcc_p.push(1); // configurationVersion
-        avcc_p.push(sps[1]); // AVCProfileIndication
-        avcc_p.push(sps[2]); // profile_compatibility
-        avcc_p.push(sps[3]); // AVCLevelIndication
-        avcc_p.push(0xff); // lengthSizeMinusOne = 3
-        avcc_p.push(0xe1); // numOfSequenceParameterSets = 1
+        let mut avcc_p = vec![
+            1,       // configurationVersion
+            sps[1],  // AVCProfileIndication
+            sps[2],  // profile_compatibility
+            sps[3],  // AVCLevelIndication
+            0xff,    // lengthSizeMinusOne = 3
+            0xe1,    // numOfSequenceParameterSets = 1
+        ];
         avcc_p.extend_from_slice(&(sps.len() as u16).to_be_bytes());
         avcc_p.extend_from_slice(sps);
         avcc_p.push(1); // numOfPictureParameterSets

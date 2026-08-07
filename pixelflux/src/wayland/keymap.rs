@@ -132,9 +132,15 @@ impl KeymapPolicy {
 
     /// Replace the base keymap text and rebuild the reverse map. Overlay assignments are
     /// retained (same keycodes), so keycodes already handed out stay valid across the swap.
-    pub fn rebuild_base(&mut self, base_text: String) {
+    /// Returns whether `base_text` compiled. A string that does not is rejected without
+    /// touching any state, so the caller needs no separate validation pass — compiling a
+    /// keymap is the expensive part of installing one and doing it twice is pure cost.
+    pub fn rebuild_base(&mut self, base_text: String) -> bool {
+        let Some(keymap) = compile_keymap(&base_text) else {
+            return false;
+        };
         self.base_map.clear();
-        if let Some(keymap) = compile_keymap(&base_text) {
+        {
             let lo = keymap.min_keycode().raw();
             let hi = keymap.max_keycode().raw();
             // Lower levels win across ALL keys, so a keysym reachable unshifted never
@@ -155,6 +161,7 @@ impl KeymapPolicy {
             }
         }
         self.base_text = base_text;
+        true
     }
 
     /// True once a base keymap has been installed.
@@ -260,6 +267,47 @@ impl KeymapPolicy {
     /// The full seat keymap: the base text with every occupied overlay slot spliced into the
     /// `xkb_keycodes` and `xkb_symbols` sections (and `maximum` raised to cover them). With no
     /// overlays, the base text verbatim.
+    /// Splice explicit `(keycode, keysym)` binds onto the current base text.
+    ///
+    /// Which keysym lands on which keycode is the caller's decision — that part tracks
+    /// layouts and user reports and belongs where it can be changed quickly. Assembling
+    /// the xkb text is fixed grammar, so it is done here: no 30 KB string is built in the
+    /// caller, and the base keymap is reused rather than re-supplied and recompiled.
+    /// `None` when the base has no recognizable keycodes/symbols sections.
+    pub fn overlay_text_for(&self, binds: &[(u32, u32)]) -> Option<String> {
+        if self.base_text.is_empty() {
+            return None;
+        }
+        if binds.is_empty() {
+            return Some(self.base_text.clone());
+        }
+        let base = &self.base_text;
+        let max_at = base.find("maximum = ")?;
+        let num_at = max_at + "maximum = ".len();
+        let num_len = base[num_at..].find(';')?;
+        let old_max: u32 = base[num_at..num_at + num_len].trim().parse().unwrap_or(255);
+        let need_max = binds.iter().map(|&(kc, _)| kc).max().unwrap_or(0);
+        let mut text = String::with_capacity(base.len() + binds.len() * 48);
+        text.push_str(&base[..num_at]);
+        text.push_str(&old_max.max(need_max).to_string());
+        let rest = &base[num_at + num_len..];
+        let kc_end = rest.find("};")?;
+        text.push_str(&rest[..kc_end]);
+        for &(kc, _) in binds {
+            text.push_str(&format!("\t<X{kc:03}> = {kc};\n"));
+        }
+        let rest = &rest[kc_end..];
+        let close_at = rest
+            .find("xkb_symbols")
+            .and_then(|sym_at| Self::section_close(rest, sym_at))?;
+        text.push_str(&rest[..close_at]);
+        for &(kc, sym) in binds {
+            text.push_str(&format!("\tkey <X{kc:03}> {{ [ {sym:#x} ] }};\n"));
+        }
+        text.push_str(&rest[close_at..]);
+        Some(text)
+    }
+
     pub fn keymap_text(&self) -> String {
         let occupied: Vec<(usize, u32)> = self
             .slots

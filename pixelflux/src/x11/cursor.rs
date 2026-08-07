@@ -444,7 +444,8 @@ mod tests {
     #[test]
     fn out_of_bbox_hotspot_clamped() {
         let mut px = vec![0u32; 16];
-        px[1 * 4 + 2] = 0xFF00_0000;
+        let (x, y) = (2usize, 1usize);
+        px[y * 4 + x] = 0xFF00_0000;
         // Visible pixel at (2,1) only. Hotspot (0,0): rebased (-2,-1) -> (0,0).
         let (t, _, hx, hy) = cursor_to_png(&reply(4, 4, 0, 0, px.clone()), 32);
         assert_eq!(t, "png");

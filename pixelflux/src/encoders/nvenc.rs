@@ -733,10 +733,10 @@ impl NvencEncoder {
     ///    VBV sizing, optional min/max QP clamps) or ConstQP; infinite GOP (`gopLength` / `idrPeriod`
     ///    = `0xFFFFFFFF`); `zeroReorderDelay` plus a bitstream-restriction VUI (`max_num_reorder_frames=0`)
     ///    so no-reorder decoders don't buffer; an explicit Annex-A level from `nvenc_h264_level`
-    ///    pinned from frame 1 so the level never bumps mid-stream; SMPTE170M VUI colorimetry,
-    ///    matching the fixed BT.601 matrix the hardware ARGB CSC applies; chroma 4:2:0 or 4:4:4
-    ///    with the matching full-range flag; repeated SPS/PPS; CABAC; no AUD; strict GOP target;
-    ///    and lookahead disabled for real-time latency.
+    ///    pinned from frame 1 so the level never bumps mid-stream; BT.709 VUI primaries and
+    ///    transfer for the sRGB source, with an SMPTE170M matrix and limited range to match the
+    ///    hardware ARGB CSC; chroma 4:2:0 or 4:4:4; repeated SPS/PPS; CABAC; no AUD; strict GOP
+    ///    target; and lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to at
     ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place; this costs
     ///    ~290 MiB of device memory, so a failed init retries at the exact size (in-place resize then
@@ -934,15 +934,22 @@ impl NvencEncoder {
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat =
                 NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag = 1;
+            // Primaries and transfer describe the source, which is sRGB desktop pixels —
+            // sRGB shares BT.709's primaries and transfer function. Only the matrix follows
+            // the encoder: NVENC's ARGB hardware CSC is fixed at BT.601, so a client that
+            // inverts BT.709 shifts saturated colour badly.
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourPrimaries =
-                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_SMPTE170M;
+                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
             config.encodeCodecConfig.h264Config.h264VUIParameters.transferCharacteristics =
-                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SMPTE170M;
+                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix =
                 NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
-            config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag =
-                if is_444 { 1 } else { 0 };
+            // That same hardware CSC emits limited range in every chroma format. The
+            // host-planar path could encode full range, but a capture moves between the
+            // two at runtime when zero-copy demotes to readback, and the declared range
+            // has to hold across that, so every NVENC session declares limited.
+            config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = 0;
             config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
             config.encodeCodecConfig.h264Config.entropyCodingMode =
                 NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
@@ -1617,8 +1624,8 @@ impl NvencEncoder {
     }
 
     /// Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
-    /// CPU-side colour conversion. NVENC's hardware ARGB→YUV conversion is fixed at the BT.601
-    /// matrix, which is why the session VUI declares SMPTE170M; a CPU 601→709 prepass would cost
+    /// CPU-side colour conversion. NVENC's hardware ARGB→YUV conversion is fixed at BT.601
+    /// limited range, which is what the session VUI declares; a CPU prepass to BT.709 would cost
     /// this path its zero-copy property.
     ///
     /// The packed rows are copied host→device into the registered ARGB surface and NVENC's hardware
@@ -1949,7 +1956,8 @@ mod gpu_tests {
     /// first post-resize frame is an IDR (steady frames are P), shrink to 480p, exercise the
     /// rejection cases (beyond headroom, chroma flip, RC-mode flip) and confirm the session still
     /// encodes afterward, and optionally dump a decodable stream. Ignored by default; run with
-    /// `cargo test gpu_ -- --ignored --nocapture`.
+    /// `cargo test gpu_ -- --ignored --nocapture --test-threads=1` — building NVENC sessions
+    /// concurrently races in the driver and intermittently faults, so the GPU set runs serially.
     #[test]
     #[ignore]
     fn gpu_resolution_reconfigure_roundtrip() {
@@ -2080,6 +2088,32 @@ mod gpu_tests {
     /// On a real GPU, a session that starts taller than the default 2304 headroom (portrait
     /// 4K: 2160×4096, within NVENC's 4096 H.264 cap) takes its own size as the `maxEncode` ceiling
     /// and encodes at that resolution. Ignored by default.
+    /// The VUI has to describe what the session actually emits. NVENC converts its ARGB
+    /// input with a fixed BT.601 matrix at limited range in both chroma formats, so the
+    /// matrix and range follow the hardware; the primaries and transfer follow the source,
+    /// which is sRGB desktop pixels and therefore BT.709. A client that inverts the wrong
+    /// matrix, or expands a limited-range frame as full-range, shifts colour visibly.
+    #[test]
+    #[ignore]
+    fn gpu_vui_describes_the_hardware_csc() {
+        for fullcolor in [false, true] {
+            let mut s = settings(1280, 720, 60.0);
+            s.video_fullcolor = fullcolor;
+            let enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+            // encodeCodecConfig is a union; a successful init leaves the H.264 arm live.
+            let h264 = unsafe { &enc.encode_config.encodeCodecConfig.h264Config };
+            let vui = &h264.h264VUIParameters;
+            assert_eq!(vui.colourMatrix as u32,
+                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M as u32);
+            assert_eq!(vui.colourPrimaries as u32,
+                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709 as u32);
+            assert_eq!(vui.transferCharacteristics as u32,
+                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709 as u32);
+            assert_eq!(vui.videoFullRangeFlag, 0, "fullcolor={fullcolor}");
+            assert_eq!(h264.chromaFormatIDC, if fullcolor { 3 } else { 1 });
+        }
+    }
+
     #[test]
     #[ignore]
     fn gpu_init_above_default_headroom() {

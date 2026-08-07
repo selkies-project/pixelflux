@@ -165,6 +165,7 @@ enum CtrlMsg {
 // Control connection: seat + virtual input devices + wlr-output-management.
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct CtrlState {
     seat: Option<wl_seat::WlSeat>,
     vk_mgr: Option<ZwpVirtualKeyboardManagerV1>,
@@ -182,24 +183,6 @@ struct CtrlState {
     sync_done: bool,
 }
 
-impl Default for CtrlState {
-    fn default() -> Self {
-        Self {
-            seat: None,
-            vk_mgr: None,
-            vptr_mgr: None,
-            has_screencopy: false,
-            outputs: Vec::new(),
-            order: Vec::new(),
-            output_mgr: None,
-            heads: Vec::new(),
-            om_serial: None,
-            cfg_result: None,
-            cfg_cancelled: false,
-            sync_done: false,
-        }
-    }
-}
 
 /// Natural sort key for an output name: text prefix plus trailing number, so
 /// HEADLESS-2 orders before HEADLESS-10. Unnamed outputs keep registry order
@@ -357,6 +340,7 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for CtrlState {
 // Capture connections: one per host output (screencopy + buffer allocation).
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct CaptureState {
     shm: Option<wl_shm::WlShm>,
     dmabuf: Option<ZwpLinuxDmabufV1>,
@@ -372,23 +356,6 @@ struct CaptureState {
     sync_done: bool,
 }
 
-impl Default for CaptureState {
-    fn default() -> Self {
-        Self {
-            shm: None,
-            dmabuf: None,
-            screencopy: None,
-            outputs: Vec::new(),
-            announce_dmabuf: None,
-            announce_shm: None,
-            buffer_done: false,
-            damage: Vec::new(),
-            ready: false,
-            failed: false,
-            sync_done: false,
-        }
-    }
-}
 
 impl CaptureState {
     fn reset_frame(&mut self) {
@@ -480,10 +447,10 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for CaptureState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_screencopy_frame_v1::Event::Buffer { format, width, height, stride } => {
-                if let WEnum::Value(f) = format {
-                    state.announce_shm = Some((f as u32, width as i32, height as i32, stride as i32));
-                }
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format: WEnum::Value(f), width, height, stride,
+            } => {
+                state.announce_shm = Some((f as u32, width as i32, height as i32, stride as i32));
             }
             zwlr_screencopy_frame_v1::Event::LinuxDmabuf { format, width, height } => {
                 state.announce_dmabuf = Some((format, width as i32, height as i32));
@@ -749,14 +716,9 @@ impl HostSession {
     pub fn try_take_frame(&self, display_id: u32) -> Option<HostFrame> {
         let handle = self.outputs.get(self.output_index_for(display_id)?)?;
         let mut newest: Option<HostFrame> = None;
-        loop {
-            match handle.frames.try_recv() {
-                Ok(frame) => {
-                    if let Some(stale) = newest.replace(frame) {
-                        handle.send(ToHost::Release { gen: stale.gen, slot: stale.slot });
-                    }
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        while let Ok(frame) = handle.frames.try_recv() {
+            if let Some(stale) = newest.replace(frame) {
+                handle.send(ToHost::Release { gen: stale.gen, slot: stale.slot });
             }
         }
         newest

@@ -299,7 +299,7 @@ impl CuX11Backend {
             // integration mirrors a core single-group binding into the group-2 columns,
             // so the refetch shows `sym` at more levels than the bind wrote.
             let still_ours =
-                cur.iter().any(|&s| s == sym) && cur.iter().all(|&s| s == 0 || s == sym);
+                cur.contains(&sym) && cur.iter().all(|&s| s == 0 || s == sym);
             if still_ours {
                 cur.fill(0);
                 changed = true;

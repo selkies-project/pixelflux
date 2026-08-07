@@ -212,7 +212,7 @@ pub(crate) fn read(socket_path: &str, mime: &str) -> Result<Option<Vec<u8>>, Str
         device.destroy();
         return Ok(None);
     };
-    let offered = state.offer_mimes.get(&offer.id()).map_or(false, |m| m.iter().any(|x| x == mime));
+    let offered = state.offer_mimes.get(&offer.id()).is_some_and(|m| m.iter().any(|x| x == mime));
     if !offered {
         device.destroy();
         return Ok(None);
@@ -272,14 +272,11 @@ fn serve_selection(socket_path: &str, entries: Vec<(String, Vec<u8>)>) -> Result
         // Sends are served inside dispatch; block until the compositor has
         // something (with a poll so a dead compositor can't pin the thread).
         queue.flush().map_err(|e| format!("flush: {e}"))?;
-        match conn.prepare_read() {
-            Some(guard) => {
-                use std::os::fd::AsRawFd;
-                if wait_readable(guard.connection_fd().as_raw_fd(), STOP_POLL)? {
-                    guard.read().map_err(|e| format!("read: {e}"))?;
-                }
+        if let Some(guard) = conn.prepare_read() {
+            use std::os::fd::AsRawFd;
+            if wait_readable(guard.connection_fd().as_raw_fd(), STOP_POLL)? {
+                guard.read().map_err(|e| format!("read: {e}"))?;
             }
-            None => {}
         }
         queue.dispatch_pending(&mut state).map_err(|e| format!("dispatch: {e}"))?;
     }

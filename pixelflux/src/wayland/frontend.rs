@@ -327,6 +327,10 @@ pub fn window_output_id(window: &Window) -> u32 {
     window_meta(window).map(|m| m.output.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
+/// A queued computer-use screenshot as `(display id, reply)`; the reply carries the
+/// encoded image or the reason it could not be produced.
+pub type ScreenshotRequest = (u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>);
+
 /// Central context threaded through every Smithay handler; owns the Wayland globals, the
 /// GBM/EGL (or pixman) renderer state, and the capture/encode pipeline state.
 ///
@@ -446,9 +450,9 @@ pub struct AppState {
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
     pub auto_gpu_selected: bool,
-    /// Computer-use screenshot request `(display id, reply)`; served from that output's
-    /// next render (the id was validated live when the request was queued).
-    pub pending_screenshot: Option<(u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>)>,
+    /// Computer-use screenshot request; served from that output's next render (the id
+    /// was validated live when the request was queued).
+    pub pending_screenshot: Option<ScreenshotRequest>,
     /// The command channel, drained in place (wakeups arrive on a separate ping channel) so
     /// the render tick can apply every queued command BEFORE starting a long render/encode —
     /// queued input is never starved behind the tick it arrived during.
@@ -919,7 +923,7 @@ impl AppState {
                     && !window_meta(w).map(|m| m.parked.load(Ordering::Relaxed)).unwrap_or(false)
                     && w.wl_surface()
                         .and_then(|s| s.client())
-                        .map_or(false, |c| c.id() == client.id())
+                        .is_some_and(|c| c.id() == client.id())
             })
     }
 
@@ -1080,6 +1084,7 @@ impl AppState {
     ///      the whole pool would collide; ship the raw pool bytes plus descriptor to the worker.
     ///    - **dmabuf** (`NotManaged`): bind it to the GLES renderer, copy the framebuffer to
     ///      `Abgr8888`, map it back (calloop-affine), and ship the raw RGBA readback.
+    ///
     ///    A sprite whose buffer could not be read is dropped by the worker, preserving the
     ///    consumer's last cursor instead of blanking it (only "hide" carries empty data).
     pub(crate) fn send_cursor_image(&mut self, image: &CursorImageStatus) {
@@ -1218,6 +1223,12 @@ impl AppState {
     /// clients only when the content actually changed (smithay dedupes by content hash).
     pub(crate) fn apply_keymap_policy(&mut self) {
         let text = self.keymap_policy.keymap_text();
+        self.apply_keymap_text(text);
+    }
+
+    /// Deliver `text` as the seat keymap (and the host virtual keyboard's, in
+    /// host-capture mode). Empty text is ignored.
+    pub(crate) fn apply_keymap_text(&mut self, text: String) {
         if text.is_empty() {
             return;
         }
@@ -1236,7 +1247,8 @@ impl AppState {
 
     /// Resolve `keysyms` to `(keycode, level)` pairs, overlay-binding whatever the base
     /// cannot produce — at most ONE keymap swap for the whole batch, and never rebinding a
-    /// keycode that is currently held down.
+    /// keycode that is currently held down. Serves computer-use; the interactive input path
+    /// resolves keysyms in selkies and injects plain keycodes.
     pub(crate) fn bind_keysyms(&mut self, keysyms: &[u32]) -> Vec<(u32, u32)> {
         let pressed: std::collections::HashSet<u32> = self
             .seat

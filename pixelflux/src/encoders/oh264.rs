@@ -134,10 +134,10 @@ impl Openh264Encoder {
             .skip_frames(true)
             .adaptive_quantization(false)
             .background_detection(false)
-            // Scene-change detection would inject IDRs the pipeline never asked for,
-            // breaking the infinite-GOP / on-demand-keyframe contract (x264 parity:
-            // `i_scenecut_threshold = 0`).
-            .scene_change_detect(false)
+            // Scene-change detection stays on: OpenH264 forces it back on under
+            // ScreenContentRealTime and warns when asked for anything else, so the
+            // infinite-GOP contract cannot be tightened from here the way x264's
+            // `i_scenecut_threshold = 0` allows.
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
             .num_threads(threads);
