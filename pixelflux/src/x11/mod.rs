@@ -712,12 +712,11 @@ where
             let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
             pl.update_rate(b, v, fps);
         }
-        if controls.tunables_dirty.swap(false, Ordering::Acquire) {
-            if let Some(t) = controls.tunables.lock().unwrap().take() {
+        if controls.tunables_dirty.swap(false, Ordering::Acquire)
+            && let Some(t) = controls.tunables.lock().unwrap().take() {
                 t.apply_to(&mut psettings);
                 pl.update_tunables(&t);
             }
-        }
 
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let stripes = pl.process(buf, frame.stride);
@@ -1035,13 +1034,12 @@ where
             let stride = surface.stride;
             let buf = surface.as_mut_slice();
 
-            if controls.capture_cursor.load(Ordering::Relaxed) {
-                if let Some(c) = conn
+            if controls.capture_cursor.load(Ordering::Relaxed)
+                && let Some(c) = conn
                     .xfixes_get_cursor_image()
                     .ok()
                     .and_then(|c| c.reply().ok())
-                {
-                    if c.width > 0 && c.height > 0 {
+                    && c.width > 0 && c.height > 0 {
                         // Translate from root coordinates using the LIVE grab origin
                         // (cap_x/cap_y follow region_dirty pans and clamp negatives
                         // exactly like the grab itself), never the immutable startup
@@ -1066,8 +1064,6 @@ where
                             img_y,
                         );
                     }
-                }
-            }
 
             if watermark.is_active() {
                 watermark.update_position(frame_w, frame_h, settings.watermark_location_enum);

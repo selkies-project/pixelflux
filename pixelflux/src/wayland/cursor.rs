@@ -201,11 +201,10 @@ fn capped_job(
 ) -> (&'static str, Vec<u8>, i32, i32) {
     use std::collections::hash_map::Entry;
     let key = (hash, cap);
-    if cache.len() >= SPRITE_CACHE_MAX && !cache.contains_key(&key) {
-        if let Some(&evict) = cache.keys().next() {
+    if cache.len() >= SPRITE_CACHE_MAX && !cache.contains_key(&key)
+        && let Some(&evict) = cache.keys().next() {
             cache.remove(&evict);
         }
-    }
     let sprite = match cache.entry(key) {
         Entry::Occupied(e) => e.into_mut(),
         // An unreadable sprite yields an empty payload, which the worker suppresses so the

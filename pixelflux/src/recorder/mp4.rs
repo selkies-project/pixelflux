@@ -44,11 +44,10 @@ pub fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
     while i + 2 < data.len() {
         if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
             let code_start = if i > 0 && data[i - 1] == 0 { i - 1 } else { i };
-            if let Some(s) = nal_start {
-                if code_start > s {
+            if let Some(s) = nal_start
+                && code_start > s {
                     nals.push(&data[s..code_start]);
                 }
-            }
             i += 3;
             nal_start = Some(i);
         } else if data[i + 2] == 0 {
@@ -58,11 +57,10 @@ pub fn split_annexb(data: &[u8]) -> Vec<&[u8]> {
             i += 3;
         }
     }
-    if let Some(s) = nal_start {
-        if data.len() > s {
+    if let Some(s) = nal_start
+        && data.len() > s {
             nals.push(&data[s..]);
         }
-    }
     nals
 }
 
@@ -402,11 +400,10 @@ impl<W: Write> FragmentWriter<W> {
     /// zero/negative duration.
     pub fn push_sample(&mut self, data: Vec<u8>, sync: bool, pts_us: u64) -> std::io::Result<()> {
         let mut dts = pts_us * (TIMESCALE as u64 / 1000) / 1000;
-        if let Some(last) = self.last_dts {
-            if dts <= last {
+        if let Some(last) = self.last_dts
+            && dts <= last {
                 dts = last + 1;
             }
-        }
         self.last_dts = Some(dts);
         if let Some(prev) = self.pending.take() {
             let duration = (dts - prev.dts).min(u32::MAX as u64) as u32;

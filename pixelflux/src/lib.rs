@@ -220,13 +220,11 @@ pub use encoders::software::StripeState;
 pub use encoders::vaapi;
 
 fn get_process_rss_bytes() -> usize {
-    if let Ok(contents) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(rss_pages) = contents.split_whitespace().nth(1) {
-            if let Ok(pages) = rss_pages.parse::<usize>() {
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/statm")
+        && let Some(rss_pages) = contents.split_whitespace().nth(1)
+        && let Ok(pages) = rss_pages.parse::<usize>() {
                 return pages * 4096;
             }
-        }
-    }
     0
 }
 
@@ -250,11 +248,10 @@ fn get_shm_usage_bytes() -> u64 {
 fn get_cached_mem_usage() -> (usize, u64) {
     static CACHE: std::sync::Mutex<Option<(Instant, usize, u64)>> = std::sync::Mutex::new(None);
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, rss, shm)) = *guard {
-        if at.elapsed() < Duration::from_millis(100) {
+    if let Some((at, rss, shm)) = *guard
+        && at.elapsed() < Duration::from_millis(100) {
             return (rss, shm);
         }
-    }
     let sampled = (Instant::now(), get_process_rss_bytes(), get_shm_usage_bytes());
     *guard = Some(sampled);
     (sampled.1, sampled.2)
@@ -783,11 +780,10 @@ fn read_card_identity(device: &std::path::Path) -> CardIdentity {
                 id.driver = v.trim().to_lowercase();
             } else if let Some(v) = line.strip_prefix("PCI_ID=") {
                 id.pci_vendor = v.split(':').next().and_then(|h| u32::from_str_radix(h, 16).ok());
-            } else if line.starts_with("OF_COMPATIBLE_") && !line.starts_with("OF_COMPATIBLE_N") {
-                if let Some(v) = line.split_once('=').map(|x| x.1) {
+            } else if line.starts_with("OF_COMPATIBLE_") && !line.starts_with("OF_COMPATIBLE_N")
+                && let Some(v) = line.split_once('=').map(|x| x.1) {
                     id.compatibles.push(v.trim().to_lowercase());
                 }
-            }
         }
     }
     if id.pci_vendor.is_none() {
@@ -795,15 +791,14 @@ fn read_card_identity(device: &std::path::Path) -> CardIdentity {
             .ok()
             .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
     }
-    if id.compatibles.is_empty() {
-        if let Ok(modalias) = std::fs::read_to_string(device.join("modalias")) {
+    if id.compatibles.is_empty()
+        && let Ok(modalias) = std::fs::read_to_string(device.join("modalias")) {
             let modalias = modalias.trim();
             if let Some(rest) = modalias.strip_prefix("of:") {
                 id.compatibles
                     .extend(rest.split('C').skip(1).map(|c| c.to_lowercase()));
             }
         }
-    }
     if id.driver.is_empty() {
         id.driver = std::fs::read_link(device.join("driver"))
             .map(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default())
@@ -856,11 +851,10 @@ fn card_matches_token(token: &str, id: &CardIdentity) -> bool {
         if u32::from_str_radix(token.trim_start_matches("0x"), 16) == Ok(vid) {
             return true;
         }
-        if let Some((_, ids)) = VENDOR_PCI_IDS.iter().find(|(n, _)| *n == token) {
-            if ids.contains(&vid) {
+        if let Some((_, ids)) = VENDOR_PCI_IDS.iter().find(|(n, _)| *n == token)
+            && ids.contains(&vid) {
                 return true;
             }
-        }
     }
     if !id.compatibles.is_empty() {
         let prefix = OF_PREFIX_ALIASES
@@ -918,11 +912,10 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
         .collect();
     cards.sort_by_key(|(n, _)| *n);
     for (_, path) in &cards {
-        if let Some(t) = token {
-            if !card_matches_token(t, &read_card_identity(&path.join("device"))) {
+        if let Some(t) = token
+            && !card_matches_token(t, &read_card_identity(&path.join("device"))) {
                 continue;
             }
-        }
         if let Ok(drm_entries) = std::fs::read_dir(path.join("device/drm")) {
             for de in drm_entries.flatten() {
                 let name = de.file_name().into_string().unwrap_or_default();
@@ -1293,11 +1286,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     };
 
     while let Some(mut f) = pool.take() {
-        if cfg.controls.tunables_dirty.swap(false, Ordering::Acquire) {
-            if let Some(t) = cfg.controls.tunables.lock().unwrap().take() {
+        if cfg.controls.tunables_dirty.swap(false, Ordering::Acquire)
+            && let Some(t) = cfg.controls.tunables.lock().unwrap().take() {
                 t.apply_to(&mut settings);
             }
-        }
         if cfg.controls.rate_dirty.swap(false, Ordering::Acquire) {
             settings.video_bitrate_kbps = cfg.controls.bitrate_kbps.load(Ordering::Relaxed);
             settings.video_vbv_multiplier =
@@ -1818,13 +1810,11 @@ fn start_capture_on_display(
     };
     let mut node = state.output_nodes.remove(node_idx);
 
-    if state.auto_gpu_selected && settings.encode_node_index < -1 {
-        if let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD") {
-            if let Ok(idx) = idx_str.parse::<i32>() {
+    if state.auto_gpu_selected && settings.encode_node_index < -1
+        && let Some(idx_str) = state.render_node_path.strip_prefix("/dev/dri/renderD")
+        && let Ok(idx) = idx_str.parse::<i32>() {
                 settings.encode_node_index = idx - 128;
             }
-        }
-    }
 
     if settings.output_mode == 1 {
         settings.width &= !1;
@@ -1868,8 +1858,8 @@ fn start_capture_on_display(
             // panic the compositor thread.
             let mut new_offscreen = None;
             let mut gbm_resize_failed = false;
-            if state.use_gpu {
-                if let Some(gbm) = state.gbm_device.as_mut() {
+            if state.use_gpu
+                && let Some(gbm) = state.gbm_device.as_mut() {
                     match gbm.create_buffer_object(
                         settings.width as u32,
                         settings.height as u32,
@@ -1889,7 +1879,6 @@ fn start_capture_on_display(
                         }
                     }
                 }
-            }
             if gbm_resize_failed {
                 // The mode commit below is skipped wholesale, so the rest of this
                 // StartCapture (encoder setup, stored settings) must see the
@@ -2059,11 +2048,10 @@ fn start_capture_on_display(
         .load_watermark(&settings.watermark_path, watermark_output_scale);
     if display_id == 0 {
         state.settings = settings.clone();
-        if state.cursor_callback_set {
-            if let Some(icon) = state.current_cursor_icon.clone() {
+        if state.cursor_callback_set
+            && let Some(icon) = state.current_cursor_icon.clone() {
                 state.send_cursor_image(&icon);
             }
-        }
     }
     state.render_cursor_on_framebuffer = settings.capture_cursor;
 
@@ -2240,16 +2228,14 @@ fn render_node_tick(
 
     // Per-display frame pacing under the one shared timer (which fires at the fastest
     // active capture's rate).
-    if let Some(cap) = node.capture.as_ref() {
-        if !take_screenshot {
+    if let Some(cap) = node.capture.as_ref()
+        && !take_screenshot {
             let fps = (if is_memory_throttling { 5.0 } else { cap.settings.target_fps }).max(1.0);
-            if let Some(last) = cap.last_tick {
-                if last.elapsed().as_secs_f64() < (1.0 / fps) * 0.9 {
+            if let Some(last) = cap.last_tick
+                && last.elapsed().as_secs_f64() < (1.0 / fps) * 0.9 {
                     return false;
                 }
-            }
         }
-    }
 
     let output = node.output.clone();
     let origin: Point<i32, smithay::utils::Logical> = node.pos.into();
@@ -2271,8 +2257,8 @@ fn render_node_tick(
     let logical_h = (height as f64 / output_scale_val).round();
 
     // A recorder connecting counts as an IDR request, kept armed across skipped ticks.
-    if let Some(cap) = node.capture.as_mut() {
-        if cap
+    if let Some(cap) = node.capture.as_mut()
+        && cap
             .recording_sink
             .as_ref()
             .map(|s| s.should_force_idr())
@@ -2280,7 +2266,6 @@ fn render_node_tick(
         {
             cap.request_idr();
         }
-    }
     let requested_idr = node.capture.as_ref().map(|c| c.pending_force_idr).unwrap_or(false);
     // A client keyframe request lands on the hardware path's atomic (RequestIdr sets
     // it whenever an encode pool exists); host mode consults it — without consuming —
@@ -2293,16 +2278,14 @@ fn render_node_tick(
     let want_idr_for_host = requested_idr || hw_idr_pending;
 
     let mut pool_slot: Option<(usize, Vec<u8>)> = None;
-    if let Some(cap) = node.capture.as_ref() {
-        if let Some(ref pool) = cap.encode_pool {
-            if !is_memory_throttling {
+    if let Some(cap) = node.capture.as_ref()
+        && let Some(ref pool) = cap.encode_pool
+        && !is_memory_throttling {
                 pool_slot = pool.try_begin();
                 if pool_slot.is_none() {
                     return true;
                 }
             }
-        }
-    }
 
     let loc_enum = node
         .capture
@@ -2344,13 +2327,11 @@ fn render_node_tick(
     if state.host.is_some() && !host_mode {
         // No host output backs this display (start_capture already warned):
         // produce nothing rather than the compositor's own empty content.
-        if let Some((id, buf)) = pool_slot.take() {
-            if let Some(cap) = node.capture.as_ref() {
-                if let Some(ref pool) = cap.encode_pool {
+        if let Some((id, buf)) = pool_slot.take()
+            && let Some(cap) = node.capture.as_ref()
+            && let Some(ref pool) = cap.encode_pool {
                     pool.cancel(id, buf);
                 }
-            }
-        }
         return false;
     }
     // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
@@ -2383,13 +2364,11 @@ fn render_node_tick(
         let wm_active = node.overlay_state.is_active();
         let wm_animated = wm_active && node.overlay_state.is_animated();
         if !have_new && !want_idr_for_host && !streaming && !take_screenshot && !wm_animated {
-            if let Some((id, buf)) = pool_slot.take() {
-                if let Some(cap) = node.capture.as_ref() {
-                    if let Some(ref pool) = cap.encode_pool {
+            if let Some((id, buf)) = pool_slot.take()
+                && let Some(cap) = node.capture.as_ref()
+                && let Some(ref pool) = cap.encode_pool {
                         pool.cancel(id, buf);
                     }
-                }
-            }
             state.host = Some(host);
             return false;
         }
@@ -2434,8 +2413,8 @@ fn render_node_tick(
         // trail); anchored watermarks are stamped once onto each fresh blit and
         // ride along with retained re-encodes.
         if let Some(src) = host_enc_dmabuf.clone() {
-            if wm_active {
-                if let Some(renderer) = state.gles_renderer.as_mut() {
+            if wm_active
+                && let Some(renderer) = state.gles_renderer.as_mut() {
                     if wm_animated {
                         if let Some((_, target)) = node.offscreen_buffer.as_mut() {
                             match compose_host_watermark(
@@ -2469,9 +2448,8 @@ fn render_node_tick(
                         }
                     }
                 }
-            }
-            if take_screenshot {
-                if let Some(renderer) = state.gles_renderer.as_mut() {
+            if take_screenshot
+                && let Some(renderer) = state.gles_renderer.as_mut() {
                     let mut shot = host_enc_dmabuf.clone().unwrap_or(src);
                     match renderer.bind(&mut shot) {
                         Ok(fb) => {
@@ -2490,13 +2468,11 @@ fn render_node_tick(
                         Err(e) => eprintln!("[HostCapture] screenshot bind: {e:?}"),
                     };
                 }
-            }
         }
-        if wm_drawn {
-            if let Some(rect) = node.overlay_state.damage_rect(width, height) {
+        if wm_drawn
+            && let Some(rect) = node.overlay_state.damage_rect(width, height) {
                 damage_rects.push(rect);
             }
-        }
         state.host = Some(host);
         if outcome != RETAINED_OK {
             if outcome == RETAINED_MISMATCH {
@@ -2509,13 +2485,11 @@ fn render_node_tick(
                     );
                 }
             }
-            if let Some((id, buf)) = pool_slot.take() {
-                if let Some(cap) = node.capture.as_ref() {
-                    if let Some(ref pool) = cap.encode_pool {
+            if let Some((id, buf)) = pool_slot.take()
+                && let Some(cap) = node.capture.as_ref()
+                && let Some(ref pool) = cap.encode_pool {
                         pool.cancel(id, buf);
                     }
-                }
-            }
             return false;
         }
         render_success = true;
@@ -2530,18 +2504,17 @@ fn render_node_tick(
                     Ok(mut frame) => {
                         let mut elements: Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> = Vec::new();
 
-                        if state.render_cursor_on_framebuffer {
-                            if let Some(pos) = pointer_local {
+                        if state.render_cursor_on_framebuffer
+                            && let Some(pos) = pointer_local {
                                 let scale = Scale::from(output_scale_val);
 
                                 if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
                                     let name = wayland::frontend::cursor_icon_to_str(icon);
                                     let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                    if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
-                                        if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                    if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time)
+                                        && let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
                                             elements.push(CompositionElements::Cursor(elem));
                                         }
-                                    }
                                 } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
                                      let phys_pos = pos.to_physical(scale);
                                      let elem_result = with_states(surface, |states| {
@@ -2558,7 +2531,6 @@ fn render_node_tick(
                                     }
                                 }
                             }
-                        }
 
                         if let Some(elem) = node.overlay_state.get_watermark_element(renderer) {
                             elements.push(CompositionElements::Cursor(elem));
@@ -2570,8 +2542,8 @@ fn render_node_tick(
                             let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                 for surface in layer_map.layers().rev() {
                                     let current_layer = surface.layer();
-                                    if current_layer == target_layer {
-                                        if let Some(geo) = layer_map.layer_geometry(surface) {
+                                    if current_layer == target_layer
+                                        && let Some(geo) = layer_map.layer_geometry(surface) {
                                             let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
                                                 WaylandSurfaceRenderElement::from_surface(
                                                     renderer, surface.wl_surface(), states,
@@ -2583,7 +2555,6 @@ fn render_node_tick(
                                                 elements.push(CompositionElements::Surface(e));
                                             }
                                         }
-                                    }
                                 }
                             };
 
@@ -2624,8 +2595,8 @@ fn render_node_tick(
                             let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                 for surface in layer_map.layers() {
                                     let current_layer = surface.layer();
-                                    if current_layer == target_layer {
-                                        if let Some(geo) = layer_map.layer_geometry(surface) {
+                                    if current_layer == target_layer
+                                        && let Some(geo) = layer_map.layer_geometry(surface) {
                                             let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
                                                 WaylandSurfaceRenderElement::from_surface(
                                                     renderer, surface.wl_surface(), states,
@@ -2637,7 +2608,6 @@ fn render_node_tick(
                                                 elements.push(CompositionElements::Surface(e));
                                             }
                                         }
-                                    }
                                 }
                             };
 
@@ -2700,8 +2670,8 @@ fn render_node_tick(
                 }
             }
         }
-    } else if !host_mode {
-        if let Some(renderer) = state.pixman_renderer.as_mut() {
+    } else if !host_mode
+        && let Some(renderer) = state.pixman_renderer.as_mut() {
             let mut cap = node.capture.as_mut();
             let (ptr, buf_age) = match pool_slot {
                 Some((id, ref mut buf)) => {
@@ -2726,18 +2696,17 @@ fn render_node_tick(
                         Ok(mut frame) => {
                             let mut elements: Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>> = Vec::new();
 
-                            if state.render_cursor_on_framebuffer {
-                                if let Some(pos) = pointer_local {
+                            if state.render_cursor_on_framebuffer
+                                && let Some(pos) = pointer_local {
                                     let scale = Scale::from(output_scale_val);
 
                                     if let Some(CursorImageStatus::Named(icon)) = &state.current_cursor_icon {
                                         let name = wayland::frontend::cursor_icon_to_str(icon);
                                         let time = Duration::from_millis(state.clock.now().as_millis() as u64);
-                                        if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time) {
-                                            if let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
+                                        if let Some(image) = state.cursor_helper.get_image_by_name(name, output_scale_val.round() as u32, time)
+                                            && let Some(elem) = node.overlay_state.get_cursor_element(renderer, image, pos, output_scale_val) {
                                                 elements.push(CompositionElements::Cursor(elem));
                                             }
-                                        }
                                     } else if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
                                          let phys_pos = pos.to_physical(scale);
                                          let elem_result = with_states(surface, |states| {
@@ -2754,7 +2723,6 @@ fn render_node_tick(
                                         }
                                     }
                                 }
-                            }
 
                             if let Some(elem) = node.overlay_state.get_watermark_element(renderer) {
                                 elements.push(CompositionElements::Cursor(elem));
@@ -2766,8 +2734,8 @@ fn render_node_tick(
                                 let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                     for surface in layer_map.layers() {
                                         let current_layer = surface.layer();
-                                        if current_layer == target_layer {
-                                            if let Some(geo) = layer_map.layer_geometry(surface) {
+                                        if current_layer == target_layer
+                                            && let Some(geo) = layer_map.layer_geometry(surface) {
                                                 let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
                                                     WaylandSurfaceRenderElement::from_surface(
                                                         renderer, surface.wl_surface(), states,
@@ -2779,7 +2747,6 @@ fn render_node_tick(
                                                     elements.push(CompositionElements::Surface(e));
                                                 }
                                             }
-                                        }
                                     }
                                 };
 
@@ -2821,8 +2788,8 @@ fn render_node_tick(
                                 let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
                                     for surface in layer_map.layers() {
                                         let current_layer = surface.layer();
-                                        if current_layer == target_layer {
-                                            if let Some(geo) = layer_map.layer_geometry(surface) {
+                                        if current_layer == target_layer
+                                            && let Some(geo) = layer_map.layer_geometry(surface) {
                                                 let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
                                                     WaylandSurfaceRenderElement::from_surface(
                                                         renderer, surface.wl_surface(), states,
@@ -2834,7 +2801,6 @@ fn render_node_tick(
                                                     elements.push(CompositionElements::Surface(e));
                                                 }
                                             }
-                                        }
                                     }
                                 };
 
@@ -2855,17 +2821,15 @@ fn render_node_tick(
                     }
                     if let Some(c) = cap {
                         c.render_seq += 1;
-                        if render_success {
-                            if let Some((id, _)) = pool_slot {
+                        if render_success
+                            && let Some((id, _)) = pool_slot {
                                 c.pool_last_render[id] = c.render_seq;
                             }
-                        }
                     }
                 },
                 Err(e) => eprintln!("Failed to bind pixman image: {:?}", e)
             }
         }
-    }
 
     if render_success {
         let time = state.clock.now();
@@ -2899,12 +2863,11 @@ fn render_node_tick(
                     cap.frame_counter = cap.frame_counter.wrapping_add(1);
                 }
             } else if cap.encode_pool.is_some() {
-                if take_screenshot {
-                    if let Some((_, ref buf)) = pool_slot {
+                if take_screenshot
+                    && let Some((_, ref buf)) = pool_slot {
                         let n = buf.len().min(node.frame_buffer.len());
                         node.frame_buffer[..n].copy_from_slice(&buf[..n]);
                     }
-                }
                 if let Some((id, buf)) = pool_slot.take() {
                     let is_animated = node.overlay_state.is_animated();
                     cap.encode_pool.as_ref().unwrap().publish(WlFrame {
@@ -3061,8 +3024,8 @@ fn render_node_tick(
                 }
             }
         }
-        if take_screenshot {
-            if let Some((_, resp)) = state.pending_screenshot.take() {
+        if take_screenshot
+            && let Some((_, resp)) = state.pending_screenshot.take() {
                 if !node.frame_buffer.is_empty() {
                     let w = width as u32;
                     let h = height as u32;
@@ -3086,15 +3049,12 @@ fn render_node_tick(
                     let _ = resp.send(Err("Screenshot render produced no pixels".to_string()));
                 }
             }
-        }
     }
-    if let Some((id, buf)) = pool_slot.take() {
-        if let Some(cap) = node.capture.as_ref() {
-            if let Some(ref pool) = cap.encode_pool {
+    if let Some((id, buf)) = pool_slot.take()
+        && let Some(cap) = node.capture.as_ref()
+        && let Some(ref pool) = cap.encode_pool {
                 pool.cancel(id, buf);
             }
-        }
-    }
     false
 }
 
@@ -3361,11 +3321,10 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
         }
     }
     for w in &state.pending_windows {
-        if let Some(meta) = wayland::frontend::window_meta(w) {
-            if meta.output.load(Ordering::Relaxed) == id {
+        if let Some(meta) = wayland::frontend::window_meta(w)
+            && meta.output.load(Ordering::Relaxed) == id {
                 meta.output.store(0, Ordering::Relaxed);
             }
-        }
     }
     let idx = state.node_idx_for_id(id).unwrap();
     let node = state.output_nodes.remove(idx);
@@ -3988,16 +3947,14 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             let local = (p - origin.to_f64()).to_i32_round();
                             let layer_map = layer_map_for_output(&node.output);
                             for layer in layer_map.layers().rev() {
-                                if layers.contains(&layer.layer()) {
-                                    if let Some(bbox) = layer_map.layer_geometry(layer) {
-                                        if bbox.contains(local) {
+                                if layers.contains(&layer.layer())
+                                    && let Some(bbox) = layer_map.layer_geometry(layer)
+                                    && bbox.contains(local) {
                                             return Some((
                                                 FocusTarget::LayerSurface(layer.clone()),
                                                 (bbox.loc + origin).to_f64(),
                                             ));
                                         }
-                                    }
-                                }
                             }
                             None
                         };
@@ -4135,18 +4092,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     }
                 }
                 ThreadCommand::RequestIdr { display_id } => {
-                    if let Some(idx) = state.node_idx_for_id(display_id) {
-                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                    if let Some(idx) = state.node_idx_for_id(display_id)
+                        && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
                             cap.request_idr();
                         }
-                    }
                 }
                 ThreadCommand::UpdateRate { display_id, bitrate_kbps, vbv_multiplier, fps } => {
-                    if let Some(idx) = state.node_idx_for_id(display_id) {
-                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                    if let Some(idx) = state.node_idx_for_id(display_id)
+                        && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
                             if let Some(b) = bitrate_kbps { cap.settings.video_bitrate_kbps = b; }
                             if let Some(v) = vbv_multiplier { cap.settings.video_vbv_multiplier = v; }
-                            if let Some(f) = fps { if f > 0.0 { cap.settings.target_fps = f; } }
+                            if let Some(f) = fps && f > 0.0 { cap.settings.target_fps = f; }
                             if let Some(GpuEncoder::Nvenc(enc)) = cap.video_encoder.as_mut() {
                                 enc.reconfigure_rate(&cap.settings);
                             }
@@ -4170,7 +4126,6 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                                 state.settings.target_fps = cap.settings.target_fps;
                             }
                         }
-                    }
                 }
                 ThreadCommand::UpdateTunables { display_id, tunables: t } => {
                     state.render_cursor_on_framebuffer = t.capture_cursor;
@@ -4178,13 +4133,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     if display_id == 0 {
                         t.apply_to(&mut state.settings);
                     }
-                    if let Some(idx) = state.node_idx_for_id(display_id) {
-                        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+                    if let Some(idx) = state.node_idx_for_id(display_id)
+                        && let Some(cap) = state.output_nodes[idx].capture.as_mut() {
                             t.apply_to(&mut cap.settings);
                             *cap.encode_controls.tunables.lock().unwrap() = Some(t);
                             cap.encode_controls.tunables_dirty.store(true, Ordering::Release);
                         }
-                    }
                 }
                 ThreadCommand::CuScreenshot { display_id, resp } => {
                     if state.node_idx_for_id(display_id).is_some() {
@@ -4242,7 +4196,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     };
     let socket_name = source.socket_name().to_string_lossy().into_owned();
     println!("[Wayland] Socket listening on: {:?}", socket_name);
-    std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    // Writing the process environment races any concurrent getenv, which is why
+    // it is unsafe: nothing here can stop a thread already running from reading
+    // it. This one write happens during compositor bring-up, before any capture
+    // or encoder thread exists, and the value is what children of this process
+    // and the backend probe below need to find the compositor.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
     publish_socket_name(&socket_name);
 
     event_loop
@@ -4443,14 +4402,16 @@ impl StripeFrame {
         view: *mut pyo3::ffi::Py_buffer,
         flags: std::os::raw::c_int,
     ) -> PyResult<()> {
-        let r = pyo3::ffi::PyBuffer_FillInfo(
-            view,
-            slf.as_ptr(),
-            slf.data.as_ptr() as *mut std::os::raw::c_void,
-            slf.data.len() as pyo3::ffi::Py_ssize_t,
-            1,
-            flags,
-        );
+        let r = unsafe {
+            pyo3::ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr(),
+                slf.data.as_ptr() as *mut std::os::raw::c_void,
+                slf.data.len() as pyo3::ffi::Py_ssize_t,
+                1,
+                flags,
+            )
+        };
         if r != 0 {
             return Err(PyErr::fetch(slf.py()));
         }
@@ -5042,20 +5003,18 @@ fn wayland_update_rate(
     vbv_multiplier: Option<f64>,
     fps: Option<f64>,
 ) {
-    if let Some(slot) = WAYLAND_BACKEND.get() {
-        if let Some(be) = slot.lock().unwrap().as_ref() {
+    if let Some(slot) = WAYLAND_BACKEND.get()
+        && let Some(be) = slot.lock().unwrap().as_ref() {
             let _ = be.bind(py).borrow().update_rate(bitrate_kbps, vbv_multiplier, fps, display_id);
         }
-    }
 }
 
 /// Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
 fn wayland_update_tunables(py: Python<'_>, display_id: u32, t: LiveTunables) {
-    if let Some(slot) = WAYLAND_BACKEND.get() {
-        if let Some(be) = slot.lock().unwrap().as_ref() {
+    if let Some(slot) = WAYLAND_BACKEND.get()
+        && let Some(be) = slot.lock().unwrap().as_ref() {
             let _ = be.bind(py).borrow().update_tunables(display_id, t);
         }
-    }
 }
 
 /// Get-or-create the singleton Wayland backend (idempotent: the first dimensions and render
@@ -5080,8 +5039,8 @@ fn ensure_wayland_backend(
     if g.is_none() {
         let mut node = (!explicit_node.is_empty()).then_some(explicit_node);
         let mut auto_gpu_selected = false;
-        if node.is_none() {
-            if let Some(request) = parse_auto_gpu(&auto_gpu) {
+        if node.is_none()
+            && let Some(request) = parse_auto_gpu(&auto_gpu) {
                 match auto_select_render_node(request.as_deref()) {
                     Some(picked) => {
                         println!("[Wayland] AUTO_GPU enabled. Selected: {}", picked);
@@ -5095,7 +5054,6 @@ fn ensure_wayland_backend(
                     }
                 }
             }
-        }
         let node = node.unwrap_or(fallback_node);
         let be = Py::new(
             py,
@@ -5196,13 +5154,11 @@ impl ScreenCapture {
                 c.stop.store(true, Ordering::Relaxed);
             }
             let cur = Some(thread::current().id());
-            if st.encode_thread_id.is_none() {
-                if let Some(rx) = st.encode_tid_rx.as_ref() {
-                    if let Ok(id) = rx.try_recv() {
+            if st.encode_thread_id.is_none()
+                && let Some(rx) = st.encode_tid_rx.as_ref()
+                && let Ok(id) = rx.try_recv() {
                         st.encode_thread_id = Some(id);
                     }
-                }
-            }
             let same = st.cap_thread_id == cur
                 || st.encode_thread_id == cur
                 || st.deliver_thread_id == cur;
@@ -5237,13 +5193,11 @@ impl ScreenCapture {
                     false
                 }
             };
-            if owned {
-                if let Some(slot) = WAYLAND_BACKEND.get() {
-                    if let Some(be) = slot.lock().unwrap().as_ref() {
+            if owned
+                && let Some(slot) = WAYLAND_BACKEND.get()
+                && let Some(be) = slot.lock().unwrap().as_ref() {
                         let _ = be.bind(py).borrow().stop_capture(did);
                     }
-                }
-            }
         } else {
             if same_thread {
                 // Detach: the threads exit on the stop flag once the callback returns.
@@ -5371,17 +5325,15 @@ impl ScreenCapture {
                         .ok()
                 })
                 .unwrap_or_default();
-            if let Some(request) = parse_auto_gpu(&auto_gpu) {
-                if let Some(picked) = auto_select_render_node(request.as_deref()) {
-                    if let Some(idx) = picked
+            if let Some(request) = parse_auto_gpu(&auto_gpu)
+                && let Some(picked) = auto_select_render_node(request.as_deref())
+                && let Some(idx) = picked
                         .strip_prefix("/dev/dri/renderD")
                         .and_then(|s| s.parse::<i32>().ok())
                     {
                         println!("[x11] AUTO_GPU enabled. Selected: {picked}");
                         rs.encode_node_index = idx - 128;
                     }
-                }
-            }
         }
 
         println!(
@@ -5515,11 +5467,10 @@ impl ScreenCapture {
                 }
             }
             2 => {
-                if let Some(slot) = WAYLAND_BACKEND.get() {
-                    if let Some(be) = slot.lock().unwrap().as_ref() {
+                if let Some(slot) = WAYLAND_BACKEND.get()
+                    && let Some(be) = slot.lock().unwrap().as_ref() {
                         let _ = be.bind(py).borrow().request_idr_frame(did);
                     }
-                }
             }
             _ => {}
         }
@@ -5923,15 +5874,13 @@ impl Drop for ScreenCapture {
                         false
                     }
                 };
-                if owned {
-                    if let Some(slot) = WAYLAND_BACKEND.get() {
-                        if let Some(be) = slot.lock().unwrap().as_ref() {
+                if owned
+                    && let Some(slot) = WAYLAND_BACKEND.get()
+                    && let Some(be) = slot.lock().unwrap().as_ref() {
                             Python::attach(|py| {
                                 let _ = be.bind(py).borrow().stop_capture(did);
                             });
                         }
-                    }
-                }
             }
             // Pair the cursor-monitor acquire from start_capture: a dropped
             // handle that never got stop_capture would pin the refcount and its
@@ -6079,8 +6028,8 @@ fn _stop_all_captures(py: Python<'_>) {
             c.stop.store(true, Ordering::Relaxed);
         }
     }
-    if let Some(slot) = WAYLAND_BACKEND.get() {
-        if let Some(be) = slot.lock().unwrap().as_ref() {
+    if let Some(slot) = WAYLAND_BACKEND.get()
+        && let Some(be) = slot.lock().unwrap().as_ref() {
             let be = be.bind(py).borrow();
             let mut displays: Vec<u32> =
                 wayland_alive().lock().unwrap().iter().copied().collect();
@@ -6098,7 +6047,6 @@ fn _stop_all_captures(py: Python<'_>) {
                 let _ = py.detach(move || ack_rx.recv_timeout(Duration::from_secs(2)));
             }
         }
-    }
     wayland_owners().lock().unwrap().clear();
     wayland_alive().lock().unwrap().clear();
     py.detach(|| std::thread::sleep(Duration::from_millis(50)));

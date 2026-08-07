@@ -426,14 +426,13 @@ impl CuBackend for CuX11Backend {
             ));
         }
         // The agent needs to see the pointer; the stream's cursor settings do not apply here.
-        if self.has_xfixes {
-            if let Some(c) = self
+        if self.has_xfixes
+            && let Some(c) = self
                 .conn
                 .xfixes_get_cursor_image()
                 .ok()
                 .and_then(|c| c.reply().ok())
-            {
-                if c.width > 0 && c.height > 0 {
+                && c.width > 0 && c.height > 0 {
                     let (img_x, img_y) =
                         super::cursor_image_origin(c.x, c.y, c.xhot, c.yhot, 0, 0);
                     super::overlay_cursor(
@@ -448,8 +447,6 @@ impl CuBackend for CuX11Backend {
                         img_y,
                     );
                 }
-            }
-        }
         // The grab is BGRX; the padding byte is undefined for depth-24 roots, so alpha is
         // forced opaque or the PNG would come out transparent.
         for px in data.chunks_exact_mut(4) {

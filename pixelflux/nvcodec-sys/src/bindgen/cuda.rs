@@ -2002,48 +2002,48 @@ impl Default for CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_st {
 }
 pub type CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_v1 = CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_st;
 pub type CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS = CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS_v1;
-extern "C" {
+unsafe extern "C" {
     pub fn cuGetErrorString(error: CUresult, pStr: *mut *const ::std::os::raw::c_char) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuGetErrorName(error: CUresult, pStr: *mut *const ::std::os::raw::c_char) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuInit(Flags: ::std::os::raw::c_uint) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDeviceGet(device: *mut CUdevice, ordinal: ::std::os::raw::c_int) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDeviceGetCount(count: *mut ::std::os::raw::c_int) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDeviceGetName(
         name: *mut ::std::os::raw::c_char,
         len: ::std::os::raw::c_int,
         dev: CUdevice,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDeviceGetUuid(uuid: *mut CUuuid, dev: CUdevice) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuCtxCreate_v2(
         pctx: *mut CUcontext,
         flags: ::std::os::raw::c_uint,
         dev: CUdevice,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuCtxDestroy_v2(ctx: CUcontext) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuCtxPushCurrent_v2(ctx: CUcontext) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuCtxPopCurrent_v2(pctx: *mut CUcontext) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemAllocPitch_v2(
         dptr: *mut CUdeviceptr,
         pPitch: *mut usize,
@@ -2052,77 +2052,77 @@ extern "C" {
         ElementSizeBytes: ::std::os::raw::c_uint,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemFree_v2(dptr: CUdeviceptr) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemAllocHost_v2(pp: *mut *mut ::std::os::raw::c_void, bytesize: usize) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemFreeHost(p: *mut ::std::os::raw::c_void) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemcpyDtoH_v2(
         dstHost: *mut ::std::os::raw::c_void,
         srcDevice: CUdeviceptr,
         ByteCount: usize,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemcpy2D_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemcpy2DUnaligned_v2(pCopy: *const CUDA_MEMCPY2D) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMemcpy2DAsync_v2(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMipmappedArrayGetLevel(
         pLevelArray: *mut CUarray,
         hMipmappedArray: CUmipmappedArray,
         level: ::std::os::raw::c_uint,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuMipmappedArrayDestroy(hMipmappedArray: CUmipmappedArray) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuStreamCreate(phStream: *mut CUstream, Flags: ::std::os::raw::c_uint) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuStreamDestroy_v2(hStream: CUstream) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuImportExternalMemory(
         extMem_out: *mut CUexternalMemory,
         memHandleDesc: *const CUDA_EXTERNAL_MEMORY_HANDLE_DESC,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuExternalMemoryGetMappedBuffer(
         devPtr: *mut CUdeviceptr,
         extMem: CUexternalMemory,
         bufferDesc: *const CUDA_EXTERNAL_MEMORY_BUFFER_DESC,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuExternalMemoryGetMappedMipmappedArray(
         mipmap: *mut CUmipmappedArray,
         extMem: CUexternalMemory,
         mipmapDesc: *const CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDestroyExternalMemory(extMem: CUexternalMemory) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuImportExternalSemaphore(
         extSem_out: *mut CUexternalSemaphore,
         semHandleDesc: *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuSignalExternalSemaphoresAsync(
         extSemArray: *const CUexternalSemaphore,
         paramsArray: *const CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS,
@@ -2130,7 +2130,7 @@ extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuWaitExternalSemaphoresAsync(
         extSemArray: *const CUexternalSemaphore,
         paramsArray: *const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS,
@@ -2138,6 +2138,6 @@ extern "C" {
         stream: CUstream,
     ) -> CUresult;
 }
-extern "C" {
+unsafe extern "C" {
     pub fn cuDestroyExternalSemaphore(extSem: CUexternalSemaphore) -> CUresult;
 }

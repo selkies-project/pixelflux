@@ -42,6 +42,14 @@
 /// 4. **Cargo directives**: reruns on changes to the NVENC header, this build script, or the
 ///    `CUDA_PATH` environment variable, and emits a `cargo:warning` when `CUDA_PATH` is unset so
 ///    it's visible that the CUDA bindings stayed on the committed version.
+/// Marks the generated `extern "C"` blocks `unsafe`, which this crate's edition requires and
+/// the pinned bindgen predates.
+#[cfg(feature = "regen")]
+fn mark_extern_blocks_unsafe(path: &std::path::Path) -> std::io::Result<()> {
+    let src = std::fs::read_to_string(path)?;
+    std::fs::write(path, src.replace("\nextern \"C\" {", "\nunsafe extern \"C\" {"))
+}
+
 #[cfg(feature = "regen")]
 fn main() -> std::io::Result<()> {
     use std::io::Write;
@@ -74,6 +82,7 @@ fn main() -> std::io::Result<()> {
         .expect("Unable to generate NVENC bindings")
         .write_to_file(&nvenc_out)
         .expect("Unable to write nvenc.rs");
+    mark_extern_blocks_unsafe(&nvenc_out)?;
 
     let hdr = std::fs::read_to_string(nvenc_header)?;
     let mut extra = String::from(
@@ -146,6 +155,7 @@ fn main() -> std::io::Result<()> {
             .expect("Unable to generate CUDA bindings")
             .write_to_file(out.join("cuda.rs"))
             .expect("Unable to write cuda.rs");
+        mark_extern_blocks_unsafe(&out.join("cuda.rs"))?;
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
     } else {
         println!(

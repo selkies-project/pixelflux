@@ -13736,7 +13736,7 @@ impl Default for _NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS {
 }
 #[doc = " Encoder Session Creation parameters"]
 pub type NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = _NV_ENC_OPEN_ENCODE_SESSIONEX_PARAMS;
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Opens an encoding session."]
     #[doc = ""]
     #[doc = " Deprecated."]
@@ -13750,7 +13750,7 @@ extern "C" {
         encoder: *mut *mut ::std::os::raw::c_void,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves the number of supported encode GUIDs."]
     #[doc = ""]
     #[doc = " The function returns the number of codec GUIDs supported by the NvEncodeAPI"]
@@ -13776,7 +13776,7 @@ extern "C" {
         encodeGUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves an array of supported encoder codec GUIDs."]
     #[doc = ""]
     #[doc = " The function returns an array of codec GUIDs supported by the NvEncodeAPI interface."]
@@ -13813,7 +13813,7 @@ extern "C" {
         GUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves the number of supported profile GUIDs."]
     #[doc = ""]
     #[doc = " The function returns the number of profile GUIDs supported for a given codec."]
@@ -13845,7 +13845,7 @@ extern "C" {
         encodeProfileGUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves an array of supported encode profile GUIDs."]
     #[doc = ""]
     #[doc = " The function returns an array of supported profile GUIDs for a particular"]
@@ -13885,7 +13885,7 @@ extern "C" {
         GUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieve the number of supported Input formats."]
     #[doc = ""]
     #[doc = " The function returns the number of supported input formats. The client must"]
@@ -13915,7 +13915,7 @@ extern "C" {
         inputFmtCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves an array of supported Input formats"]
     #[doc = ""]
     #[doc = " Returns an array of supported input formats  The client must use the input"]
@@ -13952,7 +13952,7 @@ extern "C" {
         inputFmtCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves the capability value for a specified encoder attribute."]
     #[doc = ""]
     #[doc = " The function returns the capability value for a given encoder attribute. The"]
@@ -13986,7 +13986,7 @@ extern "C" {
         capsVal: *mut ::std::os::raw::c_int,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Retrieves the number of supported preset GUIDs."]
     #[doc = ""]
     #[doc = " The function returns the number of preset GUIDs available for a given codec."]
@@ -14017,7 +14017,7 @@ extern "C" {
         encodePresetGUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Receives an array of supported encoder preset GUIDs."]
     #[doc = ""]
     #[doc = " The function returns an array of encode preset GUIDs available for a given codec."]
@@ -14064,7 +14064,7 @@ extern "C" {
         encodePresetGUIDCount: *mut u32,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Returns a preset config structure supported for given preset GUID."]
     #[doc = ""]
     #[doc = " The function returns a preset config structure for a given preset GUID."]
@@ -14106,7 +14106,7 @@ extern "C" {
         presetConfig: *mut NV_ENC_PRESET_CONFIG,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Returns a preset config structure supported for given preset GUID."]
     #[doc = ""]
     #[doc = " The function returns a preset config structure for a given preset GUID and tuning info."]
@@ -14152,7 +14152,7 @@ extern "C" {
         presetConfig: *mut NV_ENC_PRESET_CONFIG,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Initialize the encoder."]
     #[doc = ""]
     #[doc = " This API must be used to initialize the encoder. The initialization parameter"]
@@ -14238,7 +14238,7 @@ extern "C" {
         createEncodeParams: *mut NV_ENC_INITIALIZE_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Allocates Input buffer."]
     #[doc = ""]
     #[doc = " This function is used to allocate an input buffer. The client must enumerate"]
@@ -14269,7 +14269,7 @@ extern "C" {
         createInputBufferParams: *mut NV_ENC_CREATE_INPUT_BUFFER,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Release an input buffers."]
     #[doc = ""]
     #[doc = " This function is used to free an input buffer. If the client has allocated"]
@@ -14298,7 +14298,7 @@ extern "C" {
         inputBuffer: NV_ENC_INPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Set input and output CUDA stream for specified encoder attribute."]
     #[doc = ""]
     #[doc = " Encoding may involve CUDA pre-processing on the input and post-processing on encoded output."]
@@ -14335,7 +14335,7 @@ extern "C" {
         outputStream: NV_ENC_CUSTREAM_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Allocates an output bitstream buffer"]
     #[doc = ""]
     #[doc = " This function is used to allocate an output bitstream buffer and returns a"]
@@ -14370,7 +14370,7 @@ extern "C" {
         createBitstreamBufferParams: *mut NV_ENC_CREATE_BITSTREAM_BUFFER,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Release a bitstream buffer."]
     #[doc = ""]
     #[doc = " This function is used to release the output bitstream buffer allocated using"]
@@ -14399,7 +14399,7 @@ extern "C" {
         bitstreamBuffer: NV_ENC_OUTPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Submit an input picture for encoding."]
     #[doc = ""]
     #[doc = " This function is used to submit an input picture buffer for encoding. The"]
@@ -14596,7 +14596,7 @@ extern "C" {
         encodePicParams: *mut NV_ENC_PIC_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Lock output bitstream buffer"]
     #[doc = ""]
     #[doc = " This function is used to lock the bitstream buffer to read the encoded data."]
@@ -14635,7 +14635,7 @@ extern "C" {
         lockBitstreamBufferParams: *mut NV_ENC_LOCK_BITSTREAM,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Unlock the output bitstream buffer"]
     #[doc = ""]
     #[doc = " This function is used to unlock the output bitstream buffer after the client"]
@@ -14665,7 +14665,7 @@ extern "C" {
         bitstreamBuffer: NV_ENC_OUTPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Restore state of encoder"]
     #[doc = ""]
     #[doc = " This function is used to restore the state of encoder with state saved internally in"]
@@ -14695,7 +14695,7 @@ extern "C" {
         restoreState: *mut NV_ENC_RESTORE_ENCODER_STATE_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Locks an input buffer"]
     #[doc = ""]
     #[doc = " This function is used to lock the input buffer to load the uncompressed YUV"]
@@ -14729,7 +14729,7 @@ extern "C" {
         lockInputBufferParams: *mut NV_ENC_LOCK_INPUT_BUFFER,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Unlocks the input buffer"]
     #[doc = ""]
     #[doc = " This function is used to unlock the input buffer memory previously locked for"]
@@ -14759,7 +14759,7 @@ extern "C" {
         inputBuffer: NV_ENC_INPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Get encoding statistics."]
     #[doc = ""]
     #[doc = " This function is used to retrieve the encoding statistics."]
@@ -14788,7 +14788,7 @@ extern "C" {
         encodeStats: *mut NV_ENC_STAT,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Get encoded sequence and picture header."]
     #[doc = ""]
     #[doc = " This function can be used to retrieve the sequence and picture header out of"]
@@ -14825,7 +14825,7 @@ extern "C" {
         sequenceParamPayload: *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Get sequence and picture header."]
     #[doc = ""]
     #[doc = " This function can be used to retrieve the sequence and picture header out of band, even when"]
@@ -14866,7 +14866,7 @@ extern "C" {
         sequenceParamPayload: *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Register event for notification to encoding completion."]
     #[doc = ""]
     #[doc = " This function is used to register the completion event with NvEncodeAPI"]
@@ -14898,7 +14898,7 @@ extern "C" {
         eventParams: *mut NV_ENC_EVENT_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Unregister completion event."]
     #[doc = ""]
     #[doc = " This function is used to unregister completion event which has been previously"]
@@ -14927,7 +14927,7 @@ extern "C" {
         eventParams: *mut NV_ENC_EVENT_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Map an externally created input resource pointer for encoding."]
     #[doc = ""]
     #[doc = " Maps an externally allocated input resource [using and returns a NV_ENC_INPUT_PTR"]
@@ -14966,7 +14966,7 @@ extern "C" {
         mapInputResParams: *mut NV_ENC_MAP_INPUT_RESOURCE,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief  UnMaps a NV_ENC_INPUT_PTR  which was mapped for encoding"]
     #[doc = ""]
     #[doc = ""]
@@ -15001,7 +15001,7 @@ extern "C" {
         mappedInputBuffer: NV_ENC_INPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Destroy Encoding Session"]
     #[doc = ""]
     #[doc = " Destroys the encoder session previously created using ::NvEncOpenEncodeSession()"]
@@ -15029,7 +15029,7 @@ extern "C" {
     #[doc = ""]
     pub fn NvEncDestroyEncoder(encoder: *mut ::std::os::raw::c_void) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Invalidate reference frames"]
     #[doc = ""]
     #[doc = " Invalidates reference frame based on the time stamp provided by the client."]
@@ -15063,7 +15063,7 @@ extern "C" {
         invalidRefFrameTimeStamp: u64,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Opens an encoding session."]
     #[doc = ""]
     #[doc = " Opens an encoding session and returns a pointer to the encoder interface in"]
@@ -15094,7 +15094,7 @@ extern "C" {
         encoder: *mut *mut ::std::os::raw::c_void,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Registers a resource with the Nvidia Video Encoder Interface."]
     #[doc = ""]
     #[doc = " Registers a resource with the Nvidia Video Encoder Interface for book keeping."]
@@ -15125,7 +15125,7 @@ extern "C" {
         registerResParams: *mut NV_ENC_REGISTER_RESOURCE,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Unregisters a resource previously registered with the Nvidia Video Encoder Interface."]
     #[doc = ""]
     #[doc = " Unregisters a resource previously registered with the Nvidia Video Encoder Interface."]
@@ -15157,7 +15157,7 @@ extern "C" {
         registeredResource: NV_ENC_REGISTERED_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Reconfigure an existing encoding session."]
     #[doc = ""]
     #[doc = " Reconfigure an existing encoding session."]
@@ -15192,7 +15192,7 @@ extern "C" {
         reInitEncodeParams: *mut NV_ENC_RECONFIGURE_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Allocates output MV buffer for ME only mode."]
     #[doc = ""]
     #[doc = " This function is used to allocate an output MV buffer. The size of the mvBuffer is"]
@@ -15222,7 +15222,7 @@ extern "C" {
         createMVBufferParams: *mut NV_ENC_CREATE_MV_BUFFER,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Release an output MV buffer for ME only mode."]
     #[doc = ""]
     #[doc = " This function is used to release the output MV buffer allocated using"]
@@ -15250,7 +15250,7 @@ extern "C" {
         mvBuffer: NV_ENC_OUTPUT_PTR,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Submit an input picture and reference frame for motion estimation in ME only mode."]
     #[doc = ""]
     #[doc = " This function is used to submit the input frame and reference frame for motion"]
@@ -15281,7 +15281,7 @@ extern "C" {
         meOnlyParams: *mut NV_ENC_MEONLY_PARAMS,
     ) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Get the largest NvEncodeAPI version supported by the driver."]
     #[doc = ""]
     #[doc = " This function can be used by clients to determine if the driver supports"]
@@ -15297,7 +15297,7 @@ extern "C" {
     #[doc = " ::NV_ENC_ERR_INVALID_PTR \\n"]
     pub fn NvEncodeAPIGetMaxSupportedVersion(version: *mut u32) -> NVENCSTATUS;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Get the description of the last error reported by the API."]
     #[doc = ""]
     #[doc = " This function returns a null-terminated string that can be used by clients to better understand the reason"]
@@ -15312,7 +15312,7 @@ extern "C" {
         encoder: *mut ::std::os::raw::c_void,
     ) -> *const ::std::os::raw::c_char;
 }
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\brief Submit an input picture for lookahead."]
     #[doc = ""]
     #[doc = " This function can be used by clients to submit input frame for lookahead. Client could call this function"]
@@ -16327,7 +16327,7 @@ impl Default for _NV_ENCODE_API_FUNCTION_LIST {
 #[doc = " \\ingroup ENCODER_STRUCTURE"]
 #[doc = " NV_ENCODE_API_FUNCTION_LIST"]
 pub type NV_ENCODE_API_FUNCTION_LIST = _NV_ENCODE_API_FUNCTION_LIST;
-extern "C" {
+unsafe extern "C" {
     #[doc = " \\ingroup ENCODE_FUNC"]
     #[doc = " Entry Point to the NvEncodeAPI interface."]
     #[doc = ""]

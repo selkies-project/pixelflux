@@ -72,7 +72,7 @@ const SLOTS: usize = 2;
 
 /// A frame the compositor finished blitting, ready for the encoder.
 pub struct HostFrame {
-    gen: u64,
+    generation: u64,
     slot: usize,
     /// GPU path: the filled dmabuf (Arc-backed; the buffer itself stays owned by
     /// the capture thread and is reused once the slot is released).
@@ -150,9 +150,9 @@ struct LayoutSlot {
 
 enum ToHost {
     Start { width: i32, height: i32 },
-    /// Slot return; `gen` guards against slots recycled by a renegotiation
+    /// Slot return; `generation` guards against slots recycled by a renegotiation
     /// while the consumer still held the frame.
-    Release { gen: u64, slot: usize },
+    Release { generation: u64, slot: usize },
     /// Park the capture (display stopped) without ending the thread.
     Idle,
 }
@@ -703,7 +703,7 @@ impl HostSession {
         self.layout.lock().unwrap().entry(display_id).or_default().active = false;
         self.outputs[idx].send(ToHost::Idle);
         if let Some(old) = self.outputs[idx].retained.lock().unwrap().take() {
-            self.outputs[idx].send(ToHost::Release { gen: old.gen, slot: old.slot });
+            self.outputs[idx].send(ToHost::Release { generation: old.generation, slot: old.slot });
         }
     }
 
@@ -718,7 +718,7 @@ impl HostSession {
         let mut newest: Option<HostFrame> = None;
         while let Ok(frame) = handle.frames.try_recv() {
             if let Some(stale) = newest.replace(frame) {
-                handle.send(ToHost::Release { gen: stale.gen, slot: stale.slot });
+                handle.send(ToHost::Release { generation: stale.generation, slot: stale.slot });
             }
         }
         newest
@@ -733,7 +733,7 @@ impl HostSession {
         };
         let old = handle.retained.lock().unwrap().replace(frame);
         if let Some(old) = old {
-            handle.send(ToHost::Release { gen: old.gen, slot: old.slot });
+            handle.send(ToHost::Release { generation: old.generation, slot: old.slot });
         }
     }
 
@@ -1099,7 +1099,7 @@ fn capture_loop(
 
     let mut slots: Vec<Option<SlotBuffer>> = (0..SLOTS).map(|_| None).collect();
     let mut free: Vec<usize> = (0..SLOTS).collect();
-    let mut gen: u64 = 0;
+    let mut generation: u64 = 0;
     let mut announced: Option<(i32, i32)> = None;
     let mut warned_mismatch = false;
     let mut consecutive_failures = 0u32;
@@ -1122,8 +1122,8 @@ fn capture_loop(
                 }
             };
             match msg {
-                ToHost::Release { gen: g, slot } => {
-                    if g == gen {
+                ToHost::Release { generation: g, slot } => {
+                    if g == generation {
                         free.push(slot);
                     }
                 }
@@ -1150,7 +1150,7 @@ fn capture_loop(
                 s.buffer_done || s.failed
             })? {
                 Pump::Done => break,
-                Pump::Control => match drain_ctl(&from_main, gen, &mut free, &mut want) {
+                Pump::Control => match drain_ctl(&from_main, generation, &mut free, &mut want) {
                     Ctl::None => {}
                     Ctl::Renegotiate | Ctl::Idle => {
                         frame.destroy();
@@ -1201,7 +1201,7 @@ fn capture_loop(
                 *s = None;
             }
             free = (0..SLOTS).collect();
-            gen += 1;
+            generation += 1;
         }
         if (fw, fh) != (want_w, want_h) {
             // The encoder is configured for (want_w, want_h): hold frames until
@@ -1292,7 +1292,7 @@ fn capture_loop(
         loop {
             match pump_until(&conn, &mut queue, &mut state, wake, None, |s| s.ready || s.failed)? {
                 Pump::Done => break,
-                Pump::Control => match drain_ctl(&from_main, gen, &mut free, &mut want) {
+                Pump::Control => match drain_ctl(&from_main, generation, &mut free, &mut want) {
                     Ctl::None => {}
                     Ctl::Renegotiate | Ctl::Idle => {
                         aborted = true;
@@ -1332,7 +1332,7 @@ fn capture_loop(
         let damage = std::mem::take(&mut state.damage);
         let out = match slots[slot_idx].as_ref().unwrap() {
             SlotBuffer::Gpu { dmabuf, .. } => HostFrame {
-                gen,
+                generation,
                 slot: slot_idx,
                 dmabuf: Some(dmabuf.clone()),
                 cpu: None,
@@ -1341,7 +1341,7 @@ fn capture_loop(
                 damage,
             },
             SlotBuffer::Cpu { map, stride, format, .. } => HostFrame {
-                gen,
+                generation,
                 slot: slot_idx,
                 dmabuf: None,
                 cpu: Some(HostCpuFrame {
@@ -1364,15 +1364,15 @@ fn capture_loop(
 /// (generation-checked), and the newest Start/Idle decides the wait's fate.
 fn drain_ctl(
     rx: &Receiver<ToHost>,
-    gen: u64,
+    generation: u64,
     free: &mut Vec<usize>,
     want: &mut Option<(i32, i32)>,
 ) -> Ctl {
     let mut out = Ctl::None;
     loop {
         match rx.try_recv() {
-            Ok(ToHost::Release { gen: g, slot }) => {
-                if g == gen {
+            Ok(ToHost::Release { generation: g, slot }) => {
+                if g == generation {
                     free.push(slot);
                 }
             }

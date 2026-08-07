@@ -37,8 +37,8 @@ else:
 
 setup(
     name="pixelflux",
-    version="2.0.0",
-    author="Linuxserver.io",
+    version="2.1.0",
+    author="Selkies Project",
     author_email="pypi@linuxserver.io",
     description="A performant web native pixel delivery pipeline for diverse sources, blending VNC-inspired parallel processing of pixel buffers with flexible modern encoding formats.",
     long_description=long_description,

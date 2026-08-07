@@ -2,7 +2,7 @@
 name = "nvcodec-sys"
 description = "FFI bindings for the NVIDIA Video Codec SDK (NVENC) and the CUDA driver subset used by pixelflux. Generated from the bundled NVIDIA SDK headers in headers/ (NVENCAPI 13.0, from FFmpeg/nv-codec-headers sdk/13.0) and committed under src/bindgen/, so normal builds need no libclang. The NVIDIA headers retain their own license."
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 build = "build.rs"
 publish = false

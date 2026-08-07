@@ -121,12 +121,11 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for DcState {
             zwlr_data_control_device_v1::Event::Selection { id } => {
                 // Replaced offers are dead objects; drop their proxy and mimes so
                 // a long-lived watch connection doesn't accumulate them.
-                if let Some(old) = state.selection.take() {
-                    if id.as_ref().map(|o| o.id()) != Some(old.id()) {
+                if let Some(old) = state.selection.take()
+                    && id.as_ref().map(|o| o.id()) != Some(old.id()) {
                         state.offer_mimes.remove(&old.id());
                         old.destroy();
                     }
-                }
                 state.selection = id;
                 state.selection_changed = true;
             }
@@ -340,11 +339,10 @@ pub(crate) fn unwatch_all() {
 /// Stop the watch on `socket_path` (no-op when none is running).
 pub(crate) fn unwatch(socket_path: &str) {
     let mut reg = WATCHERS.lock().unwrap();
-    if let Some(map) = reg.as_mut() {
-        if let Some(handle) = map.remove(socket_path) {
+    if let Some(map) = reg.as_mut()
+        && let Some(handle) = map.remove(socket_path) {
             handle.stop.store(true, Ordering::Relaxed);
         }
-    }
 }
 
 fn watch_loop(socket_path: &str, callback: Py<PyAny>, stop: &AtomicBool) -> Result<(), String> {

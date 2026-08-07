@@ -15,6 +15,11 @@
 //! planar upload. Sessions reconfigure resolution and rate control in place, so a resize or
 //! bitrate change costs a few milliseconds instead of a full rebuild.
 
+// The NVENC and CUDA entry points are called through function pointers
+// resolved at runtime, so the safety contract is carried by the function
+// signatures rather than by a block around each call.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 
@@ -331,14 +336,13 @@ fn nvenc_negotiate(lib: &NvencLibrary) {
         }
         if let Ok(cap) = std::env::var("PIXELFLUX_NVENC_MAX_API") {
             let mut it = cap.split('.');
-            if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                if let (Ok(cm), Ok(cn)) = (a.parse::<u32>(), b.parse::<u32>()) {
+            if let (Some(a), Some(b)) = (it.next(), it.next())
+                && let (Ok(cm), Ok(cn)) = (a.parse::<u32>(), b.parse::<u32>()) {
                     let capv = (cm << 4) | (cn & 0xF);
                     if capv != 0 && (drv_max == 0 || capv < drv_max) {
                         drv_max = capv;
                     }
                 }
-            }
         }
         let candidates = [pinned, (12, 1), (12, 0), (11, 1), (11, 0), (10, 0)];
         for (maj, min) in candidates {
@@ -697,13 +701,11 @@ impl NvencEncoder {
     /// device symlink, so CUDA can bind to the same physical GPU the capture render node lives on.
     fn get_pci_bus_id(render_index: i32) -> Option<String> {
         let path = format!("/sys/class/drm/renderD{}/device", 128 + render_index);
-        if let Ok(target) = std::fs::read_link(&path) {
-            if let Some(name) = target.file_name() {
-                if let Some(name_str) = name.to_str() {
+        if let Ok(target) = std::fs::read_link(&path)
+            && let Some(name) = target.file_name()
+            && let Some(name_str) = name.to_str() {
                     return Some(name_str.to_string());
                 }
-            }
-        }
         None
     }
 

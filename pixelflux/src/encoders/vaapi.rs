@@ -12,6 +12,12 @@
 //! in BT.709 limited range on the GPU before encode, so no colorspace conversion
 //! happens on the CPU.
 
+// Every operation in these functions is an FFmpeg or VA-API call, or a
+// dereference of a pointer one handed back. Marking each individually would
+// put an `unsafe` block inside nearly every expression while isolating
+// nothing, so the safety contract is carried by the function signatures.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem;
 use std::os::fd::AsRawFd;

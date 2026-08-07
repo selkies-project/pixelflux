@@ -224,11 +224,10 @@ impl KeymapPolicy {
         if sym == 0 {
             return (0, 0);
         }
-        if let Some(&(kc, level)) = self.base_map.get(&sym) {
-            if !plain_only || level == 0 {
+        if let Some(&(kc, level)) = self.base_map.get(&sym)
+            && (!plain_only || level == 0) {
                 return (kc, level);
             }
-        }
         if let Some(&slot) = self.by_sym.get(&sym) {
             if let Some(at) = self.lru.iter().position(|&s| s == slot) {
                 self.lru.remove(at);

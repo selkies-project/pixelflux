@@ -417,14 +417,13 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
     if opts.path.is_empty() {
         return Err("recording path is empty".to_string());
     }
-    if let Some(cap) = &opts.capture {
-        if cap.output_mode != 1 {
+    if let Some(cap) = &opts.capture
+        && cap.output_mode != 1 {
             return Err(
                 "recording requires H.264 capture settings (output_mode=1); JPEG cannot be recorded"
                     .to_string(),
             );
         }
-    }
 
     let wl_tx = crate::computer_use::wayland_command_sender();
     let backend = match opts.backend {
@@ -623,8 +622,8 @@ pub fn stop() -> Result<RecordingStatus, String> {
             // A streaming client that reconfigured this display now owns it; the capture
             // must survive the recorder's exit.
             let client_owns = crate::wayland_owners().lock().unwrap().contains_key(&display_id);
-            if !client_owns {
-                if let Some(tx) = crate::computer_use::wayland_command_sender() {
+            if !client_owns
+                && let Some(tx) = crate::computer_use::wayland_command_sender() {
                     let _ = tx.send(ThreadCommand::StopCapture { display_id });
                     // The next start classifies attached-vs-own against wayland_alive:
                     // wait for the compositor to drain the stop, or an immediate restart
@@ -634,7 +633,6 @@ pub fn stop() -> Result<RecordingStatus, String> {
                         let _ = ack_rx.recv_timeout(Duration::from_secs(2));
                     }
                 }
-            }
         }
         RecordingMode::WaylandAttached => {}
     }

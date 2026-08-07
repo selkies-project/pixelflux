@@ -24,6 +24,11 @@
 //! correct) and whenever the container can see every host GPU, the strict-subset rule downstream
 //! makes the whole filter a no-op.
 
+// Walking the ELF tables and repointing GOT slots is raw-pointer work from
+// end to end, so the safety contract is carried by the function signatures
+// rather than by a block around each dereference.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use libc::{c_char, c_int, c_long, c_ulong, c_void};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -226,11 +231,10 @@ fn gpuid_to_minor(gpu_id: u32) -> i32 {
         let info = format!("/proc/driver/nvidia/gpus/{}/information", name);
         if let Ok(text) = std::fs::read_to_string(&info) {
             for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("Device Minor:") {
-                    if let Ok(m) = rest.trim().parse::<i32>() {
+                if let Some(rest) = line.strip_prefix("Device Minor:")
+                    && let Ok(m) = rest.trim().parse::<i32>() {
                         return m;
                     }
-                }
             }
         }
         break;
@@ -385,8 +389,8 @@ fn page_prot(addr: usize) -> i32 {
         let mut rr = range.split('-');
         let lo = rr.next().and_then(|s| usize::from_str_radix(s, 16).ok());
         let hi = rr.next().and_then(|s| usize::from_str_radix(s, 16).ok());
-        if let (Some(lo), Some(hi)) = (lo, hi) {
-            if addr >= lo && addr < hi {
+        if let (Some(lo), Some(hi)) = (lo, hi)
+            && addr >= lo && addr < hi {
                 let b = perms.as_bytes();
                 let mut prot = 0;
                 if b.first() == Some(&b'r') {
@@ -400,7 +404,6 @@ fn page_prot(addr: usize) -> i32 {
                 }
                 return prot;
             }
-        }
     }
     -1
 }

@@ -645,16 +645,15 @@ impl CompositorHandler for AppState {
             }
         }
 
-        if let Some(CursorImageStatus::Surface(ref cursor_surface)) = self.current_cursor_icon {
-            if cursor_surface == surface {
+        if let Some(CursorImageStatus::Surface(ref cursor_surface)) = self.current_cursor_icon
+            && cursor_surface == surface {
                 let status = CursorImageStatus::Surface(surface.clone());
                 self.send_cursor_image(&status);
             }
-        }
 
-        if let Some(handle) = with_states(surface, |states| states.data_map.get::<ForeignToplevelHandle>().cloned()) {
-             if let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(surface)) {
-                 if let Some(_toplevel) = window.toplevel() {
+        if let Some(handle) = with_states(surface, |states| states.data_map.get::<ForeignToplevelHandle>().cloned())
+             && let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(surface))
+                 && let Some(_toplevel) = window.toplevel() {
                      let (title, app_id) = with_states(surface, |states| {
                         let attributes = states.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap();
                         (attributes.title.clone(), attributes.app_id.clone())
@@ -664,8 +663,6 @@ impl CompositorHandler for AppState {
                      handle.send_app_id(&app_id.unwrap_or_default());
                      handle.send_done();
                  }
-             }
-        }
 
         let mapped = self
             .space
@@ -961,11 +958,10 @@ impl AppState {
         }
         self.space.map_element(window.clone(), pos, true);
         if let Some(surface) = window.wl_surface() {
-            if let Some(old) = old_output {
-                if old_id != id {
+            if let Some(old) = old_output
+                && old_id != id {
                     old.leave(&surface);
                 }
-            }
             new_output.enter(&surface);
             let scale = new_output.current_scale().fractional_scale();
             with_states(&surface, |states| {
@@ -1100,7 +1096,7 @@ impl AppState {
                 self.cursor_buffer = None;
                 CursorJob::Hide
             }
-            CursorImageStatus::Surface(ref surface) => {
+            CursorImageStatus::Surface(surface) => {
                 let mut hot_x = 0;
                 let mut hot_y = 0;
                 let mut is_cursor_role = false;
@@ -1109,12 +1105,11 @@ impl AppState {
                     if states.role == Some("cursor_image") {
                         is_cursor_role = true;
                     }
-                    if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>() {
-                        if let Ok(guard) = attributes.lock() {
+                    if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>()
+                        && let Ok(guard) = attributes.lock() {
                             hot_x = guard.hotspot.x;
                             hot_y = guard.hotspot.y;
                         }
-                    }
                 });
 
                 if !is_cursor_role {
@@ -1128,14 +1123,12 @@ impl AppState {
                         return Some(b.clone());
                     }
 
-                    if let Some(mutex) = states.data_map.get::<Mutex<RendererSurfaceState>>() {
-                        if let Ok(renderer_state) = mutex.try_lock() {
-                            if let Some(b) = renderer_state.buffer() {
+                    if let Some(mutex) = states.data_map.get::<Mutex<RendererSurfaceState>>()
+                        && let Ok(renderer_state) = mutex.try_lock()
+                            && let Some(b) = renderer_state.buffer() {
                                 let wl_buffer: &wayland_server::protocol::wl_buffer::WlBuffer = b;
                                 return Some(wl_buffer.clone());
                             }
-                        }
-                    }
                     None
                 });
 
@@ -1175,8 +1168,8 @@ impl AppState {
                     Err(BufferAccessError::NotManaged) => {
                         let mut gles_job = None;
                         let dmabuf_opt = get_dmabuf(&buffer).ok().cloned();
-                        if let Some(mut dmabuf) = dmabuf_opt {
-                            if let Some(renderer) = self.gles_renderer.as_mut() {
+                        if let Some(mut dmabuf) = dmabuf_opt
+                            && let Some(renderer) = self.gles_renderer.as_mut() {
                                 let width = dmabuf.width() as i32;
                                 let height = dmabuf.height() as i32;
 
@@ -1205,7 +1198,6 @@ impl AppState {
                                     Err(e) => eprintln!("Failed to bind dmabuf to renderer: {:?}", e),
                                 }
                             }
-                        }
                         gles_job
                     }
                     Err(_) => None,
@@ -1238,11 +1230,10 @@ impl AppState {
         if let Some(host) = &self.host {
             host.set_keymap(&text);
         }
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            if let Err(e) = keyboard.set_keymap_from_string(self, text) {
+        if let Some(keyboard) = self.seat.get_keyboard()
+            && let Err(e) = keyboard.set_keymap_from_string(self, text) {
                 eprintln!("[Wayland] keymap swap failed: {e:?}");
             }
-        }
     }
 
     /// Resolve `keysyms` to `(keycode, level)` pairs, overlay-binding whatever the base
@@ -2077,11 +2068,10 @@ impl XdgShellHandler for AppState {
         serial: Serial,
     ) {
         let kind = PopupKind::Xdg(surface);
-        if let Ok(root_surface) = smithay::desktop::find_popup_root_surface(&kind) {
-            if let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(&root_surface)).cloned() {
+        if let Ok(root_surface) = smithay::desktop::find_popup_root_surface(&kind)
+            && let Some(window) = self.space.elements().find(|w| w.wl_surface().as_deref() == Some(&root_surface)).cloned() {
                 let _ = self.popups.grab_popup(FocusTarget::Window(window), kind, &self.seat, serial);
             }
-        }
     }
     /// Re-track a popup whose position changed (e.g. a submenu flipping sides to stay
     /// on-screen) so the `PopupManager` follows its new geometry, then echo the client's reposition

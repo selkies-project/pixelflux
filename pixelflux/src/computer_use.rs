@@ -419,21 +419,19 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                 b.mouse_move(fx, fy);
                 sleep_ms(30);
             }
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     b.key(sc, true);
                     sleep_ms(20);
                 }
-            }
             b.button(btn, true);
             sleep_ms(20);
             b.button(btn, false);
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     sleep_ms(10);
                     b.key(sc, false);
                 }
-            }
             Ok(ok_json())
         }
 
@@ -444,24 +442,22 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                 b.mouse_move(fx, fy);
                 sleep_ms(30);
             }
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     b.key(sc, true);
                     sleep_ms(20);
                 }
-            }
             for _ in 0..n {
                 b.button(CuButton::Left, true);
                 sleep_ms(10);
                 b.button(CuButton::Left, false);
                 sleep_ms(10);
             }
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     sleep_ms(10);
                     b.key(sc, false);
                 }
-            }
             Ok(ok_json())
         }
 
@@ -496,8 +492,8 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
             // a virtual-keyboard client, since keys on pixelflux's own seat carry an
             // overlay keymap the inner compositor never sees. Falls through to the
             // local seat if the app socket is unreachable.
-            if b.name() == "wayland" {
-                if let Some(sock) = app_wayland_socket_path() {
+            if b.name() == "wayland"
+                && let Some(sock) = app_wayland_socket_path() {
                     // Failures log once per socket value; every request still
                     // retries, so a compositor that comes back is used again
                     // immediately (and re-arms the logging).
@@ -518,7 +514,6 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                         }
                     }
                 }
-            }
             let mut resolver = KeyResolver::new(b);
             let syms: Vec<u32> = text.chars().map(keysym_for_char).collect();
             resolver.prefetch(&syms);
@@ -668,12 +663,11 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                 b.mouse_move(fx, fy);
                 sleep_ms(30);
             }
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     b.key(sc, true);
                     sleep_ms(20);
                 }
-            }
             let (dx, dy) = match dir {
                 "up" => (0.0, -amount),
                 "down" => (0.0, amount),
@@ -683,12 +677,11 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
             };
             b.scroll(dx, dy);
             sleep_ms(30);
-            if let Some(ref mod_name) = req.text {
-                if let Some(sc) = handle_modifier(mod_name) {
+            if let Some(ref mod_name) = req.text
+                && let Some(sc) = handle_modifier(mod_name) {
                     sleep_ms(10);
                     b.key(sc, false);
                 }
-            }
             Ok(ok_json())
         }
 
@@ -717,8 +710,8 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
             let crop_w = right - left;
             let crop_h = bottom - top;
             let png = b.screenshot_png(display)?;
-            if crop_w > 0 && crop_h > 0 {
-                if let Ok(img) = image::load_from_memory(&png) {
+            if crop_w > 0 && crop_h > 0
+                && let Ok(img) = image::load_from_memory(&png) {
                     let cropped = img.crop_imm(left, top, crop_w, crop_h);
                     let mut out = Vec::new();
                     cropped.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
@@ -726,7 +719,6 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                     let b64 = BASE64.encode(&out);
                     return Ok(format!("{{\"data\":\"{}\"}}", b64));
                 }
-            }
             let b64 = BASE64.encode(&png);
             Ok(format!("{{\"data\":\"{}\"}}", b64))
         }
