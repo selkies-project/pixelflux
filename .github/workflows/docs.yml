@@ -1,14 +1,23 @@
 name: Docs
 
 on:
+  workflow_dispatch:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
-  deploy:
+  build:
+    name: Build documentation
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -40,17 +49,36 @@ jobs:
         working-directory: pixelflux
 
       - name: Prepare site
+        # rustdoc writes the crate under its own directory and leaves a build
+        # lock behind; the site root redirects into it and the lock is dropped.
         run: |
-          touch pixelflux/target/doc/.nojekyll
+          rm -f pixelflux/target/doc/.lock
           cat > pixelflux/target/doc/index.html << 'EOF'
           <!DOCTYPE html>
           <meta http-equiv="refresh" content="0; url=pixelflux/index.html">
           <a href="pixelflux/index.html">Redirecting...</a>
           EOF
 
-      - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+      - name: Upload rustdoc artifacts
+        uses: actions/upload-pages-artifact@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: pixelflux/target/doc
-          keep_files: true
+          path: pixelflux/target/doc
+          retention-days: 1
+
+  publish:
+    name: Publish documentation
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # deploy-pages resolves the artifact through the Actions API
+      actions: read
+      pages: write
+      id-token: write
+    if: ${{ github.event_name != 'pull_request' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
