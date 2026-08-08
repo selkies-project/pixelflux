@@ -7,10 +7,15 @@
 //! Hardware-accelerated H.264 encoding on VA-API through FFmpeg's `h264_vaapi`
 //! encoder. Frames reach the GPU by one of three entry points — a Wayland
 //! DRM-PRIME dmabuf (`encode_dmabuf`), a host BGRA frame from the X11 capture
-//! path (`encode_host_argb`), or already-planar NV12 pixels (`encode_raw`) — and
-//! an FFmpeg filter graph runs VA-VPP (`scale_vaapi`) to land the pixels as NV12
-//! in BT.709 limited range on the GPU before encode, so no colorspace conversion
-//! happens on the CPU.
+//! path (`encode_host_argb`), or already-planar pixels (`encode_raw`) — and an
+//! FFmpeg filter graph runs VA-VPP (`scale_vaapi`) to land the pixels on the GPU
+//! in BT.709 limited range before encode, so no colorspace conversion happens on
+//! the CPU.
+//!
+//! Chroma follows `video_fullcolor`: 4:2:0 lands as NV12, and 4:4:4 lands as
+//! whichever 4:4:4 surface format the VA driver reports. 4:4:4 is negotiated
+//! rather than assumed — see [`fullcolor_sw_format`] — and a device or FFmpeg
+//! build that cannot carry it fails construction so the caller falls back.
 
 // Every operation in these functions is an FFmpeg or VA-API call, or a
 // dereference of a pointer one handed back. Marking each individually would
@@ -42,6 +47,13 @@ const AV_DRM_MAX_PLANES: usize = 4;
 /// this long absorbs those transients. Quality *decreases*, which only ever sharpen the picture,
 /// apply at once and never wait.
 const QP_HYSTERESIS_LIMIT: u32 = 60;
+/// The 8-bit 4:4:4 surface formats FFmpeg's VA-API hardware context can carry, in the order this
+/// encoder wants them. Planar comes first: the readback path already holds planar I444, so that
+/// surface takes the buffer as it stands, while the packed variant costs a repack per frame.
+const FULLCOLOR_SW_FORMATS: [ff::AVPixelFormat; 2] = [
+    ff::AVPixelFormat::AV_PIX_FMT_YUV444P,
+    ff::AVPixelFormat::AV_PIX_FMT_VUYX,
+];
 
 /// Exists only to mirror FFmpeg's `libavutil/hwcontext_drm.h` ABI so a Wayland dmabuf can be
 /// handed to the `hwmap` filter without a copy.
@@ -116,6 +128,73 @@ unsafe extern "C" fn release_drm_frame(opaque: *mut c_void, data: *mut u8) {
     }));
 }
 
+/// An FFmpeg pixel format's canonical name, used both as a `scale_vaapi` argument and in the
+/// messages that explain a failed negotiation.
+fn pix_fmt_name(fmt: ff::AVPixelFormat) -> String {
+    unsafe {
+        let name = ff::av_get_pix_fmt_name(fmt);
+        if name.is_null() {
+            format!("{fmt:?}")
+        } else {
+            CStr::from_ptr(name).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// The 4:4:4 surface format to encode into on this VA device, or `None` when the driver carries
+/// none of them.
+///
+/// Chroma support is a property of the driver and of the FFmpeg build, not something a GPU vendor
+/// can be assumed to have, so it is asked for rather than inferred. This answers only the driver
+/// half: the format list comes from what the device reports it can carry, which is a pre-screen and
+/// not a guarantee, so the caller still has to survive `av_hwframe_ctx_init` (the driver really
+/// allocating such surfaces) and `avcodec_open2` (`h264_vaapi` really having a matching profile) on
+/// whichever format comes back. Both gates report their own failure, so a rejection says which
+/// layer refused.
+unsafe fn fullcolor_sw_format(device: *mut ff::AVBufferRef) -> Option<ff::AVPixelFormat> {
+    let constraints = ff::av_hwdevice_get_hwframe_constraints(device, ptr::null());
+    if constraints.is_null() {
+        return None;
+    }
+    let mut carried = Vec::new();
+    let mut fmt = (*constraints).valid_sw_formats;
+    if !fmt.is_null() {
+        while *fmt != ff::AVPixelFormat::AV_PIX_FMT_NONE {
+            carried.push(*fmt);
+            fmt = fmt.add(1);
+        }
+    }
+    let mut owned = constraints;
+    ff::av_hwframe_constraints_free(&mut owned);
+    preferred_fullcolor_format(&carried)
+}
+
+/// This encoder's pick out of the formats a device reports it carries, honouring the preference
+/// order in `FULLCOLOR_SW_FORMATS`.
+fn preferred_fullcolor_format(carried: &[ff::AVPixelFormat]) -> Option<ff::AVPixelFormat> {
+    FULLCOLOR_SW_FORMATS
+        .into_iter()
+        .find(|wanted| carried.contains(wanted))
+}
+
+/// Repack planar I444 as packed VUYX, for a driver whose only 4:4:4 surface is the packed one.
+///
+/// `planar` holds `plane` bytes of Y, then U, then V; the destination takes four bytes per pixel in
+/// V, U, Y, X order. The fourth byte is undefined in this format and is written opaque, which is
+/// what FFmpeg's own conversion emits and what a driver reading the surface as XYUV expects.
+/// `packed` is the caller's reused scratch buffer so a steady stream allocates nothing.
+fn pack_i444_as_vuyx(planar: &[u8], packed: &mut Vec<u8>, plane: usize) {
+    packed.resize(plane * 4, 0);
+    let (y, chroma) = planar.split_at(plane);
+    let (u, v) = chroma.split_at(plane);
+    for (i, px) in packed.chunks_exact_mut(4).enumerate() {
+        px[0] = v[i];
+        px[1] = u[i];
+        px[2] = y[i];
+        px[3] = 0xFF;
+    }
+}
+
 /// Format an FFmpeg error code as its human-readable string via `av_strerror`.
 fn ff_err_str(err: i32) -> String {
     unsafe {
@@ -128,19 +207,23 @@ fn ff_err_str(err: i32) -> String {
 }
 
 /// Hardware-accelerated H.264 encoder built on FFmpeg's `h264_vaapi`, owning the whole
-/// VA-API pipeline for one capture: device contexts, the NV12 surface pool, the color-convert
+/// VA-API pipeline for one capture: device contexts, the surface pool, the color-convert
 /// filter graph, the reusable frames/packet, and live rate-control state.
 ///
 /// The pointer members are raw FFmpeg objects freed in `Drop`. Three groups matter:
 ///
 /// 1. **Device / frames contexts**: `drm_device_ctx` → derived `hw_device_ctx`; `drm_frames_ctx`
-///    describes the incoming DMA-BUF, `enc_frames_ctx` the NV12 VA-surface pool the encoder draws
-///    from. `enc_frames_ctx` is kept referenced so `reopen_codec` can rebuild the codec against the
-///    same pool.
+///    describes the incoming DMA-BUF, `enc_frames_ctx` the VA-surface pool the encoder draws from.
+///    `enc_frames_ctx` is kept referenced so `reopen_codec` can rebuild the codec against the same
+///    pool.
 /// 2. **Filter graph**: `buffersrc_ctx` → hwmap/hwupload + `scale_vaapi` → `buffersink_ctx`, which
-///    lands every input as GPU NV12.
+///    lands every input on a GPU surface in `sw_format`.
 /// 3. **Reusable frames**: `video_frame` feeds the graph on the dmabuf/host paths, `sw_frame` +
-///    `hw_frame` stage the direct NV12 upload in `encode_raw`, and `packet` is the shared output.
+///    `hw_frame` stage the direct planar upload in `encode_raw`, and `packet` is the shared output.
+///
+/// `sw_format` is the surface format the session negotiated — NV12 for 4:2:0, or the 4:4:4 format
+/// the driver offered — and every path keys its plane layout off it; `packed_444` is the reused
+/// repack scratch for a driver whose only 4:4:4 surface is packed.
 ///
 /// `current_qp` / `qp_hysteresis_counter` drive the CQP hysteresis in `update_qp`. `cbr_mode`,
 /// `current_bitrate_kbps`, `current_vbv_mult`, and `current_kf_s` cache the live rate-control state
@@ -172,6 +255,9 @@ pub struct VaapiEncoder {
     width: i32,
     height: i32,
     fps: i32,
+
+    sw_format: ff::AVPixelFormat,
+    packed_444: Vec<u8>,
 
     current_qp: u32,
     qp_hysteresis_counter: u32,
@@ -244,7 +330,7 @@ impl VaapiEncoder {
 
     /// Build a VA-API encoder for the X11 **host-ARGB** path — the source is a CPU BGRA frame
     /// that the filter graph `hwupload`s onto a VA surface. Thin wrapper over `new_impl` with
-    /// `host_input = true`; the GPU still does the ARGB→NV12 convert, so there is no CPU colorspace
+    /// `host_input = true`; the GPU still does the ARGB→YUV convert, so there is no CPU colorspace
     /// conversion.
     pub fn new_host(
         settings: &RustCaptureSettings,
@@ -266,20 +352,22 @@ impl VaapiEncoder {
     ///    or `renderD128` when no index is set) and derive a VA-API device from it.
     /// 2. **Frames contexts**: a DRM-PRIME frames context (sw-format BGRA) describes the incoming
     ///    Wayland dmabufs; the encoder frames context is a pool of `initial_pool_size = 20` VA-API
-    ///    surfaces in NV12 at macroblock-aligned dimensions (width→16, height→32). A second ref to
-    ///    the encoder pool is saved so `reopen_codec` can rebuild the codec against it.
+    ///    surfaces at macroblock-aligned dimensions (width→16, height→32), in NV12 or — when
+    ///    `video_fullcolor` asks for 4:4:4 and `fullcolor_sw_format` finds one the driver carries —
+    ///    that 4:4:4 format. A second ref to the encoder pool is saved so `reopen_codec` can rebuild
+    ///    the codec against it.
     /// 3. **Codec context**: `h264_vaapi` with an effectively **infinite GOP** (`gop_size = INT_MAX`,
     ///    IDRs only on demand), **no B-frames** (low latency), **4 slices** (lets client decoders
     ///    parallelize; more than 4 upsets Chromium), and `compression_level = 6` (the VA quality
     ///    knob, biased toward speed — higher is faster). Rate control is either **CBR** (program
     ///    `bit_rate`/`rc_max_rate` and a `vbv_bits`-derived `rc_buffer_size`, `rc_mode=CBR`) or
-    ///    **CQP** (`rc_mode=CQP` plus a fixed `qp`); both then pin `profile=high`, `level=4.1`,
-    ///    `async_depth=1`.
+    ///    **CQP** (`rc_mode=CQP` plus a fixed `qp`); both then pin the minimum `level` and
+    ///    `async_depth=1`, and a 4:2:0 session also pins `profile=high`.
     /// 4. **Filter graph**: an explicit `buffersrc` → `hwmap`/`hwupload` + `scale_vaapi` →
     ///    `buffersink` chain. The buffersrc format is DRM-PRIME (carrying the DRM frames context) for
-    ///    dmabuf input, or plain BGRA for host input. `scale_vaapi` does the ARGB→NV12 convert on the
+    ///    dmabuf input, or plain BGRA for host input. `scale_vaapi` does the ARGB→YUV convert on the
     ///    GPU in **BT.709 limited range** (`out_range=tv`) so VA-API output matches the NVENC/x264
-    ///    4:2:0 color — an explicit convert is used rather than trusting encoder-side RGB CSC, which
+    ///    color — an explicit convert is used rather than trusting encoder-side RGB CSC, which
     ///    varies across VA drivers.
     /// 5. **Graph staging**: the chain is built with the segment API (parse → create filters →
     ///    attach the VA device to every filter → apply → link our endpoints to the dangling pads)
@@ -288,7 +376,7 @@ impl VaapiEncoder {
     ///    derive one from; staging mirrors what the ffmpeg CLI does so the device is attached before
     ///    those filters init.
     /// 6. **Preflight**: allocate the reusable `video_frame`/`sw_frame`/`hw_frame` and pull one
-    ///    buffer from the encoder pool to prove the NV12 surface path is live before returning.
+    ///    buffer from the encoder pool to prove the surface path is live before returning.
     ///
     /// Every failure step unwinds by unref-ing exactly the contexts allocated so far, in reverse
     /// order, so no FFmpeg object leaks on the error path.
@@ -338,6 +426,22 @@ impl VaapiEncoder {
                 ));
             }
 
+            let enc_sw_format = if settings.video_fullcolor {
+                match fullcolor_sw_format(hw_device_ctx) {
+                    Some(fmt) => fmt,
+                    None => {
+                        ff::av_buffer_unref(&mut hw_device_ctx);
+                        ff::av_buffer_unref(&mut drm_device_ctx);
+                        return Err(
+                            "4:4:4 requested but this VA-API driver carries no 4:4:4 surface format"
+                                .into(),
+                        );
+                    }
+                }
+            } else {
+                ff::AVPixelFormat::AV_PIX_FMT_NV12
+            };
+
             let mut drm_frames_ref = ff::av_hwframe_ctx_alloc(drm_device_ctx);
             if drm_frames_ref.is_null() {
                 ff::av_buffer_unref(&mut hw_device_ctx);
@@ -380,7 +484,7 @@ impl VaapiEncoder {
             }
             let enc_frames = (*enc_frames_ref).data as *mut ff::AVHWFramesContext;
             (*enc_frames).format = ff::AVPixelFormat::AV_PIX_FMT_VAAPI;
-            (*enc_frames).sw_format = ff::AVPixelFormat::AV_PIX_FMT_NV12;
+            (*enc_frames).sw_format = enc_sw_format;
             (*enc_frames).width = aligned_width;
             (*enc_frames).height = aligned_height;
             (*enc_frames).initial_pool_size = 20;
@@ -390,7 +494,10 @@ impl VaapiEncoder {
                 ff::av_buffer_unref(&mut drm_frames_ref);
                 ff::av_buffer_unref(&mut hw_device_ctx);
                 ff::av_buffer_unref(&mut drm_device_ctx);
-                return Err("Failed to init encoder frames ctx".into());
+                return Err(format!(
+                    "Failed to init encoder frames ctx: this VA-API driver allocates no {} surfaces",
+                    pix_fmt_name(enc_sw_format)
+                ));
             }
 
             let mut saved_enc_frames_ctx = ff::av_buffer_ref(enc_frames_ref);
@@ -442,7 +549,12 @@ impl VaapiEncoder {
                 set_opt(&mut opts, "qp", &settings.video_crf.to_string());
             }
             set_opt(&mut opts, "async_depth", "1");
-            set_opt(&mut opts, "profile", "high");
+            // Naming a profile is what pins 4:2:0 to High. A 4:4:4 session leaves it unset so
+            // FFmpeg matches a profile against the surface format instead, which is the one place
+            // a build whose h264_vaapi gains a 4:4:4 entry starts using it without a code change.
+            if enc_sw_format == ff::AVPixelFormat::AV_PIX_FMT_NV12 {
+                set_opt(&mut opts, "profile", "high");
+            }
             set_opt(
                 &mut opts,
                 "level",
@@ -457,6 +569,14 @@ impl VaapiEncoder {
                 ff::av_buffer_unref(&mut drm_frames_ref);
                 ff::av_buffer_unref(&mut hw_device_ctx);
                 ff::av_buffer_unref(&mut drm_device_ctx);
+                if enc_sw_format != ff::AVPixelFormat::AV_PIX_FMT_NV12 {
+                    return Err(format!(
+                        "Failed to open encoder for 4:4:4 ({}): {}. This FFmpeg build's h264_vaapi \
+                         advertises no 4:4:4 profile.",
+                        pix_fmt_name(enc_sw_format),
+                        ff_err_str(ret)
+                    ));
+                }
                 return Err(format!("Failed to open encoder: {}", ff_err_str(ret)));
             }
 
@@ -544,8 +664,11 @@ impl VaapiEncoder {
 
             let stage = if host_input { "hwupload" } else { "hwmap" };
             let filters_desc = CString::new(format!(
-                "{},scale_vaapi=w={}:h={}:format=nv12:out_color_matrix=bt709:out_range=tv",
-                stage, width, height
+                "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt709:out_range=tv",
+                stage,
+                width,
+                height,
+                pix_fmt_name(enc_sw_format)
             ))
             .unwrap();
             let mut seg: *mut ff::AVFilterGraphSegment = ptr::null_mut();
@@ -619,7 +742,7 @@ impl VaapiEncoder {
                 ff::av_buffer_unref(&mut drm_frames_ref);
                 ff::av_buffer_unref(&mut hw_device_ctx);
                 ff::av_buffer_unref(&mut drm_device_ctx);
-                return Err("Failed to allocate HW frame for NV12 path".into());
+                return Err("Failed to allocate HW frame from the encoder pool".into());
             }
 
             Ok(Self {
@@ -639,6 +762,8 @@ impl VaapiEncoder {
                 width,
                 height,
                 fps,
+                sw_format: enc_sw_format,
+                packed_444: Vec::new(),
                 current_qp: settings.video_crf as u32,
                 qp_hysteresis_counter: 0,
                 cbr_mode: settings.video_cbr_mode,
@@ -648,6 +773,13 @@ impl VaapiEncoder {
                 omit_stripe_headers: settings.omit_stripe_headers,
             })
         }
+    }
+
+    /// Whether this session negotiated 4:4:4 chroma. The request alone does not settle it — the
+    /// driver and the FFmpeg build both have to carry it — so callers describing the active
+    /// colorspace ask the encoder rather than the settings.
+    pub fn is_fullcolor(&self) -> bool {
+        self.sw_format != ff::AVPixelFormat::AV_PIX_FMT_NV12
     }
 
     /// Applies every live QP / bitrate / fps change by re-opening the whole codec context,
@@ -709,7 +841,9 @@ impl VaapiEncoder {
             set_opt(&mut opts, "qp", &qp.to_string());
         }
         set_opt(&mut opts, "async_depth", "1");
-        set_opt(&mut opts, "profile", "high");
+        if !self.is_fullcolor() {
+            set_opt(&mut opts, "profile", "high");
+        }
         set_opt(
             &mut opts,
             "level",
@@ -842,7 +976,7 @@ impl VaapiEncoder {
 
     /// Encode one Wayland DRM-PRIME dmabuf by wrapping it in an FFmpeg DRM frame descriptor
     /// and pushing it through the filter graph, which `hwmap`s it to a VA surface and converts to
-    /// NV12 before encode.
+    /// the session's surface format before encode.
     ///
     /// 1. **Quantizer**: apply the requested `qp` through `update_qp` (hysteresis / CBR-aware).
     /// 2. **Descriptor**: allocate a zeroed `AVDRMFrameDescriptor` and populate it from the dmabuf —
@@ -975,7 +1109,7 @@ impl VaapiEncoder {
     /// BGRA `video_frame` and copy the host rows in (the sole copy — plain data movement to a
     /// GPU-uploadable frame, clamped to `min(width*4, stride, dst_stride)` per row, **not** a
     /// colorspace conversion); feed the graph, where `hwupload` stages it onto a VA surface and
-    /// `scale_vaapi` converts ARGB→NV12; then pull converted frames, stamp `pict_type = I` when
+    /// `scale_vaapi` converts ARGB→YUV; then pull converted frames, stamp `pict_type = I` when
     /// `force_idr`, encode, and drain packets via `collect_packet`.
     pub fn encode_host_argb(
         &mut self,
@@ -1038,19 +1172,21 @@ impl VaapiEncoder {
         }
     }
 
-    /// Encode already-planar NV12 pixels by uploading them straight to a VA surface,
-    /// bypassing the filter graph (there is no color convert to do).
+    /// Encode already-planar pixels by uploading them straight to a VA surface, bypassing the
+    /// filter graph (there is no color convert to do).
     ///
-    /// Wraps the input as an NV12 `sw_frame` — Y plane at offset 0, interleaved UV at `width*height`,
-    /// both with `linesize = width` — after checking the buffer holds the full `w*h + w*h/2` bytes.
-    /// A fresh `hw_frame` is pulled from the encoder pool (the frame is unref'd first, or the prior
-    /// surface would leak), `av_hwframe_transfer_data` copies CPU→GPU, and the `sw_frame` is released.
-    /// Keyframes are forced through `pict_type = I` (`AV_PKT_FLAG_KEY` is a *packet* flag, unusable on
-    /// a frame); otherwise `pict_type = NONE`. The GPU frame is sent to the encoder and packets are
-    /// drained via `collect_packet`.
+    /// `pixels` carries whichever layout the session negotiated: NV12 (`w*h` of Y then `w*h/2` of
+    /// interleaved UV) for a 4:2:0 session, or planar I444 (`w*h` each of Y, U, V) for a 4:4:4 one.
+    /// The `sw_frame` is pointed at those planes without copying, except on a driver whose only
+    /// 4:4:4 surface is packed, where `pack_i444_as_vuyx` stages the frame into a reused buffer
+    /// first. A fresh `hw_frame` is pulled from the encoder pool (the frame is unref'd first, or the
+    /// prior surface would leak), `av_hwframe_transfer_data` copies CPU→GPU, and the `sw_frame` is
+    /// released. Keyframes are forced through `pict_type = I` (`AV_PKT_FLAG_KEY` is a *packet* flag,
+    /// unusable on a frame); otherwise `pict_type = NONE`. The GPU frame is sent to the encoder and
+    /// packets are drained via `collect_packet`.
     pub fn encode_raw(
         &mut self,
-        nv12_pixels: &[u8],
+        pixels: &[u8],
         frame_number: u64,
         qp: u32,
         force_idr: bool,
@@ -1060,26 +1196,41 @@ impl VaapiEncoder {
 
             let width = self.width as usize;
             let height = self.height as usize;
-            let required_size = width * height + (width * height / 2);
+            let plane = width * height;
+            let required_size = if self.is_fullcolor() { plane * 3 } else { plane + plane / 2 };
 
-            if nv12_pixels.len() < required_size {
+            if pixels.len() < required_size {
                 return Err("Input buffer too small".into());
             }
 
             ff::av_frame_unref(self.sw_frame);
-            (*self.sw_frame).format = ff::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
+            (*self.sw_frame).format = self.sw_format as i32;
             (*self.sw_frame).width = self.width;
             (*self.sw_frame).height = self.height;
 
-            (*self.sw_frame).data[0] = nv12_pixels.as_ptr() as *mut u8;
-            (*self.sw_frame).linesize[0] = self.width;
-
-            (*self.sw_frame).data[1] = nv12_pixels.as_ptr().add(width * height) as *mut u8;
-            (*self.sw_frame).linesize[1] = self.width;
+            match self.sw_format {
+                ff::AVPixelFormat::AV_PIX_FMT_YUV444P => {
+                    for i in 0..3 {
+                        (*self.sw_frame).data[i] = pixels.as_ptr().add(i * plane) as *mut u8;
+                        (*self.sw_frame).linesize[i] = self.width;
+                    }
+                }
+                ff::AVPixelFormat::AV_PIX_FMT_NV12 => {
+                    (*self.sw_frame).data[0] = pixels.as_ptr() as *mut u8;
+                    (*self.sw_frame).linesize[0] = self.width;
+                    (*self.sw_frame).data[1] = pixels.as_ptr().add(plane) as *mut u8;
+                    (*self.sw_frame).linesize[1] = self.width;
+                }
+                _ => {
+                    pack_i444_as_vuyx(pixels, &mut self.packed_444, plane);
+                    (*self.sw_frame).data[0] = self.packed_444.as_mut_ptr();
+                    (*self.sw_frame).linesize[0] = self.width * 4;
+                }
+            }
 
             ff::av_frame_unref(self.hw_frame);
             if ff::av_hwframe_get_buffer((*self.encoder_ctx).hw_frames_ctx, self.hw_frame, 0) < 0 {
-                return Err("Failed to allocate HW frame for NV12 path".into());
+                return Err("Failed to allocate HW frame from the encoder pool".into());
             }
             (*self.hw_frame).width = self.width;
             (*self.hw_frame).height = self.height;
@@ -1105,6 +1256,140 @@ impl VaapiEncoder {
             self.collect_packet(frame_number, &mut output);
 
             Ok(output)
+        }
+    }
+}
+
+#[cfg(test)]
+mod fullcolor_tests {
+    use super::*;
+
+    /// Planar I444 repacks to V, U, Y per pixel with an opaque fourth byte. The byte order is
+    /// checked against FFmpeg's own yuv444p→vuyx conversion, which produces exactly these values
+    /// for this input.
+    #[test]
+    fn packs_i444_as_vuyx() {
+        let plane = 4;
+        let y: Vec<u8> = (0..plane).map(|i| (i * 3 + 1) as u8).collect();
+        let u: Vec<u8> = (0..plane).map(|i| (i * 5 + 60) as u8).collect();
+        let v: Vec<u8> = (0..plane).map(|i| (i * 7 + 130) as u8).collect();
+        let planar: Vec<u8> = y.iter().chain(&u).chain(&v).copied().collect();
+
+        let mut packed = Vec::new();
+        pack_i444_as_vuyx(&planar, &mut packed, plane);
+        assert_eq!(
+            packed,
+            vec![
+                130, 60, 1, 255, //
+                137, 65, 4, 255, //
+                144, 70, 7, 255, //
+                151, 75, 10, 255,
+            ]
+        );
+
+        // The scratch buffer is reused across frames, so a second call must fully overwrite it.
+        pack_i444_as_vuyx(&vec![0u8; plane * 3], &mut packed, plane);
+        assert_eq!(packed, [0, 0, 0, 255].repeat(plane));
+    }
+
+    /// The planar surface wins whenever a device carries it, because `encode_raw` uploads the
+    /// readback path's I444 buffer to it without a repack; the packed one is taken only when it is
+    /// the sole 4:4:4 format on offer, and a device carrying neither yields nothing.
+    #[test]
+    fn prefers_planar_fullcolor_format() {
+        use ff::AVPixelFormat::*;
+        assert_eq!(preferred_fullcolor_format(&[AV_PIX_FMT_NV12]), None);
+        assert_eq!(
+            preferred_fullcolor_format(&[AV_PIX_FMT_NV12, AV_PIX_FMT_VUYX]),
+            Some(AV_PIX_FMT_VUYX)
+        );
+        assert_eq!(
+            preferred_fullcolor_format(&[AV_PIX_FMT_VUYX, AV_PIX_FMT_YUV444P]),
+            Some(AV_PIX_FMT_YUV444P)
+        );
+    }
+
+    /// The names handed to `scale_vaapi` have to be the ones FFmpeg parses, or the filter chain
+    /// fails to build at a point that looks like a driver fault.
+    #[test]
+    fn fullcolor_formats_have_parseable_names() {
+        for fmt in FULLCOLOR_SW_FORMATS {
+            let name = pix_fmt_name(fmt);
+            let round_trip =
+                unsafe { ff::av_get_pix_fmt(CString::new(name.clone()).unwrap().as_ptr()) };
+            assert_eq!(round_trip, fmt, "{name} did not parse back");
+        }
+    }
+
+    /// Construction either stands a session up or says why it could not; a half-built encoder is
+    /// the one outcome that must never reach a caller. When a 4:4:4 request does succeed the
+    /// session really is 4:4:4, and when 4:2:0 is asked for it never quietly becomes something
+    /// else — callers size the buffer they hand `encode_raw` from that answer, so a silent
+    /// downgrade would hand the encoder planes it does not read. Runs everywhere: a host without a
+    /// VA-API device exercises the error path, one with a device exercises the agreement.
+    #[test]
+    fn negotiated_chroma_matches_what_was_asked_for() {
+        let mut settings = RustCaptureSettings {
+            width: 128,
+            height: 128,
+            output_mode: 1,
+            video_fullcolor: true,
+            ..Default::default()
+        };
+        match VaapiEncoder::new_host(&settings) {
+            Ok(enc) => assert!(enc.is_fullcolor(), "4:4:4 session reports 4:2:0"),
+            Err(e) => assert!(!e.is_empty(), "refusal must carry a reason"),
+        }
+        settings.video_fullcolor = false;
+        match VaapiEncoder::new_host(&settings) {
+            Ok(enc) => assert!(!enc.is_fullcolor(), "4:2:0 session reports 4:4:4"),
+            Err(e) => assert!(!e.is_empty(), "refusal must carry a reason"),
+        }
+    }
+
+    /// Walk a real device's reported format list rather than a fixture: VA-API is absent on CI and
+    /// on GPU hosts without a render node, but any FFmpeg hardware device answers the same
+    /// `av_hwdevice_get_hwframe_constraints` call, so CUDA stands in to prove the walk terminates
+    /// on the format-list sentinel and that the pick comes back from what the device actually
+    /// reported. Ignored by default (needs a working hardware device).
+    #[test]
+    #[ignore]
+    fn gpu_fullcolor_format_follows_device_constraints() {
+        unsafe {
+            let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
+            assert!(
+                ff::av_hwdevice_ctx_create(
+                    &mut dev,
+                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                ) >= 0,
+                "no CUDA device"
+            );
+
+            let constraints = ff::av_hwdevice_get_hwframe_constraints(dev, ptr::null());
+            assert!(!constraints.is_null());
+            let mut carried = Vec::new();
+            let mut fmt = (*constraints).valid_sw_formats;
+            while !fmt.is_null() && *fmt != ff::AVPixelFormat::AV_PIX_FMT_NONE {
+                carried.push(*fmt);
+                fmt = fmt.add(1);
+            }
+            let mut owned = constraints;
+            ff::av_hwframe_constraints_free(&mut owned);
+
+            let picked = fullcolor_sw_format(dev);
+            println!(
+                "device carries {} formats; 4:4:4 pick: {:?}",
+                carried.len(),
+                picked.map(pix_fmt_name)
+            );
+            assert_eq!(picked, preferred_fullcolor_format(&carried));
+            if let Some(fmt) = picked {
+                assert!(carried.contains(&fmt), "picked a format the device never reported");
+            }
+            ff::av_buffer_unref(&mut dev);
         }
     }
 }

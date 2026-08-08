@@ -204,18 +204,20 @@ impl X11Pipeline {
     ///
     /// # Arguments
     ///
-    /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`,
-    ///   `encode_node_index`, and `video_fullcolor` fields drive encoder selection.
+    /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`, and
+    ///   `encode_node_index` fields drive encoder selection.
     ///
     /// # Encoder selection
     ///
     /// 1. **OpenH264** — when `use_openh264` is set (explicit opt-in, full-frame software).
     /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
-    /// 3. **VA-API** — on any other GPU driver (except 4:4:4 full-color, which falls back to the
-    ///    software path).
+    /// 3. **VA-API** — on any other GPU driver. A 4:4:4 request is carried into the attempt, so a
+    ///    device that cannot encode 4:4:4 fails here and falls through rather than being ruled out
+    ///    in advance.
     /// 4. **Software** — `software_h264_encoder`: `X11Encoder::None`, meaning the striped x264
     ///    inside `encode_cpu`, in a GPL build; the full-frame OpenH264 encoder when the `gpl`
-    ///    feature is disabled.
+    ///    feature is disabled. This is also where a 4:4:4 request lands when no hardware encoder
+    ///    can carry it, since x264 can.
     pub fn new(settings: RustCaptureSettings) -> Self {
         let hw = if settings.output_mode == 1 && settings.use_openh264 {
             println!("[x11] OpenH264 software encoder selected.");
@@ -234,20 +236,18 @@ impl X11Pipeline {
                 crate::get_gpu_driver(settings.encode_node_index.max(0));
             println!("[x11] Encode Node Index: {} | Driver: {}", settings.encode_node_index.max(0), encode_driver);
             if !encode_driver.is_empty() && !encode_driver.contains("nvidia") {
-                if settings.video_fullcolor {
-                    println!("[x11] 4:4:4 full-color requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-                    software_h264_encoder(&settings)
-                } else {
-                    println!("[x11] Initializing Unified VAAPI Encoder...");
-                    match VaapiEncoder::new_host(&settings) {
-                        Ok(e) => {
-                            println!("[x11] VAAPI Encoder initialized successfully.");
-                            X11Encoder::Vaapi(e)
-                        }
-                        Err(err) => {
-                            eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
-                            software_h264_encoder(&settings)
-                        }
+                println!("[x11] Initializing Unified VAAPI Encoder...");
+                match VaapiEncoder::new_host(&settings) {
+                    Ok(e) => {
+                        println!(
+                            "[x11] VAAPI Encoder initialized successfully ({}).",
+                            if e.is_fullcolor() { "4:4:4" } else { "4:2:0" }
+                        );
+                        X11Encoder::Vaapi(e)
+                    }
+                    Err(err) => {
+                        eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
+                        software_h264_encoder(&settings)
                     }
                 }
             } else {
@@ -292,6 +292,18 @@ impl X11Pipeline {
             X11Encoder::Openh264(_) => "OpenH264",
             X11Encoder::None => "CPU",
         }
+    }
+
+    /// The `Colorspace:` field for this pipeline's stream log, describing what its encoder settled
+    /// on: VA-API only reaches 4:4:4 when the driver and FFmpeg build carry it, and OpenH264 is
+    /// 4:2:0-only whatever was asked for.
+    pub fn colorspace_desc(&self) -> &'static str {
+        let fullcolor = match &self.hw {
+            X11Encoder::Vaapi(enc) => enc.is_fullcolor(),
+            X11Encoder::Openh264(_) => false,
+            _ => self.settings.video_fullcolor,
+        };
+        crate::encoders::colorspace_desc(fullcolor, matches!(self.hw, X11Encoder::None))
     }
 
     /// Adapt the live pipeline to recreated capture surfaces without rebuilding it.
@@ -517,6 +529,33 @@ mod tests {
             assert!(!p.process(&frame, stride).is_empty(), "recovery burst frame {i} streams while static");
         }
         assert!(p.process(&frame, stride).is_empty(), "stream goes quiet again after the recovery burst");
+    }
+
+    /// The software path is the one encoder that always carries a 4:4:4 request, and carries it at
+    /// full range, so its log line says so; without the request it reports 4:2:0. This is the same
+    /// string the Wayland log builds from the same shared helper, so an identical session reads
+    /// identically on both backends.
+    #[test]
+    fn x11_colorspace_desc_reports_what_the_software_encoder_carries() {
+        for (fullcolor, expected) in
+            [(true, "I444 (Full Range)"), (false, "I420 (Limited Range)")]
+        {
+            let p = X11Pipeline::new(RustCaptureSettings {
+                width: 64,
+                height: 64,
+                output_mode: 1,
+                use_cpu: true,
+                video_fullcolor: fullcolor,
+                ..Default::default()
+            });
+            assert_eq!(p.encoder_name(), "CPU");
+            assert_eq!(p.colorspace_desc(), expected);
+            assert_eq!(
+                p.colorspace_desc(),
+                crate::encoders::colorspace_desc(fullcolor, true),
+                "X11 and Wayland must describe the same session identically"
+            );
+        }
     }
 
     fn settings() -> RustCaptureSettings {

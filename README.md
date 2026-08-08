@@ -140,7 +140,7 @@ settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripe
 settings.video_crf = 25                            # CRF value (0-51, lower is better quality/higher bitrate)
 settings.video_paintover_crf = 18                  # CRF for H.264 paintover on static content. Must be lower than video_crf to activate.
 settings.video_paintover_burst_frames = 5          # Number of high-quality frames to send in a burst when a paintover is triggered.
-settings.video_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Supported by software encoding and NVENC.
+settings.video_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Carried by software encoding and NVENC; VA-API negotiates it per device.
 settings.video_fullframe = True                    # Encode full frames (required for HW accel) instead of just changed stripes
 settings.video_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 settings.use_openh264 = False                        # Use Cisco OpenH264 (BSD-licensed) for software full-frame H.264 instead of x264 (GPL). Required for software H.264 when built with PIXELFLUX_ENABLE_GPL=0
@@ -437,7 +437,8 @@ curl -s -X POST http://localhost:5000/computer-use \
     in-process to the GPU you selected (no separate `LD_PRELOAD` shim is required). Verified on
     NVIDIA drivers 570–595.
 *   **4:4:4 (High 4:4:4):** Set `video_fullcolor = True` to encode full-chroma H.264 via NVENC
-    (`video_fullcolor` codec), in addition to the software path.
+    (`video_fullcolor` codec), in addition to the software path. See
+    [VA-API 4:4:4](#va-api-444) for how the same request is resolved on VA-API.
 *   **Force a keyframe on demand:** `capture.request_idr_frame()` forces an IDR frame, e.g. when
     a client reconnects or its decoder is reset. It routes to whichever encoder is active
     (NVENC, VA-API, or software) and is a no-op while no capture is running.
@@ -449,6 +450,25 @@ conversion in BT.709), so there is **no CUDA Toolkit / NVRTC requirement** — o
 driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. Nothing extra to
 install at build or runtime beyond the driver.
 
+## VA-API 4:4:4
+
+`video_fullcolor = True` is carried into the VA-API session rather than ruled out in advance. The
+encoder asks the device which 4:4:4 surface format it holds (planar `yuv444p` is preferred, since
+the readback path uploads its I444 buffer to that one untouched; packed `vuyx` is taken when it is
+all a driver offers), builds the surface pool and the `scale_vaapi` convert around it, and lets
+FFmpeg match a profile to that format instead of pinning `high`.
+
+Three layers can refuse, and each says so in the log line that precedes the fallback: the driver
+carrying no 4:4:4 surface format, the driver refusing to allocate one, and `h264_vaapi` having no
+profile that matches it. **On every current driver the third is what answers**: H.264 4:4:4 has no
+`VAProfile` in libva at all, so FFmpeg's `h264_vaapi` advertises only 4:2:0 profiles (plus 10-bit
+4:2:0 from libva 1.18). A refusal falls back to the software x264 path, which does carry 4:4:4 —
+the request is honoured, on the CPU, rather than silently downgraded to 4:2:0.
+
+Nothing here is pinned to that state of affairs: a driver and FFmpeg build that gain H.264 4:4:4
+start using it with no code change, and `Colorspace:` in the stream log always reports what the
+session settled on rather than what was asked for.
+
 ## Features
 
 *   **Dual Backend (one Rust extension):**
@@ -456,7 +476,7 @@ install at build or runtime beyond the driver.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
     *   **Software:** x264 (H.264, incl. 4:4:4 — GPL, toggleable) and JPEG with multi-threaded striping, plus BSD-licensed OpenH264 full-frame software H.264.
-    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct BT.709, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert) with Zero-Copy support.
+    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct BT.709, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert, per-device 4:4:4 negotiation) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**

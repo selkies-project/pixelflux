@@ -198,6 +198,18 @@ pub mod encoders {
         };
         (frame_bits * mult).round().max(1.0).min(u32::MAX as f64) as u32
     }
+
+    /// The `Colorspace:` field of a stream log line, from what the session negotiated rather than
+    /// what was asked for: a hardware encoder can refuse 4:4:4, and only the software encoder
+    /// carries it at full range. Shared so the X11 and Wayland logs describe an identical session
+    /// identically.
+    pub fn colorspace_desc(fullcolor: bool, software: bool) -> &'static str {
+        match (fullcolor, software) {
+            (true, true) => "I444 (Full Range)",
+            (true, false) => "I444 (Limited Range)",
+            _ => "I420 (Limited Range)",
+        }
+    }
 }
 
 /// Headless Wayland compositor and cursor rendering.
@@ -1203,16 +1215,15 @@ fn build_readback_encoders(
         }
     } else {
         println!("[Wayland] Initializing Unified VAAPI Encoder...");
-        if settings.video_fullcolor {
-            println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-        } else {
-            match VaapiEncoder::new(settings) {
-                Ok(e) => {
-                    println!("[Wayland] VAAPI Encoder initialized successfully.");
-                    return (Some(GpuEncoder::Vaapi(e)), None);
-                }
-                Err(e) => eprintln!("[Wayland] Failed to init VAAPI: {}. Falling back to CPU.", e),
+        match VaapiEncoder::new(settings) {
+            Ok(e) => {
+                println!(
+                    "[Wayland] VAAPI Encoder initialized successfully ({}).",
+                    if e.is_fullcolor() { "4:4:4" } else { "4:2:0" }
+                );
+                return (Some(GpuEncoder::Vaapi(e)), None);
             }
+            Err(e) => eprintln!("[Wayland] Failed to init VAAPI: {}. Falling back to CPU.", e),
         }
     }
     #[cfg(not(feature = "gpl"))]
@@ -1278,9 +1289,13 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     let height = settings.height;
     let mut stripes: Vec<StripeState> = Vec::with_capacity(MAX_STRIPE_CAPACITY);
     let mut hw_state = StripeState::default();
+    // The CSC target follows the session's own chroma, not the request: a VA-API device that
+    // refused 4:4:4 encodes 4:2:0, and sizing this from the request would hand it a buffer laid
+    // out for planes it does not read.
+    let hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
     let mut nv12_buffer: Vec<u8> = if video_encoder.is_some() {
         let n = (width * height) as usize;
-        vec![0u8; if settings.video_fullcolor { n * 3 } else { n * 3 / 2 }]
+        vec![0u8; if hw_fullcolor { n * 3 } else { n * 3 / 2 }]
     } else {
         Vec::new()
     };
@@ -1343,7 +1358,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 // chroma format, so its session declares limited, and VA-API's own
                 // convert targets tv range as well.
                 let range = YuvRange::Limited;
-                if settings.video_fullcolor {
+                if hw_fullcolor {
                     let y_size = (w * h) as usize;
                     let (y_plane, rest) = nv12_buffer.split_at_mut(y_size);
                     let (u_plane, v_plane) = rest.split_at_mut(y_size);
@@ -1477,6 +1492,17 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     video_encoder
 }
 
+/// The chroma format a session actually carries, which is not always the one requested: NVENC
+/// takes 4:4:4 whenever asked, VA-API only when the driver and FFmpeg build both carry it, and the
+/// software x264 path (`None`) always can. Every consumer of "is this stream 4:4:4" — the readback
+/// buffer sizing, the CSC branch, and both log lines — reads it from here so they cannot disagree.
+fn encoder_fullcolor(video_encoder: Option<&GpuEncoder>, settings: &RustCaptureSettings) -> bool {
+    match video_encoder {
+        Some(GpuEncoder::Vaapi(enc)) => enc.is_fullcolor(),
+        Some(GpuEncoder::Nvenc(_)) | None => settings.video_fullcolor,
+    }
+}
+
 /// Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
 /// whichever thread owns the encoders.
 fn encoder_desc(
@@ -1498,12 +1524,7 @@ fn encoder_desc(
             None => "CPU".to_string(),
         }
     };
-    let is_444 = !openh264
-        && match video_encoder {
-            Some(GpuEncoder::Nvenc(_)) => settings.video_fullcolor,
-            Some(_) => false,
-            None => settings.video_fullcolor,
-        };
+    let is_444 = !openh264 && encoder_fullcolor(video_encoder, settings);
     let cs_str = if is_444 { "CS_IN:I444" } else { "CS_IN:I420" };
     // Only the software encoder carries 4:4:4 at full range; NVENC's hardware CSC is
     // limited-range whatever the chroma format.
@@ -1601,22 +1622,11 @@ fn log_stream_settings(
             ));
         }
 
-        let is_actually_444 = if openh264 {
-            false
-        } else {
-            match video_encoder {
-                Some(GpuEncoder::Nvenc(_)) => settings.video_fullcolor,
-                Some(_) => false,
-                None => settings.video_fullcolor,
-            }
-        };
-
-        let range_str = match (is_actually_444, video_encoder.is_none()) {
-            (true, true) => "I444 (Full Range)",
-            (true, false) => "I444 (Limited Range)",
-            _ => "I420 (Limited Range)",
-        };
-        log_msg.push_str(&format!(" | Colorspace: {}", range_str));
+        let is_actually_444 = !openh264 && encoder_fullcolor(video_encoder, settings);
+        log_msg.push_str(&format!(
+            " | Colorspace: {}",
+            encoders::colorspace_desc(is_actually_444, video_encoder.is_none() && !openh264)
+        ));
     }
 
     log_msg.push_str(&format!(
@@ -1720,8 +1730,8 @@ fn bootstrap_readback_pool(
 }
 
 /// Rebuild a broken zero-copy hardware session with the startup construction (driver
-/// match, EGL display hand-over); VAAPI stays excluded under fullcolor exactly like
-/// startup. `None` means unrecoverable — the caller demotes to readback.
+/// match, EGL display hand-over, the same chroma negotiation). `None` means unrecoverable —
+/// the caller demotes to readback.
 fn rebuild_zerocopy_encoder(
     cap: &wayland::frontend::WlCapture,
     state: &mut AppState,
@@ -1737,10 +1747,8 @@ fn rebuild_zerocopy_encoder(
         NvencEncoder::new(settings, egl_display)
             .ok()
             .map(GpuEncoder::Nvenc)
-    } else if !settings.video_fullcolor {
-        VaapiEncoder::new(settings).ok().map(GpuEncoder::Vaapi)
     } else {
-        None
+        VaapiEncoder::new(settings).ok().map(GpuEncoder::Vaapi)
     }
 }
 
@@ -2006,19 +2014,18 @@ fn start_capture_on_display(
         } else {
             prior_zero_copy = None;
             println!("[Wayland] Initializing Unified VAAPI Encoder...");
-            if settings.video_fullcolor {
-                println!("[Wayland] 4:4:4 Fullcolor requested. VAAPI does not support this profile reliably. Falling back to CPU.");
-            } else {
-                match VaapiEncoder::new(&settings) {
-                    Ok(encoder) => {
-                        video_encoder = Some(GpuEncoder::Vaapi(encoder));
-                        println!("[Wayland] VAAPI Encoder initialized successfully.");
-                    }
-                    Err(e) => eprintln!(
-                        "[Wayland] Failed to init VAAPI: {}. Falling back to CPU.",
-                        e
-                    ),
+            match VaapiEncoder::new(&settings) {
+                Ok(encoder) => {
+                    println!(
+                        "[Wayland] VAAPI Encoder initialized successfully ({}).",
+                        if encoder.is_fullcolor() { "4:4:4" } else { "4:2:0" }
+                    );
+                    video_encoder = Some(GpuEncoder::Vaapi(encoder));
                 }
+                Err(e) => eprintln!(
+                    "[Wayland] Failed to init VAAPI: {}. Falling back to CPU.",
+                    e
+                ),
             }
         }
     }

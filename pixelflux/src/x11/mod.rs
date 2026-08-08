@@ -678,11 +678,7 @@ where
                                 log_msg.push_str(&format!(" | VBV: {} kbps", psettings.video_bitrate_kbps));
                             }
                         }
-                        if psettings.video_fullcolor {
-                            log_msg.push_str(" | Colorspace: I444 (Full Range)");
-                        } else {
-                            log_msg.push_str(" | Colorspace: I420 (Limited Range)");
-                        }
+                        log_msg.push_str(&format!(" | Colorspace: {}", pl.colorspace_desc()));
                     }
                     log_msg.push_str(&format!(
                         " | Damage Thresh: {}f | Damage Dur: {}f",
