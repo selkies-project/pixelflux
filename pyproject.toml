@@ -18,15 +18,21 @@ before-all = """
     set -euxo pipefail
 
     # A transient clone failure fails the whole wheel build, so every source is
-    # retried; FFmpeg is additionally mirrored on GitHub at the identical tag.
+    # both retried and mirrored: the upstream host is tried first and a GitHub
+    # copy of the same ref after it, because an outage that outlasts the retries
+    # is what actually breaks these builds and it rarely covers both hosts. The
+    # backoff widens to about two and a half minutes per host, which rides out a
+    # blip without stalling a run behind a host that is simply gone.
     clone_source() {
         ref="$1"; dir="$2"; shift 2
         for url in "$@"; do
-            for attempt in 1 2 3; do
+            for attempt in 1 2 3 4; do
                 rm -rf "${dir}"
                 git clone --branch "${ref}" --depth 1 "${url}" "${dir}" && return 0
-                sleep $((attempt * 5))
+                echo "clone_source: ${url} failed (attempt ${attempt}/4)" >&2
+                sleep $((attempt * 15))
             done
+            echo "clone_source: giving up on ${url}" >&2
         done
         return 1
     }
@@ -65,7 +71,7 @@ before-all = """
         curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal && \
         \
         (cd /tmp && \
-            clone_source stable x264 https://code.videolan.org/videolan/x264.git && \
+            clone_source stable x264 https://code.videolan.org/videolan/x264.git https://github.com/mirror/x264.git && \
             cd x264 && \
             ./configure --prefix=/usr/local --enable-shared --disable-cli && \
             make -j$(nproc) && \
