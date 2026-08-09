@@ -139,6 +139,16 @@ pub mod encoders {
     pub mod software;
     /// VA-API hardware H.264 encoder for Intel / AMD GPUs via FFmpeg.
     pub mod vaapi;
+
+    /// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
+    /// quality drop under sustained motion) must be requested before a fixed-QP encoder commits
+    /// it. Moving the quantizer costs a codec re-open (VA-API CQP) or a full encoder rebuild
+    /// (OpenH264), and either forces an IDR, so acting on every transient increase — and then
+    /// reversing it as motion settles — would make the picture pulse. Quality *increases* (a
+    /// lower QP, e.g. a paint-over refresh) apply at once and never wait. Shared so the two
+    /// fixed-QP encoders cannot disagree about how long a drop must persist.
+    pub(crate) const QP_HYSTERESIS_LIMIT: u32 = 60;
+
     /// Lowest H.264 level whose Annex-A Table A-1 limits admit a `width` x `height` stream at
     /// `fps`, as level_idc (41 = 4.1, 52 = 5.2, 62 = 6.2).
     ///
@@ -1237,6 +1247,16 @@ fn build_readback_encoders(
     (None, None)
 }
 
+/// Planar CSC target for a readback hardware session: YUV444 needs three full planes, NV12 one
+/// plus a half-height interleaved chroma plane. Empty when no hardware session consumes it.
+fn hw_plane_buffer(width: i32, height: i32, fullcolor: bool, hw: bool) -> Vec<u8> {
+    if !hw {
+        return Vec::new();
+    }
+    let n = (width * height) as usize;
+    vec![0u8; if fullcolor { n * 3 } else { n * 3 / 2 }]
+}
+
 /// Encode-thread body for the Wayland readback paths: drain published frames and run the
 /// full encode dispatch, owning the encoders for the life of the capture.
 ///
@@ -1292,13 +1312,12 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     // The CSC target follows the session's own chroma, not the request: a VA-API device that
     // refused 4:4:4 encodes 4:2:0, and sizing this from the request would hand it a buffer laid
     // out for planes it does not read.
-    let hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
-    let mut nv12_buffer: Vec<u8> = if video_encoder.is_some() {
-        let n = (width * height) as usize;
-        vec![0u8; if hw_fullcolor { n * 3 } else { n * 3 / 2 }]
-    } else {
-        Vec::new()
-    };
+    let mut hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
+    let mut nv12_buffer: Vec<u8> =
+        hw_plane_buffer(width, height, hw_fullcolor, video_encoder.is_some());
+    // Mid-stream recovery state for the readback hardware session, mirroring the zero-copy tick.
+    let mut hw_error_streak: u32 = 0;
+    let mut hw_rebuilt = false;
 
     while let Some(mut f) = pool.take() {
         if cfg.controls.tunables_dirty.swap(false, Ordering::Acquire)
@@ -1358,8 +1377,10 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 // chroma format, so its session declares limited, and VA-API's own
                 // convert targets tv range as well.
                 let range = YuvRange::Limited;
-                if hw_fullcolor {
-                    let y_size = (w * h) as usize;
+                let y_size = (w * h) as usize;
+                // A failed conversion leaves the planes holding the previous frame, so the
+                // encode is skipped rather than submitting stale content.
+                let csc = if hw_fullcolor {
                     let (y_plane, rest) = nv12_buffer.split_at_mut(y_size);
                     let (u_plane, v_plane) = rest.split_at_mut(y_size);
                     let mut planar_image = yuv::YuvPlanarImageMut {
@@ -1372,13 +1393,12 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         width: w,
                         height: h,
                     };
-                    let _ = if cfg.use_gpu {
+                    if cfg.use_gpu {
                         yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     } else {
                         yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                    };
+                    }
                 } else {
-                    let y_size = (w * h) as usize;
                     let (y_plane, uv_plane) = nv12_buffer.split_at_mut(y_size);
                     let mut planar_image = YuvBiPlanarImageMut {
                         y_plane: BufferStoreMut::Borrowed(y_plane),
@@ -1388,34 +1408,95 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         width: w,
                         height: h,
                     };
-                    let csc = if cfg.use_gpu {
+                    if cfg.use_gpu {
                         yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
                     } else {
                         yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                    };
-                    if let Err(e) = csc {
-                        eprintln!("[wl-encode] NV12 CSC failed: {e:?}");
-                    }
-                }
-                let force_idr = decision.force_idr;
-                let result = match encoder {
-                    GpuEncoder::Nvenc(enc) => {
-                        enc.encode_raw(&nv12_buffer, f.frame_id as u64, decision.target_qp, force_idr)
-                    }
-                    GpuEncoder::Vaapi(enc) => {
-                        enc.encode_raw(&nv12_buffer, f.frame_id as u64, decision.target_qp, force_idr)
                     }
                 };
-                match result {
-                    Ok(data) if !data.is_empty() => out.push(EncodedStripe {
-                        data: Arc::new(data),
-                        data_type: 2,
-                        stripe_y_start: 0,
-                        stripe_height: height,
-                        frame_id: f.frame_id as i32,
-                    }),
-                    Ok(_) => {}
-                    Err(e) => eprintln!("HW Encode Error: {}", e),
+                let force_idr = decision.force_idr;
+                // A CSC failure feeds the same recovery ladder as an encode failure: both leave
+                // the session delivering nothing, and only the rebuild or the demote below can
+                // get the stream moving again.
+                let outcome = match csc {
+                    Err(e) => Err(format!(
+                        "{} CSC failed: {e:?}",
+                        if hw_fullcolor { "YUV444" } else { "NV12" }
+                    )),
+                    Ok(()) => match encoder {
+                        GpuEncoder::Nvenc(enc) => {
+                            enc.encode_raw(&nv12_buffer, f.frame_id as u64, decision.target_qp, force_idr)
+                        }
+                        GpuEncoder::Vaapi(enc) => {
+                            enc.encode_raw(&nv12_buffer, f.frame_id as u64, decision.target_qp, force_idr)
+                        }
+                    },
+                };
+                match outcome {
+                    Ok(data) => {
+                        hw_error_streak = 0;
+                        hw_rebuilt = false;
+                        if !data.is_empty() {
+                            out.push(EncodedStripe {
+                                data: Arc::new(data),
+                                data_type: 2,
+                                stripe_y_start: 0,
+                                stripe_height: height,
+                                frame_id: f.frame_id as i32,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        // One line per recovery window: a session failing at frame rate would
+                        // otherwise write a line per frame for the life of the capture.
+                        if hw_error_streak % HW_ERROR_RECOVERY_THRESHOLD == 0 {
+                            eprintln!("[wl-encode] HW encode error: {e}");
+                        }
+                        hw_error_streak = hw_error_streak.saturating_add(1);
+                        if hw_error_streak >= HW_ERROR_RECOVERY_THRESHOLD {
+                            // The readback session persistently fails after having worked:
+                            // rebuild it once with the startup selection, then demote to the
+                            // software encoders. A session whose encodes keep failing still
+                            // constructs, so the rebuild only counts as recovery until the
+                            // next streak; otherwise the stream would rebuild in a loop.
+                            hw_error_streak = 0;
+                            let try_gpu = !hw_rebuilt;
+                            if try_gpu {
+                                eprintln!("[wl-encode] rebuilding readback HW encoder after repeated encode errors.");
+                            } else {
+                                eprintln!("[wl-encode] readback HW encoder unrecoverable; demoting to software encoding.");
+                            }
+                            // The broken session is released before its replacement is opened:
+                            // the failure it recovers from is usually device memory pressure,
+                            // and holding both at once is what would make the rebuild fail too.
+                            drop(video_encoder.take());
+                            let (v, o) = build_readback_encoders(&settings, try_gpu, None);
+                            hw_rebuilt = try_gpu && v.is_some();
+                            video_encoder = v;
+                            openh264_encoder = o;
+                            hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
+                            nv12_buffer =
+                                hw_plane_buffer(width, height, hw_fullcolor, video_encoder.is_some());
+                            cfg.controls.force_idr.store(true, Ordering::Relaxed);
+                            let n = wayland_stripe_count(
+                                &settings,
+                                video_encoder.is_some() || openh264_encoder.is_some(),
+                            );
+                            cfg.stats.n_stripes.store(n as u32, Ordering::Relaxed);
+                            *cfg.stats.desc.lock().unwrap() = encoder_desc(
+                                &settings,
+                                video_encoder.as_ref(),
+                                openh264_encoder.is_some(),
+                                false,
+                            );
+                            log_stream_settings(
+                                &settings,
+                                n,
+                                video_encoder.as_ref(),
+                                openh264_encoder.is_some(),
+                            );
+                        }
+                    }
                 }
             }
         } else if let Some(ref mut enc) = openh264_encoder {
@@ -1430,6 +1511,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             if decision.send {
                 let force_idr = decision.force_idr;
                 let stride = (width * 4) as usize;
+                enc.update_qp(decision.target_qp);
                 match enc.encode_host_argb(&f.buf, stride, f.frame_id as u64, force_idr, cfg.use_gpu) {
                     Ok(data) if !data.is_empty() => out.push(EncodedStripe {
                         data: Arc::new(data),
@@ -1752,9 +1834,10 @@ fn rebuild_zerocopy_encoder(
     }
 }
 
-/// Consecutive encode failures before the zero-copy path recovers (~0.5s at 60fps):
-/// a hiccup outlasts it, anything longer starts to look like a dead session.
-const HW_ERROR_RECOVERY_THRESHOLD: u32 = 30;
+/// Consecutive encode failures before a hardware path recovers (~0.5s at 60fps): a hiccup
+/// outlasts it, anything longer starts to look like a dead session. Shared by every hardware
+/// encode path (Wayland zero-copy, Wayland readback, X11) so recovery timing matches.
+pub(crate) const HW_ERROR_RECOVERY_THRESHOLD: u32 = 30;
 
 fn start_capture_on_display(
     state: &mut AppState,
@@ -1767,50 +1850,6 @@ fn start_capture_on_display(
     // The cursor worker outlives individual captures, so the starting settings have to
     // reach it here — same point X11 applies the cap — or it keeps the previous capture's.
     let _ = state.cursor_tx.send(CursorJob::SetSizeCap(settings.cursor_size_cap));
-
-    // Host-capture mode: connect on first use and point this display's capture
-    // thread at the requested size. The compositor keeps running (CU, clipboard
-    // callbacks, input fallbacks) but its renderer is bypassed.
-    if !settings.wayland_host_display.is_empty() {
-        if state.host.is_none() {
-            // Capture buffers come from the same render node the encoder imports
-            // from, resolved via its live fd (the path string is not retained in
-            // auto mode); each capture thread opens its own device handle.
-            let gbm_path = if state.use_gpu {
-                state.gbm_device.as_ref().and_then(|dev| {
-                    use std::os::fd::{AsFd as _, AsRawFd as _};
-                    let fd = dev.as_fd().as_raw_fd();
-                    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
-                })
-            } else {
-                None
-            };
-            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path)
-            {
-                Ok(h) => {
-                    println!(
-                        "[HostCapture] capturing host compositor '{}' ({} outputs).",
-                        settings.wayland_host_display,
-                        h.output_count()
-                    );
-                    state.host = Some(h);
-                }
-                Err(e) => eprintln!(
-                    "[HostCapture] connect '{}' failed: {e}",
-                    settings.wayland_host_display
-                ),
-            }
-        }
-        if let Some(host) = &state.host {
-            // The node's layout offset rides along so the host's heads mirror
-            // selkies' union layout (input coordinates already assume it).
-            if let Some(idx) = state.node_idx_for_id(display_id) {
-                let pos = state.output_nodes[idx].pos;
-                host.set_layout(display_id, pos.0, pos.1);
-            }
-            host.start_capture(display_id, settings.width, settings.height);
-        }
-    }
 
     let Some(node_idx) = state.node_idx_for_id(display_id) else {
         eprintln!("[Wayland] StartCapture: no output with display id {display_id}.");
@@ -2040,6 +2079,58 @@ fn start_capture_on_display(
         println!("[Wayland] Decision: Zero-Copy path active.");
     }
 
+    // Host-capture mode: connect on first use and point this display's capture thread at
+    // the size the encoder was just configured for. The compositor keeps running (CU,
+    // clipboard callbacks, input fallbacks) but its renderer is bypassed. The buffer type
+    // follows the consumer settled on above: dmabufs only for a zero-copy encoder, shm
+    // frames for every CPU path (use_cpu, OpenH264, JPEG, readback).
+    let host_capture = !settings.wayland_host_display.is_empty();
+    if host_capture {
+        if state.host.is_none() {
+            // Capture buffers come from the same render node the encoder imports
+            // from, resolved via its live fd (the path string is not retained in
+            // auto mode); each capture thread opens its own device handle.
+            let gbm_path = if state.use_gpu {
+                state.gbm_device.as_ref().and_then(|dev| {
+                    use std::os::fd::{AsFd as _, AsRawFd as _};
+                    let fd = dev.as_fd().as_raw_fd();
+                    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+                })
+            } else {
+                None
+            };
+            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path)
+            {
+                Ok(h) => {
+                    println!(
+                        "[HostCapture] capturing host compositor '{}' ({} outputs).",
+                        settings.wayland_host_display,
+                        h.output_count()
+                    );
+                    state.host = Some(h);
+                }
+                Err(e) => eprintln!(
+                    "[HostCapture] connect '{}' failed: {e}",
+                    settings.wayland_host_display
+                ),
+            }
+        }
+        if let Some(host) = &state.host {
+            // The node's layout offset rides along so the host's heads mirror
+            // selkies' union layout (input coordinates already assume it).
+            host.set_layout(display_id, node.pos.0, node.pos.1);
+            host.start_capture(
+                display_id,
+                settings.width,
+                settings.height,
+                video_encoder.is_some(),
+            );
+        }
+    }
+    // A failed connect leaves this display compositing locally, so its frames follow the
+    // local renderer again.
+    let host_capture = host_capture && state.host.is_some();
+
     if recording_sink.is_some() && settings.output_mode == 0 {
         eprintln!(
             "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
@@ -2120,7 +2211,9 @@ fn start_capture_on_display(
         bootstrap_readback_pool(
             &mut cap,
             display_id,
-            state.use_gpu,
+            // Host frames land in the pool as BGRA whatever the local renderer is; only
+            // a GLES readback of our own compositing produces RGBA.
+            state.use_gpu && !host_capture,
             gpu_intent && (!state.use_gpu || different_gpu),
             prior_readback_encoder.take(),
         );
@@ -2343,10 +2436,16 @@ fn render_node_tick(
     }
     // Dmabuf handed to the GPU encoder in host mode (from the new or retained frame).
     let mut host_enc_dmabuf: Option<Dmabuf> = None;
+    // Host software frames arrive BGRA, so anything reading this display's frame buffer
+    // back has to know it is not the GLES readback's RGBA.
+    let mut host_cpu_frame = false;
     if host_mode {
         const RETAINED_OK: u8 = 0;
         const RETAINED_NONE: u8 = 1;
-        const RETAINED_MISMATCH: u8 = 2;
+        // The host produced the buffer type this display's consumer cannot take; each
+        // direction has its own recovery below.
+        const RETAINED_CPU_FRAME: u8 = 2;
+        const RETAINED_GPU_FRAME: u8 = 3;
         let host_idx = node.id;
         let gpu_encoder = node
             .capture
@@ -2392,8 +2491,9 @@ fn render_node_tick(
             damage_rects = if have_new { f.damage.clone() } else { Vec::new() };
             if let Some(cpu) = f.cpu.as_ref() {
                 if gpu_encoder {
-                    return RETAINED_MISMATCH; // software frames, GPU encoder
+                    return RETAINED_CPU_FRAME;
                 }
+                host_cpu_frame = true;
                 if let Some((_, ref mut buf)) = pool_slot {
                     cpu.write_bgra(f.width, f.height, buf);
                     if wm_active {
@@ -2408,7 +2508,7 @@ fn render_node_tick(
                 }
             } else if let Some(dmabuf) = f.dmabuf.as_ref() {
                 if !gpu_encoder {
-                    return RETAINED_MISMATCH; // GPU frames, CPU encoder
+                    return RETAINED_GPU_FRAME;
                 }
                 host_enc_dmabuf = Some(dmabuf.clone());
             }
@@ -2482,21 +2582,41 @@ fn render_node_tick(
             }
         state.host = Some(host);
         if outcome != RETAINED_OK {
-            if outcome == RETAINED_MISMATCH {
-                static WARNED: std::sync::atomic::AtomicBool =
-                    std::sync::atomic::AtomicBool::new(false);
-                if !WARNED.swap(true, Ordering::Relaxed) {
-                    eprintln!(
-                        "[HostCapture] host frame type and encoder mismatch \
-                         (GPU host needs a GPU encoder; software host needs a CPU encoder)."
-                    );
-                }
-            }
             if let Some((id, buf)) = pool_slot.take()
                 && let Some(cap) = node.capture.as_ref()
                 && let Some(ref pool) = cap.encode_pool {
                         pool.cancel(id, buf);
                     }
+            // A frame type this display's consumer cannot take is recovered from rather
+            // than warned about: either side of the mismatch would otherwise stream
+            // nothing for the life of the capture.
+            if outcome == RETAINED_GPU_FRAME {
+                // The host is blitting into dmabufs a CPU encoder cannot read; ask it
+                // for shm frames. Frames resume once the capture thread reallocates,
+                // and the request is idempotent, so repeating it per tick costs nothing.
+                if let Some(h) = state.host.as_ref() {
+                    h.set_buffer_type(node.id, false);
+                }
+            } else if outcome == RETAINED_CPU_FRAME
+                && let Some(cap) = node.capture.as_mut() {
+                    // The host hands out software frames only (no zwp_linux_dmabuf v3),
+                    // so the zero-copy session has nothing to import: demote it to the
+                    // readback path, which encodes those frames as they arrive.
+                    eprintln!(
+                        "[HostCapture] host delivers software frames; demoting the zero-copy encoder to readback encode."
+                    );
+                    cap.video_encoder = None;
+                    let s = &cap.settings;
+                    let try_gpu = s.output_mode == 1
+                        && !s.use_openh264
+                        && !(s.use_cpu || s.encode_node_index == -1);
+                    bootstrap_readback_pool(cap, node.id, false, try_gpu, None);
+                    cap.request_idr();
+                    // The consumer is now a CPU one, so the host stops preferring GPU slots.
+                    if let Some(h) = state.host.as_ref() {
+                        h.set_buffer_type(node.id, false);
+                    }
+                }
             return false;
         }
         render_success = true;
@@ -2600,7 +2720,7 @@ fn render_node_tick(
                             let layer_map = layer_map_for_output(&output);
 
                             let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                for surface in layer_map.layers() {
+                                for surface in layer_map.layers().rev() {
                                     let current_layer = surface.layer();
                                     if current_layer == target_layer
                                         && let Some(geo) = layer_map.layer_geometry(surface) {
@@ -2739,7 +2859,7 @@ fn render_node_tick(
                                 let layer_map = layer_map_for_output(&output);
 
                                 let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                    for surface in layer_map.layers() {
+                                    for surface in layer_map.layers().rev() {
                                         let current_layer = surface.layer();
                                         if current_layer == target_layer
                                             && let Some(geo) = layer_map.layer_geometry(surface) {
@@ -2793,7 +2913,7 @@ fn render_node_tick(
                                 let layer_map = layer_map_for_output(&output);
 
                                 let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                    for surface in layer_map.layers() {
+                                    for surface in layer_map.layers().rev() {
                                         let current_layer = surface.layer();
                                         if current_layer == target_layer
                                             && let Some(geo) = layer_map.layer_geometry(surface) {
@@ -2862,7 +2982,8 @@ fn render_node_tick(
                     && !s.use_openh264
                     && !(s.use_cpu || s.encode_node_index == -1);
                 eprintln!("[Wayland] encode thread died; rebuilding the readback path.");
-                bootstrap_readback_pool(cap, node.id, state.use_gpu, try_gpu, prior);
+                // Host frames reach the pool as BGRA; only our own GLES readback produces RGBA.
+                bootstrap_readback_pool(cap, node.id, state.use_gpu && !host_mode, try_gpu, prior);
                 cap.request_idr();
             }
             if is_memory_throttling {
@@ -2996,6 +3117,11 @@ fn render_node_tick(
                             let rebuilt = if cap.hw_rebuilt {
                                 None
                             } else {
+                                // The broken session is released before its replacement is
+                                // opened: the failure it recovers from is usually device
+                                // memory pressure, and holding both at once is what would
+                                // make the rebuild fail too.
+                                drop(cap.video_encoder.take());
                                 rebuild_zerocopy_encoder(cap, state)
                             };
                             match rebuilt {
@@ -3015,9 +3141,17 @@ fn render_node_tick(
                                     let try_gpu = s.output_mode == 1
                                         && !s.use_openh264
                                         && !(s.use_cpu || s.encode_node_index == -1);
+                                    // Host frames reach the pool as BGRA; only our own
+                                    // GLES readback produces RGBA.
                                     bootstrap_readback_pool(
-                                        cap, node.id, state.use_gpu, try_gpu, None,
+                                        cap, node.id, state.use_gpu && !host_mode, try_gpu, None,
                                     );
+                                    // The host has to switch to buffers the readback path
+                                    // can read back on the CPU.
+                                    if host_mode
+                                        && let Some(h) = state.host.as_ref() {
+                                            h.set_buffer_type(node.id, false);
+                                        }
                                 }
                             }
                             cap.hw_error_streak = 0;
@@ -3036,7 +3170,9 @@ fn render_node_tick(
                 if !node.frame_buffer.is_empty() {
                     let w = width as u32;
                     let h = height as u32;
-                    let png = if state.use_gpu {
+                    // A host software frame was written BGRA into the frame buffer, so it
+                    // needs the swap even when the local renderer is GLES.
+                    let png = if state.use_gpu && !host_cpu_frame {
                         crate::computer_use::encode_png_rgba(&node.frame_buffer, w, h)
                     } else {
                         let mut rgba = node.frame_buffer.clone();

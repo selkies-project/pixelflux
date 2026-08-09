@@ -32,6 +32,7 @@ use std::sync::Once;
 use ffmpeg_sys_next as ff;
 use libc::{close, dup};
 
+use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 
@@ -40,13 +41,6 @@ use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
 static FF_INIT: Once = Once::new();
 /// Plane/object fan-out of the `AVDRM*` descriptors, matching FFmpeg's `AV_DRM_MAX_PLANES`.
 const AV_DRM_MAX_PLANES: usize = 4;
-/// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
-/// quality drop under sustained motion) must be requested before `update_qp` commits it. A CQP
-/// re-open is the only way to move the quantizer, so acting on every transient increase — and then
-/// reversing it as motion settles — would make the picture pulse; requiring the drop to persist
-/// this long absorbs those transients. Quality *decreases*, which only ever sharpen the picture,
-/// apply at once and never wait.
-const QP_HYSTERESIS_LIMIT: u32 = 60;
 /// The 8-bit 4:4:4 surface formats FFmpeg's VA-API hardware context can carry, in the order this
 /// encoder wants them. Planar comes first: the readback path already holds planar I444, so that
 /// surface takes the buffer as it stands, while the packed variant costs a repack per frame.
@@ -206,6 +200,22 @@ fn ff_err_str(err: i32) -> String {
     }
 }
 
+/// Declare the stream's colour description on a codec context, which is the only place
+/// `h264_vaapi` takes it from: with these fields unset it writes no VUI colour info at all, and a
+/// client then has to guess — a WebRTC receiver infers range from the negotiated SDP profile, so a
+/// 4:4:4 session would display this encoder's limited-range picture unexpanded and visibly dark.
+///
+/// The values state what the filter graph actually produces: `scale_vaapi` converts to BT.709
+/// limited range (`out_color_matrix=bt709:out_range=tv`) in both chroma formats, and the desktop
+/// source is sRGB, whose primaries and transfer function are BT.709's. Every open of a context
+/// (initial and every `reopen_codec`) has to set them, since a fresh context starts unspecified.
+unsafe fn set_colorimetry(ctx: *mut ff::AVCodecContext) {
+    (*ctx).color_range = ff::AVColorRange::AVCOL_RANGE_MPEG;
+    (*ctx).colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
+    (*ctx).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
+    (*ctx).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+}
+
 /// Hardware-accelerated H.264 encoder built on FFmpeg's `h264_vaapi`, owning the whole
 /// VA-API pipeline for one capture: device contexts, the surface pool, the color-convert
 /// filter graph, the reusable frames/packet, and live rate-control state.
@@ -362,7 +372,8 @@ impl VaapiEncoder {
     ///    knob, biased toward speed — higher is faster). Rate control is either **CBR** (program
     ///    `bit_rate`/`rc_max_rate` and a `vbv_bits`-derived `rc_buffer_size`, `rc_mode=CBR`) or
     ///    **CQP** (`rc_mode=CQP` plus a fixed `qp`); both then pin the minimum `level` and
-    ///    `async_depth=1`, and a 4:2:0 session also pins `profile=high`.
+    ///    `async_depth=1`, and a 4:2:0 session also pins `profile=high`. `set_colorimetry` declares
+    ///    the BT.709 limited-range VUI the graph produces.
     /// 4. **Filter graph**: an explicit `buffersrc` → `hwmap`/`hwupload` + `scale_vaapi` →
     ///    `buffersink` chain. The buffersrc format is DRM-PRIME (carrying the DRM frames context) for
     ///    dmabuf input, or plain BGRA for host input. `scale_vaapi` does the ARGB→YUV convert on the
@@ -522,6 +533,7 @@ impl VaapiEncoder {
             (*encoder_ctx).gop_size = std::ffi::c_int::MAX;
             (*encoder_ctx).slices = 4;
             (*encoder_ctx).compression_level = 6;
+            set_colorimetry(encoder_ctx);
 
             ff::av_buffer_unref(&mut enc_frames_ref);
 
@@ -792,9 +804,10 @@ impl VaapiEncoder {
     /// chain, so the stream self-heals across the swap rather than breaking. Only the codec context
     /// is torn down and rebuilt: the VA device, the encoder frames pool, and the filter graph all
     /// persist, and the new context is re-allocated against the same `codec` and re-bound to the
-    /// saved `enc_frames_ctx` pool and `hw_device_ctx`, with the same GOP / slice / compression
-    /// settings as the initial open. **CBR** reprograms `bit_rate` / `rc_max_rate` / `rc_buffer_size`
-    /// (VBV from `vbv_bits`); **CQP** reprograms the quantizer to `qp` and records it in `current_qp`.
+    /// saved `enc_frames_ctx` pool and `hw_device_ctx`, with the same GOP / slice / compression /
+    /// colour-description settings as the initial open. **CBR** reprograms `bit_rate` /
+    /// `rc_max_rate` / `rc_buffer_size` (VBV from `vbv_bits`); **CQP** reprograms the quantizer to
+    /// `qp` and records it in `current_qp`.
     unsafe fn reopen_codec(&mut self, qp: u32) -> Result<(), String> {
         if !self.encoder_ctx.is_null() {
             ff::avcodec_free_context(&mut self.encoder_ctx);
@@ -816,6 +829,7 @@ impl VaapiEncoder {
         (*self.encoder_ctx).gop_size = std::ffi::c_int::MAX;
         (*self.encoder_ctx).slices = 4;
         (*self.encoder_ctx).compression_level = 6;
+        set_colorimetry(self.encoder_ctx);
 
         let mut opts: *mut ff::AVDictionary = ptr::null_mut();
         let set_opt = |d: &mut *mut ff::AVDictionary, k: &str, v: &str| {

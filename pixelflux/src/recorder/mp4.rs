@@ -141,7 +141,8 @@ pub fn parse_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
     let profile_idc = sps_nal[1];
     let rbsp = unescape_rbsp(&sps_nal[4..]);
     let mut r = BitReader::new(&rbsp);
-    r.ue()?; // seq_parameter_set_id
+    // seq_parameter_set_id
+    r.ue()?;
 
     let mut chroma_format_idc = 1u32;
     if matches!(
@@ -150,11 +151,13 @@ pub fn parse_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
     ) {
         chroma_format_idc = r.ue()?;
         if chroma_format_idc == 3 {
-            r.bit()?; // separate_colour_plane_flag
+            // separate_colour_plane_flag
+            r.bit()?;
         }
-        r.ue()?; // bit_depth_luma_minus8
-        r.ue()?; // bit_depth_chroma_minus8
-        r.bit()?; // qpprime_y_zero_transform_bypass_flag
+        // bit_depth_luma_minus8, bit_depth_chroma_minus8, qpprime_y_zero_transform_bypass_flag
+        r.ue()?;
+        r.ue()?;
+        r.bit()?;
         if r.bit()? == 1 {
             // seq_scaling_matrix_present_flag
             let lists = if chroma_format_idc == 3 { 12 } else { 8 };
@@ -177,28 +180,35 @@ pub fn parse_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
         }
     }
 
-    r.ue()?; // log2_max_frame_num_minus4
+    // log2_max_frame_num_minus4
+    r.ue()?;
     let pic_order_cnt_type = r.ue()?;
     if pic_order_cnt_type == 0 {
-        r.ue()?; // log2_max_pic_order_cnt_lsb_minus4
+        // log2_max_pic_order_cnt_lsb_minus4
+        r.ue()?;
     } else if pic_order_cnt_type == 1 {
-        r.bit()?; // delta_pic_order_always_zero_flag
-        r.se()?; // offset_for_non_ref_pic
-        r.se()?; // offset_for_top_to_bottom_field
+        // delta_pic_order_always_zero_flag, offset_for_non_ref_pic,
+        // offset_for_top_to_bottom_field, then the offset_for_ref_frame list
+        r.bit()?;
+        r.se()?;
+        r.se()?;
         let n = r.ue()?;
         for _ in 0..n {
             r.se()?;
         }
     }
-    r.ue()?; // max_num_ref_frames
-    r.bit()?; // gaps_in_frame_num_value_allowed_flag
+    // max_num_ref_frames, gaps_in_frame_num_value_allowed_flag
+    r.ue()?;
+    r.bit()?;
     let pic_width_in_mbs = r.ue()? + 1;
     let pic_height_in_map_units = r.ue()? + 1;
     let frame_mbs_only = r.bit()?;
     if frame_mbs_only == 0 {
-        r.bit()?; // mb_adaptive_frame_field_flag
+        // mb_adaptive_frame_field_flag
+        r.bit()?;
     }
-    r.bit()?; // direct_8x8_inference_flag
+    // direct_8x8_inference_flag
+    r.bit()?;
 
     let (mut crop_l, mut crop_r, mut crop_t, mut crop_b) = (0u32, 0u32, 0u32, 0u32);
     if r.bit()? == 1 {
@@ -236,11 +246,13 @@ fn mk_full_box(fourcc: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec
     mk_box(fourcc, &p)
 }
 
+/// The unity transformation matrix `mvhd` and `tkhd` carry: 0x00010000, 0x00010000 and
+/// 0x40000000 on the diagonal (16.16 fixed point for the first two, 2.30 for the last).
 const MATRIX_IDENTITY: [u8; 36] = {
     let mut m = [0u8; 36];
-    m[1] = 0x01; // 0x00010000
+    m[1] = 0x01;
     m[17] = 0x01;
-    m[32] = 0x40; // 0x40000000
+    m[32] = 0x40;
     m
 };
 
@@ -317,46 +329,57 @@ impl<W: Write> FragmentWriter<W> {
         }
         let ftyp = mk_box(b"ftyp", &ftyp_p);
 
+        // mvhd payload in field order: creation/modification time, timescale, duration
+        // (0 = unknown, as it must be in a fragmented movie), rate 1.0, volume 1.0, reserved,
+        // the unity matrix, pre_defined, next_track_ID.
         let mut mvhd_p = Vec::new();
-        mvhd_p.extend_from_slice(&[0u8; 8]); // creation/modification time
+        mvhd_p.extend_from_slice(&[0u8; 8]);
         mvhd_p.extend_from_slice(&TIMESCALE.to_be_bytes());
-        mvhd_p.extend_from_slice(&0u32.to_be_bytes()); // duration: unknown (fragmented)
-        mvhd_p.extend_from_slice(&0x00010000u32.to_be_bytes()); // rate 1.0
-        mvhd_p.extend_from_slice(&0x0100u16.to_be_bytes()); // volume 1.0
-        mvhd_p.extend_from_slice(&[0u8; 10]); // reserved
+        mvhd_p.extend_from_slice(&0u32.to_be_bytes());
+        mvhd_p.extend_from_slice(&0x00010000u32.to_be_bytes());
+        mvhd_p.extend_from_slice(&0x0100u16.to_be_bytes());
+        mvhd_p.extend_from_slice(&[0u8; 10]);
         mvhd_p.extend_from_slice(&MATRIX_IDENTITY);
-        mvhd_p.extend_from_slice(&[0u8; 24]); // pre_defined
-        mvhd_p.extend_from_slice(&2u32.to_be_bytes()); // next_track_ID
+        mvhd_p.extend_from_slice(&[0u8; 24]);
+        mvhd_p.extend_from_slice(&2u32.to_be_bytes());
         let mvhd = mk_full_box(b"mvhd", 0, 0, &mvhd_p);
 
+        // tkhd payload in field order: creation/modification time, track_ID, reserved, duration,
+        // the reserved/layer/alternate_group/volume block, the unity matrix, then the 16.16
+        // display width and height. Its flags mark the track enabled and in_movie.
         let mut tkhd_p = Vec::new();
         tkhd_p.extend_from_slice(&[0u8; 8]);
-        tkhd_p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-        tkhd_p.extend_from_slice(&[0u8; 4]); // reserved
-        tkhd_p.extend_from_slice(&0u32.to_be_bytes()); // duration
-        tkhd_p.extend_from_slice(&[0u8; 16]); // reserved, layer, group, volume, reserved
+        tkhd_p.extend_from_slice(&1u32.to_be_bytes());
+        tkhd_p.extend_from_slice(&[0u8; 4]);
+        tkhd_p.extend_from_slice(&0u32.to_be_bytes());
+        tkhd_p.extend_from_slice(&[0u8; 16]);
         tkhd_p.extend_from_slice(&MATRIX_IDENTITY);
         tkhd_p.extend_from_slice(&(cfg.width << 16).to_be_bytes());
         tkhd_p.extend_from_slice(&(cfg.height << 16).to_be_bytes());
-        let tkhd = mk_full_box(b"tkhd", 0, 3, &tkhd_p); // enabled | in_movie
+        let tkhd = mk_full_box(b"tkhd", 0, 3, &tkhd_p);
 
+        // mdhd payload in field order: creation/modification time, timescale, duration,
+        // language (0x55c4 = "und"), pre_defined.
         let mut mdhd_p = Vec::new();
         mdhd_p.extend_from_slice(&[0u8; 8]);
         mdhd_p.extend_from_slice(&TIMESCALE.to_be_bytes());
         mdhd_p.extend_from_slice(&0u32.to_be_bytes());
-        mdhd_p.extend_from_slice(&0x55c4u16.to_be_bytes()); // language: und
+        mdhd_p.extend_from_slice(&0x55c4u16.to_be_bytes());
         mdhd_p.extend_from_slice(&[0u8; 2]);
         let mdhd = mk_full_box(b"mdhd", 0, 0, &mdhd_p);
 
+        // hdlr payload in field order: pre_defined, the 'vide' handler type, reserved, and the
+        // handler name.
         let mut hdlr_p = Vec::new();
-        hdlr_p.extend_from_slice(&[0u8; 4]); // pre_defined
+        hdlr_p.extend_from_slice(&[0u8; 4]);
         hdlr_p.extend_from_slice(b"vide");
         hdlr_p.extend_from_slice(&[0u8; 12]);
         hdlr_p.extend_from_slice(b"pixelflux\0");
         let hdlr = mk_full_box(b"hdlr", 0, 0, &hdlr_p);
 
         let vmhd = mk_full_box(b"vmhd", 0, 1, &[0u8; 8]);
-        let url = mk_full_box(b"url ", 0, 1, &[]); // self-contained
+        // An empty 'url ' entry with flag 1 declares the media self-contained.
+        let url = mk_full_box(b"url ", 0, 1, &[]);
         let mut dref_p = 1u32.to_be_bytes().to_vec();
         dref_p.extend_from_slice(&url);
         let dref = mk_full_box(b"dref", 0, 0, &dref_p);
@@ -378,10 +401,12 @@ impl<W: Write> FragmentWriter<W> {
         let mdia = mk_box(b"mdia", &[mdhd, hdlr, minf].concat());
         let trak = mk_box(b"trak", &[tkhd, mdia].concat());
 
+        // trex payload in field order: track_ID, default_sample_description_index, then zeroed
+        // default sample duration, size and flags (each fragment states its own).
         let mut trex_p = Vec::new();
-        trex_p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-        trex_p.extend_from_slice(&1u32.to_be_bytes()); // default_sample_description_index
-        trex_p.extend_from_slice(&[0u8; 12]); // default duration/size/flags
+        trex_p.extend_from_slice(&1u32.to_be_bytes());
+        trex_p.extend_from_slice(&1u32.to_be_bytes());
+        trex_p.extend_from_slice(&[0u8; 12]);
         let trex = mk_full_box(b"trex", 0, 0, &trex_p);
         let mvex = mk_box(b"mvex", &trex);
 
@@ -428,9 +453,11 @@ impl<W: Write> FragmentWriter<W> {
     fn write_fragment(&mut self, s: &PendingSample, duration: u32) -> std::io::Result<()> {
         self.seq += 1;
 
+        // tfhd carries only the track_ID; its flags set default-base-is-moof, so sample offsets
+        // are relative to the start of this moof.
         let mut tfhd_p = Vec::new();
-        tfhd_p.extend_from_slice(&1u32.to_be_bytes()); // track_ID
-        let tfhd = mk_full_box(b"tfhd", 0, 0x020000, &tfhd_p); // default-base-is-moof
+        tfhd_p.extend_from_slice(&1u32.to_be_bytes());
+        let tfhd = mk_full_box(b"tfhd", 0, 0x020000, &tfhd_p);
 
         let mut tfdt_p = Vec::new();
         tfdt_p.extend_from_slice(&s.dts.to_be_bytes());
@@ -438,20 +465,24 @@ impl<W: Write> FragmentWriter<W> {
 
         // sample flags: sync = "depends on nothing"; non-sync also sets the non-sync bit.
         let sample_flags: u32 = if s.sync { 0x0200_0000 } else { 0x0101_0000 };
+        // trun payload in field order: sample_count, a data_offset placeholder patched in below,
+        // then this sample's duration, size and flags — exactly the fields its flags select
+        // (data-offset | sample-duration | sample-size | sample-flags).
         let mut trun_p = Vec::new();
-        trun_p.extend_from_slice(&1u32.to_be_bytes()); // sample_count
-        trun_p.extend_from_slice(&0i32.to_be_bytes()); // data_offset placeholder
+        trun_p.extend_from_slice(&1u32.to_be_bytes());
+        trun_p.extend_from_slice(&0i32.to_be_bytes());
         trun_p.extend_from_slice(&duration.to_be_bytes());
         trun_p.extend_from_slice(&(s.data.len() as u32).to_be_bytes());
         trun_p.extend_from_slice(&sample_flags.to_be_bytes());
-        // data-offset | sample-duration | sample-size | sample-flags
         let mut trun = mk_full_box(b"trun", 0, 0x000701, &trun_p);
 
         let traf_len = 8 + tfhd.len() + tfdt.len() + trun.len();
-        let moof_len = 8 + 16 + traf_len; // mfhd is 16 bytes
+        // A moof box header is 8 bytes and the mfhd inside it 16.
+        let moof_len = 8 + 16 + traf_len;
         // First sample byte sits just past the mdat header, relative to moof start.
         let data_offset = (moof_len + 8) as i32;
-        let off_pos = trun.len() - trun_p.len() + 4; // into trun payload: after sample_count
+        // The data_offset field sits in the trun payload directly after sample_count.
+        let off_pos = trun.len() - trun_p.len() + 4;
         trun[off_pos..off_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
 
         let mfhd = mk_full_box(b"mfhd", 0, 0, &self.seq.to_be_bytes());
@@ -560,34 +591,35 @@ impl H264SampleBuilder {
         let pps = self.pps.as_deref()?;
         let (width, height) = parse_sps_dimensions(sps)?;
 
-        let mut avcc_p = vec![
-            1,       // configurationVersion
-            sps[1],  // AVCProfileIndication
-            sps[2],  // profile_compatibility
-            sps[3],  // AVCLevelIndication
-            0xff,    // lengthSizeMinusOne = 3
-            0xe1,    // numOfSequenceParameterSets = 1
-        ];
+        // avcC header in field order: configurationVersion, AVCProfileIndication,
+        // profile_compatibility and AVCLevelIndication taken straight from the SPS,
+        // lengthSizeMinusOne = 3 (the 4-byte NAL lengths this muxer writes), and
+        // numOfSequenceParameterSets = 1. The SPS then the PPS follow, each length-prefixed.
+        let mut avcc_p = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
         avcc_p.extend_from_slice(&(sps.len() as u16).to_be_bytes());
         avcc_p.extend_from_slice(sps);
-        avcc_p.push(1); // numOfPictureParameterSets
+        // numOfPictureParameterSets
+        avcc_p.push(1);
         avcc_p.extend_from_slice(&(pps.len() as u16).to_be_bytes());
         avcc_p.extend_from_slice(pps);
         let avcc = mk_box(b"avcC", &avcc_p);
 
+        // avc1 sample entry in field order: reserved, data_reference_index, the
+        // pre_defined/reserved block, width and height, horizontal and vertical resolution
+        // (72 dpi), reserved, frame_count, compressorname, depth 24, pre_defined.
         let mut entry_p = Vec::new();
-        entry_p.extend_from_slice(&[0u8; 6]); // reserved
-        entry_p.extend_from_slice(&1u16.to_be_bytes()); // data_reference_index
-        entry_p.extend_from_slice(&[0u8; 16]); // pre_defined / reserved
+        entry_p.extend_from_slice(&[0u8; 6]);
+        entry_p.extend_from_slice(&1u16.to_be_bytes());
+        entry_p.extend_from_slice(&[0u8; 16]);
         entry_p.extend_from_slice(&(width as u16).to_be_bytes());
         entry_p.extend_from_slice(&(height as u16).to_be_bytes());
-        entry_p.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // horizresolution 72 dpi
-        entry_p.extend_from_slice(&0x0048_0000u32.to_be_bytes()); // vertresolution
-        entry_p.extend_from_slice(&[0u8; 4]); // reserved
-        entry_p.extend_from_slice(&1u16.to_be_bytes()); // frame_count
-        entry_p.extend_from_slice(&[0u8; 32]); // compressorname
-        entry_p.extend_from_slice(&0x0018u16.to_be_bytes()); // depth 24
-        entry_p.extend_from_slice(&(-1i16).to_be_bytes()); // pre_defined
+        entry_p.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+        entry_p.extend_from_slice(&0x0048_0000u32.to_be_bytes());
+        entry_p.extend_from_slice(&[0u8; 4]);
+        entry_p.extend_from_slice(&1u16.to_be_bytes());
+        entry_p.extend_from_slice(&[0u8; 32]);
+        entry_p.extend_from_slice(&0x0018u16.to_be_bytes());
+        entry_p.extend_from_slice(&(-1i16).to_be_bytes());
         entry_p.extend_from_slice(&avcc);
         let entry = mk_box(b"avc1", &entry_p);
 
@@ -783,8 +815,9 @@ mod tests {
         };
         w.write_init(&cfg).unwrap();
         w.push_sample(vec![0, 0, 0, 1, 0x65], true, 1000).unwrap();
-        w.push_sample(vec![0, 0, 0, 1, 0x41], false, 1000).unwrap(); // repeated clock
-        w.push_sample(vec![0, 0, 0, 1, 0x41], false, 500).unwrap(); // clock went backwards
+        // The second sample repeats the clock and the third winds it backwards.
+        w.push_sample(vec![0, 0, 0, 1, 0x41], false, 1000).unwrap();
+        w.push_sample(vec![0, 0, 0, 1, 0x41], false, 500).unwrap();
         let stats = w.finish().unwrap();
         assert_eq!(stats.samples, 3);
 

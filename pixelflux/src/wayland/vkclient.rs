@@ -94,7 +94,8 @@ fn upload_keymap(
     text: &str,
 ) -> Result<(), String> {
     let mut data = text.as_bytes().to_vec();
-    data.push(0); // compositors parse the mapping as a NUL-terminated string
+    // Compositors parse the mapping as a NUL-terminated string.
+    data.push(0);
     let fd = memfd_with(&data)?;
     vk.keymap(KEYMAP_FORMAT_XKB_V1, fd.as_fd(), data.len() as u32);
     queue.flush().map_err(|e| format!("flush keymap: {e}"))
@@ -140,8 +141,9 @@ pub fn type_text_to(socket_path: &str, text: &str) -> Result<(), String> {
             uploaded = true;
         }
         for &kc in &keycodes {
+            // Below the evdev offset the keysym has no bindable keycode.
             if kc < EVDEV_OFFSET {
-                continue; // unbindable keysym
+                continue;
             }
             for pressed in [1u32, 0] {
                 vk.key(0, kc - EVDEV_OFFSET, pressed);

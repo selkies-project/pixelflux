@@ -102,7 +102,8 @@ impl HostCpuFrame {
             f if f == wl_shm::Format::Xbgr8888 as u32
                 || f == wl_shm::Format::Abgr8888 as u32 => (4usize, true),
             f if f == wl_shm::Format::Bgr888 as u32 => (3, false),
-            _ => (4, false), // xrgb/argb: already BGRA byte order
+            // xrgb/argb: already BGRA byte order.
+            _ => (4, false),
         };
         for y in 0..h as usize {
             let src_start = y * self.stride;
@@ -146,10 +147,21 @@ struct LayoutSlot {
     want: (i32, i32),
     pos: (i32, i32),
     active: bool,
+    /// The consumer imports dmabufs directly, so the compositor blits into GPU
+    /// buffers. A CPU encode path clears this and takes shm frames instead.
+    zero_copy: bool,
+}
+
+/// What a capture thread is currently aiming at: the encoder's dimensions plus the
+/// buffer type its consumer can take. Either changing forces a slot renegotiation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Want {
+    size: (i32, i32),
+    zero_copy: bool,
 }
 
 enum ToHost {
-    Start { width: i32, height: i32 },
+    Start { width: i32, height: i32, zero_copy: bool },
     /// Slot return; `generation` guards against slots recycled by a renegotiation
     /// while the consumer still held the frame.
     Release { generation: u64, slot: usize },
@@ -346,9 +358,10 @@ struct CaptureState {
     dmabuf: Option<ZwpLinuxDmabufV1>,
     screencopy: Option<ZwlrScreencopyManagerV1>,
     outputs: Vec<(wl_output::WlOutput, Option<String>)>,
-    // Per-frame capture negotiation/results.
-    announce_dmabuf: Option<(u32, i32, i32)>, // fourcc, w, h
-    announce_shm: Option<(u32, i32, i32, i32)>, // format, w, h, stride
+    // Per-frame capture negotiation/results: the buffer types screencopy offered, as
+    // (fourcc, width, height) for dmabuf and (format, width, height, stride) for shm.
+    announce_dmabuf: Option<(u32, i32, i32)>,
+    announce_shm: Option<(u32, i32, i32, i32)>,
     buffer_done: bool,
     damage: Vec<Rectangle<i32, Physical>>,
     ready: bool,
@@ -655,13 +668,16 @@ impl HostSession {
 
     /// Aim `display_id` at `width`x`height`: assigns every active display its
     /// host output (by rank), asks the host for all modes and positions in one
-    /// atomic configuration, and points the capture threads at their sizes;
-    /// frames gate until the host applies them.
-    pub fn start_capture(&self, display_id: u32, width: i32, height: i32) {
+    /// atomic configuration, and points the capture threads at their sizes and
+    /// buffer types; frames gate until the host applies them. `zero_copy` states
+    /// whether this display's encoder imports dmabufs — a CPU consumer needs shm
+    /// frames it can read, and gets them even on a GPU-capable host.
+    pub fn start_capture(&self, display_id: u32, width: i32, height: i32, zero_copy: bool) {
         let assignments = {
             let mut layout = self.layout.lock().unwrap();
             let slot = layout.entry(display_id).or_default();
             slot.want = (width, height);
+            slot.zero_copy = zero_copy;
             slot.active = true;
             let active: Vec<(u32, LayoutSlot)> = layout
                 .iter()
@@ -685,11 +701,46 @@ impl HostSession {
             if rank >= self.outputs.len() {
                 break;
             }
-            self.outputs[rank].send(ToHost::Start { width: slot.want.0, height: slot.want.1 });
+            self.outputs[rank].send(ToHost::Start {
+                width: slot.want.0,
+                height: slot.want.1,
+                zero_copy: slot.zero_copy,
+            });
             by_output.push(*slot);
         }
         let _ = self.ctrl_tx.send(CtrlMsg::Apply(by_output));
         wake_write(self.ctrl_wake.as_raw_fd());
+    }
+
+    /// Point `display_id`'s capture at dmabufs (`zero_copy`) or shm frames without touching its
+    /// mode or position, which is what an encoder demoted or rebuilt mid-capture needs: the
+    /// layout is already what the host applied, and re-running it would mode-set the host
+    /// display again. Idempotent, so a consumer that keeps seeing the wrong buffer type until
+    /// the capture thread reallocates can call this on every frame.
+    pub fn set_buffer_type(&self, display_id: u32, zero_copy: bool) {
+        let target = {
+            let mut layout = self.layout.lock().unwrap();
+            let slot = layout.entry(display_id).or_default();
+            if slot.zero_copy == zero_copy {
+                return;
+            }
+            slot.zero_copy = zero_copy;
+            let (want, active) = (slot.want, slot.active);
+            let rank = layout
+                .iter()
+                .filter(|(_, s)| s.active)
+                .position(|(id, _)| *id == display_id);
+            match rank {
+                Some(r) if active && r < self.outputs.len() => (r, want),
+                _ => return,
+            }
+        };
+        let (idx, want) = target;
+        self.outputs[idx].send(ToHost::Start {
+            width: want.0,
+            height: want.1,
+            zero_copy,
+        });
     }
 
     /// Park `display_id`'s capture (its slot leaves the pointer extent). The
@@ -1103,7 +1154,9 @@ fn capture_loop(
     let mut announced: Option<(i32, i32)> = None;
     let mut warned_mismatch = false;
     let mut consecutive_failures = 0u32;
-    let mut want: Option<(i32, i32)> = None;
+    let mut want: Option<Want> = None;
+    // Buffer type the currently allocated slots hold; None while none exist.
+    let mut slot_zero_copy: Option<bool> = None;
 
     'main: loop {
         // Drain control; block while idle or out of slots.
@@ -1128,16 +1181,17 @@ fn capture_loop(
                     }
                 }
                 ToHost::Idle => want = None,
-                ToHost::Start { width, height } => {
-                    if want != Some((width, height)) {
+                ToHost::Start { width, height, zero_copy } => {
+                    let next = Want { size: (width, height), zero_copy };
+                    if want != Some(next) {
                         warned_mismatch = false;
                     }
-                    want = Some((width, height));
+                    want = Some(next);
                 }
             }
         }
-        let (want_w, want_h) = match want {
-            Some(w) => w,
+        let (want_w, want_h, want_zero_copy) = match want {
+            Some(w) => (w.size.0, w.size.1, w.zero_copy),
             None => continue,
         };
 
@@ -1186,6 +1240,7 @@ fn capture_loop(
             .map(|(_, w, h)| (w, h))
             .or(state.announce_shm.map(|(_, w, h, _)| (w, h)))
             .ok_or("screencopy announced no buffer type")?;
+        let mut renegotiate = false;
         if announced != Some((fw, fh)) {
             announced = Some((fw, fh));
             eprintln!(
@@ -1195,12 +1250,22 @@ fn capture_loop(
                 state.announce_dmabuf,
                 state.announce_shm,
             );
-            // Size change: drop stale buffers. The generation bump makes any
-            // release still in flight for the old buffers a no-op.
+            renegotiate = true;
+        }
+        if slot_zero_copy.is_some_and(|z| z != want_zero_copy) {
+            // The consumer switched between importing dmabufs and reading pixels (an
+            // encoder demoted, or a restart with different encode settings), so the
+            // allocated buffers are the wrong kind.
+            renegotiate = true;
+        }
+        if renegotiate {
+            // Drop the stale buffers. The generation bump makes any release still in
+            // flight for them a no-op.
             for s in slots.iter_mut() {
                 *s = None;
             }
             free = (0..SLOTS).collect();
+            slot_zero_copy = None;
             generation += 1;
         }
         if (fw, fh) != (want_w, want_h) {
@@ -1227,7 +1292,11 @@ fn capture_loop(
 
         let slot_idx = *free.last().unwrap();
         if slots[slot_idx].is_none() {
-            slots[slot_idx] = Some(match (&gbm, &state.dmabuf, state.announce_dmabuf) {
+            // Only a consumer that imports dmabufs gets GPU slots; anything reading the
+            // pixels on the CPU takes the shm path even where the host offers dmabuf.
+            let gpu_alloc = if want_zero_copy { gbm.as_ref() } else { None };
+            slot_zero_copy = Some(want_zero_copy);
+            slots[slot_idx] = Some(match (gpu_alloc, &state.dmabuf, state.announce_dmabuf) {
                 (Some(dev), Some(dmabuf_global), Some((fourcc, w, h))) => {
                     let bo = dev
                         .create_buffer_object::<()>(
@@ -1366,7 +1435,7 @@ fn drain_ctl(
     rx: &Receiver<ToHost>,
     generation: u64,
     free: &mut Vec<usize>,
-    want: &mut Option<(i32, i32)>,
+    want: &mut Option<Want>,
 ) -> Ctl {
     let mut out = Ctl::None;
     loop {
@@ -1376,9 +1445,10 @@ fn drain_ctl(
                     free.push(slot);
                 }
             }
-            Ok(ToHost::Start { width, height }) => {
-                if *want != Some((width, height)) {
-                    *want = Some((width, height));
+            Ok(ToHost::Start { width, height, zero_copy }) => {
+                let next = Want { size: (width, height), zero_copy };
+                if *want != Some(next) {
+                    *want = Some(next);
                     out = Ctl::Renegotiate;
                 }
             }

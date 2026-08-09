@@ -329,7 +329,8 @@ fn writer_thread(
             break 'recv;
         }
         let st = writer.stats();
-        shared.muxed.store(st.samples + 1, Ordering::Relaxed); // +1: one sample is buffered
+        // The writer always holds one sample back to learn its duration, so it counts as muxed.
+        shared.muxed.store(st.samples + 1, Ordering::Relaxed);
         shared.sync_frames.store(st.sync_samples, Ordering::Relaxed);
         shared.bytes.store(st.bytes, Ordering::Relaxed);
     }

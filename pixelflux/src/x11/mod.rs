@@ -929,11 +929,15 @@ where
             // Root geometry is polled on a cadence, not per frame: the reply costs a
             // round-trip that would otherwise precede every grab, and external size
             // changes are rare (live resizes arrive through region_dirty instead).
-            // Grab-failure recovery enters regardless of auto_adjust: a fixed-size
-            // region has no other re-clamp path after an external root shrink, and
-            // without one the capture dies at the failure cap instead of recovering.
+            // The gate reads the live copy, so a region re-targeted to the root edge
+            // starts following it from that point on. Grab-failure recovery enters
+            // regardless of auto_adjust: a fixed-size region has no other re-clamp
+            // path after an external root shrink, and without one the capture dies at
+            // the failure cap instead of recovering.
             geometry_check = geometry_check.saturating_sub(1);
-            if (settings.auto_adjust_screen_capture_size || grab_failures > 0) && geometry_check <= 0 {
+            if (rsettings.auto_adjust_screen_capture_size || grab_failures > 0)
+                && geometry_check <= 0
+            {
                 geometry_check = GEOMETRY_POLL_FRAMES;
                 if let Some(g) = conn.get_geometry(root).ok().and_then(|c| c.reply().ok()) {
                     // A root shrink can strand even a previously-valid offset past

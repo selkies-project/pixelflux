@@ -19,6 +19,7 @@
 //! strict-GOP streaming behavior. Host ARGB is converted to I420 with the same
 //! BT.709 path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
 
+use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange,
@@ -55,17 +56,25 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 /// (`y_buf` / `u_buf` / `v_buf`) that each frame's RGB-to-YUV conversion writes into before
 /// hand-off. `is_cbr` selects the rate-control mode: `true` is CBR (bitrate-mode RC driving a
 /// target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but with the QP pinned to a
-/// single value). `current_bitrate_bps` tracks the currently-accepted live CBR target so a
-/// rejected change can be rolled back. `omit_stripe_headers` drops the 10-byte wire header for
-/// bare Annex-B output.
+/// single value). `omit_stripe_headers` drops the 10-byte wire header for bare Annex-B output.
+///
+/// The live rate-control state is mirrored so a change can be detected, rolled back, or carried
+/// across a rebuild: `current_bitrate_bps` is the currently-accepted CBR target, `current_fps` the
+/// accepted frame rate, and `current_qp` the pinned CRF/CQP quantizer with `qp_hysteresis_counter`
+/// gating increases. `settings` is the construction configuration, kept because a QP change is
+/// applied by rebuilding the encoder from it (see `update_qp`).
 pub struct Openh264Encoder {
     encoder: Encoder,
+    settings: RustCaptureSettings,
     width: usize,
     height: usize,
     y_buf: Vec<u8>,
     u_buf: Vec<u8>,
     v_buf: Vec<u8>,
     current_bitrate_bps: i32,
+    current_fps: f32,
+    current_qp: i32,
+    qp_hysteresis_counter: u32,
     is_cbr: bool,
     omit_stripe_headers: bool,
 }
@@ -120,12 +129,55 @@ impl Openh264Encoder {
         let width = (settings.width.max(2) as usize) & !1;
         let height = (settings.height.max(2) as usize) & !1;
         let bps = (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000);
-        let fps = if settings.target_fps < 1.0 { 30.0 } else { settings.target_fps as f32 };
+        let fps = Self::clamp_fps(settings.target_fps);
+        let crf = settings.video_crf.clamp(1, 51);
+
+        let encoder = Self::build_encoder(settings, fps, bps, crf as u8)?;
+
+        let (cw, ch) = (width / 2, height / 2);
+        let mut me = Self {
+            encoder,
+            settings: settings.clone(),
+            width,
+            height,
+            y_buf: vec![0u8; width * height],
+            u_buf: vec![0u8; cw * ch],
+            v_buf: vec![0u8; cw * ch],
+            current_bitrate_bps: bps as i32,
+            current_fps: fps,
+            current_qp: crf,
+            qp_hysteresis_counter: 0,
+            is_cbr: settings.video_cbr_mode,
+            omit_stripe_headers: settings.omit_stripe_headers,
+        };
+        me.enable_four_slices();
+        Some(me)
+    }
+
+    /// The frame rate OpenH264 is configured with: the requested rate, or 30 when the capture
+    /// asks for less than 1 fps (the library rejects a sub-1 rate).
+    fn clamp_fps(target_fps: f64) -> f32 {
+        if target_fps < 1.0 {
+            30.0
+        } else {
+            target_fps as f32
+        }
+    }
+
+    /// Build one configured OpenH264 encoder, as described by `new`'s steps 2, 4 and 5. Separate
+    /// from `new` because `update_qp` rebuilds the encoder to move the pinned CRF/CQP quantizer, and
+    /// that rebuild has to reproduce the session's configuration exactly apart from the QP — hence
+    /// the live `fps` / `bitrate_bps` / `crf` arguments rather than reading the construction
+    /// settings for values a running session can have retuned.
+    fn build_encoder(
+        settings: &RustCaptureSettings,
+        fps: f32,
+        bitrate_bps: u32,
+        crf: u8,
+    ) -> Option<Encoder> {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(1).clamp(1, 4))
             .unwrap_or(1) as u16;
-        let is_cbr = settings.video_cbr_mode;
-        let crf = settings.video_crf.clamp(1, 51) as u8;
 
         let base = EncoderConfig::new()
             .max_frame_rate(FrameRate::from_hz(fps))
@@ -141,14 +193,14 @@ impl Openh264Encoder {
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
             .num_threads(threads);
-        let config = if is_cbr {
+        let config = if settings.video_cbr_mode {
             let min_qp = settings.video_min_qp.clamp(1, 51) as u8;
             let max_qp = if settings.video_max_qp > 0 {
                 settings.video_max_qp.clamp(min_qp as i32, 51) as u8
             } else {
                 51
             };
-            base.bitrate(BitRate::from_bps(bps))
+            base.bitrate(BitRate::from_bps(bitrate_bps))
                 .rate_control_mode(RateControlMode::Bitrate)
                 .qp(QpRange::new(min_qp, max_qp))
         } else {
@@ -157,22 +209,7 @@ impl Openh264Encoder {
                 .qp(QpRange::new(crf, crf))
         };
 
-        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config).ok()?;
-
-        let (cw, ch) = (width / 2, height / 2);
-        let mut me = Self {
-            encoder,
-            width,
-            height,
-            y_buf: vec![0u8; width * height],
-            u_buf: vec![0u8; cw * ch],
-            v_buf: vec![0u8; cw * ch],
-            current_bitrate_bps: bps as i32,
-            is_cbr,
-            omit_stripe_headers: settings.omit_stripe_headers,
-        };
-        me.enable_four_slices();
-        Some(me)
+        Encoder::with_api_config(OpenH264API::from_source(), config).ok()
     }
 
     /// Give every frame four fixed slices and explicit VUI colour signaling (BT.709, limited
@@ -246,9 +283,9 @@ impl Openh264Encoder {
     /// OpenH264 honors both through `SetOption`, so the reference chain and the infinite GOP are
     /// preserved and the change takes effect mid-stream — this is what makes the web UI's bitrate
     /// slider work, like NVENC and x264. The bitrate is applied only in **CBR** mode, and only when
-    /// it actually differs from the current target; in **CRF/CQP** the QP is fixed at construction,
-    /// so a CRF change instead restarts the capture and rebuilds the encoder (there is no live-QP
-    /// setter). A framerate of at least 1 fps is pushed via the frame-rate option.
+    /// it actually differs from the current target; the CRF/CQP quantizer moves through `update_qp`
+    /// instead. A framerate of at least 1 fps is pushed via the frame-rate option and mirrored in
+    /// `current_fps`, so a later `update_qp` rebuild keeps the live rate.
     pub fn reconfigure_rate(&mut self, bitrate_kbps: i32, fps: f64) {
         if self.is_cbr {
             let bps = bitrate_kbps.max(1).saturating_mul(1000);
@@ -264,6 +301,61 @@ impl Openh264Encoder {
                     std::ptr::addr_of_mut!(rate).cast(),
                 );
             }
+            self.current_fps = rate;
+        }
+    }
+
+    /// Move the CRF/CQP quantizer to `target_qp` — the quality slider and the paint-over refresh
+    /// both land here, so a session started in CRF mode retunes like the NVENC / VA-API / x264 ones
+    /// rather than staying pinned to its construction QP for its whole life.
+    ///
+    /// OpenH264 exposes no live-QP setter: `SetOption(SVC_ENCODE_PARAM_EXT)` carries a QP range, but
+    /// its in-place adjust path never copies `iMinQp` / `iMaxQp` onto the running parameter set, so
+    /// only a rebuilt encoder actually encodes at a new quantizer. The rebuild is therefore the
+    /// mechanism, and its cost — a fresh reference chain, a new parameter set, and an IDR — is what
+    /// the call is gated to avoid paying needlessly, in the same order as the VA-API CQP path:
+    ///
+    /// 1. **CBR**: no-op — the bitrate target governs quality there and the QP range is a clamp.
+    /// 2. **Unchanged QP**: reset the hysteresis counter and return, which is what makes a
+    ///    per-frame call from the pipeline free.
+    /// 3. **QP decrease** (higher quality, e.g. a paint-over refresh): rebuild immediately.
+    /// 4. **QP increase** (lower quality, e.g. sustained motion): only rebuild once
+    ///    `QP_HYSTERESIS_LIMIT` consecutive frames have asked for it, so transient motion does not
+    ///    make quality blink.
+    ///
+    /// A rebuild that fails to initialize leaves the running encoder untouched, so the session
+    /// continues at its current quantizer instead of dying on a quality change.
+    pub fn update_qp(&mut self, target_qp: u32) {
+        if self.is_cbr {
+            return;
+        }
+        let qp = (target_qp as i32).clamp(1, 51);
+        if qp == self.current_qp {
+            self.qp_hysteresis_counter = 0;
+            return;
+        }
+        if qp > self.current_qp {
+            self.qp_hysteresis_counter += 1;
+            if self.qp_hysteresis_counter <= QP_HYSTERESIS_LIMIT {
+                return;
+            }
+        }
+        self.qp_hysteresis_counter = 0;
+        match Self::build_encoder(
+            &self.settings,
+            self.current_fps,
+            self.current_bitrate_bps.max(1) as u32,
+            qp as u8,
+        ) {
+            Some(encoder) => {
+                self.encoder = encoder;
+                self.current_qp = qp;
+                self.enable_four_slices();
+            }
+            None => eprintln!(
+                "[openh264] rebuild for QP {qp} failed; staying at QP {}",
+                self.current_qp
+            ),
         }
     }
 
@@ -597,6 +689,48 @@ mod tests {
             low_quality < high_quality,
             "higher CRF must compress harder (crf40={low_quality}, crf18={high_quality})"
         );
+    }
+
+    /// A live CRF change through `update_qp` really moves the quantizer: a drop to a lower QP
+    /// (better quality) applies at once and grows subsequent output, while an immediate request to
+    /// go back up is held by the hysteresis instead of rebuilding on a transient.
+    ///
+    /// The two windows are equal-length runs of keyframes: the rebuild `update_qp` performs forces
+    /// an IDR of its own, and a window of P frames would compare motion residuals — nearly free on
+    /// a translating gradient — instead of the quantizer. Measuring intra-coded pictures on both
+    /// sides makes the size difference attributable to the QP alone, by a margin far wider than
+    /// frame-to-frame noise.
+    #[test]
+    fn live_update_qp_takes_effect() {
+        let (w, h, stride) = (256usize, 192usize, 256 * 4);
+        let s = RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            video_cbr_mode: false,
+            video_crf: 40,
+            target_fps: 30.0,
+            ..Default::default()
+        };
+        let mut e = Openh264Encoder::new(&s).unwrap();
+        let idr_run = |e: &mut Openh264Encoder, range: std::ops::Range<usize>| -> usize {
+            range
+                .map(|t| {
+                    e.encode_host_argb(&gradient_frame(w, h, t), stride, t as u64, true, false)
+                        .unwrap()
+                        .len()
+                })
+                .sum()
+        };
+        let coarse = idr_run(&mut e, 0..8);
+        e.update_qp(18);
+        assert_eq!(e.current_qp, 18, "a QP decrease must apply immediately");
+        let fine = idr_run(&mut e, 8..16);
+        assert!(
+            fine > coarse * 2,
+            "a lower live QP should grow output well beyond the coarse run (qp18={fine}, qp40={coarse})"
+        );
+        e.update_qp(40);
+        assert_eq!(e.current_qp, 18, "a single QP increase must wait out the hysteresis");
     }
 
     /// Both input byte orders encode valid, wire-headered Annex-B: the Wayland GLES readback
