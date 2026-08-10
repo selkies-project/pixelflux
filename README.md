@@ -5,7 +5,7 @@
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://linuxserver.github.io/pixelflux/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/pixelflux)
 
-**A performant web native pixel delivery pipeline for diverse sources, blending parallel processing of pixel buffers with flexible modern encoding formats.**
+**A performant pixel delivery pipeline for diverse sources, blending flexible and high-performance modern encoding formats.**
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 

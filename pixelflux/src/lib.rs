@@ -2963,6 +2963,13 @@ fn render_node_tick(
         for window in state.space.elements_for_output(&output).cloned().collect::<Vec<_>>() {
             window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
         }
+        // Panels, backgrounds and other layer-shell surfaces are composited from the
+        // layer map rather than the space, so they need the callback separately: one
+        // that never arrives leaves a client which draws on frame callbacks showing
+        // whatever it painted first, for as long as the session lasts.
+        for layer in layer_map_for_output(&output).layers() {
+            layer.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+        }
 
         if let Some(cap) = node.capture.as_mut() {
             // A dead encode thread (panic, unexpected exit) cannot drain the pool;
@@ -4476,6 +4483,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         .collect::<Vec<_>>()
                     {
                         window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
+                            Some(node.output.clone())
+                        });
+                    }
+                    for layer in layer_map_for_output(&node.output).layers() {
+                        layer.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
                             Some(node.output.clone())
                         });
                     }
