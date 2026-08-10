@@ -3492,6 +3492,66 @@ struct WaylandThreadConfig {
     cursor_size: i32,
 }
 
+/// Bring the hardware renderer up on a DRM render node: the GBM device, the EGL display and
+/// context it backs, the GLES renderer, and the allocator the render targets come from.
+///
+/// The compositor and [`probe_wayland_gpu`] share this so the probe's answer is the
+/// compositor's own. Errors name the step that failed, which is all a caller can act on.
+fn gpu_render_init(
+    device_path: &std::path::Path,
+) -> Result<(RawGbmDevice<File>, GlesRenderer), String> {
+    let file = File::options().read(true).write(true).open(device_path)
+        .map_err(|e| format!("Failed to open render device: {}", e))?;
+    let file_for_alloc = file.try_clone()
+        .map_err(|e| format!("Failed to clone file for GBM Allocator: {}", e))?;
+    let gbm_allocator = RawGbmDevice::new(file_for_alloc)
+        .map_err(|_| "Failed to create Raw GBM Device")?;
+    let gbm = GbmDevice::new(file)
+        .map_err(|_| "Failed to create GBM device")?;
+    let egl = unsafe { EGLDisplay::new(gbm) }
+        .map_err(|_| "Failed to create EGL display")?;
+    let context = EGLContext::new(&egl)
+        .map_err(|_| "Failed to create EGL context")?;
+    let renderer = unsafe { GlesRenderer::new(context) }
+        .map_err(|_| "Failed to init GlesRenderer")?;
+    Ok((gbm_allocator, renderer))
+}
+
+/// `GL_RENDERER` of a live renderer — the driver that actually answered, which is the only
+/// thing that separates a GPU from Mesa's software fallback on the same node. Empty when the
+/// context cannot be made current or the string is unavailable.
+fn gl_renderer_name(renderer: &mut GlesRenderer) -> String {
+    renderer
+        .with_context(|gl| unsafe {
+            let ptr = gl.GetString(smithay::backend::renderer::gles::ffi::RENDERER);
+            if ptr.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(ptr as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// A GPU is exposed to this container or machine.
+///
+/// Only device nodes count. `/sys/class/drm` is the host's and lists cards a container may
+/// have no access to, while `/dev` is the container's own; the NVIDIA character devices
+/// answer for a driver stack that was given no DRM node at all.
+fn gpu_exposed() -> bool {
+    std::path::Path::new("/dev/nvidiactl").exists()
+        || std::fs::read_dir("/dev/dri")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("renderD") || name.starts_with("card")
+            })
+}
 
 /// The main execution loop of the Wayland backend.
 ///
@@ -3595,21 +3655,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         println!("[Wayland] Initializing GL Renderer using device: {}", dri_node);
         let init_res: Result<(), String> = (|| {
             let device_path = std::path::Path::new(&dri_node);
-            let file = File::options().read(true).write(true).open(device_path)
-                .map_err(|e| format!("Failed to open render device: {}", e))?;
-            let file_for_alloc = file.try_clone()
-                .map_err(|e| format!("Failed to clone file for GBM Allocator: {}", e))?;
-            let gbm_allocator = RawGbmDevice::new(file_for_alloc)
-                .map_err(|_| "Failed to create Raw GBM Device")?;
-            let gbm = GbmDevice::new(file)
-                .map_err(|_| "Failed to create GBM device")?;
-            let egl = unsafe { EGLDisplay::new(gbm) }
-                .map_err(|_| "Failed to create EGL display")?;
-            let context = EGLContext::new(&egl)
-                .map_err(|_| "Failed to create EGL context")?;
-            let mut renderer = unsafe { GlesRenderer::new(context) }
-                .map_err(|_| "Failed to init GlesRenderer")?;
-            
+            let (gbm_allocator, mut renderer) = gpu_render_init(device_path)?;
+
             if let Err(e) = renderer.bind_wl_display(&dh) {
                 println!("[Wayland] Warning: Failed to bind EGL to Wayland Display (Optional): {:?}", e);
             }
@@ -3650,8 +3697,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     }
 
     if !gpu_success {
-        if !dri_node.is_empty() && !use_gpu {
-        } else {
+        if dri_node.is_empty() {
             println!("[Wayland] No render node. Initializing Software Renderer (Pixman).");
         }
         pixman_renderer = Some(PixmanRenderer::new().expect("Failed to init PixmanRenderer"));
@@ -6141,6 +6187,66 @@ fn ensure_wayland_display(
         .unwrap_or_default())
 }
 
+/// Whether a Wayland session here would be hardware accelerated, and whether there is a GPU
+/// to accelerate it.
+///
+/// Device paths do not answer this: a render node can exist with no working allocator or EGL
+/// stack behind it, and a GPU can be present with no node at all (an NVIDIA container without
+/// the graphics driver capability). So the compositor's own bring-up is run against the node
+/// it would resolve, through allocating a render target and exporting it as a dmabuf. Nothing
+/// is left running; a compositor started afterwards is unaffected.
+///
+/// A node that only reaches a software rasterizer is reported unaccelerated: Mesa answers
+/// with llvmpipe rather than failing, so the bring-up succeeding is not on its own proof of
+/// a GPU behind it.
+///
+/// `render_node` and `auto_gpu` take the same values as the capture settings of those names.
+/// Returns `node` (the resolved render node, empty when none), `accelerated`, `gpu` (a GPU is
+/// exposed here at all), `renderer` (the GL renderer reached, empty when none was), and
+/// `error` (the step that failed; empty when accelerated).
+#[pyfunction]
+#[pyo3(signature = (render_node = String::new(), auto_gpu = String::new()))]
+fn probe_wayland_gpu(
+    py: Python<'_>,
+    render_node: String,
+    auto_gpu: String,
+) -> PyResult<Py<PyAny>> {
+    let (node, name, error) = py.detach(|| {
+        let node = if render_node.is_empty() {
+            parse_auto_gpu(&auto_gpu).and_then(|token| auto_select_render_node(token.as_deref()))
+        } else {
+            Some(render_node)
+        };
+        let Some(node) = node else {
+            return (String::new(), String::new(), "No render node".to_string());
+        };
+        let mut name = String::new();
+        let result = gpu_render_init(std::path::Path::new(&node)).and_then(|(gbm, mut renderer)| {
+            let bo = gbm
+                .create_buffer_object::<()>(64, 64, GbmFormat::Argb8888, BufferObjectFlags::RENDERING)
+                .map_err(|_| "Failed to allocate GBM buffer")?;
+            bo.fd().map_err(|e| format!("Failed to export dmabuf: {e:?}"))?;
+            name = gl_renderer_name(&mut renderer);
+            let lowered = name.to_lowercase();
+            if ["llvmpipe", "softpipe", "swrast", "software rasterizer"]
+                .iter()
+                .any(|sw| lowered.contains(sw))
+            {
+                return Err(format!("Software rasterizer only ({name})"));
+            }
+            Ok(())
+        });
+        (node, name, result.err().unwrap_or_default())
+    });
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("node", &node)?;
+    d.set_item("accelerated", error.is_empty())?;
+    d.set_item("gpu", gpu_exposed())?;
+    d.set_item("renderer", &name)?;
+    d.set_item("error", &error)?;
+    Ok(d.into_any().unbind())
+}
+
 /// The running compositor's Wayland socket name (e.g. "wayland-1"), or None when no
 /// compositor thread has been started (this never creates one).
 #[pyfunction]
@@ -6229,6 +6335,7 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_wayland_gpu, m)?)?;
     m.add_function(wrap_pyfunction!(start_recording, m)?)?;
     m.add_function(wrap_pyfunction!(stop_recording, m)?)?;
     m.add_function(wrap_pyfunction!(recording_status, m)?)?;
