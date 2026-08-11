@@ -64,7 +64,7 @@ gpl = ["dep:x264-sys"]
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
-rev = "ca932e042fa9ad150605c150a86275b85f9ad5b3"
+rev = "5de53056b5cafd453371af2d4e955931ce87ef71"
 default-features = false
 features = [
     "backend_drm",

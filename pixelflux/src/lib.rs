@@ -65,9 +65,13 @@ use yuv::{
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::presentation::{PresentationState, Refresh};
+use smithay::wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState};
+use smithay::wayland::image_copy_capture::{CaptureFailureReason, ImageCopyCaptureState};
 use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
+use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::{
     backend::{
         allocator::{
@@ -1935,10 +1939,26 @@ fn start_capture_on_display(
                     Some(Point::from(node.pos)),
                 );
                 node.output.set_preferred(new_mode);
+                // Capture clients allocate to our announced size; a stale size means
+                // every frame they submit from now on fails buffer validation.
+                for cs in state
+                    .copy_sessions
+                    .iter()
+                    .filter(|cs| cs.output.upgrade().as_ref() == Some(&node.output))
+                {
+                    if let Some(c) = wayland::frontend::output_capture_constraints(
+                        &node.output,
+                        state.gles_renderer.as_ref(),
+                        &state.render_node_path,
+                    ) {
+                        cs.session.update_constraints(c);
+                    }
+                }
 
                 let pixel_count =
                     (settings.width.max(0) as usize) * (settings.height.max(0) as usize);
                 node.frame_buffer = vec![0u8; pixel_count * 4];
+                node.target_seeded = false;
 
                 if let Some(off) = new_offscreen.take() {
                     node.offscreen_buffer = Some(off);
@@ -1957,6 +1977,9 @@ fn start_capture_on_display(
             if let Some(surface) = window.wl_surface() {
                 node.output.enter(&surface);
                 with_states(&surface, |states| {
+                    smithay::wayland::compositor::send_surface_state(
+                        &surface, states, scale.ceil() as i32, Transform::Normal,
+                    );
                     with_fractional_scale(states, |fs| {
                         fs.set_preferred_scale(scale);
                     });
@@ -2241,7 +2264,7 @@ fn draw_host_watermark(
         .map_err(|e| format!("render: {e:?}"))?;
     let dst = elem.geometry(1.0.into());
     let local = Rectangle::from_size(dst.size);
-    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[], None)
         .map_err(|e| format!("draw: {e:?}"))?;
     frame.finish().map_err(|e| format!("finish: {e:?}"))
 }
@@ -2285,7 +2308,7 @@ fn compose_host_watermark(
         .map_err(|e| format!("texture: {e:?}"))?;
     let dst = elem.geometry(1.0.into());
     let local = Rectangle::from_size(dst.size);
-    elem.draw(&mut frame, elem.src(), dst, &[local], &[])
+    elem.draw(&mut frame, elem.src(), dst, &[local], &[], None)
         .map_err(|e| format!("draw: {e:?}"))?;
     frame.finish().map_err(|e| format!("finish: {e:?}"))
 }
@@ -2297,6 +2320,147 @@ fn warn_once_host_watermark(e: &str) {
     }
 }
 
+/// Copy full rows from `src` (tight `width*4` stride) into an Argb8888/Xrgb8888 shm
+/// buffer, honoring the destination's own offset and stride.
+fn copy_rows_into_shm(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    src: &[u8],
+    width: i32,
+    height: i32,
+) -> Result<(), String> {
+    use smithay::wayland::shm::with_buffer_contents_mut;
+    let src_stride = (width.max(0) as usize) * 4;
+    if src.len() < src_stride * (height.max(0) as usize) {
+        return Err("source smaller than advertised".into());
+    }
+    with_buffer_contents_mut(buffer, |ptr, len, spec| {
+        if spec.width < width || spec.height < height {
+            return Err("shm buffer smaller than the output".to_string());
+        }
+        let dst_stride = spec.stride as usize;
+        let offset = spec.offset as usize;
+        if dst_stride < src_stride || len < offset + dst_stride * (height as usize) {
+            return Err("shm stride or length mismatch".to_string());
+        }
+        for y in 0..height as usize {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr().add(y * src_stride),
+                    ptr.add(offset + y * dst_stride),
+                    src_stride,
+                );
+            }
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("{e:?}"))?
+}
+
+/// Complete parked ext-image-copy-capture frames for this output from the frame the
+/// render pass just produced. A dmabuf target is filled by one GPU blit from the
+/// output's composited buffer; an shm target by one readback (GLES) or one row copy
+/// (pixman). With no damage, a session that has already received content keeps its
+/// frame parked, so a static screen costs capture clients nothing.
+fn service_copy_frames(
+    state: &mut AppState,
+    node: &mut wayland::frontend::OutputNode,
+    width: i32,
+    height: i32,
+    damage_rects: &[Rectangle<i32, Physical>],
+) {
+    use smithay::backend::renderer::{buffer_type, Blit, BufferType, ExportMem, TextureFilter};
+    use smithay::utils::Buffer as BufferCoords;
+
+    if state.copy_sessions.is_empty() {
+        return;
+    }
+    let time = state.clock.now();
+    for i in 0..state.copy_sessions.len() {
+        {
+            let cs = &state.copy_sessions[i];
+            if cs.output.upgrade().as_ref() != Some(&node.output)
+                || cs.pending.is_none()
+                || (damage_rects.is_empty() && cs.delivered_once)
+            {
+                continue;
+            }
+        }
+        let first = !state.copy_sessions[i].delivered_once;
+        let frame = state.copy_sessions[i].pending.take().unwrap();
+        let buffer = frame.buffer();
+        let full = Rectangle::<i32, Physical>::new((0, 0).into(), (width, height).into());
+        let result: Result<(), String> = match buffer_type(&buffer) {
+            Some(BufferType::Dma) => (|| {
+                let renderer = state.gles_renderer.as_mut().ok_or("no GLES renderer")?;
+                let mut client = smithay::wayland::dmabuf::get_dmabuf(&buffer)
+                    .map_err(|e| e.to_string())?
+                    .clone();
+                let (_bo, offscreen) = node
+                    .offscreen_buffer
+                    .as_mut()
+                    .ok_or("no composited buffer")?;
+                let src = renderer.bind(offscreen).map_err(|e| format!("{e:?}"))?;
+                let mut dst = renderer.bind(&mut client).map_err(|e| format!("{e:?}"))?;
+                // ready() promises readable contents, and implicit dmabuf sync cannot
+                // be relied on cross-process on every driver: wait out the blit fence
+                // (microseconds) before declaring the frame done.
+                renderer
+                    .blit(&src, &mut dst, full, full, TextureFilter::Linear)
+                    .map_err(|e| format!("{e:?}"))?
+                    .wait()
+                    .map_err(|_| "blit fence interrupted".to_string())?;
+                Ok(())
+            })(),
+            Some(BufferType::Shm) => (|| {
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    let (_bo, offscreen) = node
+                        .offscreen_buffer
+                        .as_mut()
+                        .ok_or("no composited buffer")?;
+                    let fb = renderer.bind(offscreen).map_err(|e| format!("{e:?}"))?;
+                    let mapping = renderer
+                        .copy_framebuffer(
+                            &fb,
+                            Rectangle::new((0, 0).into(), (width, height).into()),
+                            Fourcc::Argb8888,
+                        )
+                        .map_err(|e| format!("{e:?}"))?;
+                    let data = renderer.map_texture(&mapping).map_err(|e| format!("{e:?}"))?;
+                    copy_rows_into_shm(&buffer, data, width, height)
+                } else {
+                    copy_rows_into_shm(&buffer, &node.frame_buffer, width, height)
+                }
+            })(),
+            _ => Err("unsupported buffer type".into()),
+        };
+        match result {
+            Ok(()) => {
+                let damage: Option<Vec<Rectangle<i32, BufferCoords>>> = if first {
+                    None
+                } else {
+                    Some(
+                        damage_rects
+                            .iter()
+                            .map(|r| {
+                                Rectangle::new(
+                                    (r.loc.x, r.loc.y).into(),
+                                    (r.size.w, r.size.h).into(),
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                frame.success(Transform::Normal, damage, time);
+                state.copy_sessions[i].delivered_once = true;
+            }
+            Err(e) => {
+                eprintln!("[Wayland] copy-capture frame failed: {e}");
+                frame.fail(CaptureFailureReason::Unknown);
+            }
+        }
+    }
+}
+
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
@@ -2305,7 +2469,8 @@ fn render_node_tick(
         .pending_screenshot
         .as_ref()
         .is_some_and(|(id, _)| *id == node.id);
-    if node.capture.is_none() && !take_screenshot {
+    let copy_frame_wanted = state.copy_frame_pending_for(&node.output);
+    if node.capture.is_none() && !take_screenshot && !copy_frame_wanted {
         return false;
     }
 
@@ -2401,7 +2566,7 @@ fn render_node_tick(
     let mut render_success = false;
     let mut render_sync = None;
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
-    let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(true);
+    let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(!node.target_seeded);
 
     // Host-capture mode: the host compositor already blitted this display's frame
     // into one of our buffers (screencopy); adopt it in place of compositing.
@@ -2941,6 +3106,7 @@ fn render_node_tick(
         }
 
     if render_success {
+        node.target_seeded = true;
         let time = state.clock.now();
         // The composited frame is what the capture consumes, so this render is also the
         // presentation moment for wp_presentation feedback.
@@ -2971,6 +3137,12 @@ fn render_node_tick(
         };
         node.frame_seq += 1;
         feedback.presented(time, refresh, node.frame_seq, wp_presentation_feedback::Kind::Vsync);
+
+        // Host mode renders nothing locally, so there is no composited buffer to
+        // serve capture clients from; their frames stay parked.
+        if !host_mode {
+            service_copy_frames(state, node, width, height, &damage_rects);
+        }
 
         if let Some(cap) = node.capture.as_mut() {
             // A dead encode thread (panic, unexpected exit) cannot drain the pool;
@@ -3342,6 +3514,7 @@ fn create_output_on(
         overlay_state: OverlayState::default(),
         capture: None,
         frame_seq: 0,
+        target_seeded: false,
     });
     // A nested session opens one host toplevel per screen and the extras wait
     // parked until a display exists for them: hand the newest waiting window to
@@ -3709,7 +3882,10 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         use_gpu = false;
     }
 
-    let compositor_state = CompositorState::new::<AppState>(&dh);
+    let compositor_state = CompositorState::new_v6::<AppState>(&dh);
+    let image_capture_source_state = ImageCaptureSourceState::new();
+    let output_capture_source_state = OutputCaptureSourceState::new::<AppState>(&dh);
+    let image_copy_capture_state = ImageCopyCaptureState::new::<AppState>(&dh);
     let fractional_scale_state = FractionalScaleManagerState::new::<AppState>(&dh);
     let shm_state = ShmState::new::<AppState>(&dh, vec![]);
     let output_state = OutputManagerState::new_with_xdg_output::<AppState>(&dh);
@@ -3719,6 +3895,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let layer_shell_state = WlrLayerShellState::new::<AppState>(&dh);
     let data_device_state = DataDeviceState::new::<AppState>(&dh);
     let data_control_state = DataControlState::new::<AppState, _>(&dh, None, |_| true);
+    let ext_data_control_state = ExtDataControlState::new::<AppState, _>(&dh, None, |_| true);
+    let cursor_shape_state = CursorShapeManagerState::new::<AppState>(&dh);
     let _vk_global = dh.create_global::<AppState, ZwpVirtualKeyboardManagerV1, _>(1, ());
     let pointer_warp_state = PointerWarpManager::new::<AppState>(&dh);
     let relative_pointer_state = RelativePointerManagerState::new::<AppState>(&dh);
@@ -3747,6 +3925,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         single_pixel_buffer,
         dmabuf_state,
         dmabuf_global,
+        ext_data_control_state,
+        cursor_shape_state,
+        image_capture_source_state,
+        output_capture_source_state,
+        image_copy_capture_state,
+        copy_sessions: Vec::new(),
         output_state,
         seat_state,
         shell_state,
@@ -3851,6 +4035,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         overlay_state: OverlayState::default(),
         capture: None,
         frame_seq: 0,
+        target_seeded: false,
     });
 
     /// Apply every queued control command in FIFO order. Sends wake the loop through the
@@ -4447,7 +4632,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             }
 
             let any_capturing = state.output_nodes.iter().any(|n| n.capture.is_some());
-            if !any_capturing && state.pending_screenshot.is_none() {
+            let any_copy_frame = state.copy_sessions.iter().any(|cs| cs.pending.is_some());
+            if !any_capturing && state.pending_screenshot.is_none() && !any_copy_frame {
                 // No render/encode work, but committed clients still need their
                 // frame callbacks: a vsynced client (FIFO Vulkan present, games, a
                 // nested compositor's own clients) otherwise blocks in its swap
@@ -4498,7 +4684,15 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 if let Some(renderer) = state.gles_renderer.as_mut() {
                     let _ = renderer.cleanup_texture_cache();
                 }
-                return TimeoutAction::ToDuration(IDLE_FRAME_INTERVAL);
+                // A parked capture session is an attached consumer that may request a
+                // frame at any moment: tick at frame pace so that request waits at most
+                // one frame, not a quarter second.
+                let idle = if state.copy_sessions.is_empty() {
+                    IDLE_FRAME_INTERVAL
+                } else {
+                    Duration::from_millis(16)
+                };
+                return TimeoutAction::ToDuration(idle);
             }
 
             // Render every output that needs it. The nodes are taken out of the state so

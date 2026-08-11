@@ -786,9 +786,9 @@ dependencies = [
 
 [[package]]
 name = "input"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbdc09524a91f9cacd26f16734ff63d7dc650daffadd2b6f84d17a285bd875a9"
+checksum = "f9793345a65d71317763a33066b5d8351f8760dde8d4930fe9e39b5f14a7959d"
 dependencies = [
  "bitflags",
  "input-sys",
@@ -1770,7 +1770,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/Smithay/smithay?rev=ca932e042fa9ad150605c150a86275b85f9ad5b3#ca932e042fa9ad150605c150a86275b85f9ad5b3"
+source = "git+https://github.com/Smithay/smithay?rev=5de53056b5cafd453371af2d4e955931ce87ef71#5de53056b5cafd453371af2d4e955931ce87ef71"
 dependencies = [
  "appendlist",
  "atomic_float",

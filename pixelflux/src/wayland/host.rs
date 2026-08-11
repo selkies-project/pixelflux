@@ -3,13 +3,17 @@
 //!
 //! The host compositor owns the session — one seat, one selection, one screen
 //! model — and pixelflux captures and injects as a privileged-protocol client:
-//! frames via `zwlr_screencopy_v1` (v3 `copy_with_damage`, so idle screens cost
-//! nothing), keyboard via a persistent `zwp_virtual_keyboard_v1` device carrying
-//! selkies' own keymap text, pointer via `zwlr_virtual_pointer_v1`. Zero-copy is
-//! preserved by allocating the capture buffers from pixelflux's OWN GBM device
-//! (render node — no privileges): the compositor blits straight into the dmabufs
-//! the encoder imports, so no CPU ever touches a frame. Without a GPU the same
-//! loop degrades to wl_shm buffers feeding the CPU encode pool.
+//! frames via `ext_image_copy_capture_v1` where the host offers it (wlroots
+//! 0.19+, KWin 6.2+, cosmic) and `zwlr_screencopy_v1` (v3 `copy_with_damage`)
+//! everywhere else — both damage-gated, so idle screens cost nothing
+//! (`PIXELFLUX_HOST_CAPTURE=zwlr` forces the fallback); keyboard via a
+//! persistent `zwp_virtual_keyboard_v1` device carrying selkies' own keymap
+//! text, pointer via `zwlr_virtual_pointer_v1`. Zero-copy is preserved by
+//! allocating the capture buffers from pixelflux's OWN GBM device (render node —
+//! no privileges): the compositor blits straight into the dmabufs the encoder
+//! imports, so no CPU ever touches a frame. A host that cannot import our
+//! dmabufs (other GPU, software renderer) and any run without a GPU degrade to
+//! wl_shm buffers feeding the CPU encode pool.
 //!
 //! Every host `wl_output` maps to one selkies display id, in registry order: a
 //! control thread on the primary connection owns wlr-output-management and
@@ -36,6 +40,15 @@ use smithay::backend::allocator::Buffer as _;
 use smithay::utils::{Physical, Rectangle};
 use wayland_client::protocol::{wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::ext::image_capture_source::v1::client::{
+    ext_image_capture_source_v1::ExtImageCaptureSourceV1,
+    ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1,
+};
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1::{self, ExtImageCopyCaptureFrameV1},
+    ext_image_copy_capture_manager_v1::{self, ExtImageCopyCaptureManagerV1},
+    ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
     zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
@@ -183,6 +196,8 @@ struct CtrlState {
     vk_mgr: Option<ZwpVirtualKeyboardManagerV1>,
     vptr_mgr: Option<ZwlrVirtualPointerManagerV1>,
     has_screencopy: bool,
+    has_ext_capture: bool,
+    has_ext_source: bool,
     outputs: Vec<(wl_output::WlOutput, Option<String>)>,
     /// Registry indices in display order (natural name sort — registry
     /// announcement order is not guaranteed to match output creation order).
@@ -238,6 +253,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CtrlState {
                     state.vptr_mgr = Some(registry.bind(name, version.min(2), qh, ()))
                 }
                 "zwlr_screencopy_manager_v1" if version >= 3 => state.has_screencopy = true,
+                "ext_image_copy_capture_manager_v1" => state.has_ext_capture = true,
+                "ext_output_image_capture_source_manager_v1" => state.has_ext_source = true,
                 "wl_output" => {
                     let idx = state.outputs.len();
                     let out = registry.bind(name, version.min(4), qh, idx);
@@ -357,6 +374,8 @@ struct CaptureState {
     shm: Option<wl_shm::WlShm>,
     dmabuf: Option<ZwpLinuxDmabufV1>,
     screencopy: Option<ZwlrScreencopyManagerV1>,
+    ext_capture: Option<ExtImageCopyCaptureManagerV1>,
+    ext_source_mgr: Option<ExtOutputImageCaptureSourceManagerV1>,
     outputs: Vec<(wl_output::WlOutput, Option<String>)>,
     // Per-frame capture negotiation/results: the buffer types screencopy offered, as
     // (fourcc, width, height) for dmabuf and (format, width, height, stride) for shm.
@@ -367,6 +386,21 @@ struct CaptureState {
     ready: bool,
     failed: bool,
     sync_done: bool,
+    // Non-immed zwp_linux_buffer_params result: the host either delivered a
+    // wl_buffer for our dmabuf or refused the import.
+    params_created: Option<wayland_client::protocol::wl_buffer::WlBuffer>,
+    params_failed: bool,
+    // ext session constraints stream in flight; `done` seals it into the committed
+    // set and bumps the serial (a new set arrives whenever the output changes).
+    ext_pending_size: Option<(i32, i32)>,
+    ext_pending_shm: Vec<u32>,
+    ext_pending_dma: Vec<(u32, Vec<u64>)>,
+    ext_size: Option<(i32, i32)>,
+    ext_shm_formats: Vec<u32>,
+    ext_dma_formats: Vec<(u32, Vec<u64>)>,
+    ext_serial: u64,
+    ext_stopped: bool,
+    ext_fail_reason: Option<ext_image_copy_capture_frame_v1::FailureReason>,
 }
 
 
@@ -378,6 +412,7 @@ impl CaptureState {
         self.damage.clear();
         self.ready = false;
         self.failed = false;
+        self.ext_fail_reason = None;
     }
 }
 
@@ -407,6 +442,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for CaptureState {
                 "zwlr_screencopy_manager_v1" if version >= 3 => {
                     state.screencopy = Some(registry.bind(name, 3, qh, ()))
                 }
+                "ext_image_copy_capture_manager_v1" => {
+                    state.ext_capture = Some(registry.bind(name, 1, qh, ()))
+                }
+                "ext_output_image_capture_source_manager_v1" => {
+                    state.ext_source_mgr = Some(registry.bind(name, 1, qh, ()))
+                }
                 "wl_output" => {
                     let idx = state.outputs.len();
                     let out = registry.bind(name, version.min(4), qh, idx);
@@ -422,6 +463,83 @@ delegate_noop!(CaptureState: ignore wl_shm::WlShm);
 delegate_noop!(CaptureState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(CaptureState: ignore wayland_client::protocol::wl_buffer::WlBuffer);
 delegate_noop!(CaptureState: ZwlrScreencopyManagerV1);
+delegate_noop!(CaptureState: ExtImageCopyCaptureManagerV1);
+delegate_noop!(CaptureState: ExtOutputImageCaptureSourceManagerV1);
+delegate_noop!(CaptureState: ExtImageCaptureSourceV1);
+
+impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureSessionV1,
+        event: ext_image_copy_capture_session_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_session_v1::Event;
+        match event {
+            Event::BufferSize { width, height } => {
+                state.ext_pending_size = Some((width as i32, height as i32));
+            }
+            Event::ShmFormat { format } => {
+                let raw = match format {
+                    WEnum::Value(f) => f as u32,
+                    WEnum::Unknown(u) => u,
+                };
+                state.ext_pending_shm.push(raw);
+            }
+            Event::DmabufDevice { .. } => {
+                // Buffers are allocated from pixelflux's own render node, like the
+                // wlr-screencopy path; a cross-device host fails the dmabuf import
+                // and the shm formats below still apply.
+            }
+            Event::DmabufFormat { format, modifiers } => {
+                let mods = modifiers
+                    .chunks_exact(8)
+                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                    .collect();
+                state.ext_pending_dma.push((format, mods));
+            }
+            Event::Done => {
+                state.ext_size = state.ext_pending_size.take();
+                state.ext_shm_formats = std::mem::take(&mut state.ext_pending_shm);
+                state.ext_dma_formats = std::mem::take(&mut state.ext_pending_dma);
+                state.ext_serial += 1;
+            }
+            Event::Stopped => state.ext_stopped = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for CaptureState {
+    fn event(
+        state: &mut Self,
+        _: &ExtImageCopyCaptureFrameV1,
+        event: ext_image_copy_capture_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use ext_image_copy_capture_frame_v1::Event;
+        match event {
+            Event::Damage { x, y, width, height } => {
+                state.damage.push(Rectangle::new(
+                    (x, y).into(),
+                    (width, height).into(),
+                ));
+            }
+            Event::Ready => state.ready = true,
+            Event::Failed { reason } => {
+                state.failed = true;
+                if let WEnum::Value(r) = reason {
+                    state.ext_fail_reason = Some(r);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<ZwpLinuxDmabufV1, ()> for CaptureState {
     fn event(
@@ -439,14 +557,27 @@ impl Dispatch<ZwpLinuxDmabufV1, ()> for CaptureState {
 
 impl Dispatch<ZwpLinuxBufferParamsV1, ()> for CaptureState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ZwpLinuxBufferParamsV1,
-        _: zwp_linux_buffer_params_v1::Event,
+        event: zwp_linux_buffer_params_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // created/failed are only sent for non-immed creation.
+        match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => {
+                state.params_created = Some(buffer);
+            }
+            zwp_linux_buffer_params_v1::Event::Failed => state.params_failed = true,
+            _ => {}
+        }
+    }
+
+    fn event_created_child(
+        _opcode: u16,
+        qhandle: &QueueHandle<Self>,
+    ) -> std::sync::Arc<dyn wayland_client::backend::ObjectData> {
+        qhandle.make_data::<wayland_client::protocol::wl_buffer::WlBuffer, _>(())
     }
 }
 
@@ -543,8 +674,11 @@ impl HostSession {
         bounded_roundtrip(&conn, &mut queue, &mut state)?;
 
         let seat = state.seat.clone().ok_or("host compositor advertises no wl_seat")?;
-        if !state.has_screencopy {
-            return Err("host compositor lacks zwlr_screencopy_manager_v1 (v3)".into());
+        if !state.has_screencopy && !(state.has_ext_capture && state.has_ext_source) {
+            return Err(
+                "host compositor offers neither ext-image-copy-capture nor zwlr_screencopy_manager_v1 (v3)"
+                    .into(),
+            );
         }
         if state.outputs.is_empty() {
             return Err("host compositor has no wl_output".into());
@@ -1047,6 +1181,103 @@ fn fourcc_to_gbm(fourcc: u32) -> GbmFormat {
     }
 }
 
+/// A dmabuf-backed capture slot: a GBM buffer object from pixelflux's render node,
+/// exported and wrapped in a host `wl_buffer`. `modifiers` narrows the allocation to
+/// what the host advertised; empty leaves the driver's choice, which the host learns
+/// through the params anyway. `Ok(None)` means the host refused the import (wrong
+/// device, unsupported modifier): the caller degrades to shm slots instead of dying
+/// to the protocol error `create_immed` would raise.
+#[allow(clippy::too_many_arguments)]
+fn alloc_gpu_slot(
+    conn: &Connection,
+    queue: &mut EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    wake: RawFd,
+    dev: &GbmDevice<File>,
+    dmabuf_global: &ZwpLinuxDmabufV1,
+    fourcc: u32,
+    w: i32,
+    h: i32,
+    modifiers: &[u64],
+) -> Result<Option<SlotBuffer>, String> {
+    let qh = queue.handle();
+    let format = fourcc_to_gbm(fourcc);
+    let bo = if modifiers.is_empty() {
+        dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
+    } else {
+        dev.create_buffer_object_with_modifiers2::<()>(
+            w as u32,
+            h as u32,
+            format,
+            modifiers.iter().map(|&m| gbm::Modifier::from(m)),
+            BufferObjectFlags::RENDERING,
+        )
+        .or_else(|_| {
+            dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
+        })
+    }
+    .map_err(|e| format!("GBM allocation {w}x{h}: {e:?}"))?;
+    let dmabuf = crate::create_dmabuf_from_bo(&bo);
+    let params = dmabuf_global.create_params(&qh, ());
+    let modifier: u64 = dmabuf.format().modifier.into();
+    for (i, handle) in dmabuf.handles().enumerate() {
+        params.add(
+            handle,
+            i as u32,
+            dmabuf.offsets().nth(i).unwrap_or(0),
+            dmabuf.strides().nth(i).unwrap_or(0),
+            (modifier >> 32) as u32,
+            (modifier & 0xffff_ffff) as u32,
+        );
+    }
+    state.params_created = None;
+    state.params_failed = false;
+    params.create(w, h, fourcc, zwp_linux_buffer_params_v1::Flags::empty());
+    loop {
+        match pump_until(conn, queue, state, wake, Some(Duration::from_secs(2)), |s| {
+            s.params_created.is_some() || s.params_failed
+        })? {
+            Pump::Done => break,
+            Pump::Control => continue,
+            Pump::Timeout => {
+                params.destroy();
+                return Err("host answered neither created nor failed for the dmabuf".into());
+            }
+        }
+    }
+    params.destroy();
+    match state.params_created.take() {
+        Some(wl) => Ok(Some(SlotBuffer::Gpu { _bo: bo, dmabuf, wl })),
+        None => Ok(None),
+    }
+}
+
+/// An shm-backed capture slot in a memfd pool the CPU consumer reads in place.
+fn alloc_cpu_slot(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<CaptureState>,
+    format: u32,
+    w: i32,
+    h: i32,
+    stride: i32,
+) -> Result<SlotBuffer, String> {
+    let size = (stride * h) as usize;
+    let fd = memfd_with(&vec![0u8; size])?;
+    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    let wl = pool.create_buffer(
+        0,
+        w,
+        h,
+        stride,
+        WEnum::<wl_shm::Format>::from(format).into_result().unwrap_or(wl_shm::Format::Xrgb8888),
+        qh,
+        (),
+    );
+    let file = File::from(fd);
+    let map = unsafe { memmap2::MmapMut::map_mut(&file) }.map_err(|e| format!("shm map: {e}"))?;
+    Ok(SlotBuffer::Cpu { _pool: pool, map: Arc::new(map), stride, format, wl })
+}
+
 /// What a control-channel drain decided while a capture wait was in progress.
 enum Ctl {
     None,
@@ -1125,7 +1356,6 @@ fn capture_loop(
     // Names (wl_output v4) arrive after the binds from the first round-trip.
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
 
-    let screencopy = state.screencopy.clone().ok_or("no zwlr_screencopy_manager_v1")?;
     // Select this thread's output by the name the control connection assigned
     // it; ordering fallback only when the host names nothing.
     let by_name = expect_name.as_ref().and_then(|expect| {
@@ -1148,6 +1378,25 @@ fn capture_loop(
         .and_then(|f| GbmDevice::new(f).ok());
     let wake = wake_rd.as_raw_fd();
 
+    // Hosts speaking ext-image-copy-capture (wlroots 0.19+, KWin 6.2+, cosmic) get a
+    // persistent session with compositor-side damage gating; everything else takes
+    // wlr-screencopy v3 below, unchanged. PIXELFLUX_HOST_CAPTURE=zwlr forces the
+    // fallback for triage.
+    let force = std::env::var("PIXELFLUX_HOST_CAPTURE").unwrap_or_default();
+    if force != "zwlr" && state.ext_capture.is_some() && state.ext_source_mgr.is_some() {
+        match capture_loop_ext(
+            &conn, &mut queue, &mut state, &output, gbm.as_ref(), wake, index, &from_main,
+            &frame_tx,
+        ) {
+            ExtOutcome::Finished => return Ok(()),
+            ExtOutcome::Unavailable(e) => {
+                eprintln!("[HostCapture] output {index}: ext capture unavailable ({e}); using wlr-screencopy.");
+            }
+        }
+    }
+
+    let screencopy = state.screencopy.clone().ok_or("no zwlr_screencopy_manager_v1")?;
+
     let mut slots: Vec<Option<SlotBuffer>> = (0..SLOTS).map(|_| None).collect();
     let mut free: Vec<usize> = (0..SLOTS).collect();
     let mut generation: u64 = 0;
@@ -1157,6 +1406,7 @@ fn capture_loop(
     let mut want: Option<Want> = None;
     // Buffer type the currently allocated slots hold; None while none exist.
     let mut slot_zero_copy: Option<bool> = None;
+    let mut gpu_refused = false;
 
     'main: loop {
         // Drain control; block while idle or out of slots.
@@ -1266,6 +1516,7 @@ fn capture_loop(
             }
             free = (0..SLOTS).collect();
             slot_zero_copy = None;
+            gpu_refused = false;
             generation += 1;
         }
         if (fw, fh) != (want_w, want_h) {
@@ -1294,55 +1545,33 @@ fn capture_loop(
         if slots[slot_idx].is_none() {
             // Only a consumer that imports dmabufs gets GPU slots; anything reading the
             // pixels on the CPU takes the shm path even where the host offers dmabuf.
-            let gpu_alloc = if want_zero_copy { gbm.as_ref() } else { None };
             slot_zero_copy = Some(want_zero_copy);
-            slots[slot_idx] = Some(match (gpu_alloc, &state.dmabuf, state.announce_dmabuf) {
-                (Some(dev), Some(dmabuf_global), Some((fourcc, w, h))) => {
-                    let bo = dev
-                        .create_buffer_object::<()>(
-                            w as u32,
-                            h as u32,
-                            fourcc_to_gbm(fourcc),
-                            BufferObjectFlags::RENDERING,
-                        )
-                        .map_err(|e| format!("GBM allocation {w}x{h}: {e:?}"))?;
-                    let dmabuf = crate::create_dmabuf_from_bo(&bo);
-                    let params = dmabuf_global.create_params(&qh, ());
-                    let modifier: u64 = dmabuf.format().modifier.into();
-                    for (i, handle) in dmabuf.handles().enumerate() {
-                        params.add(
-                            handle,
-                            i as u32,
-                            dmabuf.offsets().nth(i).unwrap_or(0),
-                            dmabuf.strides().nth(i).unwrap_or(0),
-                            (modifier >> 32) as u32,
-                            (modifier & 0xffff_ffff) as u32,
-                        );
+            let mut built: Option<SlotBuffer> = None;
+            if want_zero_copy && !gpu_refused {
+                let dmabuf_global = state.dmabuf.clone();
+                if let (Some(dev), Some(dmabuf_global), Some((fourcc, w, h))) =
+                    (gbm.as_ref(), dmabuf_global.as_ref(), state.announce_dmabuf)
+                {
+                    match alloc_gpu_slot(
+                        &conn, &mut queue, &mut state, wake, dev, dmabuf_global, fourcc, w, h, &[],
+                    )? {
+                        Some(slot) => built = Some(slot),
+                        None => {
+                            gpu_refused = true;
+                            eprintln!(
+                                "[HostCapture] output {index}: host refused the dmabuf import; capturing via shm."
+                            );
+                        }
                     }
-                    let wl = params.create_immed(w, h, fourcc, zwp_linux_buffer_params_v1::Flags::empty(), &qh, ());
-                    params.destroy();
-                    SlotBuffer::Gpu { _bo: bo, dmabuf, wl }
                 }
-                _ => {
+            }
+            slots[slot_idx] = Some(match built {
+                Some(slot) => slot,
+                None => {
                     let (format, w, h, stride) =
                         state.announce_shm.ok_or("no shm fallback announced")?;
                     let shm = state.shm.clone().ok_or("host compositor lacks wl_shm")?;
-                    let size = (stride * h) as usize;
-                    let fd = memfd_with(&vec![0u8; size])?;
-                    let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
-                    let wl = pool.create_buffer(
-                        0,
-                        w,
-                        h,
-                        stride,
-                        WEnum::<wl_shm::Format>::from(format).into_result().unwrap_or(wl_shm::Format::Xrgb8888),
-                        &qh,
-                        (),
-                    );
-                    let file = File::from(fd);
-                    let map = unsafe { memmap2::MmapMut::map_mut(&file) }
-                        .map_err(|e| format!("shm map: {e}"))?;
-                    SlotBuffer::Cpu { _pool: pool, map: Arc::new(map), stride, format, wl }
+                    alloc_cpu_slot(&shm, &qh, format, w, h, stride)?
                 }
             });
         }
@@ -1425,6 +1654,337 @@ fn capture_loop(
         };
         if frame_tx.send(out).is_err() {
             return Ok(());
+        }
+    }
+}
+
+/// How the ext capture loop ended: `Finished` is a normal teardown (the thread is
+/// done); `Unavailable` means it could not get going, so wlr-screencopy should run.
+enum ExtOutcome {
+    Finished,
+    Unavailable(String),
+}
+
+/// ext-image-copy-capture capture loop: one persistent session per output. The
+/// compositor holds each capture until the content actually changes, so a static
+/// screen costs nothing — the property `copy_with_damage` provides on the wlr path.
+/// Frames land in the same slot machinery and `HostFrame` shape as that path.
+#[allow(clippy::too_many_arguments)]
+fn capture_loop_ext(
+    conn: &Connection,
+    queue: &mut EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    output: &wl_output::WlOutput,
+    gbm: Option<&GbmDevice<File>>,
+    wake: RawFd,
+    index: usize,
+    from_main: &Receiver<ToHost>,
+    frame_tx: &Sender<HostFrame>,
+) -> ExtOutcome {
+    let qh = queue.handle();
+    let src_mgr = state.ext_source_mgr.clone().expect("checked by caller");
+    let mgr = state.ext_capture.clone().expect("checked by caller");
+    let source = src_mgr.create_source(output, &qh, ());
+    let session = mgr.create_session(
+        &source,
+        ext_image_copy_capture_manager_v1::Options::PaintCursors,
+        &qh,
+        (),
+    );
+
+    let mut slots: Vec<Option<SlotBuffer>> = (0..SLOTS).map(|_| None).collect();
+    let mut free: Vec<usize> = (0..SLOTS).collect();
+    let mut generation: u64 = 0;
+    let mut want: Option<Want> = None;
+    let mut slot_zero_copy: Option<bool> = None;
+    let mut gpu_refused = false;
+    let mut seen_serial: u64 = 0;
+    let mut warned_mismatch = false;
+    let mut consecutive_failures = 0u32;
+
+    let teardown = |session: &ExtImageCopyCaptureSessionV1, source: &ExtImageCaptureSourceV1| {
+        session.destroy();
+        source.destroy();
+    };
+
+    // The first constraint set decides whether this protocol works here at all.
+    loop {
+        match pump_until(conn, queue, state, wake, Some(Duration::from_secs(5)), |s| {
+            s.ext_serial > 0 || s.ext_stopped
+        }) {
+            Ok(Pump::Done) => break,
+            Ok(Pump::Control) => {
+                match drain_ctl(from_main, generation, &mut free, &mut want) {
+                    Ctl::Dead => {
+                        teardown(&session, &source);
+                        return ExtOutcome::Finished;
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(Pump::Timeout) => {
+                teardown(&session, &source);
+                return ExtOutcome::Unavailable("no buffer constraints within 5s".into());
+            }
+            Err(e) => {
+                teardown(&session, &source);
+                return ExtOutcome::Unavailable(e);
+            }
+        }
+    }
+    if state.ext_stopped {
+        teardown(&session, &source);
+        return ExtOutcome::Unavailable("session stopped before constraints".into());
+    }
+    eprintln!(
+        "[HostCapture] output {index} ext session: {:?} dma_formats={} shm_formats={}",
+        state.ext_size,
+        state.ext_dma_formats.len(),
+        state.ext_shm_formats.len(),
+    );
+
+    'main: loop {
+        // Drain control; block while idle or out of slots.
+        loop {
+            let blocking = want.is_none() || free.is_empty();
+            let msg = if blocking {
+                match from_main.recv() {
+                    Ok(m) => m,
+                    Err(_) => {
+                        teardown(&session, &source);
+                        return ExtOutcome::Finished;
+                    }
+                }
+            } else {
+                match from_main.try_recv() {
+                    Ok(m) => m,
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        teardown(&session, &source);
+                        return ExtOutcome::Finished;
+                    }
+                }
+            };
+            match msg {
+                ToHost::Release { generation: g, slot } => {
+                    if g == generation {
+                        free.push(slot);
+                    }
+                }
+                ToHost::Idle => want = None,
+                ToHost::Start { width, height, zero_copy } => {
+                    let next = Want { size: (width, height), zero_copy };
+                    if want != Some(next) {
+                        warned_mismatch = false;
+                    }
+                    want = Some(next);
+                }
+            }
+        }
+        let (want_w, want_h, want_zero_copy) = match want {
+            Some(w) => (w.size.0, w.size.1, w.zero_copy),
+            None => continue,
+        };
+        if state.ext_stopped {
+            // The output is going away; nothing else on this connection will revive it.
+            teardown(&session, &source);
+            return ExtOutcome::Finished;
+        }
+
+        // Fresh constraints obsolete every allocated buffer.
+        if seen_serial != state.ext_serial || slot_zero_copy.is_some_and(|z| z != want_zero_copy) {
+            seen_serial = state.ext_serial;
+            for s in slots.iter_mut() {
+                *s = None;
+            }
+            free = (0..SLOTS).collect();
+            slot_zero_copy = None;
+            gpu_refused = false;
+            generation += 1;
+        }
+
+        let Some((cw, ch)) = state.ext_size else {
+            teardown(&session, &source);
+            return ExtOutcome::Unavailable("constraints carried no size".into());
+        };
+        if (cw, ch) != (want_w, want_h) {
+            // The encoder is configured for (want_w, want_h): hold frames until the
+            // host applies the resize rather than capture mismatched buffers.
+            if !warned_mismatch {
+                warned_mismatch = true;
+                eprintln!(
+                    "[HostCapture] output {index}: waiting for host {want_w}x{want_h} (currently {cw}x{ch})."
+                );
+            }
+            let _ = pump_until(conn, queue, state, wake, Some(Duration::from_millis(150)), |s| {
+                s.ext_serial != seen_serial
+            });
+            continue;
+        }
+        warned_mismatch = false;
+
+        let slot_idx = *free.last().unwrap();
+        if slots[slot_idx].is_none() {
+            // Only a consumer that imports dmabufs gets GPU slots; anything reading
+            // the pixels on the CPU takes the shm path even where the host offers
+            // dmabuf. XR24/AR24 keep the bytes BGRA, which is what every consumer
+            // downstream assumes.
+            let dma_choice = [0x3432_5258u32, 0x3432_5241]
+                .iter()
+                .find_map(|f| state.ext_dma_formats.iter().find(|(code, _)| code == f))
+                .cloned();
+            slot_zero_copy = Some(want_zero_copy);
+            let mut slot: Option<SlotBuffer> = None;
+            if want_zero_copy && !gpu_refused {
+                let dmabuf_global = state.dmabuf.clone();
+                if let (Some(dev), Some(dmabuf_global), Some((fourcc, modifiers))) =
+                    (gbm, dmabuf_global.as_ref(), dma_choice)
+                {
+                    match alloc_gpu_slot(
+                        conn, queue, state, wake, dev, dmabuf_global, fourcc, cw, ch, &modifiers,
+                    ) {
+                        Ok(Some(built)) => slot = Some(built),
+                        Ok(None) => {
+                            gpu_refused = true;
+                            eprintln!(
+                                "[HostCapture] output {index}: host refused the dmabuf import; capturing via shm."
+                            );
+                        }
+                        Err(e) => {
+                            teardown(&session, &source);
+                            return ExtOutcome::Unavailable(e);
+                        }
+                    }
+                }
+            }
+            let built = match slot {
+                Some(slot) => Ok(slot),
+                None => {
+                    let format = [1u32, 0]
+                        .iter()
+                        .find(|f| state.ext_shm_formats.contains(f))
+                        .copied()
+                        .or_else(|| state.ext_shm_formats.first().copied());
+                    match (state.shm.clone(), format) {
+                        (Some(shm), Some(format)) => {
+                            alloc_cpu_slot(&shm, &qh, format, cw, ch, cw * 4)
+                        }
+                        _ => Err("host offers no usable shm format".into()),
+                    }
+                }
+            };
+            match built {
+                Ok(slot) => slots[slot_idx] = Some(slot),
+                Err(e) => {
+                    teardown(&session, &source);
+                    return ExtOutcome::Unavailable(e);
+                }
+            }
+        }
+        free.pop();
+
+        state.reset_frame();
+        let frame = {
+            let slot = slots[slot_idx].as_ref().unwrap();
+            let wl = match slot {
+                SlotBuffer::Gpu { wl, .. } => wl,
+                SlotBuffer::Cpu { wl, .. } => wl,
+            };
+            let frame = session.create_frame(&qh, ());
+            frame.attach_buffer(wl);
+            // Slots rotate, so the attached buffer holds a frame from SLOTS captures
+            // ago: everything in it is stale from the host's point of view.
+            frame.damage_buffer(0, 0, cw, ch);
+            frame.capture();
+            frame
+        };
+        if let Err(e) = queue.flush() {
+            frame.destroy();
+            teardown(&session, &source);
+            return ExtOutcome::Unavailable(format!("flush: {e}"));
+        }
+
+        let mut aborted = false;
+        loop {
+            match pump_until(conn, queue, state, wake, None, |s| {
+                s.ready || s.failed || s.ext_stopped || s.ext_serial != seen_serial
+            }) {
+                Ok(Pump::Done) => break,
+                Ok(Pump::Control) => match drain_ctl(from_main, generation, &mut free, &mut want) {
+                    Ctl::None => {}
+                    Ctl::Renegotiate | Ctl::Idle => {
+                        aborted = true;
+                        break;
+                    }
+                    Ctl::Dead => {
+                        frame.destroy();
+                        teardown(&session, &source);
+                        return ExtOutcome::Finished;
+                    }
+                },
+                Ok(Pump::Timeout) => {}
+                Err(e) => {
+                    frame.destroy();
+                    teardown(&session, &source);
+                    return ExtOutcome::Unavailable(e);
+                }
+            }
+        }
+        frame.destroy();
+        if aborted || state.ext_serial != seen_serial {
+            free.push(slot_idx);
+            continue 'main;
+        }
+        if state.ext_stopped {
+            teardown(&session, &source);
+            return ExtOutcome::Finished;
+        }
+        if state.failed {
+            free.push(slot_idx);
+            if state.ext_fail_reason
+                == Some(ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints)
+            {
+                // Constraints changed under us; the serial check above rebuilds the
+                // buffers on the next pass.
+                continue;
+            }
+            consecutive_failures += 1;
+            if consecutive_failures == 3 {
+                eprintln!("[HostCapture] output {index}: repeated capture failures; is the output alive?");
+            }
+            let _ = pump_until(conn, queue, state, wake, Some(Duration::from_millis(50)), |_| false);
+            continue;
+        }
+        consecutive_failures = 0;
+
+        let damage = std::mem::take(&mut state.damage);
+        let out = match slots[slot_idx].as_ref().unwrap() {
+            SlotBuffer::Gpu { dmabuf, .. } => HostFrame {
+                generation,
+                slot: slot_idx,
+                dmabuf: Some(dmabuf.clone()),
+                cpu: None,
+                width: cw,
+                height: ch,
+                damage,
+            },
+            SlotBuffer::Cpu { map, stride, format, .. } => HostFrame {
+                generation,
+                slot: slot_idx,
+                dmabuf: None,
+                cpu: Some(HostCpuFrame {
+                    map: map.clone(),
+                    stride: *stride as usize,
+                    format: *format,
+                }),
+                width: cw,
+                height: ch,
+                damage,
+            },
+        };
+        if frame_tx.send(out).is_err() {
+            teardown(&session, &source);
+            return ExtOutcome::Finished;
         }
     }
 }

@@ -35,6 +35,21 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::{
     Bind, ExportMem, gles::GlesRenderer, pixman::PixmanRenderer, ImportDma,
 };
+use smithay::backend::allocator::Modifier;
+use smithay::backend::drm::DrmNode;
+use smithay::output::WeakOutput;
+use smithay::wayland::image_capture_source::{
+    ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
+    OutputCaptureSourceHandler, OutputCaptureSourceState,
+};
+use smithay::wayland::image_copy_capture::{
+    BufferConstraints, CaptureFailureReason, DmabufConstraints, Frame as CopyFrame,
+    FrameRef as CopyFrameRef, ImageCopyCaptureHandler, ImageCopyCaptureState,
+    Session as CopySession, SessionRef as CopySessionRef,
+};
+use smithay::{
+    delegate_image_capture_source, delegate_image_copy_capture, delegate_output_capture_source,
+};
 use smithay::input::dnd::{DndFocus, Source};
 use std::sync::Arc;
 use crate::wayland::cursor::{Cursor, CursorJob};
@@ -71,6 +86,11 @@ use smithay::delegate_layer_shell;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
 use smithay::{delegate_foreign_toplevel_list, delegate_xdg_decoration};
 use smithay::wayland::selection::wlr_data_control::{DataControlHandler, DataControlState};
+use smithay::wayland::selection::ext_data_control::{
+    DataControlHandler as ExtDataControlHandler, DataControlState as ExtDataControlState,
+};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::{delegate_cursor_shape, delegate_ext_data_control};
 use smithay::delegate_data_control;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -276,6 +296,23 @@ pub struct OutputNode {
     pub capture: Option<WlCapture>,
     /// Monotonic count of frames reported presented through wp_presentation.
     pub frame_seq: u64,
+    /// Whether the render target already holds a fully composited frame, so a
+    /// capture-less render (screenshot, copy-capture client) may use buffer age
+    /// instead of redrawing everything. Cleared whenever the target is replaced.
+    pub target_seeded: bool,
+}
+
+/// One ext-image-copy-capture session: an external client capturing one of this
+/// compositor's outputs. A requested frame parks in `pending` until the render loop
+/// has content for it, so delivery happens at most once per composited frame and an
+/// unchanged screen holds the frame instead of duplicating it.
+pub struct OutputCopySession {
+    pub session: CopySession,
+    pub output: WeakOutput,
+    pub pending: Option<CopyFrame>,
+    /// The first frame of a session ships without waiting for damage; only
+    /// afterwards does an unchanged screen hold the frame.
+    pub delivered_once: bool,
 }
 
 impl OutputNode {
@@ -387,6 +424,12 @@ pub struct AppState {
     pub single_pixel_buffer: SinglePixelBufferState,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
+    pub ext_data_control_state: ExtDataControlState,
+    pub cursor_shape_state: CursorShapeManagerState,
+    pub image_capture_source_state: ImageCaptureSourceState,
+    pub output_capture_source_state: OutputCaptureSourceState,
+    pub image_copy_capture_state: ImageCopyCaptureState,
+    pub copy_sessions: Vec<OutputCopySession>,
     #[allow(dead_code)]
     pub output_state: OutputManagerState,
     pub seat_state: SeatState<AppState>,
@@ -786,6 +829,9 @@ impl CompositorHandler for AppState {
                     target_output.enter(surface);
                     let scale = target_output.current_scale().fractional_scale();
                     with_states(surface, |states| {
+                        smithay::wayland::compositor::send_surface_state(
+                            surface, states, scale.ceil() as i32, smithay::utils::Transform::Normal,
+                        );
                         smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
                             fs.set_preferred_scale(scale);
                         });
@@ -967,6 +1013,9 @@ impl AppState {
             new_output.enter(&surface);
             let scale = new_output.current_scale().fractional_scale();
             with_states(&surface, |states| {
+                smithay::wayland::compositor::send_surface_state(
+                    &surface, states, scale.ceil() as i32, smithay::utils::Transform::Normal,
+                );
                 smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
                     fs.set_preferred_scale(scale);
                 });
@@ -1403,6 +1452,19 @@ impl DataControlHandler for AppState {
         &mut self.data_control_state
     }
 }
+/// No graphics tablets exist here (input is injected); the default no-op tool-image
+/// callback is all cursor-shape's tablet half needs.
+impl smithay::wayland::tablet_manager::TabletSeatHandler for AppState {}
+
+/// ext-data-control: the standardized successor of wlr-data-control. Both globals
+/// stay advertised, sharing the same selection state, so older clipboard managers
+/// keep working while current ones use the ext protocol.
+impl ExtDataControlHandler for AppState {
+    fn data_control_state(&mut self) -> &mut ExtDataControlState {
+        &mut self.ext_data_control_state
+    }
+}
+
 /// Marker impl enabling Wayland drag-and-drop grabs with Smithay's default behavior.
 impl WaylandDndGrabHandler for AppState {}
 /// Buffer lifecycle hook: buffer destruction needs no bookkeeping here.
@@ -1446,6 +1508,109 @@ impl DmabufHandler for AppState {
     }
 }
 
+impl ImageCaptureSourceHandler for AppState {
+    fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
+}
+
+impl OutputCaptureSourceHandler for AppState {
+    fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
+        &mut self.output_capture_source_state
+    }
+
+    fn output_source_created(&mut self, source: ImageCaptureSource, output: &Output) {
+        source.user_data().insert_if_missing(|| output.downgrade());
+    }
+}
+
+/// ext-image-copy-capture: external clients capturing this compositor's outputs.
+///
+/// A dmabuf-capable client gets the render formats of the GLES renderer and its frames
+/// are filled with one GPU blit from the output's composited buffer; an shm client gets
+/// a readback. Frames complete from the render loop, never from a stale backbuffer.
+impl ImageCopyCaptureHandler for AppState {
+    fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
+        &mut self.image_copy_capture_state
+    }
+
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
+        let output = source.user_data().get::<WeakOutput>()?.upgrade()?;
+        output_capture_constraints(&output, self.gles_renderer.as_ref(), &self.render_node_path)
+    }
+
+    fn new_session(&mut self, session: CopySession) {
+        let Some(output) = session.source().user_data().get::<WeakOutput>().cloned() else {
+            session.stop();
+            return;
+        };
+        match self.capture_constraints(&session.source()) {
+            Some(constraints) => {
+                session.update_constraints(constraints);
+                self.copy_sessions.push(OutputCopySession {
+                    session,
+                    output,
+                    pending: None,
+                    delivered_once: false,
+                });
+            }
+            None => session.stop(),
+        }
+    }
+
+    fn frame(&mut self, session: &CopySessionRef, frame: CopyFrame) {
+        match self.copy_sessions.iter_mut().find(|cs| cs.session == *session) {
+            Some(cs) => cs.pending = Some(frame),
+            None => frame.fail(CaptureFailureReason::Unknown),
+        }
+    }
+
+    fn frame_aborted(&mut self, frame: CopyFrameRef) {
+        for cs in self.copy_sessions.iter_mut() {
+            if cs.pending.as_ref().is_some_and(|f| *f == frame) {
+                cs.pending = None;
+            }
+        }
+    }
+
+    fn session_destroyed(&mut self, session: CopySessionRef) {
+        self.copy_sessions.retain(|cs| cs.session != session);
+    }
+}
+
+impl AppState {
+    pub fn copy_frame_pending_for(&self, output: &Output) -> bool {
+        self.copy_sessions
+            .iter()
+            .any(|cs| cs.pending.is_some() && cs.output.upgrade().as_ref() == Some(output))
+    }
+}
+
+/// Buffer constraints for capturing `output`: its current mode's size, the shm formats
+/// both render paths can serve, and — with a GLES renderer — the renderer's dmabuf
+/// render formats so a client buffer can be blitted to on the GPU.
+pub fn output_capture_constraints(
+    output: &Output,
+    renderer: Option<&GlesRenderer>,
+    render_node_path: &str,
+) -> Option<BufferConstraints> {
+    let mode = output.current_mode()?;
+    let dma = renderer.and_then(|renderer| {
+        let node = DrmNode::from_path(render_node_path).ok()?;
+        let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
+        for f in Bind::<Dmabuf>::supported_formats(renderer)? {
+            match formats.iter_mut().find(|(code, _)| *code == f.code) {
+                Some((_, mods)) => mods.push(f.modifier),
+                None => formats.push((f.code, vec![f.modifier])),
+            }
+        }
+        (!formats.is_empty()).then_some(DmabufConstraints { node, formats })
+    });
+    Some(BufferConstraints {
+        size: (mode.size.w, mode.size.h).into(),
+        shm: vec![wl_shm::Format::Argb8888, wl_shm::Format::Xrgb8888],
+        dma,
+    })
+}
+
 /// Fractional-scale protocol: tells a newly-bound surface the output's current fractional
 /// scale so it renders at the right pixel density.
 impl FractionalScaleHandler for AppState {
@@ -1456,6 +1621,9 @@ impl FractionalScaleHandler for AppState {
         if let Some(output) = self.primary_output() {
             let scale = output.current_scale().fractional_scale();
             with_states(&surface, |states| {
+                smithay::wayland::compositor::send_surface_state(
+                    &surface, states, scale.ceil() as i32, smithay::utils::Transform::Normal,
+                );
                 smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
                     fs.set_preferred_scale(scale);
                 });
@@ -2362,6 +2530,11 @@ delegate_output!(AppState);
 delegate_seat!(AppState);
 delegate_xdg_shell!(AppState);
 delegate_dmabuf!(AppState);
+delegate_image_capture_source!(AppState);
+delegate_output_capture_source!(AppState);
+delegate_image_copy_capture!(AppState);
+delegate_ext_data_control!(AppState);
+delegate_cursor_shape!(AppState);
 delegate_fractional_scale!(AppState);
 delegate_data_device!(AppState);
 delegate_data_control!(AppState);

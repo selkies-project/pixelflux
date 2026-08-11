@@ -86,6 +86,22 @@ To test launching programs into this backend simply add `WAYLAND_DISPLAY=wayland
 WAYLAND_DISPLAY=wayland-1 glmark2-es2-wayland -s 1920x1080
 ```
 
+### Host capture (external compositors)
+
+Setting `wayland_host_display` to another compositor's socket captures **that** session instead
+of the built-in one, with input injected through the virtual keyboard/pointer protocols. Frames
+are fetched with `ext-image-copy-capture-v1` when the host offers it (wlroots 0.19+, KWin 6.2+,
+COSMIC) and `zwlr-screencopy-v1` (v3) otherwise, so any wlroots-era or KDE compositor works;
+`PIXELFLUX_HOST_CAPTURE=zwlr` forces the fallback for triage. Both protocols share the same
+buffer plan: with a GPU the host blits into GBM dmabufs that the encoder imports directly (no
+CPU copy anywhere), a host that cannot import our dmabufs (other GPU, software renderer) is
+captured through shm instead, and both are damage-gated so a static screen costs nothing.
+
+The built-in compositor also **serves** `ext-image-copy-capture-v1` (with per-output sources),
+so standard capture tools — or another pixelflux — can record a pixelflux session: dmabuf
+clients are filled by one GPU blit from the composited frame, shm clients by one readback, and
+an unchanged screen holds the frame instead of duplicating it.
+
 ### Automatic GPU Selection
 
 Set the `auto_gpu` attribute on `CaptureSettings` to let pixelflux pick a render node
@@ -121,7 +137,7 @@ settings.capture_y = 0
 settings.capture_cursor = True
 settings.target_fps = 60.0
 settings.scale = 1.0  # Fractional scaling (Wayland only)
-settings.wayland_host_display = ""                  # Capture from an EXTERNAL wlroots compositor instead of the built-in one (host-capture mode)
+settings.wayland_host_display = ""                  # Capture from an EXTERNAL compositor instead of the built-in one (host-capture mode)
 
 # --- Encoding Mode ---
 # 0 for JPEG, 1 for H.264
