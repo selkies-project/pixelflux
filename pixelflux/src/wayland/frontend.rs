@@ -274,6 +274,8 @@ pub struct OutputNode {
     /// for the bouncing anchor, animated) against the output's own frame dimensions.
     pub overlay_state: OverlayState,
     pub capture: Option<WlCapture>,
+    /// Monotonic count of frames reported presented through wp_presentation.
+    pub frame_seq: u64,
 }
 
 impl OutputNode {

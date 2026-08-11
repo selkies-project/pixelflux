@@ -64,7 +64,9 @@ use yuv::{
 
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
-use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::presentation::{PresentationState, Refresh};
+use smithay::desktop::utils::OutputPresentationFeedback;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
 use smithay::{
     backend::{
@@ -250,45 +252,23 @@ fn get_process_rss_bytes() -> usize {
     0
 }
 
-fn get_shm_usage_bytes() -> u64 {
+/// Blocks actually allocated, not apparent size, so a sparse file is not reported as
+/// memory the process took. Feeds the debug log line only.
+fn shm_usage_in(dir: &str) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let mut total_size = 0;
-    if let Ok(entries) = std::fs::read_dir("/dev/shm") {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Ok(metadata) = entry.metadata() {
-                total_size += metadata.len();
+                total_size += metadata.blocks() * 512;
             }
         }
     }
     total_size
 }
 
-/// Memory reads for the throttle watchdog, answered from a 100 ms cache: the
-/// render timer re-arms at 1 ms while an encode pool is saturated, and a
-/// per-tick /proc read plus a full /dev/shm directory walk would spin the
-/// syscall count of an otherwise deliberate busy-wait. The watchdog is a
-/// hysteresis and tolerates the staleness.
-fn get_cached_mem_usage() -> (usize, u64) {
-    static CACHE: std::sync::Mutex<Option<(Instant, usize, u64)>> = std::sync::Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((at, rss, shm)) = *guard
-        && at.elapsed() < Duration::from_millis(100) {
-            return (rss, shm);
-        }
-    let sampled = (Instant::now(), get_process_rss_bytes(), get_shm_usage_bytes());
-    *guard = Some(sampled);
-    (sampled.1, sampled.2)
-}
-
-fn calculate_memory_threshold(width: i32, height: i32) -> usize {
-    let frame_size = (width.max(0) as usize)
-        .saturating_mul(height.max(0) as usize)
-        .saturating_mul(4);
-    let base_app_memory: usize = 300 * 1024 * 1024;
-    let buffer_allowance = frame_size.saturating_mul(20);
-    let min_threshold: usize = 1536 * 1024 * 1024;
-    base_app_memory
-        .saturating_add(buffer_allowance)
-        .max(min_threshold)
+fn get_shm_usage_bytes() -> u64 {
+    shm_usage_in("/dev/shm")
 }
 
 use encoders::nvenc::NvencEncoder;
@@ -1108,6 +1088,10 @@ const WL_POOL_SURFACES: usize = 2;
 /// real display wall; the fps/scale bounds keep timing math finite and sane.
 const MAX_CAPTURE_DIM: i32 = 16384;
 const MAX_FPS: f64 = 1000.0;
+/// How often frame callbacks go out while nothing is being captured. Fast enough that a
+/// client blocked on one keeps making progress, slow enough that an unwatched session is
+/// not drawing frames nobody asked for.
+const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_FPS: f64 = 60.0;
 const MAX_SCALE: f64 = 8.0;
 
@@ -2316,7 +2300,6 @@ fn warn_once_host_watermark(e: &str) {
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
-    is_memory_throttling: bool,
 ) -> bool {
     let take_screenshot = state
         .pending_screenshot
@@ -2330,7 +2313,7 @@ fn render_node_tick(
     // active capture's rate).
     if let Some(cap) = node.capture.as_ref()
         && !take_screenshot {
-            let fps = (if is_memory_throttling { 5.0 } else { cap.settings.target_fps }).max(1.0);
+            let fps = cap.settings.target_fps.max(1.0);
             if let Some(last) = cap.last_tick
                 && last.elapsed().as_secs_f64() < (1.0 / fps) * 0.9 {
                     return false;
@@ -2379,13 +2362,12 @@ fn render_node_tick(
 
     let mut pool_slot: Option<(usize, Vec<u8>)> = None;
     if let Some(cap) = node.capture.as_ref()
-        && let Some(ref pool) = cap.encode_pool
-        && !is_memory_throttling {
-                pool_slot = pool.try_begin();
-                if pool_slot.is_none() {
-                    return true;
-                }
+        && let Some(ref pool) = cap.encode_pool {
+            pool_slot = pool.try_begin();
+            if pool_slot.is_none() {
+                return true;
             }
+        }
 
     let loc_enum = node
         .capture
@@ -2960,8 +2942,16 @@ fn render_node_tick(
 
     if render_success {
         let time = state.clock.now();
+        // The composited frame is what the capture consumes, so this render is also the
+        // presentation moment for wp_presentation feedback.
+        let mut feedback = OutputPresentationFeedback::new(&output);
         for window in state.space.elements_for_output(&output).cloned().collect::<Vec<_>>() {
             window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+            window.take_presentation_feedback(
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |_, _| wp_presentation_feedback::Kind::empty(),
+            );
         }
         // Panels, backgrounds and other layer-shell surfaces are composited from the
         // layer map rather than the space, so they need the callback separately: one
@@ -2969,7 +2959,18 @@ fn render_node_tick(
         // whatever it painted first, for as long as the session lasts.
         for layer in layer_map_for_output(&output).layers() {
             layer.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
+            layer.take_presentation_feedback(
+                &mut feedback,
+                |_, _| Some(output.clone()),
+                |_, _| wp_presentation_feedback::Kind::empty(),
+            );
         }
+        let refresh = match node.capture.as_ref() {
+            Some(c) => Refresh::Fixed(Duration::from_secs_f64(1.0 / c.settings.target_fps.max(1.0))),
+            None => Refresh::Unknown,
+        };
+        node.frame_seq += 1;
+        feedback.presented(time, refresh, node.frame_seq, wp_presentation_feedback::Kind::Vsync);
 
         if let Some(cap) = node.capture.as_mut() {
             // A dead encode thread (panic, unexpected exit) cannot drain the pool;
@@ -2993,11 +2994,7 @@ fn render_node_tick(
                 bootstrap_readback_pool(cap, node.id, state.use_gpu && !host_mode, try_gpu, prior);
                 cap.request_idr();
             }
-            if is_memory_throttling {
-                if cap.encode_pool.is_none() {
-                    cap.frame_counter = cap.frame_counter.wrapping_add(1);
-                }
-            } else if cap.encode_pool.is_some() {
+            if cap.encode_pool.is_some() {
                 if take_screenshot
                     && let Some((_, ref buf)) = pool_slot {
                         let n = buf.len().min(node.frame_buffer.len());
@@ -3344,6 +3341,7 @@ fn create_output_on(
         offscreen_buffer: offscreen,
         overlay_state: OverlayState::default(),
         capture: None,
+        frame_seq: 0,
     });
     // A nested session opens one host toplevel per screen and the extras wait
     // parked until a display exists for them: hand the newest waiting window to
@@ -3852,6 +3850,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         offscreen_buffer,
         overlay_state: OverlayState::default(),
         capture: None,
+        frame_seq: 0,
     });
 
     /// Apply every queued control command in FIFO order. Sends wake the loop through the
@@ -4413,7 +4412,6 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         .expect("Failed to init wayland socket source");
 
     let timer = Timer::immediate();
-    let mut is_memory_throttling = false;
     event_loop
         .handle()
         .insert_source(timer, move |_, _, state| {
@@ -4423,29 +4421,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             let loop_start_time = Instant::now();
             state.space.refresh();
 
-            let (current_rss, shm_usage) = get_cached_mem_usage();
-            // The threshold follows the largest active capture (fallback: primary settings).
-            let (max_w, max_h) = state
-                .output_nodes
-                .iter()
-                .filter_map(|n| n.capture.as_ref().map(|c| (c.settings.width, c.settings.height)))
-                .fold((state.settings.width, state.settings.height), |acc, (w, h)| {
-                    (acc.0.max(w), acc.1.max(h))
-                });
-            let memory_threshold = calculate_memory_threshold(max_w, max_h);
-
-            if current_rss > memory_threshold || shm_usage > (4 * 1024 * 1024 * 1024) {
-                if !is_memory_throttling {
-                    is_memory_throttling = true;
-                }
-            } else if is_memory_throttling
-                && current_rss < (memory_threshold as f64 * 0.75) as usize && shm_usage < (3 * 1024 * 1024 * 1024) {
-                    is_memory_throttling = false;
-                }
-
             let now = Instant::now();
             let elapsed = now.duration_since(state.last_log_time).as_secs_f64();
             if elapsed >= 1.0 {
+                // Memory is read here rather than per tick: it is reported, not acted on,
+                // and /proc plus a /dev/shm walk have no place in the render path.
+                let mut mem: Option<(usize, u64)> = None;
                 for node in &state.output_nodes {
                     let Some(cap) = node.capture.as_ref() else { continue };
                     let frames = cap.encode_stats.frames.swap(0, Ordering::Relaxed);
@@ -4455,13 +4436,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         let stripes_per_sec = stripes as f64 / elapsed;
                         let mode_str = cap.encode_stats.desc.lock().unwrap().clone();
                         let n_stripes = cap.encode_stats.n_stripes.load(Ordering::Relaxed);
+                        let (current_rss, shm_usage) = *mem
+                            .get_or_insert_with(|| (get_process_rss_bytes(), get_shm_usage_bytes()));
 
-                        let rss_mb = current_rss / 1024 / 1024;
-                        let shm_mb = shm_usage / 1024 / 1024;
-                        let throttle_warn = if is_memory_throttling { " [THROTTLED]" } else { "" };
-
-                        println!("Display: {} Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2} Mem: {}MB SHM: {}MB{}",
-                            node.id, cap.settings.width, cap.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec, rss_mb, shm_mb, throttle_warn);
+                        println!("Display: {} Res: {}x{} Mode: {} Stripes: {} EncFPS: {:.2} EncStripes/s: {:.2} Mem: {}MB SHM: {}MB",
+                            node.id, cap.settings.width, cap.settings.height, mode_str, n_stripes, actual_fps, stripes_per_sec, current_rss / 1024 / 1024, shm_usage / 1024 / 1024);
                     }
                 }
                 state.last_log_time = now;
@@ -4474,8 +4453,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 // nested compositor's own clients) otherwise blocks in its swap
                 // until a viewer attaches — apps appear frozen whenever nobody is
                 // watching.
+                //
+                // Slowly, though: at a viewing rate the clients draw at a viewing rate
+                // too, and every frame they hand over is one that nothing renders,
+                // encodes or looks at. Unblocking them is the whole purpose here, and
+                // that costs a callback every so often rather than sixty a second.
                 let time = state.clock.now();
                 for node in &state.output_nodes {
+                    // Nothing is presented while nothing captures, so any requested
+                    // wp_presentation feedback is discarded outright: a client pacing
+                    // on it falls back to its own timer instead of waiting forever.
+                    let mut feedback = OutputPresentationFeedback::new(&node.output);
                     for window in state
                         .space
                         .elements_for_output(&node.output)
@@ -4485,14 +4473,32 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
                             Some(node.output.clone())
                         });
+                        window.take_presentation_feedback(
+                            &mut feedback,
+                            |_, _| Some(node.output.clone()),
+                            |_, _| wp_presentation_feedback::Kind::empty(),
+                        );
                     }
                     for layer in layer_map_for_output(&node.output).layers() {
                         layer.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
                             Some(node.output.clone())
                         });
+                        layer.take_presentation_feedback(
+                            &mut feedback,
+                            |_, _| Some(node.output.clone()),
+                            |_, _| wp_presentation_feedback::Kind::empty(),
+                        );
                     }
+                    feedback.discarded();
                 }
-                return TimeoutAction::ToDuration(Duration::from_millis(16));
+                // Rendering prunes the renderer's dmabuf-import cache when it unbinds;
+                // here nothing renders, so prune explicitly or every buffer a client
+                // commits (each import-validated in `dmabuf_imported`) leaves its
+                // texture and EGLImage behind for good.
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    let _ = renderer.cleanup_texture_cache();
+                }
+                return TimeoutAction::ToDuration(IDLE_FRAME_INTERVAL);
             }
 
             // Render every output that needs it. The nodes are taken out of the state so
@@ -4501,7 +4507,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             let mut nodes = std::mem::take(&mut state.output_nodes);
             let mut any_pool_busy = false;
             for node in nodes.iter_mut() {
-                if render_node_tick(state, node, is_memory_throttling) {
+                if render_node_tick(state, node) {
                     any_pool_busy = true;
                 }
             }
@@ -4516,13 +4522,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 .iter()
                 .filter_map(|n| n.capture.as_ref().map(|c| c.settings.target_fps))
                 .fold(0.0f64, f64::max);
-            let raw_fps = if is_memory_throttling {
-                5.0
-            } else if max_fps > 0.0 {
-                max_fps
-            } else {
-                state.settings.target_fps
-            };
+            let raw_fps = if max_fps > 0.0 { max_fps } else { state.settings.target_fps };
             // Settings are sanitized at the Python boundary; this final guard keeps a
             // non-finite value from ever reaching Duration::from_secs_f64 (panics on NaN).
             let fps = if raw_fps.is_finite() && raw_fps > 0.0 { raw_fps.min(MAX_FPS) } else { DEFAULT_FPS };
@@ -6369,6 +6369,37 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 
     Ok(())
+}
+
+#[cfg(test)]
+mod shm_usage_tests {
+    //! What the session reports as its /dev/shm usage: allocated blocks, so a sparse
+    //! file is not counted as memory anyone holds.
+    use super::shm_usage_in;
+
+    #[test]
+    fn only_allocated_blocks_count() {
+        let dir = std::env::temp_dir().join(format!("pixelflux-shm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap().to_string();
+
+        std::fs::File::create(dir.join("sparse"))
+            .unwrap()
+            .set_len(8 * 1024 * 1024 * 1024)
+            .unwrap();
+        let sparse = shm_usage_in(&path);
+
+        std::fs::write(dir.join("dense"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+        let dense = shm_usage_in(&path);
+
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(sparse < 1024 * 1024, "an 8 GiB sparse file counted {sparse} bytes");
+        assert!(
+            dense - sparse >= 4 * 1024 * 1024,
+            "a 4 MiB written file added only {} bytes",
+            dense - sparse
+        );
+    }
 }
 
 #[cfg(test)]
