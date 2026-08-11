@@ -97,6 +97,11 @@ buffer plan: with a GPU the host blits into GBM dmabufs that the encoder imports
 CPU copy anywhere), a host that cannot import our dmabufs (other GPU, software renderer) is
 captured through shm instead, and both are damage-gated so a static screen costs nothing.
 
+Displays map onto host outputs by rank, so multi-display capture needs the host to expose that
+many outputs: `ScreenCapture.output_capacity()` reports the host's output count (`-1` when
+self-compositing, where outputs are created on demand), and `create_output` refuses ids the
+host cannot back rather than minting an output that would never receive a frame.
+
 The built-in compositor also **serves** `ext-image-copy-capture-v1` (with per-output sources),
 so standard capture tools — or another pixelflux — can record a pixelflux session: dmabuf
 clients are filled by one GPU blit from the composited frame, shm clients by one readback, and

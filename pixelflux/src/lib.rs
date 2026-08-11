@@ -652,6 +652,10 @@ pub enum ThreadCommand {
     RepositionOutput { id: u32, x: i32, y: i32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every live output as `(id, x, y, width, height, scale, capturing)`.
     ListOutputs { reply: std::sync::mpsc::Sender<Vec<OutputDesc>> },
+    /// Reply with how many displays this backend can back with real content: -1 when
+    /// self-compositing (outputs are created on demand), the host compositor's output
+    /// count in host-capture mode.
+    OutputCapacity { reply: std::sync::mpsc::Sender<i64> },
     /// Move the window with the given id onto output `output_id` (fullscreened there).
     MoveWindowToOutput { window_id: u32, output_id: u32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every mapped window as `(window_id, title, app_id, output_id)`.
@@ -3441,6 +3445,17 @@ fn create_output_on(
     if state.node_idx_for_id(id).is_some() || width <= 0 || height <= 0 || scale <= 0.0 {
         return false;
     }
+    // Host-capture mode: displays map onto host outputs by rank, so an output beyond
+    // the host's count would exist but never receive a frame. Refuse it instead.
+    if let Some(host) = state.host.as_ref() {
+        let capacity = host.output_count();
+        if state.output_nodes.len() >= capacity {
+            eprintln!(
+                "[Wayland] CreateOutput {id}: rejected, the host compositor has {capacity} output(s) and all are backing displays."
+            );
+            return false;
+        }
+    }
     let logical_size = (
         (width as f64 / scale).round() as i32,
         (height as f64 / scale).round() as i32,
@@ -4066,6 +4081,10 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 }
                 ThreadCommand::DestroyOutput { id, reply } => {
                     let _ = reply.send(destroy_output_on(state, id));
+                }
+                ThreadCommand::OutputCapacity { reply } => {
+                    let _ = reply
+                        .send(state.host.as_ref().map_or(-1, |h| h.output_count() as i64));
                 }
                 ThreadCommand::RepositionOutput { id, x, y, reply } => {
                     let _ = reply.send(reposition_output_on(state, id, x, y));
@@ -4957,6 +4976,19 @@ impl WaylandBackend {
         Ok(py
             .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
             .unwrap_or_default())
+    }
+
+    /// How many displays this backend can back with real content: -1 when
+    /// self-compositing (outputs are created on demand, no fixed bound), otherwise the
+    /// host compositor's output count. Host-capture mode reports -1 until the first
+    /// capture start establishes the host session; 0 when the backend is unresponsive.
+    fn output_capacity(&self, py: Python<'_>) -> PyResult<i64> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<i64>();
+        self.send(ThreadCommand::OutputCapacity { reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to query output capacity: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(0))
     }
 
     /// Move the window with the given id onto output `output_id`, fullscreened at that
@@ -6230,6 +6262,11 @@ impl ScreenCapture {
     fn list_outputs(&self, py: Python<'_>) -> PyResult<Vec<OutputDesc>> {
         wayland_backend_running(py)
             .map_or(Ok(Vec::new()), |be| be.bind(py).borrow().list_outputs(py))
+    }
+    /// Display capacity (see `WaylandBackend.output_capacity`); -1 when no backend runs.
+    fn output_capacity(&self, py: Python<'_>) -> PyResult<i64> {
+        wayland_backend_running(py)
+            .map_or(Ok(-1), |be| be.bind(py).borrow().output_capacity(py))
     }
     /// Move a window onto an output (fullscreened there); false when no backend runs.
     fn move_window_to_output(&self, py: Python<'_>, window_id: u32, output_id: u32) -> PyResult<bool> {
