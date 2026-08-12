@@ -110,10 +110,19 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Classify the tag
+        id: kind
+        run: |
+          # A pre-release tag must not take the "Latest release" badge
+          case "${GITHUB_REF#refs/tags/}" in
+            *[ab]*|*rc*|*dev*) echo "prerelease=true" ;;
+            *) echo "prerelease=false" ;;
+          esac >> "$GITHUB_OUTPUT"
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           name: ${{ github.ref_name }}
           body: ${{ steps.notes.outputs.content }}
-          prerelease: false
+          prerelease: ${{ steps.kind.outputs.prerelease == 'true' }}
           files: wheelhouse/*.whl
