@@ -466,10 +466,13 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ### NVENC color conversion
 
-NVENC encodes the captured ARGB directly (the driver's hardware does the ARGB→NV12 colorspace
-conversion in BT.709), so there is **no CUDA Toolkit / NVRTC requirement** — only the NVIDIA
-driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. Nothing extra to
-install at build or runtime beyond the driver.
+NVENC encodes the captured ARGB directly, so there is **no CUDA Toolkit / NVRTC requirement** —
+only the NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime.
+The driver's ARGB→YUV hardware conversion is fixed at BT.601 limited range (no encode-session
+flag retargets it), so pixelflux declares exactly that in the VUI — BT.709 primaries and
+transfer for the sRGB desktop source, SMPTE 170M matrix, limited range — and uses the same
+matrix when it converts on the host-planar path, so clients decode correct colour either way.
+Nothing extra to install at build or runtime beyond the driver.
 
 ## VA-API 4:4:4
 
@@ -497,7 +500,7 @@ session settled on rather than what was asked for.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
     *   **Software:** x264 (H.264, incl. 4:4:4 — GPL, toggleable) and JPEG with multi-threaded striping, plus BSD-licensed OpenH264 full-frame software H.264.
-    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct BT.709, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert, per-device 4:4:4 negotiation) with Zero-Copy support.
+    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct with matched VUI colour signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert, per-device 4:4:4 negotiation) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**
