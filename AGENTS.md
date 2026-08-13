@@ -27,7 +27,9 @@ you are confident there will be no regressions (or able to validate regressions)
 Python and JavaScript, as well as thread usage in all languages, so that everything is performant and does not lead to
 hanging or lagging. Performance preservation or improvements such as zero-copy and latency-reducing measures are
 always important. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher, and CUDA/NVENC 11
-to 13 or higher. Update the translations as well (and write/update additional entries if necessary) as necessary.
+to 13 or higher. Protocol clients form fallback ladders that bind the newest architecture first (ext- before
+zwlr-data-control in dcclient) and exist to keep selkies' Wayland path subprocess-free — they replace wtype/wl-copy
+style forks, so extend them in-process rather than shelling out. Update the translations as well (and write/update additional entries if necessary) as necessary.
 A defect that predates the change you are making is still in scope: finding it does not make it someone else's,
 and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is broken, what you ruled out, and
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either

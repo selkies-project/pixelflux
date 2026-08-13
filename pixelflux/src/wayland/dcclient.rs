@@ -1,14 +1,17 @@
-//! `zwlr_data_control_v1` CLIENT: the native clipboard bridge to a NESTED app
-//! compositor (labwc/kwin running under pixelflux).
+//! Data-control CLIENT: the native clipboard bridge to a NESTED app compositor
+//! (labwc/kwin running under pixelflux).
 //!
 //! Apps in a nested session use the inner compositor's selection, which
 //! pixelflux's own clipboard machinery never sees. selkies bridges it over the
 //! ScreenCapture ABI backed by this module instead of forking wl-copy/wl-paste
-//! per operation: one-shot [`list_types`]/[`read`], a persistent-source [`write`]
-//! (a detached thread serves paste requests until another client takes the
-//! selection), and [`watch`] (a thread reporting selection changes to a Python
-//! callback). Every compositor round-trip is deadline-bounded via
-//! [`wlclient::bounded_roundtrip`].
+//! per operation: one-shot [`list_types`]/[`read`], a [`write`] that returns with
+//! the selection taken (a detached thread then serves paste requests until
+//! another client takes the selection), and [`watch`] (a thread reporting
+//! selection changes to a Python callback). The compositor is spoken to through
+//! `ext_data_control_manager_v1` (KWin since Plasma 6.3, wlroots since 0.19) or
+//! `zwlr_data_control_manager_v1` (earlier wlroots and KWin), preferring the
+//! standardized ext form when both are advertised. Every compositor round-trip
+//! is deadline-bounded via [`wlclient::bounded_roundtrip`].
 
 use std::collections::HashMap;
 use std::os::fd::AsFd;
@@ -21,6 +24,12 @@ use pyo3::{Py, PyAny, Python};
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_registry, wl_seat};
 use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1::{self, ExtDataControlDeviceV1},
+    ext_data_control_manager_v1::ExtDataControlManagerV1,
+    ext_data_control_offer_v1::{self, ExtDataControlOfferV1},
+    ext_data_control_source_v1::{self, ExtDataControlSourceV1},
+};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
     zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
@@ -37,13 +46,117 @@ use crate::wayland::wlclient::{
 /// flag, bounding unwatch/shutdown latency.
 const STOP_POLL: Duration = Duration::from_millis(500);
 
+/// The two data-control protocol families behind one shape: both define the
+/// same manager/device/source/offer object graph with identical semantics, so
+/// each wrapper dispatches the one request set to whichever family the
+/// compositor advertised. Objects never mix families: everything descends from
+/// the single manager chosen at bind time.
+enum DcManager {
+    Ext(ExtDataControlManagerV1),
+    Wlr(ZwlrDataControlManagerV1),
+}
+
+enum DcDevice {
+    Ext(ExtDataControlDeviceV1),
+    Wlr(ZwlrDataControlDeviceV1),
+}
+
+enum DcSource {
+    Ext(ExtDataControlSourceV1),
+    Wlr(ZwlrDataControlSourceV1),
+}
+
+#[derive(Clone)]
+enum DcOffer {
+    Ext(ExtDataControlOfferV1),
+    Wlr(ZwlrDataControlOfferV1),
+}
+
+impl DcManager {
+    fn get_data_device(&self, seat: &wl_seat::WlSeat, qh: &QueueHandle<DcState>) -> DcDevice {
+        match self {
+            DcManager::Ext(m) => DcDevice::Ext(m.get_data_device(seat, qh, ())),
+            DcManager::Wlr(m) => DcDevice::Wlr(m.get_data_device(seat, qh, ())),
+        }
+    }
+
+    fn create_data_source(&self, qh: &QueueHandle<DcState>) -> DcSource {
+        match self {
+            DcManager::Ext(m) => DcSource::Ext(m.create_data_source(qh, ())),
+            DcManager::Wlr(m) => DcSource::Wlr(m.create_data_source(qh, ())),
+        }
+    }
+}
+
+impl DcDevice {
+    fn set_selection(&self, source: Option<&DcSource>) {
+        match self {
+            DcDevice::Ext(d) => d.set_selection(source.map(|s| match s {
+                DcSource::Ext(s) => s,
+                DcSource::Wlr(_) => unreachable!("mixed data-control families"),
+            })),
+            DcDevice::Wlr(d) => d.set_selection(source.map(|s| match s {
+                DcSource::Wlr(s) => s,
+                DcSource::Ext(_) => unreachable!("mixed data-control families"),
+            })),
+        }
+    }
+
+    fn destroy(&self) {
+        match self {
+            DcDevice::Ext(d) => d.destroy(),
+            DcDevice::Wlr(d) => d.destroy(),
+        }
+    }
+}
+
+impl DcSource {
+    fn offer(&self, mime: String) {
+        match self {
+            DcSource::Ext(s) => s.offer(mime),
+            DcSource::Wlr(s) => s.offer(mime),
+        }
+    }
+
+    fn destroy(&self) {
+        match self {
+            DcSource::Ext(s) => s.destroy(),
+            DcSource::Wlr(s) => s.destroy(),
+        }
+    }
+}
+
+impl DcOffer {
+    fn id(&self) -> ObjectId {
+        match self {
+            DcOffer::Ext(o) => o.id(),
+            DcOffer::Wlr(o) => o.id(),
+        }
+    }
+
+    fn receive(&self, mime: String, fd: std::os::fd::BorrowedFd<'_>) {
+        match self {
+            DcOffer::Ext(o) => o.receive(mime, fd),
+            DcOffer::Wlr(o) => o.receive(mime, fd),
+        }
+    }
+
+    fn destroy(&self) {
+        match self {
+            DcOffer::Ext(o) => o.destroy(),
+            DcOffer::Wlr(o) => o.destroy(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct DcState {
     seat: Option<wl_seat::WlSeat>,
-    manager: Option<ZwlrDataControlManagerV1>,
+    manager_ext: Option<ExtDataControlManagerV1>,
+    manager_wlr: Option<ZwlrDataControlManagerV1>,
     /// Advertised mimes per live offer.
     offer_mimes: HashMap<ObjectId, Vec<String>>,
-    selection: Option<ZwlrDataControlOfferV1>,
+    selection: Option<DcOffer>,
     /// Set on every `selection` event (the watch loop's change edge).
     selection_changed: bool,
     /// Compositor told this device it is done (seat gone).
@@ -62,6 +175,61 @@ impl SyncState for DcState {
 }
 impl_sync_callback!(DcState);
 
+impl DcState {
+    /// The bound manager, preferring ext over wlr; the loser is released.
+    fn take_manager(&mut self) -> Result<DcManager, String> {
+        if let Some(m) = self.manager_ext.take() {
+            if let Some(w) = self.manager_wlr.take() {
+                w.destroy();
+            }
+            return Ok(DcManager::Ext(m));
+        }
+        self.manager_wlr.take().map(DcManager::Wlr).ok_or_else(|| {
+            "app compositor advertises neither ext_data_control_manager_v1 \
+             nor zwlr_data_control_manager_v1"
+                .to_string()
+        })
+    }
+
+    fn on_data_offer(&mut self, id: ObjectId) {
+        self.offer_mimes.entry(id).or_default();
+    }
+
+    fn on_offer_mime(&mut self, id: ObjectId, mime_type: String) {
+        self.offer_mimes.entry(id).or_default().push(mime_type);
+    }
+
+    fn on_selection(&mut self, offer: Option<DcOffer>) {
+        // Replaced offers are dead objects; drop their proxy and mimes so a
+        // long-lived watch connection doesn't accumulate them.
+        if let Some(old) = self.selection.take()
+            && offer.as_ref().map(|o| o.id()) != Some(old.id()) {
+                self.offer_mimes.remove(&old.id());
+                old.destroy();
+            }
+        self.selection = offer;
+        self.selection_changed = true;
+    }
+
+    /// This bridge carries the regular selection only, but ext v1 still
+    /// introduces an offer per primary-selection change; release it (unless the
+    /// compositor reused the regular selection's object) so it can't pile up.
+    fn on_primary_selection(&mut self, offer: Option<DcOffer>) {
+        if let Some(o) = offer
+            && self.selection.as_ref().map(|s| s.id()) != Some(o.id()) {
+                self.offer_mimes.remove(&o.id());
+                o.destroy();
+            }
+    }
+
+    fn on_send(&mut self, mime_type: &str, fd: std::os::fd::OwnedFd) {
+        if let Some((_, data)) = self.serve.iter().find(|(m, _)| m == mime_type) {
+            let _ = write_fd_all(&fd, data, IO_TIMEOUT);
+        }
+        // fd drops here, closing the pipe so the paster sees EOF.
+    }
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for DcState {
     fn event(
         state: &mut Self,
@@ -78,8 +246,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for DcState {
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, 1, qh, ()));
                 }
-                "zwlr_data_control_manager_v1" if state.manager.is_none() => {
-                    state.manager = Some(registry.bind(name, 1, qh, ()));
+                "ext_data_control_manager_v1" if state.manager_ext.is_none() => {
+                    state.manager_ext = Some(registry.bind(name, 1, qh, ()));
+                }
+                "zwlr_data_control_manager_v1" if state.manager_wlr.is_none() => {
+                    state.manager_wlr = Some(registry.bind(name, 1, qh, ()));
                 }
                 _ => {}
             }
@@ -88,7 +259,23 @@ impl Dispatch<wl_registry::WlRegistry, ()> for DcState {
 }
 
 delegate_noop!(DcState: ignore wl_seat::WlSeat);
+delegate_noop!(DcState: ExtDataControlManagerV1);
 delegate_noop!(DcState: ZwlrDataControlManagerV1);
+
+impl Dispatch<ExtDataControlOfferV1, ()> for DcState {
+    fn event(
+        state: &mut Self,
+        offer: &ExtDataControlOfferV1,
+        event: ext_data_control_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let ext_data_control_offer_v1::Event::Offer { mime_type } = event {
+            state.on_offer_mime(offer.id(), mime_type);
+        }
+    }
+}
 
 impl Dispatch<ZwlrDataControlOfferV1, ()> for DcState {
     fn event(
@@ -100,9 +287,40 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for DcState {
         _: &QueueHandle<Self>,
     ) {
         if let zwlr_data_control_offer_v1::Event::Offer { mime_type } = event {
-            state.offer_mimes.entry(offer.id()).or_default().push(mime_type);
+            state.on_offer_mime(offer.id(), mime_type);
         }
     }
+}
+
+impl Dispatch<ExtDataControlDeviceV1, ()> for DcState {
+    fn event(
+        state: &mut Self,
+        _: &ExtDataControlDeviceV1,
+        event: ext_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_device_v1::Event::DataOffer { id } => {
+                state.on_data_offer(id.id());
+            }
+            ext_data_control_device_v1::Event::Selection { id } => {
+                state.on_selection(id.map(DcOffer::Ext));
+            }
+            ext_data_control_device_v1::Event::PrimarySelection { id } => {
+                state.on_primary_selection(id.map(DcOffer::Ext));
+            }
+            ext_data_control_device_v1::Event::Finished => {
+                state.finished = true;
+            }
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(DcState, ExtDataControlDeviceV1, [
+        ext_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ExtDataControlOfferV1, ()),
+    ]);
 }
 
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for DcState {
@@ -116,18 +334,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for DcState {
     ) {
         match event {
             zwlr_data_control_device_v1::Event::DataOffer { id } => {
-                state.offer_mimes.entry(id.id()).or_default();
+                state.on_data_offer(id.id());
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                // Replaced offers are dead objects; drop their proxy and mimes so
-                // a long-lived watch connection doesn't accumulate them.
-                if let Some(old) = state.selection.take()
-                    && id.as_ref().map(|o| o.id()) != Some(old.id()) {
-                        state.offer_mimes.remove(&old.id());
-                        old.destroy();
-                    }
-                state.selection = id;
-                state.selection_changed = true;
+                state.on_selection(id.map(DcOffer::Wlr));
             }
             zwlr_data_control_device_v1::Event::Finished => {
                 state.finished = true;
@@ -141,6 +351,27 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for DcState {
     ]);
 }
 
+impl Dispatch<ExtDataControlSourceV1, ()> for DcState {
+    fn event(
+        state: &mut Self,
+        _: &ExtDataControlSourceV1,
+        event: ext_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_data_control_source_v1::Event::Send { mime_type, fd } => {
+                state.on_send(&mime_type, fd);
+            }
+            ext_data_control_source_v1::Event::Cancelled => {
+                state.cancelled = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<ZwlrDataControlSourceV1, ()> for DcState {
     fn event(
         state: &mut Self,
@@ -152,10 +383,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for DcState {
     ) {
         match event {
             zwlr_data_control_source_v1::Event::Send { mime_type, fd } => {
-                if let Some((_, data)) = state.serve.iter().find(|(m, _)| *m == mime_type) {
-                    let _ = write_fd_all(&fd, data, IO_TIMEOUT);
-                }
-                // fd drops here, closing the pipe so the paster sees EOF.
+                state.on_send(&mime_type, fd);
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
                 state.cancelled = true;
@@ -169,10 +397,7 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for DcState {
 /// the current selection already delivered.
 fn open_device(
     socket_path: &str,
-) -> Result<
-    (Connection, wayland_client::EventQueue<DcState>, DcState, ZwlrDataControlDeviceV1),
-    String,
-> {
+) -> Result<(Connection, wayland_client::EventQueue<DcState>, DcState, DcDevice), String> {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
@@ -182,11 +407,8 @@ fn open_device(
     let mut state = DcState::default();
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
     let seat = state.seat.clone().ok_or("app compositor advertises no wl_seat")?;
-    let manager = state
-        .manager
-        .clone()
-        .ok_or("app compositor does not advertise zwlr_data_control_manager_v1")?;
-    let device = manager.get_data_device(&seat, &qh, ());
+    let manager = state.take_manager()?;
+    let device = manager.get_data_device(&seat, &qh);
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
     Ok((conn, queue, state, device))
 }
@@ -230,22 +452,11 @@ pub(crate) fn read(socket_path: &str, mime: &str) -> Result<Option<Vec<u8>>, Str
 
 /// Take the selection, serving `entries` (mime, bytes) to every paster from a
 /// detached thread until another client takes the selection (or the compositor
-/// goes away). Replacing a previous write is implicit: the compositor cancels
-/// the old source when the new one takes the selection.
+/// goes away). The selection is compositor-acknowledged when this returns, so a
+/// caller may immediately trigger a paste against it. Replacing a previous
+/// write is implicit: the compositor cancels the old source when the new one
+/// takes the selection.
 pub(crate) fn write(socket_path: &str, entries: Vec<(String, Vec<u8>)>) -> Result<(), String> {
-    let path = socket_path.to_string();
-    std::thread::Builder::new()
-        .name("pf-dc-selection".into())
-        .spawn(move || {
-            if let Err(e) = serve_selection(&path, entries) {
-                eprintln!("[Clipboard] app-compositor selection serve ended: {e}");
-            }
-        })
-        .map_err(|e| format!("spawn: {e}"))?;
-    Ok(())
-}
-
-fn serve_selection(socket_path: &str, entries: Vec<(String, Vec<u8>)>) -> Result<(), String> {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
@@ -255,18 +466,33 @@ fn serve_selection(socket_path: &str, entries: Vec<(String, Vec<u8>)>) -> Result
     let mut state = DcState::default();
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
     let seat = state.seat.clone().ok_or("app compositor advertises no wl_seat")?;
-    let manager = state
-        .manager
-        .clone()
-        .ok_or("app compositor does not advertise zwlr_data_control_manager_v1")?;
-    let device = manager.get_data_device(&seat, &qh, ());
-    let source = manager.create_data_source(&qh, ());
+    let manager = state.take_manager()?;
+    let device = manager.get_data_device(&seat, &qh);
+    let source = manager.create_data_source(&qh);
     for (mime, _) in &entries {
         source.offer(mime.clone());
     }
     state.serve = entries;
     device.set_selection(Some(&source));
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
+    std::thread::Builder::new()
+        .name("pf-dc-selection".into())
+        .spawn(move || {
+            if let Err(e) = serve_selection(conn, queue, state, device, source) {
+                eprintln!("[Clipboard] app-compositor selection serve ended: {e}");
+            }
+        })
+        .map_err(|e| format!("spawn: {e}"))?;
+    Ok(())
+}
+
+fn serve_selection(
+    conn: Connection,
+    mut queue: wayland_client::EventQueue<DcState>,
+    mut state: DcState,
+    device: DcDevice,
+    source: DcSource,
+) -> Result<(), String> {
     while !state.cancelled && !state.finished {
         // Sends are served inside dispatch; block until the compositor has
         // something (with a poll so a dead compositor can't pin the thread).
