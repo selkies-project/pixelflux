@@ -1,4 +1,4 @@
-//! `zwp_virtual_keyboard_v1` client for typing Unicode text into ANOTHER Wayland
+//! `zwp_virtual_keyboard_v1` client for typing Unicode text into a nested
 //! compositor's socket.
 //!
 //! pixelflux is normally the compositor, but in a nested deployment (a labwc/kwin

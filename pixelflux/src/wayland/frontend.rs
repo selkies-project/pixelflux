@@ -355,6 +355,14 @@ pub struct WindowMeta {
 /// the origin — so far negative coordinates can never collide with a real output.
 pub const PARKED_POS: (i32, i32) = (-(1 << 20), -(1 << 20));
 
+/// The logical size a parked screen is held at. A nested session lays its desktop out across
+/// every screen it has, including one waiting here: at the size of a real screen it would
+/// double the session's coordinate space, sending anything a client centres on the desktop
+/// (X11 applications place themselves) onto the screen nobody is watching. Small enough not
+/// to move that centre, large enough to lay out on; `place_window_on_output` configures the
+/// real size the moment the screen is given an output.
+pub const PARKED_LOGICAL_SIZE: (i32, i32) = (320, 240);
+
 /// The window's meta, inserted at `new_toplevel`; windows created before that (none in
 /// practice) read as id 0 / primary output.
 pub fn window_meta(window: &Window) -> Option<&WindowMeta> {
@@ -773,16 +781,17 @@ impl CompositorHandler for AppState {
                     meta.output.store(target_id, Ordering::Relaxed);
                     meta.parked.store(park, Ordering::Relaxed);
                 }
-                let (logical_width, logical_height) =
-                    if let Some(size) = self.logical_size_of(target_id) {
-                        size
-                    } else {
-                        let scale = self.settings.scale.max(0.1);
-                        (
-                            (self.settings.width as f64 / scale).round() as i32,
-                            (self.settings.height as f64 / scale).round() as i32,
-                        )
-                    };
+                let (logical_width, logical_height) = if park {
+                    PARKED_LOGICAL_SIZE
+                } else if let Some(size) = self.logical_size_of(target_id) {
+                    size
+                } else {
+                    let scale = self.settings.scale.max(0.1);
+                    (
+                        (self.settings.width as f64 / scale).round() as i32,
+                        (self.settings.height as f64 / scale).round() as i32,
+                    )
+                };
 
                 toplevel.with_pending_state(|state| {
                     state.states.set(XdgState::Activated);
@@ -856,6 +865,18 @@ impl CompositorHandler for AppState {
                     let target = FocusTarget::Window(window.clone());
                     if let Some(keyboard) = self.seat.get_keyboard() {
                         keyboard.set_focus(self, Some(target.clone()), serial);
+                    }
+                } else {
+                    // A client that drew before answering the parked size (a nested
+                    // compositor's spare screen starts at its backend's own default)
+                    // is told again now that it has mapped, so the session lays out
+                    // on a screen the size of the one it is waiting for.
+                    let geo = window.geometry();
+                    if (geo.size.w - PARKED_LOGICAL_SIZE.0).abs() > 1
+                        || (geo.size.h - PARKED_LOGICAL_SIZE.1).abs() > 1
+                    {
+                        let tl = toplevel.clone();
+                        self.send_forced_fullscreen_configure(&tl);
                     }
                 }
             }
@@ -985,6 +1006,10 @@ impl AppState {
             self.output_nodes[idx].output.leave(&surface);
         }
         self.space.map_element(window.clone(), PARKED_POS, false);
+        if let Some(toplevel) = window.toplevel() {
+            let toplevel = toplevel.clone();
+            self.send_forced_fullscreen_configure(&toplevel);
+        }
     }
 
     /// Place `window` on output `id`: retag its meta, remap it at the output's layout
@@ -1333,7 +1358,17 @@ impl AppState {
             .find(|w| w.toplevel().map(|t| t == toplevel).unwrap_or(false))
             .map(window_output_id)
             .unwrap_or(0);
-        let (logical_width, logical_height) = if let Some(size) = self.logical_size_of(output_id) {
+        let parked = self
+            .space
+            .elements()
+            .chain(self.pending_windows.iter())
+            .find(|w| w.toplevel().map(|t| t == toplevel).unwrap_or(false))
+            .and_then(window_meta)
+            .map(|meta| meta.parked.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        let (logical_width, logical_height) = if parked {
+            PARKED_LOGICAL_SIZE
+        } else if let Some(size) = self.logical_size_of(output_id) {
             size
         } else {
             let scale = self.settings.scale.max(0.1);

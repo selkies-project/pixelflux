@@ -21,5 +21,7 @@ pub mod vkclient;
 pub mod wlclient;
 /// Data-control clipboard client bridging a nested app compositor's selection.
 pub mod dcclient;
+/// Output-management client scaling a nested app compositor's screens.
+pub mod outclient;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;

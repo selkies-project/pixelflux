@@ -551,7 +551,7 @@ pub(crate) fn watch(socket_path: &str, callback: Py<PyAny>) -> Result<(), String
     Ok(())
 }
 
-/// Stop every clipboard watch (process teardown sweep; watches are NOT tied to
+/// Stop every clipboard watch (process teardown sweep; watches are not tied to
 /// captures, so the global stop helper must reach them explicitly).
 pub(crate) fn unwatch_all() {
     let mut reg = WATCHERS.lock().unwrap();

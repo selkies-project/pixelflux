@@ -6092,6 +6092,44 @@ impl ScreenCapture {
             }
         })
     }
+    /// Scale the app compositor's `index`-th screen, so its applications draw
+    /// larger while the capture keeps its full resolution. False when that
+    /// compositor manages no outputs for clients (KWin), whose scale follows
+    /// the capture output's instead.
+    fn set_app_output_scale(
+        &self,
+        py: Python<'_>,
+        display: String,
+        index: usize,
+        scale: f64,
+    ) -> PyResult<bool> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::set_output_scale(&path, index, scale)
+        })
+        .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Hold the app compositor's screens past the first `keep` at a small size,
+    /// so a session that opened more screens than there are capture outputs does
+    /// not lay its desktop out across one nobody sees. Returns how many were
+    /// resized (0 = that compositor manages no outputs for clients).
+    fn hold_spare_app_screens(
+        &self,
+        py: Python<'_>,
+        display: String,
+        keep: usize,
+        width: i32,
+        height: i32,
+    ) -> PyResult<usize> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::hold_spare_screens(&path, keep, (width, height))
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
     fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
         py.detach(move || {
