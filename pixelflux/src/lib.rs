@@ -6070,6 +6070,28 @@ impl ScreenCapture {
             }
         })
     }
+    /// Tap `keysyms` in order through `display`'s virtual keyboard, verbatim: the
+    /// caller owns which keysym spells which character (selkies' policy layer);
+    /// this owns delivery. Same one-shot client and errors as `type_text_wayland`.
+    fn type_keysyms_wayland(
+        &self,
+        py: Python<'_>,
+        display: String,
+        keysyms: Vec<u32>,
+    ) -> PyResult<()> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::vkclient::type_keysyms_to(&path, &keysyms)
+        })
+        .map_err(|e: String| {
+            if e.contains("zwp_virtual_keyboard_manager_v1") {
+                VirtualKeyboardUnavailable::new_err(e)
+            } else {
+                pyo3::exceptions::PyRuntimeError::new_err(e)
+            }
+        })
+    }
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
     fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
         py.detach(move || {
