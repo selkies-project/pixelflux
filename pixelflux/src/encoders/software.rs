@@ -812,11 +812,17 @@ pub fn encode_cpu(
     let damage_block_duration = settings.damage_block_duration as i32;
     #[cfg(feature = "gpl")]
     let video_cbr = settings.video_cbr_mode;
+    // Every stripe instantiates its own x264, and ABR is per encoder
+    // instance, so the requested rate is a whole-stream budget split evenly
+    // across the stripes. The full-frame path (single stripe) divides by
+    // one; CRF needs no division (a per-quality target).
     #[cfg(feature = "gpl")]
-    let video_bitrate = settings.video_bitrate_kbps;
+    let stripe_share = n_processing_stripes.max(1) as i32;
+    #[cfg(feature = "gpl")]
+    let video_bitrate = (settings.video_bitrate_kbps / stripe_share).max(1);
     #[cfg(feature = "gpl")]
     let video_vbv = (crate::encoders::vbv_bits(
-        (video_bitrate.max(0) as u32).saturating_mul(1000),
+        (video_bitrate.max(1) as u32).saturating_mul(1000),
         target_fps,
         settings.keyframe_interval_s,
         settings.video_vbv_multiplier,

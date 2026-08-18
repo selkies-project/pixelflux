@@ -1035,7 +1035,7 @@ impl WlFramePool {
             if self.stop.load(Ordering::Acquire) {
                 return None;
             }
-            let (gg, _) = self.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+            let (gg, _) = self.cv.wait_timeout(g, WL_POOL_WAKE_QUANTUM).unwrap();
             g = gg;
         }
     }
@@ -1090,6 +1090,9 @@ impl WlEncodeControls {
 /// Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
 /// publish slot, so a deeper pool would only add latency (staler frames), never overlap.
 const WL_POOL_SURFACES: usize = 2;
+/// The encode thread's bounded idle wait in `WlFramePool::take` — also the
+/// wake latency teardown budgets for when it harvests that thread's encoder.
+const WL_POOL_WAKE_QUANTUM: Duration = Duration::from_millis(20);
 
 /// Upper bounds for Python-supplied capture geometry: keeps a hostile or buggy setting from
 /// turning into a multi-GB `vec![]` allocation that would abort the process. 16384 covers every
@@ -1715,21 +1718,59 @@ fn log_stream_settings(
 /// hardware session for in-place reuse by a following start. The encode thread is joined
 /// before the delivery sender drops (it feeds that sender), and the zero-copy session (if
 /// any) is left on the capture for the caller to reuse or drop.
-fn teardown_capture(cap: &mut wayland::frontend::WlCapture) -> Option<GpuEncoder> {
+fn teardown_capture(
+    cap: &mut wayland::frontend::WlCapture,
+) -> (
+    Option<GpuEncoder>,
+    Option<std::thread::JoinHandle<()>>,
+    Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+) {
     if let Some(p) = cap.encode_pool.take() {
         p.shutdown();
     }
-    let prior = cap.encode_join.take().and_then(|j| j.join().ok()).flatten();
+    if let Some(flag) = cap.deliver_discard.take() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    // Harvest the readback encoder for reuse only while the encode thread
+    // exits on its own schedule: one pool wake plus one frame interval. Past
+    // that it is wedged in a deliver send behind a consumer still inside
+    // Python, and joining here would freeze the event loop on that callback
+    // (this teardown runs on it) — the handle is deferred to the reaper and
+    // the encoder rebuilt instead of reused.
+    let mut prior = None;
+    let mut deferred_encode = None;
+    if let Some(join) = cap.encode_join.take() {
+        let deadline = Instant::now()
+            + WL_POOL_WAKE_QUANTUM
+            + Duration::from_secs_f64(1.0 / cap.settings.target_fps.max(1.0));
+        loop {
+            if join.is_finished() {
+                prior = join.join().ok().flatten();
+                break;
+            }
+            if Instant::now() >= deadline {
+                deferred_encode = Some(join);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     if let Some(tx) = cap.deliver_tx.take() {
         drop(tx);
     }
-    if let Some(j) = cap.deliver_join.take() {
-        let _ = j.join();
-    }
+    // Never join the deliver thread here either: it may sit mid-Python-
+    // callback. The raised discard flag plus the dropped senders end its loop
+    // after at most the in-flight callback (a deferred encode thread's send
+    // unblocks as the discard drain frees the channel slot, and its exit
+    // drops the last sender). The handle goes to the caller — a restart
+    // hands it to the successor's deliver thread, which joins it before
+    // delivering, so stale stripes can never follow the new stream into
+    // Python; a plain stop hands it to the reaper.
+    let join = cap.deliver_join.take();
     cap.pending_hw_delivery = None;
     cap.pending_hw_damage = false;
     cap.recording_sink = None;
-    prior
+    (prior, join, deferred_encode)
 }
 
 /// Stop the capture bound to `display_id`, leaving the output (and every other display's
@@ -1739,7 +1780,9 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     if let Some(mut cap) = state.output_nodes[idx].capture.take() {
         println!("[Wayland] Capture loop stopped (display {display_id}).");
         cap.video_encoder = None;
-        let _ = teardown_capture(&mut cap);
+        let (_, join, deferred_encode) = teardown_capture(&mut cap);
+        state.deliver_reaper.extend(join);
+        state.encode_reaper.extend(deferred_encode);
     }
     wayland_alive().lock().unwrap().remove(&display_id);
 }
@@ -1864,15 +1907,71 @@ fn start_capture_on_display(
     // reuse candidates below (zero-copy inline, readback via the encode config).
     let mut prior_zero_copy: Option<GpuEncoder> = None;
     let mut prior_readback_encoder: Option<GpuEncoder> = None;
+    let mut prior_deliver_join: Option<std::thread::JoinHandle<()>> = None;
     if let Some(mut old) = node.capture.take() {
         prior_zero_copy = old.video_encoder.take();
-        prior_readback_encoder = teardown_capture(&mut old);
+        let deferred_encode;
+        (prior_readback_encoder, prior_deliver_join, deferred_encode) =
+            teardown_capture(&mut old);
+        state.encode_reaper.extend(deferred_encode);
     }
 
     // Bind only after the old capture is gone: its sink unlinks the socket path in
     // Drop, which would strip a fresh bind's filesystem name and leave every later
     // recorder connect with ENOENT.
     let recording_sink = crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
+
+    // Host-capture mode: connect on first use and negotiate this display's mode
+    // with the host before anything is sized from the settings. A host that
+    // keeps its own mode (refusal, or no layout management — KWin) decides
+    // every frame's dimensions, so the encoder setup, the local output mirror
+    // and the stored settings below must all see that size, the same way a
+    // failed GBM resize falls back to the live mode.
+    let host_capture = !settings.wayland_host_display.is_empty();
+    if host_capture && state.host.is_none() {
+        // Capture buffers come from the same render node the encoder imports
+        // from, resolved via its live fd (the path string is not retained in
+        // auto mode); each capture thread opens its own device handle.
+        let gbm_path = if state.use_gpu {
+            state.gbm_device.as_ref().and_then(|dev| {
+                use std::os::fd::{AsFd as _, AsRawFd as _};
+                let fd = dev.as_fd().as_raw_fd();
+                std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+            })
+        } else {
+            None
+        };
+        match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path) {
+            Ok(h) => {
+                println!(
+                    "[HostCapture] capturing host compositor '{}' ({} outputs).",
+                    settings.wayland_host_display,
+                    h.output_count()
+                );
+                state.host = Some(h);
+            }
+            Err(e) => eprintln!(
+                "[HostCapture] connect '{}' failed: {e}",
+                settings.wayland_host_display
+            ),
+        }
+    }
+    // A failed connect leaves this display compositing locally, so its frames follow the
+    // local renderer again.
+    let host_capture = host_capture && state.host.is_some();
+    if host_capture && let Some(host) = &state.host {
+        // The node's layout offset rides along so the host's heads mirror
+        // selkies' union layout (input coordinates already assume it).
+        host.set_layout(display_id, node.pos.0, node.pos.1);
+        if let Some((rw, rh)) = host.negotiate_layout(display_id, settings.width, settings.height)
+        {
+            eprintln!(
+                "[HostCapture] host kept {rw}x{rh} for display {display_id}; capturing at that size."
+            );
+            settings.width = rw;
+            settings.height = rh;
+        }
+    }
 
     {
         // Never panic the compositor thread: an output momentarily without a current
@@ -2090,57 +2189,19 @@ fn start_capture_on_display(
         println!("[Wayland] Decision: Zero-Copy path active.");
     }
 
-    // Host-capture mode: connect on first use and point this display's capture thread at
-    // the size the encoder was just configured for. The compositor keeps running (CU,
-    // clipboard callbacks, input fallbacks) but its renderer is bypassed. The buffer type
-    // follows the consumer settled on above: dmabufs only for a zero-copy encoder, shm
-    // frames for every CPU path (use_cpu, OpenH264, JPEG, readback).
-    let host_capture = !settings.wayland_host_display.is_empty();
-    if host_capture {
-        if state.host.is_none() {
-            // Capture buffers come from the same render node the encoder imports
-            // from, resolved via its live fd (the path string is not retained in
-            // auto mode); each capture thread opens its own device handle.
-            let gbm_path = if state.use_gpu {
-                state.gbm_device.as_ref().and_then(|dev| {
-                    use std::os::fd::{AsFd as _, AsRawFd as _};
-                    let fd = dev.as_fd().as_raw_fd();
-                    std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
-                })
-            } else {
-                None
-            };
-            match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path)
-            {
-                Ok(h) => {
-                    println!(
-                        "[HostCapture] capturing host compositor '{}' ({} outputs).",
-                        settings.wayland_host_display,
-                        h.output_count()
-                    );
-                    state.host = Some(h);
-                }
-                Err(e) => eprintln!(
-                    "[HostCapture] connect '{}' failed: {e}",
-                    settings.wayland_host_display
-                ),
-            }
-        }
-        if let Some(host) = &state.host {
-            // The node's layout offset rides along so the host's heads mirror
-            // selkies' union layout (input coordinates already assume it).
-            host.set_layout(display_id, node.pos.0, node.pos.1);
-            host.start_capture(
-                display_id,
-                settings.width,
-                settings.height,
-                video_encoder.is_some(),
-            );
-        }
+    // Point this display's host capture thread at the size the encoder was just
+    // configured for. The compositor keeps running (CU, clipboard callbacks, input
+    // fallbacks) but its renderer is bypassed. The buffer type follows the consumer
+    // settled on above: dmabufs only for a zero-copy encoder, shm frames for every
+    // CPU path (use_cpu, OpenH264, JPEG, readback).
+    if host_capture && let Some(host) = &state.host {
+        host.start_capture(
+            display_id,
+            settings.width,
+            settings.height,
+            video_encoder.is_some(),
+        );
     }
-    // A failed connect leaves this display compositing locally, so its frames follow the
-    // local renderer again.
-    let host_capture = host_capture && state.host.is_some();
 
     if recording_sink.is_some() && settings.output_mode == 0 {
         eprintln!(
@@ -2171,6 +2232,7 @@ fn start_capture_on_display(
         recording_sink,
         deliver_tx: None,
         deliver_join: None,
+        deliver_discard: None,
         pending_hw_delivery: None,
         pending_hw_damage: false,
         encode_pool: None,
@@ -2191,30 +2253,44 @@ fn start_capture_on_display(
 
     {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
+        let discard = Arc::new(AtomicBool::new(false));
+        let thread_discard = discard.clone();
+        let predecessor = prior_deliver_join;
         // With no Python callback (internal recorder-owned capture) the delivery thread
         // only drains the channel: the recorder already consumed the frames at the
         // delivery-layer tap, upstream of this per-consumer handoff.
-        let join = match cb {
-            Some(cb) => thread::spawn(move || {
-                crate::boost_thread_priority(-10);
-                while let Ok(stripes) = rx.recv() {
-                    if PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
-                    Python::attach(|py| {
-                        for s in stripes {
-                            match Py::new(py, StripeFrame::new_owned_meta(
-                                s.data, s.data_type, s.stripe_y_start,
-                                s.stripe_height, s.frame_id,
-                            )) {
-                                Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
-                                Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
+        let join = thread::spawn(move || {
+            // The predecessor capture's deliver thread finishes first, off the
+            // event loop: encoded stripes reach Python in capture order across
+            // a reconfigure, and a stale pre-teardown stripe can never land
+            // after this capture's first frame.
+            if let Some(handle) = predecessor {
+                let _ = handle.join();
+            }
+            match cb {
+                Some(cb) => {
+                    crate::boost_thread_priority(-10);
+                    while let Ok(stripes) = rx.recv() {
+                        if thread_discard.load(Ordering::Relaxed)
+                            || PY_SHUTDOWN.load(Ordering::Relaxed) { continue; }
+                        Python::attach(|py| {
+                            for s in stripes {
+                                match Py::new(py, StripeFrame::new_owned_meta(
+                                    s.data, s.data_type, s.stripe_y_start,
+                                    s.stripe_height, s.frame_id,
+                                )) {
+                                    Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
+                                    Err(e) => eprintln!("[wayland] frame alloc error: {e:?}"),
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
-            }),
-            None => thread::spawn(move || while rx.recv().is_ok() {}),
-        };
+                None => while rx.recv().is_ok() {},
+            }
+        });
         cap.deliver_tx = Some(tx);
+        cap.deliver_discard = Some(discard);
         cap.deliver_join = Some(join);
     }
 
@@ -2606,7 +2682,21 @@ fn render_node_tick(
         // The session steps out of `state` while frames are adopted so the
         // renderer can composite the watermark / serve screenshot readbacks.
         let host = state.host.take().unwrap();
-        let new_frame = host.try_take_frame(host_idx);
+        // Stale-geometry rejection: a frame captured before a mode change is
+        // useless at the new size (the CPU path would blit old-pitch rows into
+        // a new-size buffer, and HW encoders cannot take a mismatched dmabuf),
+        // so it goes back to the pool instead of being retained or encoded.
+        let expect = node
+            .capture
+            .as_ref()
+            .map(|c| (c.settings.width, c.settings.height));
+        let new_frame = match (host.try_take_frame(host_idx), expect) {
+            (Some(f), Some((w, h))) if f.width != w || f.height != h => {
+                host.release_frame(host_idx, f);
+                None
+            }
+            (f, _) => f,
+        };
         let have_new = new_frame.is_some();
         // Streaming mode wants a constant-rate stream (the client's decoder pipeline
         // is built for it), so re-encode the retained frame every tick like the
@@ -3995,6 +4085,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         auto_gpu_selected,
         pending_screenshot: None,
         command_rx: None,
+        last_input_at: None,
+        frame_idle_long: false,
+        last_idle_service_at: None,
+        deliver_reaper: Vec::new(),
+        encode_reaper: Vec::new(),
     };
     // Seed the keymap policy with the seat's initial keymap so overlay binds splice onto
     // the exact text clients received.
@@ -4058,10 +4153,65 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     /// queued input is applied ahead of a long render/encode instead of waiting it out.
     fn drain_thread_commands(state: &mut AppState) {
         let Some(rx) = state.command_rx.take() else { return };
+        let mut had_input = false;
         while let Ok(cmd) = rx.try_recv() {
+            had_input |= matches!(
+                cmd,
+                ThreadCommand::KeyboardKey { .. }
+                    | ThreadCommand::KeyboardKeys { .. }
+                    | ThreadCommand::PointerMotion { .. }
+                    | ThreadCommand::PointerRelativeMotion { .. }
+                    | ThreadCommand::PointerButton { .. }
+                    | ThreadCommand::PointerAxis { .. }
+            );
             handle_thread_command(state, cmd);
         }
+        if had_input {
+            state.last_input_at = Some(Instant::now());
+        }
         state.command_rx = Some(rx);
+    }
+
+    /// One idle-tick service pass for committed clients while nothing captures:
+    /// frame callbacks unblock vsynced clients, requested presentation feedback
+    /// is discarded (nothing presents), and the renderer's import cache is
+    /// pruned since no render will do it. Shared by the frame timer's idle
+    /// branch and the input wake handler, which must not let a fresh keypress
+    /// wait out an already-armed long idle deadline.
+    fn send_idle_frame_callbacks(state: &mut AppState) {
+        let time = state.clock.now();
+        for node in &state.output_nodes {
+            let mut feedback = OutputPresentationFeedback::new(&node.output);
+            for window in state
+                .space
+                .elements_for_output(&node.output)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
+                    Some(node.output.clone())
+                });
+                window.take_presentation_feedback(
+                    &mut feedback,
+                    |_, _| Some(node.output.clone()),
+                    |_, _| wp_presentation_feedback::Kind::empty(),
+                );
+            }
+            for layer in layer_map_for_output(&node.output).layers() {
+                layer.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
+                    Some(node.output.clone())
+                });
+                layer.take_presentation_feedback(
+                    &mut feedback,
+                    |_, _| Some(node.output.clone()),
+                    |_, _| wp_presentation_feedback::Kind::empty(),
+                );
+            }
+            feedback.discarded();
+        }
+        if let Some(renderer) = state.gles_renderer.as_mut() {
+            let _ = renderer.cleanup_texture_cache();
+        }
     }
 
     fn handle_thread_command(state: &mut AppState, cmd: ThreadCommand) {
@@ -4303,6 +4453,19 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let _ = reply.send((pressed, mods));
                 }
                 ThreadCommand::Barrier { reply } => {
+                    // The shutdown path fences on this after its StopCaptures:
+                    // joining the reaped threads before acknowledging means
+                    // nothing that can attach to Python survives past the
+                    // fence, so the interpreter never finalizes under a live
+                    // callback. Bounded — discard flags are up and senders
+                    // dropped, so each chain exits after at most its
+                    // in-flight callback.
+                    for join in state.encode_reaper.drain(..) {
+                        let _ = join.join();
+                    }
+                    for join in state.deliver_reaper.drain(..) {
+                        let _ = join.join();
+                    }
                     let _ = reply.send(());
                 }
                 ThreadCommand::GetXkbKeymap { reply } => {
@@ -4583,6 +4746,21 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         .handle()
         .insert_source(wake_rx, |_, _, state| {
             drain_thread_commands(state);
+            // Input landing while the frame timer sits on its long idle
+            // deadline must not wait it out: service the frame callbacks now
+            // (at most at frame pace) so the app's echo repaint starts with
+            // the keypress; the timer's own next fire re-arms the short pace.
+            if state.frame_idle_long
+                && state
+                    .last_input_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(50))
+                && state
+                    .last_idle_service_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(16))
+            {
+                state.last_idle_service_at = Some(Instant::now());
+                send_idle_frame_callbacks(state);
+            }
         })
         .unwrap();
 
@@ -4622,6 +4800,26 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             // Apply queued commands (input above all) BEFORE the render/encode work: a
             // command that raced the timer wakeup would otherwise wait out the whole tick.
             drain_thread_commands(state);
+            // Deliver and deferred encode threads of stopped captures are
+            // joined only once they report finished (a plain atomic load), so
+            // the tick never waits on one; whatever remains at shutdown, the
+            // Barrier drain joins.
+            let mut i = 0;
+            while i < state.deliver_reaper.len() {
+                if state.deliver_reaper[i].is_finished() {
+                    let _ = state.deliver_reaper.swap_remove(i).join();
+                } else {
+                    i += 1;
+                }
+            }
+            let mut i = 0;
+            while i < state.encode_reaper.len() {
+                if state.encode_reaper[i].is_finished() {
+                    let _ = state.encode_reaper.swap_remove(i).join();
+                } else {
+                    i += 1;
+                }
+            }
             let loop_start_time = Instant::now();
             state.space.refresh();
 
@@ -4663,56 +4861,27 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 // too, and every frame they hand over is one that nothing renders,
                 // encodes or looks at. Unblocking them is the whole purpose here, and
                 // that costs a callback every so often rather than sixty a second.
-                let time = state.clock.now();
-                for node in &state.output_nodes {
-                    // Nothing is presented while nothing captures, so any requested
-                    // wp_presentation feedback is discarded outright: a client pacing
-                    // on it falls back to its own timer instead of waiting forever.
-                    let mut feedback = OutputPresentationFeedback::new(&node.output);
-                    for window in state
-                        .space
-                        .elements_for_output(&node.output)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                    {
-                        window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
-                            Some(node.output.clone())
-                        });
-                        window.take_presentation_feedback(
-                            &mut feedback,
-                            |_, _| Some(node.output.clone()),
-                            |_, _| wp_presentation_feedback::Kind::empty(),
-                        );
-                    }
-                    for layer in layer_map_for_output(&node.output).layers() {
-                        layer.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
-                            Some(node.output.clone())
-                        });
-                        layer.take_presentation_feedback(
-                            &mut feedback,
-                            |_, _| Some(node.output.clone()),
-                            |_, _| wp_presentation_feedback::Kind::empty(),
-                        );
-                    }
-                    feedback.discarded();
-                }
-                // Rendering prunes the renderer's dmabuf-import cache when it unbinds;
-                // here nothing renders, so prune explicitly or every buffer a client
-                // commits (each import-validated in `dmabuf_imported`) leaves its
-                // texture and EGLImage behind for good.
-                if let Some(renderer) = state.gles_renderer.as_mut() {
-                    let _ = renderer.cleanup_texture_cache();
-                }
+                state.last_idle_service_at = Some(Instant::now());
+                send_idle_frame_callbacks(state);
                 // A parked capture session is an attached consumer that may request a
                 // frame at any moment: tick at frame pace so that request waits at most
-                // one frame, not a quarter second.
-                let idle = if state.copy_sessions.is_empty() {
-                    IDLE_FRAME_INTERVAL
-                } else {
+                // one frame, not a quarter second. Input gets the same window: apps
+                // pacing on frame callbacks see their echo promptly after a keypress,
+                // or the idle rate alone turns typing into a 250ms stutter. The wake
+                // handler covers the first keypress landing while the long deadline
+                // is already armed.
+                let post_input = state
+                    .last_input_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
+                let idle = if !state.copy_sessions.is_empty() || post_input {
                     Duration::from_millis(16)
+                } else {
+                    IDLE_FRAME_INTERVAL
                 };
+                state.frame_idle_long = idle == IDLE_FRAME_INTERVAL;
                 return TimeoutAction::ToDuration(idle);
             }
+            state.frame_idle_long = false;
 
             // Render every output that needs it. The nodes are taken out of the state so
             // each per-output render can borrow the shared renderer/space alongside its

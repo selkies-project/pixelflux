@@ -31,7 +31,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use gbm::{BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
@@ -183,8 +183,25 @@ enum ToHost {
 }
 
 enum CtrlMsg {
-    Apply(Vec<LayoutSlot>),
+    Apply { epoch: u64, slots: Vec<LayoutSlot> },
 }
+
+/// Outcome ledger for layout requests: every Apply carries an epoch, and the
+/// control thread records whether the newest one it processed was realized by
+/// the host. Waiters block on `decided` catching up to their epoch — a newer
+/// request subsumes an older one (same layout map), so `>=` is enough.
+#[derive(Default)]
+struct LayoutOutcome {
+    epoch: u64,
+    decided: u64,
+    realized: bool,
+}
+
+/// Bound for one layout negotiation, shared by the control thread's
+/// apply_layout and the session-side wait for its outcome; a host that
+/// answers even slower than this keeps the optimistic want, which is the
+/// pre-negotiation behavior.
+const LAYOUT_DEADLINE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Control connection: seat + virtual input devices + wlr-output-management.
@@ -199,6 +216,10 @@ struct CtrlState {
     has_ext_capture: bool,
     has_ext_source: bool,
     outputs: Vec<(wl_output::WlOutput, Option<String>)>,
+    /// Current mode per output, registry-indexed and shared with the session:
+    /// when the host keeps its own size (refused or unmanageable layout), the
+    /// capture follows this instead of gating on the size it asked for.
+    sizes: Arc<Mutex<Vec<(i32, i32)>>>,
     /// Registry indices in display order (natural name sort — registry
     /// announcement order is not guaranteed to match output creation order).
     order: Vec<usize>,
@@ -289,7 +310,37 @@ macro_rules! impl_output_name {
         }
     };
 }
-impl_output_name!(CtrlState);
+impl Dispatch<wl_output::WlOutput, usize> for CtrlState {
+    fn event(
+        state: &mut Self,
+        _: &wl_output::WlOutput,
+        event: wl_output::Event,
+        idx: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_output::Event::Name { name } => {
+                if let Some(o) = state.outputs.get_mut(*idx) {
+                    o.1 = Some(name);
+                }
+            }
+            wl_output::Event::Mode { flags, width, height, .. } => {
+                if flags
+                    .into_result()
+                    .is_ok_and(|f| f.contains(wl_output::Mode::Current))
+                {
+                    let mut sizes = state.sizes.lock().unwrap();
+                    if sizes.len() <= *idx {
+                        sizes.resize(*idx + 1, (0, 0));
+                    }
+                    sizes[*idx] = (width, height);
+                }
+            }
+            _ => {}
+        }
+    }
+}
 
 delegate_noop!(CtrlState: ignore wl_seat::WlSeat);
 delegate_noop!(CtrlState: ZwpVirtualKeyboardManagerV1);
@@ -655,6 +706,10 @@ pub struct HostSession {
     ctrl_wake: OwnedFd,
     outputs: Vec<OutputHandle>,
     layout: Mutex<std::collections::BTreeMap<u32, LayoutSlot>>,
+    /// Rank -> registry index, for looking a display's host output up in `sizes`.
+    order: Vec<usize>,
+    sizes: Arc<Mutex<Vec<(i32, i32)>>>,
+    layout_outcome: Arc<(Mutex<LayoutOutcome>, Condvar)>,
     alive: Arc<AtomicBool>,
 }
 
@@ -761,16 +816,32 @@ impl HostSession {
 
         let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel::<CtrlMsg>();
         let (ctrl_wake_rd, ctrl_wake) = wake_pipe()?;
+        let order_for_session = state.order.clone();
+        let sizes = state.sizes.clone();
+        let layout_outcome = Arc::new((Mutex::new(LayoutOutcome::default()), Condvar::new()));
         {
             let conn = conn.clone();
+            let outcome = layout_outcome.clone();
             std::thread::Builder::new()
                 .name("pf-host-ctrl".into())
-                .spawn(move || control_loop(conn, queue, state, ctrl_rx, ctrl_wake_rd))
+                .spawn(move || control_loop(conn, queue, state, ctrl_rx, ctrl_wake_rd, outcome))
                 .map_err(|e| format!("spawn: {e}"))?;
         }
 
         let layout = Mutex::new(std::collections::BTreeMap::new());
-        Ok(Self { conn, vk, vptr, ctrl_tx, ctrl_wake, outputs, layout, alive })
+        Ok(Self {
+            conn,
+            vk,
+            vptr,
+            ctrl_tx,
+            ctrl_wake,
+            outputs,
+            layout,
+            order: order_for_session,
+            sizes,
+            layout_outcome,
+            alive,
+        })
     }
 
     pub fn output_count(&self) -> usize {
@@ -798,6 +869,66 @@ impl HostSession {
     pub fn set_layout(&self, display_id: u32, x: i32, y: i32) {
         let mut layout = self.layout.lock().unwrap();
         layout.entry(display_id).or_default().pos = (x, y);
+    }
+
+    /// The current mode of the host output backing `display_id` (physical
+    /// pixels), as the host last announced it.
+    fn host_output_size(&self, display_id: u32) -> Option<(i32, i32)> {
+        let rank = self.output_index_for(display_id)?;
+        let registry_idx = *self.order.get(rank)?;
+        let size = *self.sizes.lock().unwrap().get(registry_idx)?;
+        (size.0 > 0 && size.1 > 0).then_some(size)
+    }
+
+    /// Number a layout request and hand it to the control thread.
+    fn send_apply(&self, slots: Vec<LayoutSlot>) -> u64 {
+        let epoch = {
+            let (lock, _) = &*self.layout_outcome;
+            let mut o = lock.lock().unwrap();
+            o.epoch += 1;
+            o.epoch
+        };
+        let _ = self.ctrl_tx.send(CtrlMsg::Apply { epoch, slots });
+        wake_write(self.ctrl_wake.as_raw_fd());
+        epoch
+    }
+
+    /// Ask the host for `display_id`'s wanted mode ahead of the capture start
+    /// and report what it realized: Some(size) when the host kept a different
+    /// size (it refused the layout, or offers no layout management at all),
+    /// None when the want was applied — or when no answer arrived in time,
+    /// keeping the optimistic want. A refused want is rewritten to the
+    /// realized size, so the pointer extent and the coming capture start
+    /// agree with what the host actually produces instead of gating forever
+    /// on a mode it declined.
+    pub fn negotiate_layout(&self, display_id: u32, width: i32, height: i32) -> Option<(i32, i32)> {
+        let slots = {
+            let mut layout = self.layout.lock().unwrap();
+            let slot = layout.entry(display_id).or_default();
+            slot.want = (width, height);
+            slot.active = true;
+            layout
+                .iter()
+                .filter(|(_, s)| s.active)
+                .map(|(_, s)| *s)
+                .take(self.outputs.len())
+                .collect::<Vec<_>>()
+        };
+        let epoch = self.send_apply(slots);
+        let (lock, cvar) = &*self.layout_outcome;
+        let (outcome, timeout) = cvar
+            .wait_timeout_while(lock.lock().unwrap(), LAYOUT_DEADLINE, |o| o.decided < epoch)
+            .unwrap();
+        if timeout.timed_out() || outcome.realized {
+            return None;
+        }
+        drop(outcome);
+        let realized = self.host_output_size(display_id)?;
+        if realized == (width, height) {
+            return None;
+        }
+        self.layout.lock().unwrap().entry(display_id).or_default().want = realized;
+        Some(realized)
     }
 
     /// Aim `display_id` at `width`x`height`: assigns every active display its
@@ -835,6 +966,18 @@ impl HostSession {
             if rank >= self.outputs.len() {
                 break;
             }
+            // A mode change invalidates everything buffered for this output:
+            // those frames belong to the old geometry and would otherwise be
+            // consumed at the new one.
+            let size_mismatch = self.outputs[rank]
+                .retained
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|f| f.width != slot.want.0 || f.height != slot.want.1);
+            if size_mismatch {
+                self.drop_buffered_frames(rank);
+            }
             self.outputs[rank].send(ToHost::Start {
                 width: slot.want.0,
                 height: slot.want.1,
@@ -842,8 +985,7 @@ impl HostSession {
             });
             by_output.push(*slot);
         }
-        let _ = self.ctrl_tx.send(CtrlMsg::Apply(by_output));
-        wake_write(self.ctrl_wake.as_raw_fd());
+        self.send_apply(by_output);
     }
 
     /// Point `display_id`'s capture at dmabufs (`zero_copy`) or shm frames without touching its
@@ -870,6 +1012,9 @@ impl HostSession {
             }
         };
         let (idx, want) = target;
+        // Same geometry, new buffer type: a retained dmabuf cannot be consumed
+        // by the shm path (nor vice versa), so everything buffered goes back.
+        self.drop_buffered_frames(idx);
         self.outputs[idx].send(ToHost::Start {
             width: want.0,
             height: want.1,
@@ -877,9 +1022,25 @@ impl HostSession {
         });
     }
 
+    /// Drop every buffered frame for an output: a mode or buffer-type change
+    /// makes the cached pixels unusable — consumed at the new geometry they
+    /// smear garbage rows or fault an encoder built for the new size. The
+    /// slots go straight back to the pool; dropping them silently would wedge
+    /// a slot until the next renegotiation.
+    fn drop_buffered_frames(&self, idx: usize) {
+        let handle = &self.outputs[idx];
+        if let Some(old) = handle.retained.lock().unwrap().take() {
+            handle.send(ToHost::Release { generation: old.generation, slot: old.slot });
+        }
+        while let Ok(frame) = handle.frames.try_recv() {
+            handle.send(ToHost::Release { generation: frame.generation, slot: frame.slot });
+        }
+    }
+
     /// Park `display_id`'s capture (its slot leaves the pointer extent). The
-    /// retained frame goes back to the capture pool — dropping it silently
-    /// would wedge one of the two slots until the next renegotiation.
+    /// retained frame and anything still queued go back to the capture pool —
+    /// an idle output has no consumer for them, and dropping them silently
+    /// would wedge slots until the next renegotiation.
     pub fn idle_output(&self, display_id: u32) {
         let Some(idx) = self.output_index_for(display_id) else {
             self.layout.lock().unwrap().entry(display_id).or_default().active = false;
@@ -887,13 +1048,21 @@ impl HostSession {
         };
         self.layout.lock().unwrap().entry(display_id).or_default().active = false;
         self.outputs[idx].send(ToHost::Idle);
-        if let Some(old) = self.outputs[idx].retained.lock().unwrap().take() {
-            self.outputs[idx].send(ToHost::Release { generation: old.generation, slot: old.slot });
-        }
+        self.drop_buffered_frames(idx);
     }
 
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Hand one frame back to the pool (same path the drain/idle releases take).
+    pub fn release_frame(&self, display_id: u32, frame: HostFrame) {
+        if let Some(idx) = self.output_index_for(display_id) {
+            self.outputs[idx].send(ToHost::Release {
+                generation: frame.generation,
+                slot: frame.slot,
+            });
+        }
     }
 
     /// Newest ready frame for `display_id`, releasing any staler ones straight
@@ -1025,19 +1194,28 @@ fn control_loop(
     mut state: CtrlState,
     ctrl_rx: Receiver<CtrlMsg>,
     wake_rd: OwnedFd,
+    outcome: Arc<(Mutex<LayoutOutcome>, Condvar)>,
 ) {
     let qh = queue.handle();
     loop {
-        let mut pending: Option<Vec<LayoutSlot>> = None;
+        let mut pending: Option<(u64, Vec<LayoutSlot>)> = None;
         loop {
             match ctrl_rx.try_recv() {
-                Ok(CtrlMsg::Apply(slots)) => pending = Some(slots),
+                Ok(CtrlMsg::Apply { epoch, slots }) => pending = Some((epoch, slots)),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
         }
-        if let Some(slots) = pending {
-            apply_layout(&conn, &mut queue, &mut state, &qh, &slots);
+        if let Some((epoch, slots)) = pending {
+            let realized = apply_layout(&conn, &mut queue, &mut state, &qh, &slots);
+            let (lock, cvar) = &*outcome;
+            let mut o = lock.lock().unwrap();
+            if epoch > o.decided {
+                o.decided = epoch;
+                o.realized = realized;
+            }
+            drop(o);
+            cvar.notify_all();
         }
         if queue.dispatch_pending(&mut state).is_err() {
             return;
@@ -1067,29 +1245,32 @@ fn control_loop(
 
 /// Ask the host (wlr-output-management) to give every active output its wanted
 /// mode and layout position in one atomic configuration. Retries across a
-/// `cancelled` (stale serial); a refusal only warns — capture threads keep
-/// gating on the size they were promised.
+/// `cancelled` (stale serial). Returns whether the host realized the layout:
+/// on `false` (refusal, or no manager at all — KWin offers only its own
+/// kde_output_management protocol) the session falls the wants back to the
+/// host's actual sizes so capture follows the host instead of gating forever
+/// on a size it will never produce.
 fn apply_layout(
     conn: &Connection,
     queue: &mut EventQueue<CtrlState>,
     state: &mut CtrlState,
     qh: &QueueHandle<CtrlState>,
     slots: &[LayoutSlot],
-) {
+) -> bool {
     let Some(mgr) = state.output_mgr.clone() else {
         eprintln!("[HostCapture] host lacks zwlr_output_manager_v1; capture follows the host's own size.");
-        return;
+        return false;
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + LAYOUT_DEADLINE;
     for _ in 0..3 {
         while state.om_serial.is_none() && Instant::now() < deadline {
             if !pump_ctrl(conn, queue, state) {
-                return;
+                return false;
             }
         }
         let Some(serial) = state.om_serial else {
             eprintln!("[HostCapture] output-management serial never arrived; resize skipped.");
-            return;
+            return false;
         };
         state.cfg_result = None;
         state.cfg_cancelled = false;
@@ -1122,14 +1303,14 @@ fn apply_layout(
         }
         if !any {
             cfg.destroy();
-            return;
+            return false;
         }
         cfg.apply();
         let _ = queue.flush();
         while state.cfg_result.is_none() && !state.cfg_cancelled && Instant::now() < deadline {
             if !pump_ctrl(conn, queue, state) {
                 cfg.destroy();
-                return;
+                return false;
             }
         }
         cfg.destroy();
@@ -1140,9 +1321,11 @@ fn apply_layout(
         }
         if state.cfg_result != Some(true) {
             eprintln!("[HostCapture] host refused the layout; capture follows the host's own size.");
+            return false;
         }
-        return;
+        return true;
     }
+    false
 }
 
 /// One bounded dispatch step for the control connection (false = connection died).

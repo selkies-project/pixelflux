@@ -230,6 +230,9 @@ pub struct WlCapture {
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
     pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
     pub deliver_join: Option<std::thread::JoinHandle<()>>,
+    /// Raised at teardown so the deliver thread stops calling into Python and
+    /// only drains: its exit is then bounded by the one in-flight callback.
+    pub deliver_discard: Option<Arc<AtomicBool>>,
     pub pending_hw_delivery: Option<Vec<crate::encoders::software::EncodedStripe>>,
     pub pending_hw_damage: bool,
     pub encode_pool: Option<Arc<crate::WlFramePool>>,
@@ -510,6 +513,26 @@ pub struct AppState {
     /// the render tick can apply every queued command BEFORE starting a long render/encode —
     /// queued input is never starved behind the tick it arrived during.
     pub command_rx: Option<smithay::reexports::calloop::channel::Channel<crate::ThreadCommand>>,
+    /// When the last input command landed: the no-capture tick speeds up right
+    /// after input so apps pacing on frame callbacks respond promptly (they
+    /// are the ones noticing the idle rate while nobody encodes).
+    pub last_input_at: Option<Instant>,
+    /// Whether the frame timer is armed at the long idle interval: input
+    /// arriving then must not wait that deadline out, so the wake handler
+    /// sends the idle frame callbacks itself (frame-paced via
+    /// `last_idle_service_at`) instead of waiting for the timer.
+    pub frame_idle_long: bool,
+    /// When idle frame callbacks were last serviced, bounding the wake
+    /// handler's servicing to frame pace under an input storm.
+    pub last_idle_service_at: Option<Instant>,
+    /// Deliver threads of stopped captures, joined without blocking the event
+    /// loop: the timer tick reaps the finished ones, and the shutdown Barrier
+    /// drains the rest so nothing that can attach to Python outlives it.
+    pub deliver_reaper: Vec<std::thread::JoinHandle<()>>,
+    /// Encode threads whose teardown-time harvest expired (wedged behind a
+    /// consumer inside Python); reaped like the deliver threads, with the
+    /// unclaimed encoder dropped here on the event loop — its usual home.
+    pub encode_reaper: Vec<std::thread::JoinHandle<Option<crate::GpuEncoder>>>,
 }
 
 /// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
