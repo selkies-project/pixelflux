@@ -99,7 +99,6 @@ before-all = """
         apk add --no-cache \
             build-base \
             clang \
-            clang20-libclang \
             cmake \
             nasm \
             pixman-dev \
@@ -116,6 +115,11 @@ before-all = """
             eudev-dev \
             musl-dev \
             ffmpeg-dev && \
+        \
+        # bindgen opens libclang at runtime, and Alpine names that package after
+        # the compiler's major version, which moves every release: take the one
+        # belonging to the clang just installed.
+        apk add --no-cache "clang$(clang -dumpversion | cut -d. -f1)-libclang" && \
         \
         curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal
     else

@@ -1090,9 +1090,15 @@ impl WlEncodeControls {
 /// Two buffers: one being encoded while the calloop fills the other. try_begin gates on the
 /// publish slot, so a deeper pool would only add latency (staler frames), never overlap.
 const WL_POOL_SURFACES: usize = 2;
-/// The encode thread's bounded idle wait in `WlFramePool::take` — also the
-/// wake latency teardown budgets for when it harvests that thread's encoder.
+/// The encode thread's bounded idle wait in `WlFramePool::take`.
 const WL_POOL_WAKE_QUANTUM: Duration = Duration::from_millis(20);
+/// How long a reconfigured output holds its frames while its clients answer the new size.
+/// It is measured from the start, which rebuilds the encode path before there is any frame
+/// to hold: the first one arrives roughly 300 ms later, so a window shorter than that
+/// expires before it can suppress anything and the hold does nothing at all. This one
+/// outlasts the rebuild and a client's own repaint, and is the whole delay an output that
+/// no client ever draws on pays before its content reaches the viewer regardless.
+const WL_CONTENT_HOLD: Duration = Duration::from_millis(500);
 
 /// Upper bounds for Python-supplied capture geometry: keeps a hostile or buggy setting from
 /// turning into a multi-GB `vec![]` allocation that would abort the process. 16384 covers every
@@ -1141,7 +1147,14 @@ struct WlEncodeConfig {
     /// HW session handed back by the previous encode thread; reconfigured in place and
     /// reused when still compatible, sparing the stream a session rebuild.
     prior: Option<GpuEncoder>,
-    recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
+    /// The outgoing encode thread of a capture being restarted, joined here — off the
+    /// calloop — before this thread builds anything. Everything the predecessor did
+    /// therefore precedes everything this thread does, and its readback hardware session is
+    /// inherited rather than rebuilt.
+    predecessor: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    /// Weak, so the calloop's teardown owns the sink's lifetime: a strong handle held here
+    /// could outlive the capture and unlink a successor's freshly bound socket path.
+    recording_sink: Option<std::sync::Weak<crate::recording_sink::RecordingSink>>,
     deliver_tx: std::sync::mpsc::SyncSender<Vec<EncodedStripe>>,
     controls: Arc<WlEncodeControls>,
     stats: Arc<WlEncodeStats>,
@@ -1282,8 +1295,9 @@ fn hw_plane_buffer(width: i32, height: i32, fullcolor: bool, hw: bool) -> Vec<u8
 fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEncoder> {
     crate::boost_thread_priority(-10);
     let mut settings = cfg.settings;
+    let inherited = cfg.predecessor.and_then(|h| h.join().ok().flatten());
     let (mut video_encoder, mut openh264_encoder) =
-        build_readback_encoders(&settings, cfg.try_gpu, cfg.prior);
+        build_readback_encoders(&settings, cfg.try_gpu, cfg.prior.or(inherited));
     if cfg.try_gpu && video_encoder.is_none() && openh264_encoder.is_none() {
         println!("[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding.");
     }
@@ -1303,6 +1317,8 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     let width = settings.width;
     let height = settings.height;
     let mut stripes: Vec<StripeState> = Vec::with_capacity(MAX_STRIPE_CAPACITY);
+    // Smoothed number of stripes carrying the encode budget (see stripe_rate_control).
+    let mut stripes_carrying: f32 = 1.0;
     let mut hw_state = StripeState::default();
     // The CSC target follows the session's own chroma, not the request: a VA-API device that
     // refused 4:4:4 encodes 4:2:0, and sizing this from the request would hand it a buffer laid
@@ -1338,13 +1354,11 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
         }
 
         // A recorder connecting counts as a request, so the decision layer sends a
-        // decodable frame even when the screen is static.
+        // decodable frame even when the screen is static. A sink whose capture has been
+        // torn down is already gone, and its last frames are not recorded.
+        let recording_sink = cfg.recording_sink.as_ref().and_then(|w| w.upgrade());
         let requested_idr = cfg.controls.force_idr.swap(false, Ordering::Relaxed)
-            || cfg
-                .recording_sink
-                .as_ref()
-                .map(|s| s.should_force_idr())
-                .unwrap_or(false);
+            || recording_sink.as_ref().is_some_and(|s| s.should_force_idr());
 
         let mut out: Vec<EncodedStripe> = Vec::new();
         if let Some(ref mut encoder) = video_encoder {
@@ -1529,6 +1543,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                     && crate::pipeline::periodic_idr_due(&settings, f.frame_id));
             out = encoders::software::encode_cpu(
                 &mut stripes,
+                &mut stripes_carrying,
                 &f.buf,
                 width,
                 height,
@@ -1551,7 +1566,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
         if !out.is_empty() {
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
-            if let Some(ref socket) = cfg.recording_sink {
+            if let Some(ref socket) = recording_sink {
                 socket.write_frame(&out, settings.height);
             }
             crate::recorder::wayland_tap(cfg.display_id, &out);
@@ -1614,30 +1629,17 @@ fn encoder_desc(
     format!("H264 ({}) {} {} {} CRF:{}", backend, cs_str, range_str, frame_str, settings.video_crf)
 }
 
-/// Decide how many horizontal stripes a frame is split into, which is really the choice of how
-/// much encode parallelism to spend on it. A full-frame session (`fullframe_encoder`: a HW or
-/// OpenH264 encoder, or a forced `video_fullframe`) is one contiguous H.264 stream and so is always a
-/// SINGLE stripe; the striped CPU paths instead fan the frame out across cores — bounded by
-/// `height/64` for H.264 so no stripe is shorter than a macroblock row, or by `height` for JPEG — so
-/// a many-core host encodes a frame in parallel without over-subscribing a tiny one.
+/// How many horizontal stripes a frame is split into, for the settings line and the stats.
+///
+/// A full-frame session (`fullframe_encoder`: a HW or OpenH264 encoder, or a forced
+/// `video_fullframe`) is one contiguous H.264 stream and so a single stripe. Everything else
+/// asks the encoder's own rule, so what is reported is what is encoded.
 fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool) -> usize {
-    let num_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    if settings.output_mode == 1 {
-        if fullframe_encoder || settings.video_fullframe {
-            1
-        } else {
-            let min_h = 64;
-            if settings.height < min_h {
-                1
-            } else {
-                num_cores.min((settings.height / min_h) as usize).max(1)
-            }
-        }
-    } else {
-        num_cores.min(settings.height as usize).max(1)
-    }
+    crate::encoders::software::stripe_count(
+        settings.height,
+        settings.output_mode,
+        fullframe_encoder || settings.video_fullframe,
+    )
 }
 
 /// One-shot "Stream settings active" line, printed by the thread that owns the encoders
@@ -1714,14 +1716,17 @@ fn log_stream_settings(
     println!("{}", log_msg);
 }
 
-/// Tear down a capture's encode/delivery threads and pools, returning any readback
-/// hardware session for in-place reuse by a following start. The encode thread is joined
-/// before the delivery sender drops (it feeds that sender), and the zero-copy session (if
-/// any) is left on the capture for the caller to reuse or drop.
+/// Tear down a capture's encode/delivery threads and pools, returning both join handles as
+/// `(deliver, encode)` for the caller to place. NEITHER is joined here: this runs on the
+/// calloop thread, which also dispatches Wayland clients and input, and either thread can be
+/// parked behind a consumer still inside Python. A restart hands each handle to its
+/// successor thread, which joins it off the event loop — the encode successor inheriting the
+/// readback hardware session, the deliver successor keeping stripes in capture order across
+/// the restart — and a plain stop hands both to the reaper. The zero-copy session (if any)
+/// is left on the capture for the caller to reuse or drop.
 fn teardown_capture(
     cap: &mut wayland::frontend::WlCapture,
 ) -> (
-    Option<GpuEncoder>,
     Option<std::thread::JoinHandle<()>>,
     Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
 ) {
@@ -1731,46 +1736,18 @@ fn teardown_capture(
     if let Some(flag) = cap.deliver_discard.take() {
         flag.store(true, Ordering::Relaxed);
     }
-    // Harvest the readback encoder for reuse only while the encode thread
-    // exits on its own schedule: one pool wake plus one frame interval. Past
-    // that it is wedged in a deliver send behind a consumer still inside
-    // Python, and joining here would freeze the event loop on that callback
-    // (this teardown runs on it) — the handle is deferred to the reaper and
-    // the encoder rebuilt instead of reused.
-    let mut prior = None;
-    let mut deferred_encode = None;
-    if let Some(join) = cap.encode_join.take() {
-        let deadline = Instant::now()
-            + WL_POOL_WAKE_QUANTUM
-            + Duration::from_secs_f64(1.0 / cap.settings.target_fps.max(1.0));
-        loop {
-            if join.is_finished() {
-                prior = join.join().ok().flatten();
-                break;
-            }
-            if Instant::now() >= deadline {
-                deferred_encode = Some(join);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
+    let encode_join = cap.encode_join.take();
     if let Some(tx) = cap.deliver_tx.take() {
         drop(tx);
     }
-    // Never join the deliver thread here either: it may sit mid-Python-
-    // callback. The raised discard flag plus the dropped senders end its loop
-    // after at most the in-flight callback (a deferred encode thread's send
-    // unblocks as the discard drain frees the channel slot, and its exit
-    // drops the last sender). The handle goes to the caller — a restart
-    // hands it to the successor's deliver thread, which joins it before
-    // delivering, so stale stripes can never follow the new stream into
-    // Python; a plain stop hands it to the reaper.
     let join = cap.deliver_join.take();
     cap.pending_hw_delivery = None;
     cap.pending_hw_damage = false;
+    // The last strong reference: dropping it here, before a following start binds its own
+    // sink, is what keeps the outgoing sink's unlink from stripping the successor's socket
+    // path. The encode thread holds only a Weak.
     cap.recording_sink = None;
-    (prior, join, deferred_encode)
+    (join, encode_join)
 }
 
 /// Stop the capture bound to `display_id`, leaving the output (and every other display's
@@ -1780,9 +1757,9 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     if let Some(mut cap) = state.output_nodes[idx].capture.take() {
         println!("[Wayland] Capture loop stopped (display {display_id}).");
         cap.video_encoder = None;
-        let (_, join, deferred_encode) = teardown_capture(&mut cap);
+        let (join, encode_join) = teardown_capture(&mut cap);
         state.deliver_reaper.extend(join);
-        state.encode_reaper.extend(deferred_encode);
+        state.encode_reaper.extend(encode_join);
     }
     wayland_alive().lock().unwrap().remove(&display_id);
 }
@@ -1802,6 +1779,7 @@ fn bootstrap_readback_pool(
     use_gpu: bool,
     try_gpu: bool,
     prior: Option<GpuEncoder>,
+    predecessor: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
 ) {
     let Some(deliver_tx) = cap.deliver_tx.clone() else {
         return;
@@ -1831,7 +1809,8 @@ fn bootstrap_readback_pool(
         use_gpu,
         try_gpu,
         prior,
-        recording_sink: cap.recording_sink.clone(),
+        predecessor,
+        recording_sink: cap.recording_sink.as_ref().map(Arc::downgrade),
         deliver_tx,
         controls: cap.encode_controls.clone(),
         stats: cap.encode_stats.clone(),
@@ -1906,14 +1885,11 @@ fn start_capture_on_display(
     // Tear down this display's previous capture first; its hardware sessions are the
     // reuse candidates below (zero-copy inline, readback via the encode config).
     let mut prior_zero_copy: Option<GpuEncoder> = None;
-    let mut prior_readback_encoder: Option<GpuEncoder> = None;
+    let mut prior_encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>> = None;
     let mut prior_deliver_join: Option<std::thread::JoinHandle<()>> = None;
     if let Some(mut old) = node.capture.take() {
         prior_zero_copy = old.video_encoder.take();
-        let deferred_encode;
-        (prior_readback_encoder, prior_deliver_join, deferred_encode) =
-            teardown_capture(&mut old);
-        state.encode_reaper.extend(deferred_encode);
+        (prior_deliver_join, prior_encode_join) = teardown_capture(&mut old);
     }
 
     // Bind only after the old capture is gone: its sink unlinks the socket path in
@@ -2302,7 +2278,8 @@ fn start_capture_on_display(
             // a GLES readback of our own compositing produces RGBA.
             state.use_gpu && !host_capture,
             gpu_intent && (!state.use_gpu || different_gpu),
-            prior_readback_encoder.take(),
+            None,
+            prior_encode_join.take(),
         );
     } else {
         cap.encode_stats.n_stripes.store(1, Ordering::Relaxed);
@@ -2310,13 +2287,21 @@ fn start_capture_on_display(
             encoder_desc(&settings, cap.video_encoder.as_ref(), false, true);
         log_stream_settings(&settings, 1, cap.video_encoder.as_ref(), false);
     }
-    drop(prior_readback_encoder);
+    // A zero-copy start has no successor encode thread to inherit the outgoing readback
+    // session, so the outgoing thread is reaped instead.
+    state.encode_reaper.extend(prior_encode_join);
     // Force the keyframe unconditionally: the damage tracker and offscreen buffer
     // stay warm across stop/start, so a restarted capture on a static screen
     // otherwise produces no damage, no first frame, and no IDR in either path.
     cap.request_idr();
 
     node.capture = Some(cap);
+    // The start reprogrammed this output, and until a client answers at the new size the
+    // compositor paints its clear colour over whatever the client does not cover — a
+    // freshly created output, whose session window is still parked at a placeholder size,
+    // is covered by none of it. Those frames are held rather than streamed as a blank
+    // screen; the deadline releases an output no client ever draws on.
+    node.content_hold_until = Some(Instant::now() + WL_CONTENT_HOLD);
     state.output_nodes.insert(node_idx, node);
     wayland_alive().lock().unwrap().insert(display_id);
 }
@@ -2584,6 +2569,31 @@ fn render_node_tick(
     let logical_w = (width as f64 / output_scale_val).round();
     let logical_h = (height as f64 / output_scale_val).round();
 
+    // A reconfigured or freshly created output composites its clear colour wherever a client
+    // has not yet answered the new size; publishing is held until one covers the output so
+    // that grey never reaches the stream. Compositing continues, so the frame callbacks the
+    // waited-on clients redraw on keep flowing and the hold cannot deadlock on itself. Host
+    // capture streams the host compositor's own frames and has no such gap.
+    let hold_frame = match node.content_hold_until {
+        Some(deadline)
+            if state.host.is_none()
+                && Instant::now() < deadline
+                && !wayland::frontend::output_content_covers(
+                    &state.space,
+                    node.id,
+                    logical_w,
+                    logical_h,
+                ) =>
+        {
+            true
+        }
+        Some(_) => {
+            node.content_hold_until = None;
+            false
+        }
+        None => false,
+    };
+
     // A recorder connecting counts as an IDR request, kept armed across skipped ticks.
     if let Some(cap) = node.capture.as_mut()
         && cap
@@ -2606,7 +2616,8 @@ fn render_node_tick(
     let want_idr_for_host = requested_idr || hw_idr_pending;
 
     let mut pool_slot: Option<(usize, Vec<u8>)> = None;
-    if let Some(cap) = node.capture.as_ref()
+    if !hold_frame
+        && let Some(cap) = node.capture.as_ref()
         && let Some(ref pool) = cap.encode_pool {
             pool_slot = pool.try_begin();
             if pool_slot.is_none() {
@@ -2851,7 +2862,7 @@ fn render_node_tick(
                     let try_gpu = s.output_mode == 1
                         && !s.use_openh264
                         && !(s.use_cpu || s.encode_node_index == -1);
-                    bootstrap_readback_pool(cap, node.id, false, try_gpu, None);
+                    bootstrap_readback_pool(cap, node.id, false, try_gpu, None, None);
                     cap.request_idr();
                     // The consumer is now a CPU one, so the host stops preferring GPU slots.
                     if let Some(h) = state.host.as_ref() {
@@ -3238,7 +3249,7 @@ fn render_node_tick(
             service_copy_frames(state, node, width, height, &damage_rects);
         }
 
-        if let Some(cap) = node.capture.as_mut() {
+        if !hold_frame && let Some(cap) = node.capture.as_mut() {
             // A dead encode thread (panic, unexpected exit) cannot drain the pool;
             // every publish would park the slot and each tick would silently skip
             // while is_capturing still reports true. Rebuild the readback path in
@@ -3257,7 +3268,7 @@ fn render_node_tick(
                     && !(s.use_cpu || s.encode_node_index == -1);
                 eprintln!("[Wayland] encode thread died; rebuilding the readback path.");
                 // Host frames reach the pool as BGRA; only our own GLES readback produces RGBA.
-                bootstrap_readback_pool(cap, node.id, state.use_gpu && !host_mode, try_gpu, prior);
+                bootstrap_readback_pool(cap, node.id, state.use_gpu && !host_mode, try_gpu, prior, None);
                 cap.request_idr();
             }
             if cap.encode_pool.is_some() {
@@ -3415,6 +3426,7 @@ fn render_node_tick(
                                     // GLES readback produces RGBA.
                                     bootstrap_readback_pool(
                                         cap, node.id, state.use_gpu && !host_mode, try_gpu, None,
+                                        None,
                                     );
                                     // The host has to switch to buffers the readback path
                                     // can read back on the CPU.
@@ -3620,6 +3632,7 @@ fn create_output_on(
         capture: None,
         frame_seq: 0,
         target_seeded: false,
+        content_hold_until: None,
     });
     // A nested session opens one host toplevel per screen and the extras wait
     // parked until a display exists for them: hand the newest waiting window to
@@ -4146,6 +4159,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         capture: None,
         frame_seq: 0,
         target_seeded: false,
+        content_hold_until: None,
     });
 
     /// Apply every queued control command in FIFO order. Sends wake the loop through the

@@ -303,6 +303,12 @@ pub struct OutputNode {
     /// capture-less render (screenshot, copy-capture client) may use buffer age
     /// instead of redrawing everything. Cleared whenever the target is replaced.
     pub target_seeded: bool,
+    /// Deadline for this output's post-reconfigure content hold. While it is set, the
+    /// display composites but does not publish: a resized or freshly created output paints
+    /// its clear colour wherever a client has not yet answered the new size, and that grey
+    /// must not reach the stream. Cleared by the first tick a client covers the output, and
+    /// by the deadline for one that never does.
+    pub content_hold_until: Option<Instant>,
 }
 
 /// One ext-image-copy-capture session: an external client capturing one of this
@@ -316,6 +322,31 @@ pub struct OutputCopySession {
     /// The first frame of a session ships without waiting for damage; only
     /// afterwards does an unchanged screen hold the frame.
     pub delivered_once: bool,
+}
+
+/// Every window placed on `display_id` and actually composited there. Keyed off the window's
+/// own output tag rather than the Space's output map, which only catches up on the next
+/// `Space::refresh`; a parked window carries the tag but is mapped clear of every output.
+pub fn windows_on_output(space: &Space<Window>, display_id: u32) -> impl Iterator<Item = &Window> {
+    space.elements().filter(move |w| {
+        window_output_id(w) == display_id
+            && !window_meta(w).map(|m| m.parked.load(Ordering::Relaxed)).unwrap_or(false)
+    })
+}
+
+/// Whether a client on this display has COMMITTED content spanning the whole output. Under
+/// forced fullscreen a window answers its configure at the output's logical size, so one
+/// still carrying its pre-configure size reads as not covering and holds the display's frames.
+pub fn output_content_covers(
+    space: &Space<Window>,
+    display_id: u32,
+    logical_w: f64,
+    logical_h: f64,
+) -> bool {
+    windows_on_output(space, display_id).any(|w| {
+        let size = w.geometry().size;
+        size.w as f64 >= logical_w && size.h as f64 >= logical_h
+    })
 }
 
 impl OutputNode {

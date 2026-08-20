@@ -688,8 +688,15 @@ pub struct EncodedStripe {
 ///    conversion band each, since the parallelism there already comes from encoding the stripes
 ///    concurrently.
 #[allow(clippy::too_many_arguments)]
+/// No stripe is shorter than a macroblock row.
+const MIN_STRIPE_HEIGHT: i32 = 64;
+/// How fast the smoothed count of budget-carrying stripes follows the frame's.
+const CARRY_RISE: f32 = 0.3;
+const CARRY_FALL: f32 = 0.05;
+
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
+    carrying: &mut f32,
     raw_pixels: &[u8],
     width: i32,
     height: i32,
@@ -700,18 +707,8 @@ pub fn encode_cpu(
     hash_damage: bool,
     force_idr_all: bool,
 ) -> Vec<EncodedStripe> {
-    let num_cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let min_stripe_height = 64;
-    let mut n_processing_stripes = num_cores;
-
-    if (settings.output_mode == 1 && settings.video_fullframe) || height < min_stripe_height {
-        n_processing_stripes = 1;
-    } else {
-        let max_stripes_by_height = (height as usize) / (min_stripe_height as usize);
-        n_processing_stripes = n_processing_stripes.min(max_stripes_by_height).max(1);
-    }
+    let n_processing_stripes =
+        stripe_count(height, settings.output_mode, settings.video_fullframe);
 
     if stripes.len() != n_processing_stripes {
         stripes.resize_with(n_processing_stripes, StripeState::default);
@@ -812,28 +809,21 @@ pub fn encode_cpu(
     let damage_block_duration = settings.damage_block_duration as i32;
     #[cfg(feature = "gpl")]
     let video_cbr = settings.video_cbr_mode;
-    // Every stripe instantiates its own x264, and ABR is per encoder
-    // instance, so the requested rate is a whole-stream budget split evenly
-    // across the stripes. The full-frame path (single stripe) divides by
-    // one; CRF needs no division (a per-quality target).
+    // The requested rate is a whole-screen budget, and CRF needs no division
+    // at all (a per-quality target).
     #[cfg(feature = "gpl")]
-    let stripe_share = n_processing_stripes.max(1) as i32;
-    #[cfg(feature = "gpl")]
-    let video_bitrate = (settings.video_bitrate_kbps / stripe_share).max(1);
-    #[cfg(feature = "gpl")]
-    let video_vbv = (crate::encoders::vbv_bits(
-        (video_bitrate.max(1) as u32).saturating_mul(1000),
-        target_fps,
-        settings.keyframe_interval_s,
-        settings.video_vbv_multiplier,
-    ) / 1000)
-        .max(1) as i32;
+    let (video_bitrate, video_vbv) =
+        stripe_rate_control(settings, *carrying, n_processing_stripes);
     // Full-frame x264 threads follow the same policy as the OpenH264 encoder:
     // one fewer than the cores (headroom for the capture thread), clamped to
     // [1, 4] to match the four-slice ceiling below.
     #[cfg(feature = "gpl")]
     let h264_threads = if n_processing_stripes == 1 {
-        num_cores.saturating_sub(1).clamp(1, 4) as i32
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .saturating_sub(1)
+            .clamp(1, 4) as i32
     } else {
         1
     };
@@ -1084,11 +1074,57 @@ pub fn encode_cpu(
                 None
             }
     };
-    if n_processing_stripes <= 1 {
+    let encoded: Vec<EncodedStripe> = if n_processing_stripes <= 1 {
         stripes.iter_mut().enumerate().filter_map(&stripe_body).collect()
     } else {
         stripes.par_iter_mut().enumerate().filter_map(&stripe_body).collect()
+    };
+    // Follow motion spreading out quickly and narrowing slowly: the budget is
+    // better spent late than overshot the moment a screen goes still again.
+    let sent = encoded.len() as f32;
+    let alpha = if sent > *carrying { CARRY_RISE } else { CARRY_FALL };
+    *carrying += (sent - *carrying) * alpha;
+    encoded
+}
+
+/// How many horizontal stripes a frame of `height` is split into, which is the choice of how
+/// much encode parallelism to spend on it.
+///
+/// A full-frame session is one contiguous stream and so a single stripe; otherwise the frame
+/// fans out across cores, bounded so no stripe is shorter than a macroblock row. Both the
+/// encoder and the settings line report from here, so what is logged is what is encoded.
+pub fn stripe_count(height: i32, output_mode: i32, fullframe: bool) -> usize {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if (output_mode == 1 && fullframe) || height < MIN_STRIPE_HEIGHT {
+        return 1;
     }
+    cores.min((height / MIN_STRIPE_HEIGHT) as usize).max(1)
+}
+
+/// Split the configured CBR budget across the stripes carrying it, returning the
+/// `(bitrate_kbps, vbv_kbit)` each stripe's encoder is programmed with.
+///
+/// Every stripe runs its own x264 and rate control is per instance, metered against the
+/// declared frame rate rather than against the frames that stripe was actually sent. So the
+/// screen's rate is one stripe's rate times the number of stripes that carry motion, and the
+/// budget is divided by that number — not by the stripe count, which on a screen where one
+/// corner moves would spend a fraction of what was configured. The divisor is the smoothed
+/// count so it changes on the scale of a moving average and not every frame: a rate that
+/// swings frame to frame leaves x264 chasing it and delivers less than either rate would.
+#[cfg(feature = "gpl")]
+fn stripe_rate_control(
+    settings: &RustCaptureSettings, carrying: f32, n_stripes: usize,
+) -> (i32, i32) {
+    let divisor = (carrying.round().max(1.0) as usize).min(n_stripes.max(1)) as i32;
+    let bitrate = (settings.video_bitrate_kbps / divisor).max(1);
+    let vbv = (crate::encoders::vbv_bits(
+        (bitrate as u32).saturating_mul(1000),
+        settings.target_fps,
+        settings.keyframe_interval_s,
+        settings.video_vbv_multiplier,
+    ) / 1000)
+        .max(1) as i32;
+    (bitrate, vbv)
 }
 
 /// Divide `height` into `n` contiguous stripes as `(y_start, stripe_height)`, with the split
@@ -1127,6 +1163,102 @@ fn compute_stripe_geometries(height: usize, n: usize, output_mode: i32) -> Vec<(
 
 #[cfg(test)]
 mod tests {
+    /// The configured bitrate is a budget for the screen, not for each stripe: every stripe
+    /// runs its own rate control, so what reaches an encoder is the budget over the number of
+    /// stripes carrying motion. Dividing by the stripe count instead spends a fraction of the
+    /// configured rate whenever only part of the screen moves, and dividing by nothing at all
+    /// spends a multiple of it whenever the whole screen does.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn cbr_budget_is_split_across_the_stripes_carrying_it() {
+        use crate::RustCaptureSettings;
+        for &kbps in &[500i32, 4000, 8000, 20000] {
+            let settings = RustCaptureSettings {
+                video_cbr_mode: true,
+                video_bitrate_kbps: kbps,
+                ..Default::default()
+            };
+            for &n in &[1usize, 2, 4, 12, 64] {
+                let (all, _) = super::stripe_rate_control(&settings, n as f32, n);
+                let total = all * n as i32;
+                assert!(
+                    total <= kbps && kbps - total < n as i32,
+                    "{n} stripes at {all} kbps must sum to the configured {kbps}"
+                );
+                let (one, _) = super::stripe_rate_control(&settings, 1.0, n);
+                assert_eq!(one, kbps, "a lone moving stripe carries the whole budget");
+                let (over, _) = super::stripe_rate_control(&settings, n as f32 * 4.0, n);
+                assert_eq!(over, all, "the divisor never exceeds the stripes that exist");
+                let (under, _) = super::stripe_rate_control(&settings, 0.0, n);
+                assert_eq!(under, kbps, "and never falls below one");
+            }
+            let (vbv_one, whole) = super::stripe_rate_control(&settings, 1.0, 8);
+            let (_, share) = super::stripe_rate_control(&settings, 8.0, 8);
+            assert_eq!(vbv_one, kbps);
+            assert!(
+                (share * 8 - whole).abs() <= 9,
+                "each stripe's buffer is its share of the whole-screen one: {share}x8 vs {whole}"
+            );
+        }
+    }
+
+    /// The divisor follows the screen rather than the configuration: full-screen motion moves
+    /// it to the stripe count within a few frames, and it comes back down when the motion
+    /// stops. A divisor recomputed per frame would swing between those two ends every frame,
+    /// which leaves the encoder chasing a square wave and delivering less than either rate.
+    #[test]
+    fn the_budget_divisor_follows_motion_and_is_smoothed() {
+        use crate::RustCaptureSettings;
+        let (w, h) = (64, 512);
+        let settings = RustCaptureSettings {
+            width: w,
+            height: h,
+            output_mode: 0,
+            jpeg_quality: 40,
+            use_paint_over_quality: false,
+            ..Default::default()
+        };
+        let full = [smithay::utils::Rectangle::new((0, 0).into(), (w, h).into())];
+        let stripes_n = super::stripe_count(h, settings.output_mode, settings.video_fullframe);
+        if stripes_n < 2 {
+            return;
+        }
+        let mut stripes = Vec::new();
+        let mut carrying = 1.0f32;
+        for frame in 0..40u16 {
+            let shade = 40u8.wrapping_add(frame.wrapping_mul(7) as u8);
+            let px = vec![shade; (w * h * 4) as usize];
+            super::encode_cpu(
+                &mut stripes, &mut carrying, &px, w, h, &full, &settings, frame,
+                false, false, false,
+            );
+        }
+        assert!(
+            carrying > stripes_n as f32 * 0.75,
+            "full-screen motion must move the divisor toward the {stripes_n} stripes it uses, \
+             not leave it at {carrying}"
+        );
+        let moved = carrying;
+        // Motion that narrows to one corner narrows the divisor with it, so the budget
+        // follows the stripes that are actually spending it. A frame with no motion at all
+        // encodes nothing and carries nothing, so it leaves the divisor where it was.
+        let band = [smithay::utils::Rectangle::new((0, 0).into(), (w, 64).into())];
+        for frame in 40..120u16 {
+            let shade = 40u8.wrapping_add(frame.wrapping_mul(11) as u8);
+            let mut px = vec![200u8; (w * h * 4) as usize];
+            for byte in px.iter_mut().take((w * 64 * 4) as usize) {
+                *byte = shade;
+            }
+            super::encode_cpu(
+                &mut stripes, &mut carrying, &px, w, h, &band, &settings, frame,
+                false, false, false,
+            );
+        }
+        assert!(
+            carrying < moved * 0.5,
+            "motion in one stripe must bring the divisor back down: {carrying} vs {moved}"
+        );
+    }
     use super::{compute_stripe_geometries, StripeState};
 
     /// With `threshold = 2` and `duration = 3`, a first change reads dirty and two consecutive
@@ -1169,19 +1301,20 @@ mod tests {
             ..Default::default()
         };
         let mut stripes = Vec::new();
+        let mut carrying = 1.0f32;
         let full = [smithay::utils::Rectangle::new(
             (0, 0).into(),
             (w, h).into(),
         )];
         let dirty = super::encode_cpu(
-            &mut stripes, &pixels, w, h, &full, &settings, 0, false, false, false,
+            &mut stripes, &mut carrying, &pixels, w, h, &full, &settings, 0, false, false, false,
         );
         assert!(!dirty.is_empty(), "damaged frame must encode");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &pixels, w, h, &[], &settings, frame, false, false, false,
+                &mut stripes, &mut carrying, &pixels, w, h, &[], &settings, frame, false, false, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once");
@@ -1218,15 +1351,16 @@ mod tests {
             ..Default::default()
         };
         let mut stripes = Vec::new();
+        let mut carrying = 1.0f32;
         let first = super::encode_cpu(
-            &mut stripes, &static_px, w, h, &[], &settings, 0, false, true, false,
+            &mut stripes, &mut carrying, &static_px, w, h, &[], &settings, 0, false, true, false,
         );
         assert!(!first.is_empty(), "first frame hashes as changed and encodes");
 
         let mut fired_at = None;
         for frame in 1..=20u16 {
             let out = super::encode_cpu(
-                &mut stripes, &static_px, w, h, &[], &settings, frame, false, true, false,
+                &mut stripes, &mut carrying, &static_px, w, h, &[], &settings, frame, false, true, false,
             );
             if !out.is_empty() {
                 assert!(fired_at.is_none(), "paint-over must fire exactly once while static");
@@ -1236,7 +1370,7 @@ mod tests {
         assert_eq!(fired_at, Some(settings.paint_over_trigger_frames as u16));
 
         let woke = super::encode_cpu(
-            &mut stripes, &changed_px, w, h, &[], &settings, 21, false, true, false,
+            &mut stripes, &mut carrying, &changed_px, w, h, &[], &settings, 21, false, true, false,
         );
         assert!(!woke.is_empty(), "content change after idle must encode");
     }

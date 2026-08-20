@@ -250,6 +250,8 @@ fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
 pub struct X11Pipeline {
     settings: RustCaptureSettings,
     stripes: Vec<StripeState>,
+    /// Smoothed number of stripes carrying the encode budget (see `stripe_rate_control`).
+    stripes_carrying: f32,
     hw: X11Encoder,
     hw_state: StripeState,
     frame_counter: u16,
@@ -286,6 +288,7 @@ impl X11Pipeline {
         Self {
             settings,
             stripes: Vec::new(),
+            stripes_carrying: 1.0,
             hw,
             hw_state: StripeState::default(),
             frame_counter: 0,
@@ -524,6 +527,7 @@ impl X11Pipeline {
                     && periodic_idr_due(&self.settings, self.frame_counter));
             encode_cpu(
                 &mut self.stripes,
+                &mut self.stripes_carrying,
                 argb,
                 width,
                 height,

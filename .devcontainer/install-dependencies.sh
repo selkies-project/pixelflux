@@ -7,12 +7,13 @@
 set -euxo pipefail
 
 sudo apt-get update
-# System C libraries the crate links against (x264-sys -> libx264, turbojpeg ->
-# libjpeg-turbo, x11rb -> libxcb + shm + xfixes, VA-API, GBM/DRM, Wayland/xkb) plus
-# the build toolchain (nasm is needed to build the vendored OpenH264 source).
+# System C libraries the crate links against (x264-sys -> libx264, x11rb -> libxcb
+# + shm + xfixes, VA-API, GBM/DRM, Wayland/xkb) plus the build toolchain (nasm is
+# needed to build the vendored OpenH264 and libjpeg-turbo sources, which are
+# statically linked and need no system copy).
 sudo apt-get install -y \
   build-essential pkg-config nasm clang libclang-dev curl ca-certificates \
-  libjpeg-turbo8-dev libx264-dev \
+  libx264-dev \
   libva-dev libdrm-dev libgbm-dev \
   libwayland-dev libxkbcommon-dev \
   libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
