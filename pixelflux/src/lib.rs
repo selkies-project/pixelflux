@@ -2053,6 +2053,15 @@ fn start_capture_on_display(
             if wayland::frontend::window_output_id(window) != display_id {
                 continue;
             }
+            // A parked screen is tagged for this display but composited on none: it
+            // holds PARKED_LOGICAL_SIZE until `create_output` gives it one. Resizing it
+            // here would double the session's coordinate space onto a screen nobody
+            // watches, which is where a window that centres itself then lands.
+            if wayland::frontend::window_meta(window)
+                .is_some_and(|meta| meta.parked.load(Ordering::Relaxed))
+            {
+                continue;
+            }
             if let Some(surface) = window.wl_surface() {
                 node.output.enter(&surface);
                 with_states(&surface, |states| {
@@ -6290,6 +6299,28 @@ impl ScreenCapture {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             crate::wayland::outclient::set_output_scale(&path, index, scale)
+        })
+        .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Give the app compositor's `index`-th screen this mode and scale in one
+    /// configuration, so the session lays its desktop out once. Setting them
+    /// separately exposes a geometry that never exists — the pre-connect mode at
+    /// the new scale — and a client that does not lay out again keeps it.
+    /// False = that compositor manages no outputs for clients.
+    fn set_app_screen_geometry(
+        &self,
+        py: Python<'_>,
+        display: String,
+        index: usize,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) -> PyResult<bool> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::set_screen_geometry(&path, index, (width, height), scale)
         })
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)

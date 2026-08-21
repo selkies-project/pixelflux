@@ -154,7 +154,36 @@ pub fn set_output_scale(
             .get(index)
             .cloned()
             .ok_or_else(|| format!("no enabled screen at index {index}"))?;
-        Ok(vec![(target, Plan::Scale(scale))])
+        Ok(vec![(target, Plan { scale: Some(scale), ..Plan::default() })])
+    })
+    .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
+}
+
+/// Give the `index`-th screen of the compositor on `socket_path` this mode and
+/// scale in one configuration.
+///
+/// A session lays its desktop out once per applied configuration, so setting the
+/// two separately leaves it briefly at a geometry that never exists — a screen
+/// still carrying the pre-connect mode at the new scale is a fraction of its
+/// final size, and a client that does not lay out again keeps that size.
+pub fn set_screen_geometry(
+    socket_path: &str,
+    index: usize,
+    size: (i32, i32),
+    scale: f64,
+) -> Result<ScaleOutcome, String> {
+    if !(0.1..=16.0).contains(&scale) {
+        return Err(format!("scale {scale} out of range"));
+    }
+    if size.0 <= 0 || size.1 <= 0 {
+        return Err(format!("size {}x{} out of range", size.0, size.1));
+    }
+    configure(socket_path, move |heads| {
+        let target = heads
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("no enabled screen at index {index}"))?;
+        Ok(vec![(target, Plan { mode: Some(size), scale: Some(scale) })])
     })
     .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
 }
@@ -173,7 +202,7 @@ pub fn hold_spare_screens(
             .iter()
             .skip(keep)
             .cloned()
-            .map(|h| (h, Plan::Mode(size)))
+            .map(|h| (h, Plan { mode: Some(size), ..Plan::default() }))
             .collect())
     })
 }
@@ -184,10 +213,11 @@ fn trailing_number(name: &str) -> u32 {
     digits.chars().rev().collect::<String>().parse().unwrap_or(0)
 }
 
-/// What a head is being asked to change.
-enum Plan {
-    Scale(f64),
-    Mode((i32, i32)),
+/// What a head is being asked to change; an unset field keeps its current value.
+#[derive(Clone, Copy, Default)]
+struct Plan {
+    mode: Option<(i32, i32)>,
+    scale: Option<f64>,
 }
 
 /// Apply `plan` to the compositor's enabled heads. `plan` receives them in
@@ -235,9 +265,11 @@ where
     for head in &enabled {
         let cfg_head = config.enable_head(head, &qh, ());
         if let Some((_, want)) = wanted.iter().find(|(h, _)| h == head) {
-            match want {
-                Plan::Scale(scale) => cfg_head.set_scale(*scale),
-                Plan::Mode((w, h)) => cfg_head.set_custom_mode(*w, *h, 0),
+            if let Some((w, h)) = want.mode {
+                cfg_head.set_custom_mode(w, h, 0);
+            }
+            if let Some(scale) = want.scale {
+                cfg_head.set_scale(scale);
             }
         }
     }
