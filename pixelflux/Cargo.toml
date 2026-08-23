@@ -2,6 +2,8 @@
 name = "pixelflux"
 version = "2.1.0"
 edition = "2024"
+# let-chains (stable in edition 2024 since 1.88) are the newest language feature used.
+rust-version = "1.89"
 
 [lib]
 name = "pixelflux"
@@ -19,14 +21,15 @@ crossbeam-channel = "0.5"
 calloop = "0.14"
 turbojpeg = "1.3" 
 rayon = "1.10"
-# Striped software H.264 (GPL-2.0+ libx264). Optional, enabled by the default `gpl`
-# feature; build with `--no-default-features` (or PIXELFLUX_ENABLE_GPL=0) to exclude it.
+# Software H.264 is one of two encoders, chosen at build time by the features below:
+# GPL-2.0+ libx264 (the default `gpl` feature) or BSD-licensed Cisco OpenH264 (the
+# `openh264` feature, used when `gpl` is off; setup.py selects it for
+# PIXELFLUX_ENABLE_GPL=0). OpenH264 builds its vendored C source (C toolchain + nasm),
+# no runtime download; openh264-sys2 carries the raw set_option calls (live bitrate,
+# slice layout) the safe wrapper does not expose.
 x264-sys = { version = "0.2.2", optional = true }
-# BSD-licensed Cisco OpenH264 as an alternative software H.264 encoder; builds the
-# vendored C source (needs a C toolchain + nasm), no runtime download. openh264-sys2
-# is used for the raw set_option live-bitrate path the safe wrapper doesn't expose.
-openh264 = "0.9"
-openh264-sys2 = "0.9"
+openh264 = { version = "0.9", optional = true }
+openh264-sys2 = { version = "0.9", optional = true }
 libc = "0.2"
 # fast_mode enables YuvConversionMode::Fast: empirically 1.23x faster than libyuv ARGBToI420
 # on x86-64-v3 (AVX2) at <=1 LSB error vs a float BT.709 reference (accuracy preserved).
@@ -59,8 +62,18 @@ features = ["cuda"]
 
 [features]
 default = ["gpl"]
-## GPL-licensed components (GPL-2.0+ libx264 for striped software H.264).
+## GPL-licensed components: libx264 (GPL-2.0+) as the software H.264 encoder. Wins over
+## `openh264` whenever both are enabled.
 gpl = ["dep:x264-sys"]
+## BSD-licensed Cisco OpenH264 as the software H.264 encoder of a build without `gpl`;
+## the crate fails to compile with neither feature (no software H.264 at all).
+openh264 = ["dep:openh264", "dep:openh264-sys2"]
+
+# The OpenH264 crates are dev-dependencies as well, so the OpenH264 encoder and the
+# webcam H.264 round trip are always built and tested, whichever encoder the build ships.
+[dev-dependencies]
+openh264 = "0.9"
+openh264-sys2 = "0.9"
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"

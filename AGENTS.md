@@ -35,4 +35,29 @@ and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
+Software H.264 is resolved at build time, never by a setting: the default `gpl` feature makes libx264 the
+encoder behind every CPU H.264 session (striped and full-frame), and a build without it
+(`PIXELFLUX_ENABLE_GPL=0` → `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same
+striped path (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; `SOFTWARE_H264_ENCODER`
+/ `SOFTWARE_H264_FULLCOLOR` in `lib.rs` (exported to Python as `pixelflux.SOFTWARE_H264_ENCODER`) are the only
+places the choice is read, and selkies derives its rate-control default from the exported name. Test both
+configurations (`cargo test --lib` and `cargo test --lib --no-default-features --features openh264`); the
+OpenH264 crates are also dev-dependencies so its tests run under the default build.
+
+The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
+`AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the
+fixed device format, and publishing happen on the camera's own thread. Sinks are the shared-memory ring served to the
+Selkies V4L2 interposer (`ring.rs`/`server.rs`; the layout is mirrored byte-for-byte by
+`selkies/addons/v4l2-interposer/v4l2_interposer.c` and checked by selkies' `tests/unit/test_webcam_abi.py`), a
+v4l2loopback output device (`v4l2out.rs`), and a PipeWire `Video/Source` node (`pipewire.rs`, `libpipewire-0.3`
+loaded at run time, pods built by hand — never add a build-time PipeWire dependency). `cargo test --lib webcam`
+covers the ring, decoders (including an OpenH264→avcodec round trip) and pod layouts; the device-level and browser
+checks live in selkies (`tests/integration/test_webcam_device.py`, `tests/e2e/test_webcam.py`).
+
+Licensing is part of the build matrix: `LICENSES.md` inventories every crate and native library of the default
+(`gpl`, libx264) and `PIXELFLUX_ENABLE_GPL=0` (`openh264`) builds, `scripts/check-licenses.py` and
+`pixelflux/deny.toml` gate both (the `Licenses` workflow runs them), and a new crate that links, loads or vendors
+native code has to be described in the script's `NATIVE` table and in `LICENSES.md` before the check passes.
+Copyleft stays confined to the `gpl` feature.
+
 Update this file when certain details change.

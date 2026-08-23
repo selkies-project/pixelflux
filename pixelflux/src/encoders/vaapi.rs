@@ -30,7 +30,7 @@ use std::ptr;
 use std::sync::Once;
 
 use ffmpeg_sys_next as ff;
-use libc::{close, dup};
+use libc::{close, dup, lseek, SEEK_END};
 
 use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
@@ -869,10 +869,23 @@ impl VaapiEncoder {
         ff::av_dict_free(&mut opts);
 
         if ret < 0 {
+            // A failed open leaves the context unopened with its hw_frames_ctx released, so
+            // it is freed outright: the encode entry points refuse a null context and the
+            // caller rebuilds the session.
+            ff::avcodec_free_context(&mut self.encoder_ctx);
             return Err(format!("Failed to re-open encoder: {}", ff_err_str(ret)));
         }
 
         self.current_qp = qp;
+        Ok(())
+    }
+
+    /// The encode entry points run behind this: a rate or QP re-open that failed leaves no
+    /// codec context, and the session has to be rebuilt rather than encoded into.
+    fn require_open_codec(&self) -> Result<(), String> {
+        if self.encoder_ctx.is_null() {
+            return Err("no open codec context after a failed re-open; the session needs a rebuild".into());
+        }
         Ok(())
     }
 
@@ -925,8 +938,9 @@ impl VaapiEncoder {
     /// bitrate or VBV multiplier; in any mode, a different target fps. When nothing changed it returns
     /// without touching the codec. On a real change it caches the new fps / bitrate / VBV / keyframe
     /// interval and calls `reopen_codec` carrying the **current** QP, so a CQP stream keeps its
-    /// quantizer across the change.
-    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) {
+    /// quantizer across the change. `Err` means the re-open failed and the session no longer
+    /// has a codec context: the caller has to rebuild it.
+    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         unsafe {
             let mut changed = false;
             if self.cbr_mode
@@ -940,15 +954,13 @@ impl VaapiEncoder {
                 changed = true;
             }
             if !changed {
-                return;
+                return Ok(());
             }
             self.fps = new_fps;
             self.current_bitrate_kbps = settings.video_bitrate_kbps;
             self.current_vbv_mult = settings.video_vbv_multiplier;
             self.current_kf_s = settings.keyframe_interval_s;
-            if let Err(e) = self.reopen_codec(self.current_qp) {
-                eprintln!("[vaapi] rate reconfigure failed: {e}");
-            }
+            self.reopen_codec(self.current_qp)
         }
     }
 
@@ -995,9 +1007,9 @@ impl VaapiEncoder {
     /// 1. **Quantizer**: apply the requested `qp` through `update_qp` (hysteresis / CBR-aware).
     /// 2. **Descriptor**: allocate a zeroed `AVDRMFrameDescriptor` and populate it from the dmabuf —
     ///    one object per handle with a freshly `dup`'d fd (so FFmpeg owns independent fds), the object
-    ///    size computed from the plane stride and the height rounded up to 32, the format modifier,
-    ///    and one layer whose planes carry each plane's offset and pitch. A single-handle multi-plane
-    ///    buffer points all planes at object 0.
+    ///    size the fd reports (`lseek` to its end, which is the buffer object's allocation whatever
+    ///    the tiling or padding), the format modifier, and one layer whose planes carry each plane's
+    ///    offset and pitch. A single-handle multi-plane buffer points all planes at object 0.
     /// 3. **Ownership**: the dup'd fds live in a boxed `DmabufResources` handed to `av_buffer_create`
     ///    as `release_drm_frame`'s opaque, so FFmpeg closes them on teardown. If building that buffer
     ///    fails, `release_drm_frame` is called directly to clean up.
@@ -1017,6 +1029,7 @@ impl VaapiEncoder {
     ) -> Result<Vec<u8>, String> {
         unsafe {
             self.update_qp(qp)?;
+            self.require_open_codec()?;
 
             let desc_size = mem::size_of::<AVDRMFrameDescriptor>();
             let desc_ptr = ff::av_mallocz(desc_size) as *mut AVDRMFrameDescriptor;
@@ -1025,7 +1038,6 @@ impl VaapiEncoder {
             }
 
             let mut resources = DmabufResources { fds: Vec::new() };
-            let strides: Vec<u32> = dmabuf.strides().collect();
 
             (*desc_ptr).nb_objects = dmabuf.handles().count() as i32;
             (*desc_ptr).nb_layers = 1;
@@ -1041,11 +1053,18 @@ impl VaapiEncoder {
                 }
                 resources.fds.push(fd);
                 (*desc_ptr).objects[i].fd = fd;
-                
-                let stride = strides.get(i).copied().unwrap_or(strides[0]);
-                let aligned_height = (self.height + 31) & !31;
-                (*desc_ptr).objects[i].size = (stride as usize) * (aligned_height as usize);
-                
+                // The dmabuf fd reports the object's real size; deriving it from stride and
+                // height is wrong for tiled or compressed layouts and for any BO padded beyond
+                // the image rows.
+                let object_size = lseek(fd, 0, SEEK_END);
+                if object_size <= 0 {
+                    for &dup_fd in &resources.fds {
+                        close(dup_fd);
+                    }
+                    ff::av_free(desc_ptr as *mut c_void);
+                    return Err("Failed to query the dmabuf object size".into());
+                }
+                (*desc_ptr).objects[i].size = object_size as usize;
                 (*desc_ptr).objects[i].format_modifier = u64::from(dmabuf.format().modifier);
             }
 
@@ -1135,6 +1154,7 @@ impl VaapiEncoder {
     ) -> Result<Vec<u8>, String> {
         unsafe {
             self.update_qp(qp)?;
+            self.require_open_codec()?;
 
             let h = self.height as usize;
             let needed = stride.checked_mul(h).ok_or("stride overflow")?;
@@ -1207,6 +1227,7 @@ impl VaapiEncoder {
     ) -> Result<Vec<u8>, String> {
         unsafe {
             self.update_qp(qp)?;
+            self.require_open_codec()?;
 
             let width = self.width as usize;
             let height = self.height as usize;

@@ -12,7 +12,7 @@
 //! new keysyms produces ONE keymap swap, and a keycode that is currently held down is never
 //! recycled, so its release event always means the symbol its press meant.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use smithay::input::keyboard::xkb;
 
@@ -44,6 +44,11 @@ pub struct KeymapPolicy {
     overlay_first: u32,
     /// Overlay slot count.
     overlay_capacity: usize,
+    /// Externally-owned overlay binds (keycode -> keysym): selkies resolves its own
+    /// keysyms and hands the compositor explicit assignments. Held here so every keymap
+    /// the policy emits carries them, and a policy rebuild (computer-use bind, base-layout
+    /// swap) keeps them live instead of dropping them until selkies re-sends.
+    manual_overlay: BTreeMap<u32, u32>,
 }
 
 /// Keysym one literal character types as: Latin-1 printables map 1:1, `\n` types
@@ -127,6 +132,7 @@ impl KeymapPolicy {
             lru: VecDeque::new(),
             overlay_first: first,
             overlay_capacity: (last - first + 1) as usize,
+            manual_overlay: BTreeMap::new(),
         }
     }
 
@@ -263,50 +269,18 @@ impl KeymapPolicy {
         self.lru.remove(at)
     }
 
-    /// The full seat keymap: the base text with every occupied overlay slot spliced into the
-    /// `xkb_keycodes` and `xkb_symbols` sections (and `maximum` raised to cover them). With no
-    /// overlays, the base text verbatim.
-    /// Splice explicit `(keycode, keysym)` binds onto the current base text.
-    ///
-    /// Which keysym lands on which keycode is the caller's decision — that part tracks
-    /// layouts and user reports and belongs where it can be changed quickly. Assembling
-    /// the xkb text is fixed grammar, so it is done here: no 30 KB string is built in the
-    /// caller, and the base keymap is reused rather than re-supplied and recompiled.
-    /// `None` when the base has no recognizable keycodes/symbols sections.
-    pub fn overlay_text_for(&self, binds: &[(u32, u32)]) -> Option<String> {
-        if self.base_text.is_empty() {
-            return None;
-        }
-        if binds.is_empty() {
-            return Some(self.base_text.clone());
-        }
-        let base = &self.base_text;
-        let max_at = base.find("maximum = ")?;
-        let num_at = max_at + "maximum = ".len();
-        let num_len = base[num_at..].find(';')?;
-        let old_max: u32 = base[num_at..num_at + num_len].trim().parse().unwrap_or(255);
-        let need_max = binds.iter().map(|&(kc, _)| kc).max().unwrap_or(0);
-        let mut text = String::with_capacity(base.len() + binds.len() * 48);
-        text.push_str(&base[..num_at]);
-        text.push_str(&old_max.max(need_max).to_string());
-        let rest = &base[num_at + num_len..];
-        let kc_end = rest.find("};")?;
-        text.push_str(&rest[..kc_end]);
-        for &(kc, _) in binds {
-            text.push_str(&format!("\t<X{kc:03}> = {kc};\n"));
-        }
-        let rest = &rest[kc_end..];
-        let close_at = rest
-            .find("xkb_symbols")
-            .and_then(|sym_at| Self::section_close(rest, sym_at))?;
-        text.push_str(&rest[..close_at]);
-        for &(kc, sym) in binds {
-            text.push_str(&format!("\tkey <X{kc:03}> {{ [ {sym:#x} ] }};\n"));
-        }
-        text.push_str(&rest[close_at..]);
-        Some(text)
+    /// Replace the externally-owned overlay binds (keycode -> keysym). selkies resolves its
+    /// own keysyms and re-sends the whole set on every change, so a full replace is the
+    /// contract. They then ride along in every `keymap_text`, so a base-layout swap or a
+    /// computer-use policy bind re-applies them instead of dropping them.
+    pub fn set_manual_overlay(&mut self, binds: &[(u32, u32)]) {
+        self.manual_overlay = binds.iter().copied().collect();
     }
 
+    /// The full seat keymap: the base text with every occupied policy overlay slot and every
+    /// externally-owned bind spliced into the `xkb_keycodes` and `xkb_symbols` sections (and
+    /// `maximum` raised to cover them). With neither, the base text verbatim. A manual bind
+    /// sharing a keycode with a policy slot is emitted last, so its symbol wins.
     pub fn keymap_text(&self) -> String {
         let occupied: Vec<(usize, u32)> = self
             .slots
@@ -314,7 +288,7 @@ impl KeymapPolicy {
             .enumerate()
             .filter_map(|(i, s)| s.map(|sym| (i, sym)))
             .collect();
-        if occupied.is_empty() {
+        if occupied.is_empty() && self.manual_overlay.is_empty() {
             return self.base_text.clone();
         }
         let base = &self.base_text;
@@ -326,8 +300,11 @@ impl KeymapPolicy {
             return self.base_text.clone();
         };
         let old_max: u32 = base[num_at..num_at + num_len].trim().parse().unwrap_or(255);
-        let need_max = self.overlay_first + occupied.last().map(|&(i, _)| i as u32).unwrap_or(0);
-        let mut text = String::with_capacity(base.len() + occupied.len() * 48);
+        let slot_max = self.overlay_first + occupied.last().map(|&(i, _)| i as u32).unwrap_or(0);
+        let manual_max = self.manual_overlay.keys().copied().max().unwrap_or(0);
+        let need_max = slot_max.max(manual_max);
+        let mut text =
+            String::with_capacity(base.len() + (occupied.len() + self.manual_overlay.len()) * 48);
         text.push_str(&base[..num_at]);
         text.push_str(&old_max.max(need_max).to_string());
         let rest = &base[num_at + num_len..];
@@ -339,6 +316,9 @@ impl KeymapPolicy {
         for &(i, _) in &occupied {
             text.push_str(&format!("\t<P{:03}> = {};\n", i, self.overlay_first + i as u32));
         }
+        for &kc in self.manual_overlay.keys() {
+            text.push_str(&format!("\t<X{kc:03}> = {kc};\n"));
+        }
         let rest = &rest[kc_end..];
         let Some(close_at) = rest
             .find("xkb_symbols")
@@ -349,6 +329,9 @@ impl KeymapPolicy {
         text.push_str(&rest[..close_at]);
         for &(i, sym) in &occupied {
             text.push_str(&format!("\tkey <P{:03}> {{ [ {:#x} ] }};\n", i, sym));
+        }
+        for (&kc, &sym) in &self.manual_overlay {
+            text.push_str(&format!("\tkey <X{kc:03}> {{ [ {sym:#x} ] }};\n"));
         }
         text.push_str(&rest[close_at..]);
         text
@@ -456,6 +439,38 @@ mod tests {
         // 'a' resolves plain in the base without consuming a slot.
         assert!(out[1] < 150);
         assert_eq!(out[1], p.resolve(0x61).unwrap().0);
+    }
+
+    #[test]
+    fn manual_overlay_survives_policy_rebind_and_layout_swap() {
+        // selkies' explicit binds must keep resolving after a computer-use policy bind
+        // (which re-applies keymap_text) and after a base-layout swap.
+        let mut p = policy();
+        // Two selkies-owned keycodes carrying emoji keysyms.
+        let manual = [(220u32, 0x0101_F600u32), (221u32, 0x0101_F601u32)];
+        p.set_manual_overlay(&manual);
+        // A computer-use batch binds its own keysyms through the policy pool.
+        let (_out, changed) = p.bind_many(&[0x1004E00, 0x1004E01], &HashSet::new());
+        assert!(changed);
+        let km = compile_keymap(&p.keymap_text()).expect("merged keymap compiles");
+        for &(kc, sym) in &manual {
+            let got = km.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0);
+            assert_eq!(got.len(), 1, "manual keycode {kc} has one sym");
+            assert_eq!(got[0].raw(), sym, "manual keycode {kc} keeps its keysym");
+        }
+        // A base-layout swap must not drop the manual binds either.
+        let de = compile_rmlvo("", "", "de", "", "").expect("de keymap");
+        assert!(p.rebuild_base(de));
+        let km = compile_keymap(&p.keymap_text()).expect("post-swap keymap compiles");
+        for &(kc, sym) in &manual {
+            let got = km.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0);
+            assert_eq!(got.first().map(|s| s.raw()), Some(sym));
+        }
+        // Clearing them removes the binds (the emoji keysym no longer resolves).
+        p.set_manual_overlay(&[]);
+        let km = compile_keymap(&p.keymap_text()).expect("cleared keymap compiles");
+        let got = km.key_get_syms_by_level(xkb::Keycode::new(220), 0, 0);
+        assert!(got.iter().all(|s| s.raw() != manual[0].1));
     }
 
     #[test]

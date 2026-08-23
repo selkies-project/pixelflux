@@ -64,6 +64,11 @@ pub mod cursor;
 ///    by the capture thread with the same drain/recreate machinery as auto-adjust.
 pub struct Controls {
     pub stop: AtomicBool,
+    /// Set by the capture thread as it returns — after it has joined its encode thread and
+    /// so dropped the NVENC/CUDA session. The atexit sweep waits on this (bounded) before
+    /// letting the interpreter finalize, because that hardware-session drop racing process
+    /// exit segfaults, exactly as the Wayland branch fences with a Barrier.
+    pub finished: AtomicBool,
     pub force_idr: AtomicBool,
     pub rate_dirty: AtomicBool,
     pub bitrate_kbps: AtomicI32,
@@ -82,6 +87,7 @@ impl Controls {
     pub fn new(s: &RustCaptureSettings) -> Self {
         Self {
             stop: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             force_idr: AtomicBool::new(false),
             rate_dirty: AtomicBool::new(false),
             bitrate_kbps: AtomicI32::new(s.video_bitrate_kbps),
@@ -604,7 +610,7 @@ impl FramePool {
 ///    (NVENC's pinned-host cache) must be dropped even at identical dimensions. An in-place
 ///    [`X11Pipeline::reshape`] is preferred — NVENC reconfigures its live session and the striped
 ///    software path just re-derives stripe state — so a resize never stalls on a full encoder
-///    re-init; encoders that cannot follow in place (VAAPI/OpenH264) report `false` and the pipeline
+///    re-init; encoders that cannot follow in place (VAAPI) report `false` and the pipeline
 ///    is rebuilt. On a rebuild the old pipeline (with its GPU session/surfaces) is dropped BEFORE the
 ///    new one is built, so an auto-adjust resize never holds two full encoder allocations at once
 ///    (transient 2x GPU memory). The rebuilt settings pull the CURRENT bitrate / VBV / fps from the
@@ -633,7 +639,7 @@ where
     if recording_sink.is_some() {
         if settings.output_mode == 0 {
             eprintln!("[recording_sink] recording_socket set but output_mode is JPEG; no recordable H.264 stream.");
-        } else if settings.use_cpu && !settings.use_openh264 && !settings.video_fullframe {
+        } else if settings.use_cpu && !settings.video_fullframe {
             eprintln!("[recording_sink] recording_socket set but the CPU encoder is striped; set video_fullframe=true for a recordable stream.");
         }
     }
@@ -662,11 +668,13 @@ where
                 drop(pipeline.take());
                 pipeline = Some(X11Pipeline::new(psettings.clone()));
                 if let Some(pl) = &pipeline {
-                    let enc_name = pl.encoder_name();
                     let mut log_msg = format!(
                         "[x11] Stream settings active -> Res: {}x{} | FPS: {:.1} | Encoder: {}",
-                        psettings.width, psettings.height, psettings.target_fps, enc_name
+                        psettings.width, psettings.height, psettings.target_fps, pl.encoder_name()
                     );
+                    if psettings.output_mode == 1 && pl.encoder_name() == "CPU" {
+                        log_msg.push_str(&format!(" ({})", crate::encoders::SOFTWARE_H264_ENCODER));
+                    }
                     if psettings.output_mode == 0 {
                         log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", psettings.jpeg_quality));
                     } else {

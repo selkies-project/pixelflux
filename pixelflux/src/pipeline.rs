@@ -11,7 +11,6 @@
 //! identically either way. Keeping the decision logic here, source-agnostic, is what guarantees it.
 
 use crate::encoders::nvenc::NvencEncoder;
-use crate::encoders::oh264::Openh264Encoder;
 use crate::encoders::software::{encode_cpu, EncodedStripe, StripeState};
 use crate::encoders::vaapi::VaapiEncoder;
 use crate::RustCaptureSettings;
@@ -52,8 +51,9 @@ pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> b
 /// A static screen costs almost nothing to stream; a client that just joined or reset can always
 /// recover a clean picture. The GOP is left infinite and an IDR is forced only when a consumer
 /// genuinely needs a fresh decode entry point. Every forced IDR is followed by a short "recovery
-/// burst" that keeps streaming until rate control converges. All three encoders (NVENC / VAAPI /
-/// OpenH264) share this one function so they cannot drift apart.
+/// burst" that keeps streaming until rate control converges. Both hardware encoders (NVENC /
+/// VAAPI) share this one function so they cannot drift apart; the software path applies the same
+/// policy per stripe inside `encode_cpu`.
 ///
 /// Priority order: (1) recovery burst in progress, (2) always-on streaming/animated modes,
 /// (3) motion detected, (4) recovery keyframe on static screen, (5) paint-over refresh.
@@ -145,65 +145,27 @@ pub fn decide_hw_fullframe(
     HwFrameDecision { send: send_frame, force_idr, target_qp }
 }
 
-/// Hardware encoder bound to the X11 (host-ARGB) pipeline. Software JPEG/x264 needs no
-/// persistent encoder object (`encode_cpu` owns per-stripe x264 state), so it is `None`.
+/// Hardware encoder bound to the X11 (host-ARGB) pipeline. The software path (JPEG, and H.264
+/// through the build's software encoder — `SOFTWARE_H264_ENCODER`) needs no persistent encoder
+/// object here: `encode_cpu` owns its per-stripe state, so it is `None`.
 #[allow(clippy::large_enum_variant)]
 enum X11Encoder {
     None,
     Nvenc(NvencEncoder),
     Vaapi(VaapiEncoder),
-    Openh264(Openh264Encoder),
-}
-
-/// Software H.264 encoder used when hardware encoders are unavailable or the CPU is forced.
-/// With GPL components this is the striped x264 path (its state lives per-stripe inside
-/// `encode_cpu`, so no persistent object exists here); without them (the crate built with the
-/// `gpl` feature disabled) the BSD-licensed OpenH264 full-frame encoder is substituted instead.
-#[cfg(feature = "gpl")]
-fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
-    let _ = settings;
-    X11Encoder::None
-}
-
-#[cfg(not(feature = "gpl"))]
-fn software_h264_encoder(settings: &RustCaptureSettings) -> X11Encoder {
-    if settings.output_mode != 1 {
-        return X11Encoder::None;
-    }
-    println!("[x11] pixelflux was built without GPL components (libx264 disabled); substituting the BSD-licensed OpenH264 software encoder.");
-    match Openh264Encoder::new(settings) {
-        Some(e) => X11Encoder::Openh264(e),
-        None => {
-            eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
-            X11Encoder::None
-        }
-    }
 }
 
 /// Choose the full-frame encoder for the X11 host-ARGB path, following the settings and the
 /// effective encode device. Used both at construction and when a live session has to be rebuilt
 /// after a streak of encode failures.
 fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
-    if settings.output_mode == 1 && settings.use_openh264 {
-        println!("[x11] OpenH264 software encoder selected.");
-        return match Openh264Encoder::new(settings) {
-            Some(e) => X11Encoder::Openh264(e),
-            None => {
-                #[cfg(feature = "gpl")]
-                eprintln!("[x11] OpenH264 init failed; falling back to software x264");
-                #[cfg(not(feature = "gpl"))]
-                eprintln!("[x11] OpenH264 init failed; no software H.264 encoder is available in this GPL-free build.");
-                X11Encoder::None
-            }
-        };
-    }
     if settings.output_mode == 1 && !settings.use_cpu && settings.encode_node_index != -1 {
         let encode_driver = crate::get_gpu_driver(settings.encode_node_index.max(0));
         println!(
             "[x11] Encode Node Index: {} | Driver: {}",
             settings.encode_node_index.max(0), encode_driver
         );
-        if !encode_driver.is_empty() && !encode_driver.contains("nvidia") {
+        if !crate::driver_selects_nvenc(&encode_driver) {
             println!("[x11] Initializing Unified VAAPI Encoder...");
             match VaapiEncoder::new_host(settings) {
                 Ok(e) => {
@@ -214,8 +176,8 @@ fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
                     return X11Encoder::Vaapi(e);
                 }
                 Err(err) => {
-                    eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU.");
-                    return software_h264_encoder(settings);
+                    eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU ({}).", crate::encoders::SOFTWARE_H264_ENCODER);
+                    return X11Encoder::None;
                 }
             }
         }
@@ -226,15 +188,18 @@ fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
                 X11Encoder::Nvenc(e)
             }
             Err(err) => {
-                eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU.");
-                software_h264_encoder(settings)
+                eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU ({}).", crate::encoders::SOFTWARE_H264_ENCODER);
+                X11Encoder::None
             }
         };
     }
     if settings.output_mode == 1 {
-        println!("[x11] No GPU Encoder available -> Using CPU Software Encoding.");
+        println!(
+            "[x11] No GPU Encoder available -> Using CPU Software Encoding ({}).",
+            crate::encoders::SOFTWARE_H264_ENCODER
+        );
     }
-    software_h264_encoder(settings)
+    X11Encoder::None
 }
 
 /// Everything the X11 host-ARGB path has to remember between frames.
@@ -242,8 +207,9 @@ fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
 /// Unlike the Wayland backend, X11 capture has no compositor to report what changed, so this
 /// context exists to hold the state that stands in for that missing damage signal: the per-stripe
 /// hashes and the persistent encoder session that let `process()` discover damage by comparing
-/// content frame-to-frame. Full-frame H.264 runs through `decide_hw_fullframe`; striped JPEG/x264
-/// runs through `encode_cpu` with `hash_damage=true`.
+/// content frame-to-frame. Hardware full-frame H.264 runs through `decide_hw_fullframe`; the
+/// software path (JPEG, striped or full-frame software H.264) runs through `encode_cpu` with
+/// `hash_damage=true`.
 ///
 /// Recording fan-out (socket sink and MP4 recorder) is handled at the delivery layer; a
 /// consumer needing a keyframe goes through [`X11Pipeline::request_idr`] like everyone else.
@@ -256,12 +222,10 @@ pub struct X11Pipeline {
     hw_state: StripeState,
     frame_counter: u16,
     pending_force_idr: bool,
-    /// Consecutive hardware encode failures, whether this pipeline already spent its one
-    /// rebuild, and whether it has reached the bottom of the ladder; together they drive
-    /// `recover_hw`.
+    /// Consecutive hardware encode failures and whether this pipeline already spent its one
+    /// rebuild; together they drive `recover_hw`.
     hw_error_streak: u32,
     hw_rebuilt: bool,
-    hw_recovery_exhausted: bool,
 }
 
 impl X11Pipeline {
@@ -269,20 +233,19 @@ impl X11Pipeline {
     ///
     /// # Arguments
     ///
-    /// * `settings` - Capture configuration. The `output_mode`, `use_openh264`, `use_cpu`, and
+    /// * `settings` - Capture configuration. The `output_mode`, `use_cpu`, and
     ///   `encode_node_index` fields drive encoder selection.
     ///
     /// # Encoder selection
     ///
-    /// 1. **OpenH264** — when `use_openh264` is set (explicit opt-in, full-frame software).
-    /// 2. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
-    /// 3. **VA-API** — on any other GPU driver. A 4:4:4 request is carried into the attempt, so a
+    /// 1. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
+    /// 2. **VA-API** — on any other GPU driver. A 4:4:4 request is carried into the attempt, so a
     ///    device that cannot encode 4:4:4 fails here and falls through rather than being ruled out
     ///    in advance.
-    /// 4. **Software** — `software_h264_encoder`: `X11Encoder::None`, meaning the striped x264
-    ///    inside `encode_cpu`, in a GPL build; the full-frame OpenH264 encoder when the `gpl`
-    ///    feature is disabled. This is also where a 4:4:4 request lands when no hardware encoder
-    ///    can carry it, since x264 can.
+    /// 3. **Software** — `X11Encoder::None`: the striped (or, with `video_fullframe`, full-frame)
+    ///    software path inside `encode_cpu`, encoding with the build's software H.264 encoder
+    ///    (`SOFTWARE_H264_ENCODER`). This is also where a 4:4:4 request lands when no hardware
+    ///    encoder can carry it; libx264 carries it, OpenH264 encodes it 4:2:0.
     pub fn new(settings: RustCaptureSettings) -> Self {
         let hw = select_encoder(&settings);
         Self {
@@ -295,20 +258,7 @@ impl X11Pipeline {
             pending_force_idr: false,
             hw_error_streak: 0,
             hw_rebuilt: false,
-            hw_recovery_exhausted: false,
         }
-    }
-
-    /// Whether this build offers an encoder below the one currently running. Without GPL
-    /// components the software rung *is* OpenH264, so an OpenH264 session has nothing under it
-    /// and the ladder ends with it; with libx264 the rung below is always the striped software
-    /// path, which `X11Encoder::None` selects.
-    fn has_rung_below_hw(&self) -> bool {
-        #[cfg(not(feature = "gpl"))]
-        if self.settings.output_mode == 1 && matches!(self.hw, X11Encoder::Openh264(_)) {
-            return false;
-        }
-        true
     }
 
     /// React to a streak of hardware encode failures: rebuild the session once with the startup
@@ -317,23 +267,19 @@ impl X11Pipeline {
     /// recovery until an encode succeeds; otherwise the stream would rebuild in a loop and never
     /// demote. Streaming nothing forever is not an option.
     ///
-    /// The demote is the last rung: once it lands on the encoder the ladder ends with, the
-    /// caller stops re-entering, so a persistently failing software encoder is not rebuilt on
-    /// every further streak.
+    /// The demote is the last rung: the software path has no encode-error streak of its own, so
+    /// once the pipeline lands there it is never re-entered.
     fn recover_hw(&mut self) {
         self.hw_error_streak = 0;
         if self.hw_rebuilt {
-            self.hw_recovery_exhausted = !self.has_rung_below_hw();
-            if self.hw_recovery_exhausted {
-                eprintln!("[x11] software encoder still failing; nothing below it in this build.");
-            } else {
-                eprintln!("[x11] HW encoder unrecoverable; demoting to software encoding.");
-            }
+            eprintln!(
+                "[x11] HW encoder unrecoverable; demoting to software encoding ({}).",
+                crate::encoders::SOFTWARE_H264_ENCODER
+            );
             // The broken session is released before its replacement is built: these failures
             // are usually device memory pressure, and holding both at once is what would make
             // the replacement fail too.
             self.hw = X11Encoder::None;
-            self.hw = software_h264_encoder(&self.settings);
         } else {
             eprintln!("[x11] rebuilding HW encoder after repeated encode errors.");
             self.hw = X11Encoder::None;
@@ -355,19 +301,20 @@ impl X11Pipeline {
         match &self.hw {
             X11Encoder::Nvenc(_) => "NVENC",
             X11Encoder::Vaapi(_) => "VAAPI",
-            X11Encoder::Openh264(_) => "OpenH264",
             X11Encoder::None => "CPU",
         }
     }
 
     /// The `Colorspace:` field for this pipeline's stream log, describing what its encoder settled
-    /// on: VA-API only reaches 4:4:4 when the driver and FFmpeg build carry it, and OpenH264 is
-    /// 4:2:0-only whatever was asked for.
+    /// on: VA-API only reaches 4:4:4 when the driver and FFmpeg build carry it, and the software
+    /// encoder only when the build's one does (`SOFTWARE_H264_FULLCOLOR`).
     pub fn colorspace_desc(&self) -> &'static str {
         let fullcolor = match &self.hw {
             X11Encoder::Vaapi(enc) => enc.is_fullcolor(),
-            X11Encoder::Openh264(_) => false,
-            _ => self.settings.video_fullcolor,
+            X11Encoder::Nvenc(_) => self.settings.video_fullcolor,
+            X11Encoder::None => {
+                self.settings.video_fullcolor && crate::encoders::SOFTWARE_H264_FULLCOLOR
+            }
         };
         crate::encoders::colorspace_desc(fullcolor, matches!(self.hw, X11Encoder::None))
     }
@@ -382,7 +329,7 @@ impl X11Pipeline {
     /// # Returns
     ///
     /// `true` if the pipeline was successfully adapted in place; `false` when the active encoder
-    /// cannot follow (VAAPI, OpenH264 on resize) and the caller must rebuild.
+    /// cannot follow (VAAPI on resize) and the caller must rebuild.
     pub fn reshape(&mut self, settings: &RustCaptureSettings, size_changed: bool) -> bool {
         if !size_changed {
             if let X11Encoder::Nvenc(enc) = &mut self.hw {
@@ -408,21 +355,29 @@ impl X11Pipeline {
     }
 
     /// Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
-    /// kb; ignored unless CBR is active) and the target fps. NVENC and OpenH264 reconfigure their
-    /// live session immediately; VAAPI re-opens its codec context to apply the new rate; the x264
-    /// software path picks the new values up on the next `process()` (encode_cpu reads the updated
-    /// settings and reconfigures each stripe).
+    /// kb; ignored unless CBR is active) and the target fps. NVENC reconfigures its live session
+    /// immediately; VAAPI re-opens its codec context to apply the new rate; the software path picks
+    /// the new values up on the next `process()` (encode_cpu reads the updated settings and
+    /// reconfigures each stripe's encoder).
     pub fn update_rate(&mut self, bitrate_kbps: i32, vbv_multiplier: f64, fps: f64) {
         self.settings.video_bitrate_kbps = bitrate_kbps;
         self.settings.video_vbv_multiplier = vbv_multiplier;
         if fps > 0.0 {
             self.settings.target_fps = fps;
         }
-        match &mut self.hw {
-            X11Encoder::Nvenc(enc) => enc.reconfigure_rate(&self.settings),
-            X11Encoder::Openh264(enc) => enc.reconfigure_rate(bitrate_kbps, fps),
-            X11Encoder::Vaapi(enc) => enc.reconfigure_rate(&self.settings),
-            _ => {}
+        let rate_error = match &mut self.hw {
+            X11Encoder::Nvenc(enc) => {
+                enc.reconfigure_rate(&self.settings);
+                None
+            }
+            X11Encoder::Vaapi(enc) => enc.reconfigure_rate(&self.settings).err(),
+            X11Encoder::None => None,
+        };
+        if let Some(e) = rate_error {
+            // The failed re-open left the VA-API session without a codec context, so it goes
+            // through the rebuild-or-demote ladder instead of being encoded into.
+            eprintln!("[x11] VAAPI rate reconfigure failed: {e}");
+            self.recover_hw();
         }
     }
 
@@ -473,17 +428,12 @@ impl X11Pipeline {
                     X11Encoder::Vaapi(enc) => {
                         enc.encode_host_argb(argb, stride, fc, d.target_qp, force_idr)
                     }
-                    X11Encoder::Openh264(enc) => {
-                        enc.update_qp(d.target_qp);
-                        enc.encode_host_argb(argb, stride, fc, force_idr, false)
-                    }
                     X11Encoder::None => unreachable!(),
                 };
                 match res {
                     Ok(data) if !data.is_empty() => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
-                        self.hw_recovery_exhausted = false;
                         vec![EncodedStripe {
                             data: Arc::new(data),
                             data_type: 2,
@@ -495,7 +445,6 @@ impl X11Pipeline {
                     Ok(_) => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
-                        self.hw_recovery_exhausted = false;
                         Vec::new()
                     }
                     Err(e) => {
@@ -505,9 +454,7 @@ impl X11Pipeline {
                             eprintln!("[x11] HW encode error: {e}");
                         }
                         self.hw_error_streak = self.hw_error_streak.saturating_add(1);
-                        if self.hw_error_streak >= crate::HW_ERROR_RECOVERY_THRESHOLD
-                            && !self.hw_recovery_exhausted
-                        {
+                        if self.hw_error_streak >= crate::HW_ERROR_RECOVERY_THRESHOLD {
                             self.recover_hw();
                         }
                         Vec::new()
@@ -584,10 +531,10 @@ mod tests {
         assert!(n3 > 0, "changed frame should emit dirty stripes");
     }
 
-    /// Software x264, paint-over off, non-streaming: a requested IDR on a static screen is
-    /// followed by a short recovery burst so rate control can refine the keyframe, instead of the
-    /// stream going silent and stranding an unrefined keyframe. The stream goes quiet again once
-    /// the burst ends.
+    /// Software H.264 (the build's encoder), paint-over off, non-streaming: a requested IDR on
+    /// a static screen is followed by a short recovery burst so rate control can refine the
+    /// keyframe, instead of the stream going silent and stranding an unrefined keyframe. The
+    /// stream goes quiet again once the burst ends.
     #[test]
     fn x11_software_h264_streams_recovery_burst_after_requested_idr() {
         let s = RustCaptureSettings {
@@ -618,15 +565,17 @@ mod tests {
         assert!(p.process(&frame, stride).is_empty(), "stream goes quiet again after the recovery burst");
     }
 
-    /// The software path is the one encoder that always carries a 4:4:4 request, and carries it at
-    /// full range, so its log line says so; without the request it reports 4:2:0. This is the same
-    /// string the Wayland log builds from the same shared helper, so an identical session reads
-    /// identically on both backends.
+    /// The software path carries a 4:4:4 request exactly when the build's encoder does —
+    /// libx264 at full range, so its log line says so; OpenH264 never, reporting the 4:2:0 it
+    /// encodes — and without the request it reports 4:2:0. This is the same string the Wayland log
+    /// builds from the same shared helper, so an identical session reads identically on both
+    /// backends.
     #[test]
     fn x11_colorspace_desc_reports_what_the_software_encoder_carries() {
-        for (fullcolor, expected) in
-            [(true, "I444 (Full Range)"), (false, "I420 (Limited Range)")]
-        {
+        let carries_444 = crate::encoders::SOFTWARE_H264_FULLCOLOR;
+        assert_eq!(carries_444, crate::encoders::SOFTWARE_H264_ENCODER == "x264");
+        let i444 = if carries_444 { "I444 (Full Range)" } else { "I420 (Limited Range)" };
+        for (fullcolor, expected) in [(true, i444), (false, "I420 (Limited Range)")] {
             let p = X11Pipeline::new(RustCaptureSettings {
                 width: 64,
                 height: 64,
@@ -639,7 +588,7 @@ mod tests {
             assert_eq!(p.colorspace_desc(), expected);
             assert_eq!(
                 p.colorspace_desc(),
-                crate::encoders::colorspace_desc(fullcolor, true),
+                crate::encoders::colorspace_desc(fullcolor && carries_444, true),
                 "X11 and Wayland must describe the same session identically"
             );
         }

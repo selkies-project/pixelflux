@@ -115,15 +115,27 @@ const DT_SYMTAB: i64 = 6;
 /// ELF `.dynamic` tag `DT_JMPREL` (23): address of the PLT relocation table (`.rela.plt`).
 const DT_JMPREL: i64 = 23;
 
-/// Why the filter also handles eager GOT binds: `R_X86_64_GLOB_DAT` (6) names a GOT slot
-/// bound eagerly, the form `-fno-plt` builds use — and NVIDIA libraries route `ioctl` through such a
-/// slot in `.rela.dyn`. Alongside `R_X86_64_JUMP_SLOT`, it names a GOT entry holding a function
-/// pointer the filter repoints.
-const R_X86_64_GLOB_DAT: u32 = 6;
-/// The classic lazily-bound PLT GOT slot the filter repoints: `R_X86_64_JUMP_SLOT` (7), found
-/// in `.rela.plt`, names a GOT entry holding a function pointer — the common case, paired with
-/// `R_X86_64_GLOB_DAT` for the `-fno-plt` case.
-const R_X86_64_JUMP_SLOT: u32 = 7;
+// The two GOT-slot relocation types the filter repoints, per target architecture: the
+// eagerly-bound `GLOB_DAT` slot the `-fno-plt` form uses (in `.rela.dyn`, the layout NVIDIA ships)
+// and the classic lazily-bound `JUMP_SLOT` slot (in `.rela.plt`). Their numeric codes differ by
+// architecture, so keying on the x86-64 values alone would silently match nothing on aarch64 and
+// leave the multi-GPU filter a no-op there. `RELOC_ARCH_SUPPORTED` is false on any other
+// architecture, where `install` reports the filter unsupported rather than patching nothing.
+cfg_if::cfg_if! {
+    if #[cfg(target_arch = "x86_64")] {
+        const RELOC_GLOB_DAT: u32 = 6;
+        const RELOC_JUMP_SLOT: u32 = 7;
+        const RELOC_ARCH_SUPPORTED: bool = true;
+    } else if #[cfg(target_arch = "aarch64")] {
+        const RELOC_GLOB_DAT: u32 = 1025;
+        const RELOC_JUMP_SLOT: u32 = 1026;
+        const RELOC_ARCH_SUPPORTED: bool = true;
+    } else {
+        const RELOC_GLOB_DAT: u32 = u32::MAX;
+        const RELOC_JUMP_SLOT: u32 = u32::MAX;
+        const RELOC_ARCH_SUPPORTED: bool = false;
+    }
+}
 
 /// Identity of the RM control device, cached so the hook only rewrites responses that truly
 /// came from it: the `rdev` of `/dev/nvidiactl`, resolved once at `install()`. A value of 0 means it
@@ -513,7 +525,7 @@ unsafe fn patch_reloc_table(
     for i in 0..count {
         let r = rela.add(i);
         let rtype = elf64_r_type((*r).r_info);
-        if rtype != R_X86_64_JUMP_SLOT && rtype != R_X86_64_GLOB_DAT {
+        if rtype != RELOC_JUMP_SLOT && rtype != RELOC_GLOB_DAT {
             continue;
         }
         let sym_idx = elf64_r_sym((*r).r_info) as usize;
@@ -613,6 +625,10 @@ pub fn install() {
             eprintln!("[pixelflux] multi-GPU NVENC filter disabled via PIXELFLUX_DISABLE_GPU_FILTER");
             return;
         }
+        if !RELOC_ARCH_SUPPORTED {
+            eprintln!("[pixelflux] multi-GPU NVENC filter unsupported on this architecture; not patching");
+            return;
+        }
         unsafe {
             let mut st: libc::stat = std::mem::zeroed();
             if libc::stat(c"/dev/nvidiactl".as_ptr(), &mut st) == 0 {
@@ -678,6 +694,26 @@ mod tests {
     #[test]
     fn ioc_nr_extracts_low_byte() {
         assert_eq!(ioc_nr(0xC020462A), NV_ESC_RM_CONTROL);
+    }
+
+    /// The GOT-slot relocation codes track the build architecture: keying on the x86-64
+    /// numbers on aarch64 would match nothing and silently disable the filter, so each supported
+    /// arch carries its own `JUMP_SLOT` / `GLOB_DAT` pair. The two arches the filter supports use
+    /// distinct codes, and both must be flagged supported.
+    #[test]
+    fn reloc_types_track_the_target_arch() {
+        assert!(RELOC_ARCH_SUPPORTED, "x86-64 / aarch64 builds are supported");
+        assert_ne!(RELOC_JUMP_SLOT, RELOC_GLOB_DAT);
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(RELOC_JUMP_SLOT, 7);
+            assert_eq!(RELOC_GLOB_DAT, 6);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(RELOC_JUMP_SLOT, 1026);
+            assert_eq!(RELOC_GLOB_DAT, 1025);
+        }
     }
 
     /// Proves the property the whole gate rests on — matching stays size-agnostic yet

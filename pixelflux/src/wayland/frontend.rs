@@ -223,6 +223,10 @@ pub enum GpuEncoder {
 /// per display.
 pub struct WlCapture {
     pub settings: RustCaptureSettings,
+    /// The Python frame callback, shared with the delivery thread. Kept here so a
+    /// reconfigure the calloop performs on its own (a host that kept a different mode)
+    /// can respawn delivery with the same consumer; `None` for a recorder-owned capture.
+    pub callback: Option<Arc<Py<PyAny>>>,
     /// Zero-copy GPU session (GLES render + same-GPU dmabuf encode), calloop-affine;
     /// `None` whenever a readback path is active for this display.
     pub video_encoder: Option<GpuEncoder>,
@@ -309,6 +313,16 @@ pub struct OutputNode {
     /// must not reach the stream. Cleared by the first tick a client covers the output, and
     /// by the deadline for one that never does.
     pub content_hold_until: Option<Instant>,
+}
+
+/// A host-capture layout request in flight for one display: the epoch of the apply it
+/// rode on, the size the capture was configured for, and the geometry readers parked
+/// behind it, answered once the host has decided so they report the size actually
+/// captured (the realized-geometry barrier).
+pub struct PendingHostLayout {
+    pub epoch: u64,
+    pub want: (i32, i32),
+    pub geometry_waiters: Vec<std::sync::mpsc::Sender<(i32, i32, f64)>>,
 }
 
 /// One ext-image-copy-capture session: an external client capturing one of this
@@ -528,8 +542,18 @@ pub struct AppState {
     /// Host-capture session when pixelflux captures an EXTERNAL compositor:
     /// frames arrive by screencopy and input routes to its virtual devices.
     pub host: Option<crate::wayland::host::HostSession>,
+    /// Per display, the layout request the host has not answered yet. A capture start
+    /// submits its mode and carries on at that size; the render tick polls the verdict
+    /// and re-sizes the capture to the host's own mode when the host kept it. Emptied
+    /// with the host session.
+    pub host_layout_pending: std::collections::HashMap<u32, PendingHostLayout>,
 
     pub current_cursor_icon: Option<CursorImageStatus>,
+    /// A surface-backed cursor set during the dispatch in progress and not delivered yet:
+    /// clients commit the sprite's buffer after `set_cursor` in the same batch, so delivery
+    /// waits for that commit, or for the end of the dispatch when none comes, rather than
+    /// shipping the surface's previous sprite under the new hotspot.
+    pub cursor_surface_pending: bool,
     pub cursor_buffer: Option<WlBuffer>,
     pub render_cursor_on_framebuffer: bool,
     pub pointer_warp_state: PointerWarpManager,
@@ -755,6 +779,7 @@ impl CompositorHandler for AppState {
         if let Some(CursorImageStatus::Surface(ref cursor_surface)) = self.current_cursor_icon
             && cursor_surface == surface {
                 let status = CursorImageStatus::Surface(surface.clone());
+                self.cursor_surface_pending = false;
                 self.send_cursor_image(&status);
             }
 
@@ -1231,14 +1256,22 @@ impl AppState {
                 let mut hot_y = 0;
                 let mut is_cursor_role = false;
 
+                // The hotspot is set in logical surface coordinates; the consumer gets the
+                // sprite in buffer pixels, so the hotspot ships in the same units.
                 with_states(surface, |states| {
                     if states.role == Some("cursor_image") {
                         is_cursor_role = true;
                     }
+                    let buffer_scale = states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer_scale
+                        .max(1);
                     if let Some(attributes) = states.data_map.get::<Mutex<CursorImageAttributes>>()
                         && let Ok(guard) = attributes.lock() {
-                            hot_x = guard.hotspot.x;
-                            hot_y = guard.hotspot.y;
+                            hot_x = guard.hotspot.x * buffer_scale;
+                            hot_y = guard.hotspot.y * buffer_scale;
                         }
                 });
 
@@ -1339,6 +1372,18 @@ impl AppState {
             }
         };
         let _ = self.cursor_tx.send(job);
+    }
+
+    /// Deliver a surface-backed cursor whose dispatch ended without a commit of its surface
+    /// (a client re-showing a sprite it attached earlier).
+    pub(crate) fn flush_pending_cursor(&mut self) {
+        if !self.cursor_surface_pending {
+            return;
+        }
+        self.cursor_surface_pending = false;
+        if let Some(icon) = self.current_cursor_icon.clone() {
+            self.send_cursor_image(&icon);
+        }
     }
 
     /// Re-apply the policy's keymap (base + overlays) to the seat keyboard, broadcasting to
@@ -2215,10 +2260,14 @@ impl SeatHandler for AppState {
     }
 
     /// A client requested a cursor change (named, hidden, or surface-backed): retain it as
-    /// the current icon and forward it to the Python cursor callback.
+    /// the current icon and forward it to the Python cursor callback. A surface-backed one
+    /// is delivered by the surface's commit or by `flush_pending_cursor`, whichever is first.
     fn cursor_image(&mut self, _seat: &Seat<AppState>, image: CursorImageStatus) {
         self.current_cursor_icon = Some(image.clone());
-        self.send_cursor_image(&image);
+        self.cursor_surface_pending = matches!(image, CursorImageStatus::Surface(_));
+        if !self.cursor_surface_pending {
+            self.send_cursor_image(&image);
+        }
     }
 
     /// Keep BOTH selections' focus following keyboard focus: without the data-device half,

@@ -4,12 +4,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! CPU-based striped encoder: x264 for H.264 and turbojpeg for JPEG.
+//! CPU-based striped encoder: H.264 through the build's software encoder — libx264 with the
+//! `gpl` feature, Cisco OpenH264 without it (`SOFTWARE_H264_ENCODER`) — and turbojpeg for JPEG.
 //!
 //! Frames are split into horizontal stripes processed in parallel via rayon. Each stripe is
 //! independently hashed against the previous frame for change detection, and only dirty stripes
-//! are encoded. The x264 path maintains per-stripe encoder state across frames for inter-prediction;
-//! the JPEG path is stateless.
+//! are encoded. The H.264 path maintains per-stripe encoder state across frames for
+//! inter-prediction, and both libraries emit the same per-stripe wire framing; the JPEG path is
+//! stateless.
 
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
@@ -33,11 +35,11 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// encoders, spreading the conversion across up to `bands` threads so it never bottlenecks a frame.
 ///
 /// **Why the band split exists.** Colour conversion is a non-trivial slice of per-frame CPU. The
-/// striped x264 path already parallelizes it for free — each stripe converts on its own rayon
-/// worker — but a single full-frame consumer (the whole-frame x264 stripe, or the OpenH264
-/// full-frame encoder, which passes `bands = 4`) would otherwise convert its entire image on one
-/// thread and stall the frame there. Splitting into horizontal bands hands that lone conversion the
-/// same multi-threading the striped path enjoys. The cut is horizontal because YUV planes are
+/// striped path already parallelizes it for free — each stripe converts on its own rayon worker —
+/// but a single full-frame consumer (the whole-frame x264 stripe, or a full-frame OpenH264
+/// instance, which passes `bands = 4`) would otherwise convert its entire image on one thread and
+/// stall the frame there. Splitting into horizontal bands hands that lone conversion the same
+/// multi-threading the striped path enjoys. The cut is horizontal because YUV planes are
 /// row-major, so a horizontal boundary yields contiguous, non-overlapping plane sub-slices with no
 /// per-row seam bookkeeping.
 ///
@@ -181,6 +183,11 @@ pub struct H264EncoderWrapper {
     current_fps: u32,
     #[allow(dead_code)]
     full_range: bool,
+    /// Open-time parameters retained so a frame-rate change can reopen the session: x264's live
+    /// reconfigure cannot alter the frame rate, and CBR/VBV budgets are derived from it.
+    threads: i32,
+    min_qp: i32,
+    max_qp: i32,
 }
 
 #[cfg(feature = "gpl")]
@@ -301,6 +308,9 @@ impl H264EncoderWrapper {
                     current_vbv: vbv_kbit,
                     current_fps: if fps < 1.0 { 30 } else { fps as u32 },
                     full_range: param.vui.b_fullrange == 1,
+                    threads,
+                    min_qp,
+                    max_qp,
                 })
             }
         }
@@ -329,16 +339,20 @@ impl H264EncoderWrapper {
         }
     }
 
-    /// Retune bitrate/VBV (CBR only) and/or frame rate on the running encoder, structured to
+    /// Retune bitrate/VBV (CBR only) and/or frame rate to match the live settings, structured to
     /// be called unconditionally every frame so the caller need not track what changed itself.
     ///
-    /// Because `encode_cpu` fires it on every frame, the first thing it does is compute the would-be
-    /// values and bail before touching the encoder when neither the CBR bitrate/VBV nor the frame
-    /// rate actually differs from what is live — that self-gating is what keeps a per-frame call
-    /// nearly free. Bitrate and VBV apply only in CBR mode (they are meaningless under CRF); the
-    /// frame rate applies in either. Changed fields are written into the live parameter set and
-    /// pushed via `x264_encoder_reconfig`, and the tracked mirror advances only on a successful
-    /// reconfig so it cannot drift from the encoder's real state.
+    /// Because `encode_cpu` fires it on every frame, it first computes the would-be values and bails
+    /// before touching the encoder when neither the CBR bitrate/VBV nor the frame rate differs from
+    /// what is live — that self-gating keeps a per-frame call nearly free.
+    ///
+    /// A frame-rate change reopens the encoder rather than reconfiguring it: `x264_encoder_reconfig`
+    /// does not apply `i_fps_*`, and the CBR/VBV per-frame budget is `bitrate / fps`, so a session
+    /// left at its old rate ships roughly half the configured bitrate once fps halves. The reopen
+    /// carries the new bitrate/VBV too, and a fresh session emits an IDR on its first frame; a failed
+    /// reopen keeps the working session instead of nulling the handle. A bitrate/VBV-only change
+    /// (CBR) stays a live `x264_encoder_reconfig`, and the tracked mirror advances only on success so
+    /// it cannot drift from the encoder's real state.
     pub fn reconfigure_rate(&mut self, bitrate_kbps: i32, vbv_kbit: i32, fps: f64) {
         let bk = bitrate_kbps.saturating_abs();
         let new_fps = if fps < 1.0 { 30 } else { fps as u32 };
@@ -348,26 +362,33 @@ impl H264EncoderWrapper {
         if !rate_changed && !fps_changed {
             return;
         }
+        if fps_changed {
+            if let Some(fresh) = H264EncoderWrapper::new(
+                self.width,
+                self.height,
+                self.current_crf,
+                self.is_i444,
+                new_fps as f64,
+                self.threads,
+                self.is_cbr,
+                bk,
+                vbv_kbit,
+                self.min_qp,
+                self.max_qp,
+            ) {
+                *self = fresh;
+            }
+            return;
+        }
         unsafe {
             let mut param: x264_sys::x264_param_t = std::mem::zeroed();
             x264_sys::x264_encoder_parameters(self.encoder, &mut param);
-            if rate_changed {
-                param.rc.i_bitrate = bk;
-                param.rc.i_vbv_max_bitrate = bk;
-                param.rc.i_vbv_buffer_size = vbv_kbit.max(1);
-            }
-            if fps_changed {
-                param.i_fps_num = new_fps;
-                param.i_fps_den = 1;
-            }
+            param.rc.i_bitrate = bk;
+            param.rc.i_vbv_max_bitrate = bk;
+            param.rc.i_vbv_buffer_size = vbv_kbit.max(1);
             if x264_sys::x264_encoder_reconfig(self.encoder, &mut param) == 0 {
-                if rate_changed {
-                    self.current_bitrate = bk;
-                    self.current_vbv = vbv_kbit;
-                }
-                if fps_changed {
-                    self.current_fps = new_fps;
-                }
+                self.current_bitrate = bk;
+                self.current_vbv = vbv_kbit;
             }
         }
     }
@@ -485,8 +506,8 @@ impl H264EncoderWrapper {
 /// or recomputed from scratch each frame:
 /// - **Reused buffers**: `y_buf` / `u_buf` / `v_buf` hold the stripe's YUV planes and `packet_buf`
 ///   the encoded output, grown in place rather than reallocated per frame.
-/// - **Encoder**: `h264_encoder` is the stripe's x264 instance, reused until its geometry or chroma
-///   format changes.
+/// - **Encoder**: `h264_encoder` is the stripe's software H.264 instance — libx264 in a `gpl`
+///   build, OpenH264 otherwise — reused until its geometry (or, for x264, chroma format) changes.
 /// - **Paint-over / recovery**: `no_motion_frame_count` counts consecutive static frames,
 ///   `paint_over_sent` guards against re-sending a high-quality repaint of a still region, and
 ///   `h264_burst_frames_remaining` tracks a post-repaint or recovery streaming burst.
@@ -500,6 +521,8 @@ pub struct StripeState {
     pub paint_over_sent: bool,
     #[cfg(feature = "gpl")]
     pub h264_encoder: Option<H264EncoderWrapper>,
+    #[cfg(not(feature = "gpl"))]
+    pub h264_encoder: Option<crate::encoders::oh264::Openh264Encoder>,
     pub h264_burst_frames_remaining: i32,
     #[cfg(feature = "gpl")]
     pub y_buf: Vec<u8>,
@@ -604,13 +627,13 @@ pub struct EncodedStripe {
 }
 
 /// The software encoder's per-frame entry point: split the frame into horizontal stripes,
-/// decide per stripe whether it needs sending, and encode only those as JPEG or x264 H.264
-/// across the rayon pool.
+/// decide per stripe whether it needs sending, and encode only those as JPEG or H.264 (libx264
+/// or OpenH264, by build) across the rayon pool.
 ///
 /// Two pressures drive the design: CPU H.264/JPEG is expensive, so the frame is cut into
 /// parallel stripes; bandwidth is precious, so unchanged stripes are skipped. Each stripe is
 /// independently hashed against the previous frame for change detection, and only dirty stripes
-/// are encoded. The x264 path maintains per-stripe encoder state across frames for
+/// are encoded. The H.264 path maintains per-stripe encoder state across frames for
 /// inter-prediction; the JPEG path is stateless.
 ///
 /// # Arguments
@@ -672,21 +695,23 @@ pub struct EncodedStripe {
 ///      hands the compressed buffer straight through; otherwise a 6-byte stripe header (`0x03` tag,
 ///      a reserved byte, frame number, y-start) is prepended to match the H.264 path's native
 ///      framing so the transport can forward the buffer without re-framing.
-///    - **H.264** (`output_mode 1`): the stripe's x264 encoder is reused unless the width, height,
-///      or chroma format changed, in which case it is rebuilt and an IDR forced; otherwise CRF and
-///      rate are reconfigured live. ARGB is converted to YUV (a conversion failure skips the stripe
-///      rather than encoding garbage), and an 8-byte fixed header (frame number, y-start, width,
-///      height) is emitted. The live CBR VBV budget is recomputed here from the bitrate/fps so it
+///    - **H.264** (`output_mode 1`): the stripe's encoder is reused unless the width, height, or
+///      (x264) chroma format changed, in which case it is rebuilt and an IDR forced; otherwise CRF
+///      and rate are reconfigured live. With libx264, ARGB is converted to YUV here (a conversion
+///      failure skips the stripe rather than encoding garbage) and an 8-byte fixed header (frame
+///      number, y-start, width, height) is emitted; OpenH264 converts and frames inside
+///      `encode_stripe_argb` with the same header layout, and encodes a 4:4:4 request 4:2:0 (said
+///      once per process). The live CBR budget is recomputed here from the bitrate/fps so it
 ///      rescales with live changes.
 /// 7. **Dispatch**: a single full-frame stripe runs inline (sequential — empirically faster than a
-///    one-element rayon job) with a single-band colour conversion and the same thread policy as the
-///    OpenH264 encoder — one fewer than the available cores, clamped to `[1, 4]`. The slice threads
-///    keep the in-frame encode latency inside the frame budget at high resolutions; the cap is four
-///    because `zerolatency` makes x264 slice-threaded and more than four slices trips decode
-///    glitches in some Chromium builds, and the minus-one leaves headroom for the capture thread.
-///    Multiple stripes instead run across the rayon pool with a single x264 thread and one
-///    conversion band each, since the parallelism there already comes from encoding the stripes
-///    concurrently.
+///    one-element rayon job) with one fewer encode thread than the available cores, clamped to
+///    `[1, 4]` (x264 with a single-band colour conversion; OpenH264 adds four slices and a four-band
+///    conversion of its own). The slice threads keep the in-frame encode latency inside the frame
+///    budget at high resolutions; the cap is four because `zerolatency` makes x264 slice-threaded
+///    and more than four slices trips decode glitches in some Chromium builds, and the minus-one
+///    leaves headroom for the capture thread. Multiple stripes instead run across the rayon pool
+///    with a single encode thread and one conversion band each, since the parallelism there
+///    already comes from encoding the stripes concurrently.
 #[allow(clippy::too_many_arguments)]
 /// No stripe is shorter than a macroblock row.
 const MIN_STRIPE_HEIGHT: i32 = 64;
@@ -794,7 +819,6 @@ pub fn encode_cpu(
     let video_crf = settings.video_crf;
     let video_po_crf = settings.video_paintover_crf;
     let video_burst = settings.video_paintover_burst_frames;
-    #[cfg(feature = "gpl")]
     let video_fullcolor = settings.video_fullcolor;
     let video_streaming = settings.video_streaming_mode;
     let jpeg_q = settings.jpeg_quality;
@@ -802,7 +826,6 @@ pub fn encode_cpu(
     let trigger_frames = settings.paint_over_trigger_frames;
     let use_paint_over = settings.use_paint_over_quality;
     let burst_crf = if use_paint_over && video_po_crf < video_crf { video_po_crf } else { video_crf };
-    #[cfg(feature = "gpl")]
     let target_fps = settings.target_fps;
     let omit_headers = settings.omit_stripe_headers;
     let damage_block_threshold = settings.damage_block_threshold;
@@ -810,13 +833,14 @@ pub fn encode_cpu(
     #[cfg(feature = "gpl")]
     let video_cbr = settings.video_cbr_mode;
     // The requested rate is a whole-screen budget, and CRF needs no division
-    // at all (a per-quality target).
-    #[cfg(feature = "gpl")]
+    // at all (a per-quality target). OpenH264 sizes its own buffer, so only
+    // x264 reads the VBV share.
+    #[cfg_attr(not(feature = "gpl"), allow(unused_variables))]
     let (video_bitrate, video_vbv) =
         stripe_rate_control(settings, *carrying, n_processing_stripes);
-    // Full-frame x264 threads follow the same policy as the OpenH264 encoder:
-    // one fewer than the cores (headroom for the capture thread), clamped to
-    // [1, 4] to match the four-slice ceiling below.
+    // Full-frame x264 threads: one fewer than the cores (headroom for the
+    // capture thread), clamped to [1, 4] to match the four-slice ceiling below.
+    // A full-frame OpenH264 instance applies the same policy internally.
     #[cfg(feature = "gpl")]
     let h264_threads = if n_processing_stripes == 1 {
         std::thread::available_parallelism()
@@ -829,6 +853,13 @@ pub fn encode_cpu(
     };
     #[cfg(feature = "gpl")]
     let csc_bands = 1;
+    if output_mode == 1 && video_fullcolor && !crate::encoders::SOFTWARE_H264_FULLCOLOR {
+        static FULLCOLOR_LOGGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !FULLCOLOR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[software] 4:4:4 full-color requested; OpenH264 is 4:2:0-only, encoding 4:2:0.");
+        }
+    }
 
     let stripe_body = |(i, stripe_state): (usize, &mut StripeState)| -> Option<EncodedStripe> {
             if i >= stripe_geometries.len() {
@@ -841,9 +872,6 @@ pub fn encode_cpu(
 
             let mut send_this_stripe = false;
             let mut quality_or_crf = if output_mode == 0 { jpeg_q } else { video_crf };
-            // Only the x264 stripe encoder consumes this; without `gpl` there is no
-            // consumer, so the flag and its sites go away with it.
-            #[cfg(feature = "gpl")]
             let mut force_idr = false;
             let is_dirty = if !hash_damage {
                 stripe_is_dirty[i]
@@ -890,10 +918,7 @@ pub fn encode_cpu(
                         send_this_stripe = true;
                         stripe_state.paint_over_sent = true;
                         quality_or_crf = video_po_crf;
-                        #[cfg(feature = "gpl")]
-                        {
-                            force_idr = true;
-                        }
+                        force_idr = true;
                         stripe_state.h264_burst_frames_remaining = video_burst - 1;
                     }
                 }
@@ -902,10 +927,7 @@ pub fn encode_cpu(
             if force_idr_all {
                 send_this_stripe = true;
                 if output_mode == 1 {
-                    #[cfg(feature = "gpl")]
-                    {
-                        force_idr = true;
-                    }
+                    force_idr = true;
                     if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
                         stripe_state.paint_over_sent = true;
                         stripe_state.h264_burst_frames_remaining = video_burst;
@@ -1061,12 +1083,59 @@ pub fn encode_cpu(
                         None
                     }
                         } else {
-                            static GPL_OFF_LOGGED: std::sync::atomic::AtomicBool =
+                    use crate::encoders::oh264::Openh264Encoder;
+                    let needs_reinit = stripe_state.h264_encoder.as_ref().is_none_or(|enc| {
+                        enc.width() != width_usize || enc.height() != actual_height
+                    });
+                    if needs_reinit {
+                        stripe_state.h264_encoder = Openh264Encoder::new_stripe(
+                            settings,
+                            width_usize,
+                            actual_height,
+                            quality_or_crf,
+                            video_bitrate,
+                            n_processing_stripes == 1,
+                        );
+                        if stripe_state.h264_encoder.is_none() {
+                            // Once per process: a geometry OpenH264 refuses (wider than
+                            // 3840, say) would otherwise log on every stripe of every frame.
+                            static INIT_FAILED_LOGGED: std::sync::atomic::AtomicBool =
                                 std::sync::atomic::AtomicBool::new(false);
-                            if !GPL_OFF_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                eprintln!("[software] software H.264 encoding unavailable: pixelflux was built without GPL components (libx264 disabled). Use JPEG, OpenH264 (`use_openh264 = true`), or a hardware encoder.");
+                            if !INIT_FAILED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!(
+                                    "[software] OpenH264 init failed for a {}x{} stripe; no software H.264 for it",
+                                    width_usize, actual_height
+                                );
                             }
+                        }
+                        force_idr = true;
+                    } else if let Some(ref mut enc) = stripe_state.h264_encoder {
+                        enc.update_qp(quality_or_crf.max(0) as u32);
+                        enc.reconfigure_rate(video_bitrate, target_fps);
+                    }
+
+                    let enc = stripe_state.h264_encoder.as_mut()?;
+                    match enc.encode_stripe_argb(
+                        stripe_bytes,
+                        width_usize * 4,
+                        frame_counter as u64,
+                        y_start as u16,
+                        force_idr,
+                        use_gpu,
+                    ) {
+                        Ok(data) if !data.is_empty() => Some(EncodedStripe {
+                            data: Arc::new(data),
+                            data_type: 2,
+                            stripe_y_start: y_start as i32,
+                            stripe_height: actual_height as i32,
+                            frame_id: frame_counter as i32,
+                        }),
+                        Ok(_) => None,
+                        Err(e) => {
+                            eprintln!("[software] OpenH264 encode failed for stripe at y={y_start}: {e}");
                             None
+                        }
+                    }
                         }
                     }
                 }
@@ -1104,14 +1173,13 @@ pub fn stripe_count(height: i32, output_mode: i32, fullframe: bool) -> usize {
 /// Split the configured CBR budget across the stripes carrying it, returning the
 /// `(bitrate_kbps, vbv_kbit)` each stripe's encoder is programmed with.
 ///
-/// Every stripe runs its own x264 and rate control is per instance, metered against the
+/// Every stripe runs its own encoder and rate control is per instance, metered against the
 /// declared frame rate rather than against the frames that stripe was actually sent. So the
 /// screen's rate is one stripe's rate times the number of stripes that carry motion, and the
 /// budget is divided by that number — not by the stripe count, which on a screen where one
 /// corner moves would spend a fraction of what was configured. The divisor is the smoothed
 /// count so it changes on the scale of a moving average and not every frame: a rate that
-/// swings frame to frame leaves x264 chasing it and delivers less than either rate would.
-#[cfg(feature = "gpl")]
+/// swings frame to frame leaves the encoder chasing it and delivers less than either rate would.
 fn stripe_rate_control(
     settings: &RustCaptureSettings, carrying: f32, n_stripes: usize,
 ) -> (i32, i32) {
@@ -1168,7 +1236,6 @@ mod tests {
     /// stripes carrying motion. Dividing by the stripe count instead spends a fraction of the
     /// configured rate whenever only part of the screen moves, and dividing by nothing at all
     /// spends a multiple of it whenever the whole screen does.
-    #[cfg(feature = "gpl")]
     #[test]
     fn cbr_budget_is_split_across_the_stripes_carrying_it() {
         use crate::RustCaptureSettings;
@@ -1260,6 +1327,69 @@ mod tests {
         );
     }
     use super::{compute_stripe_geometries, StripeState};
+
+    /// Without `gpl` the striped H.264 path runs one OpenH264 instance per stripe and speaks
+    /// the x264 stripes' protocol: the first frame emits every stripe as an IDR whose wire header
+    /// carries that stripe's y-start and geometry, each stripe is an independently decodable
+    /// stream (a decoder fed only that stripe's bytes yields a picture of the stripe's size), a
+    /// static follow-up frame sends nothing, and motion confined to the top rows re-sends only
+    /// the top stripe, as a delta frame.
+    #[cfg(not(feature = "gpl"))]
+    #[test]
+    fn openh264_stripes_are_independent_streams() {
+        use crate::RustCaptureSettings;
+        use openh264::decoder::Decoder;
+        use openh264::formats::YUVSource;
+        let (w, h) = (128, 512);
+        let settings = RustCaptureSettings {
+            width: w,
+            height: h,
+            output_mode: 1,
+            video_crf: 25,
+            use_paint_over_quality: false,
+            video_streaming_mode: false,
+            ..Default::default()
+        };
+        let n = super::stripe_count(h, settings.output_mode, settings.video_fullframe);
+        if n < 2 {
+            return;
+        }
+        let mut stripes = Vec::new();
+        let mut carrying = 1.0f32;
+        let px: Vec<u8> = (0..(w * h * 4) as usize).map(|i| (i % 251) as u8).collect();
+        let first = super::encode_cpu(
+            &mut stripes, &mut carrying, &px, w, h, &[], &settings, 0, false, true, false,
+        );
+        assert_eq!(first.len(), n, "every stripe is sent on the first frame");
+        for (stripe, (y, sh)) in first.iter().zip(compute_stripe_geometries(h as usize, n, 1)) {
+            let d = &stripe.data;
+            assert_eq!(d[0], 0x04, "H.264 stripe tag");
+            assert_eq!(d[1], 0x01, "first frame of a stripe is an IDR");
+            assert_eq!(u16::from_be_bytes([d[2], d[3]]), 0, "frame number");
+            assert_eq!(u16::from_be_bytes([d[4], d[5]]) as usize, y, "y-start");
+            assert_eq!(u16::from_be_bytes([d[6], d[7]]) as i32, w, "width");
+            assert_eq!(u16::from_be_bytes([d[8], d[9]]) as usize, sh, "stripe height");
+            assert_eq!((stripe.stripe_y_start as usize, stripe.stripe_height as usize), (y, sh));
+            let mut dec = Decoder::new().expect("decoder");
+            let img = dec.decode(&d[10..]).expect("decode").expect("an IDR decodes on its own");
+            assert_eq!(img.dimensions(), (w as usize, sh), "each stripe is its own stream");
+        }
+        let quiet = super::encode_cpu(
+            &mut stripes, &mut carrying, &px, w, h, &[], &settings, 1, false, true, false,
+        );
+        assert!(quiet.is_empty(), "a static frame sends nothing");
+        let mut moved = px.clone();
+        for b in moved.iter_mut().take((w * 8 * 4) as usize) {
+            *b = b.wrapping_add(97);
+        }
+        let top = super::encode_cpu(
+            &mut stripes, &mut carrying, &moved, w, h, &[], &settings, 2, false, true, false,
+        );
+        assert_eq!(top.len(), 1, "motion in the top rows re-sends the top stripe alone");
+        assert_eq!(top[0].stripe_y_start, 0);
+        assert_eq!(top[0].data[1], 0x00, "an unforced follow-up is a delta frame");
+        assert_eq!(u16::from_be_bytes([top[0].data[2], top[0].data[3]]), 2, "frame number");
+    }
 
     /// With `threshold = 2` and `duration = 3`, a first change reads dirty and two consecutive
     /// changes open a damage block that holds dirty for three frames without re-hashing; once content
@@ -1428,8 +1558,8 @@ mod qp_bound_sweep {
     //! Invariants under test: the CBR QP clamp reaches libx264/OpenH264 (a max clamp must
     //! raise worst-case fidelity on rate-starved text at the cost of bitrate overshoot;
     //! a min clamp must cut spend on over-budgeted content) and defaults (0) leave the
-    //! encoders' own behavior untouched. Each encoder is swept separately so the OpenH264
-    //! sweep still runs without the `gpl` feature, where it is the only software H.264 path.
+    //! encoders' own behavior untouched. Each encoder is swept separately: the OpenH264
+    //! sweep runs in every build (the crate is a dev-dependency), the x264 one needs `gpl`.
     #[cfg(feature = "gpl")]
     use super::H264EncoderWrapper;
     use crate::encoders::oh264::Openh264Encoder;
@@ -1616,8 +1746,8 @@ mod qp_bound_sweep {
         );
     }
 
-    /// The OpenH264 counterpart of [`cbr_qp_bound_sweep_x264`], and the only software H.264
-    /// sweep that runs in a build without the `gpl` feature.
+    /// The OpenH264 counterpart of [`cbr_qp_bound_sweep_x264`]: the software H.264 sweep of a
+    /// build without the `gpl` feature, where OpenH264 is the encoder behind every stripe.
     ///
     /// Same scrolling-text workload and 2 Mbps CBR `max_qp` sweep, with luma PSNR measured against
     /// this encoder's own near-lossless QP-12 reference. Capping `max_qp` at 30 must lift fidelity
@@ -1640,6 +1770,87 @@ mod qp_bound_sweep {
         assert!(
             capped > base + 0.5,
             "oh264 max-QP clamp had no effect: {capped:.2} vs {base:.2} dB"
+        );
+    }
+
+    /// After a live frame-rate change the CBR stream still tracks the configured bitrate.
+    ///
+    /// x264's per-frame CBR budget is `bitrate / fps`, so halving the frame rate at a fixed kbps
+    /// budget must roughly double each encoded frame while the per-second bitrate holds. This encodes
+    /// incompressible full-frame noise at 4 Mbps CBR (content the rate controller cannot undershoot,
+    /// so per-frame size sits at the budget), measures the mean encoded frame size at 60 fps, drops
+    /// to 30 fps through `reconfigure_rate`, and requires the per-frame size to roughly double — so
+    /// the per-second bitrate is preserved rather than collapsing to half, which is what the pre-fix
+    /// path did by leaving the session budgeting for 60 fps (`x264_encoder_reconfig` never applies a
+    /// frame-rate change). Single-threaded so the rate-control measurement is deterministic; warmup
+    /// frames are discarded so the ABR controller and the post-reopen IDR do not skew the mean.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn cbr_bitrate_tracks_configured_rate_after_fps_change() {
+        const TARGET_KBPS: i32 = 4000;
+        const WARMUP: usize = 24;
+        const MEASURED: usize = 96;
+        let u = vec![128u8; (W / 2) * (H / 2)];
+        let v = vec![128u8; (W / 2) * (H / 2)];
+        let vbv = |fps: f64| {
+            (crate::encoders::vbv_bits((TARGET_KBPS as u32) * 1000, fps, 0.0, 0.0) / 1000).max(1)
+                as i32
+        };
+        // A fresh incompressible luma plane every frame, so inter-prediction cannot cheapen a
+        // frame and CBR must spend its whole per-frame budget: the per-frame size then reads the
+        // budget directly, which is exactly what a frame-rate change is supposed to move.
+        let noise_luma = |frame: usize| -> Vec<u8> {
+            let mut y = vec![0u8; W * H];
+            let mut s = (frame as u32).wrapping_mul(2654435761).wrapping_add(1);
+            for p in y.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                *p = (s >> 24) as u8;
+            }
+            y
+        };
+
+        let mut enc =
+            H264EncoderWrapper::new(W as i32, H as i32, 25, false, 60.0, 1, true, TARGET_KBPS, vbv(60.0), 0, 0)
+                .expect("x264 init");
+
+        let measure = |enc: &mut H264EncoderWrapper, start: usize| -> f64 {
+            let mut bytes = 0usize;
+            let mut counted = 0usize;
+            for i in start..start + WARMUP + MEASURED {
+                let y = noise_luma(i);
+                let mut out = Vec::new();
+                enc.encode_with_headers(
+                    &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32, i as i64, i == start,
+                    &[], true, &mut out,
+                );
+                if i >= start + WARMUP && !out.is_empty() {
+                    bytes += out.len();
+                    counted += 1;
+                }
+            }
+            bytes as f64 / counted.max(1) as f64
+        };
+
+        let per_frame_60 = measure(&mut enc, 0);
+        enc.reconfigure_rate(TARGET_KBPS, vbv(30.0), 30.0);
+        let per_frame_30 = measure(&mut enc, 1000);
+
+        let eff_60 = per_frame_60 * 8.0 * 60.0 / 1000.0;
+        let eff_30 = per_frame_30 * 8.0 * 30.0 / 1000.0;
+        println!(
+            "x264 CBR {TARGET_KBPS} kbps: 60fps {eff_60:.0} kbps ({per_frame_60:.0} B/frame), 30fps {eff_30:.0} kbps ({per_frame_30:.0} B/frame)"
+        );
+
+        let ratio = per_frame_30 / per_frame_60.max(1.0);
+        assert!(
+            (1.5..2.6).contains(&ratio),
+            "30fps per-frame size {per_frame_30:.0} B vs 60fps {per_frame_60:.0} B (ratio {ratio:.2}); halving fps should roughly double each frame"
+        );
+        assert!(
+            eff_30 > eff_60 * 0.75,
+            "30fps effective bitrate {eff_30:.0} kbps collapsed from the 60fps {eff_60:.0} kbps; fps change did not re-budget the bitrate"
         );
     }
 }

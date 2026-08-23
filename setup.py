@@ -11,9 +11,11 @@ from setuptools_rust import Binding, RustExtension, Strip
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-# GPL components (GPL-2.0+ libx264, used for striped software H.264) are enabled by
-# default. Set PIXELFLUX_ENABLE_GPL=0 (or "false"/"no") to build without them; the
-# BSD-licensed OpenH264 encoder is then substituted for software H.264.
+# The software H.264 encoder is chosen at build time. The default build enables the GPL
+# components (GPL-2.0+ libx264 encodes every software H.264 session). Set
+# PIXELFLUX_ENABLE_GPL=0 (or "false"/"no") to build without them: the BSD-licensed
+# OpenH264 then encodes every software H.264 session instead, with no other difference
+# in the API (pixelflux.SOFTWARE_H264_ENCODER reports which one a build carries).
 _enable_gpl = os.environ.get("PIXELFLUX_ENABLE_GPL", "1").strip().lower() not in (
     "0",
     "false",
@@ -23,15 +25,15 @@ _enable_gpl = os.environ.get("PIXELFLUX_ENABLE_GPL", "1").strip().lower() not in
 if _enable_gpl:
     print(
         "NOTICE: pixelflux is being built WITH GPL-licensed components "
-        "(GPL-2.0+ libx264 for striped software H.264), which is the default. "
+        "(GPL-2.0+ libx264 as the software H.264 encoder), which is the default. "
         "Set PIXELFLUX_ENABLE_GPL=0 to exclude every GPL-licensed component.",
         file=sys.stderr,
     )
 else:
     print(
         "NOTICE: pixelflux is being built WITHOUT GPL-licensed components "
-        "(PIXELFLUX_ENABLE_GPL=0): libx264 is excluded and OpenH264 (BSD) "
-        "substitutes for software H.264.",
+        "(PIXELFLUX_ENABLE_GPL=0): libx264 is excluded and OpenH264 (BSD) is the "
+        "software H.264 encoder.",
         file=sys.stderr,
     )
 
@@ -57,7 +59,7 @@ setup(
             binding=Binding.PyO3,
             debug=False,
             strip=Strip.All,
-            args=([] if _enable_gpl else ["--no-default-features"]),
+            args=([] if _enable_gpl else ["--no-default-features", "--features", "openh264"]),
         )
     ],
 

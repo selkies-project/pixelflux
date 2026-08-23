@@ -11,9 +11,11 @@
 //! the NVENC API version against the installed driver (set-once per process), and stamps every
 //! NVENCAPI struct with the exact `NV_ENC_*_VER` word the negotiated SDK defines, so one binary
 //! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU three ways: a
-//! zero-copy dmabuf import (EGLImage → CUDA), a pinned host→device copy of packed ARGB, and a raw
-//! planar upload. Sessions reconfigure resolution and rate control in place, so a resize or
-//! bitrate change costs a few milliseconds instead of a full rebuild.
+//! zero-copy dmabuf import (EGLImage → CUDA, the mapped plane registered with NVENC in place as
+//! pitch-linear memory or as a CUDA array), a pinned host→device upload of packed BGRA / RGBA that
+//! the hardware CSC converts, and a raw planar upload. Sessions reconfigure resolution and rate
+//! control in place, so a resize or bitrate change costs a few milliseconds instead of a full
+//! rebuild.
 
 // The NVENC and CUDA entry points are called through function pointers
 // resolved at runtime, so the safety contract is carried by the function
@@ -30,7 +32,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use libloading::{Library, Symbol};
-use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer};
+use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer, Fourcc};
 
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
@@ -59,6 +61,13 @@ const EGL_NONE: EGLint = 0x3038;
 /// Opaque CUDA graphics-resource handle for the EGL interop path — an `EGLImageKHR`
 /// registered with CUDA maps to one of these.
 type CUgraphicsResource = *mut c_void;
+
+/// `CUeglFrame::frame_type` values: the mapped planes are CUDA arrays, or pitch-linear device
+/// memory.
+const CU_EGL_FRAME_TYPE_ARRAY: u32 = 0;
+const CU_EGL_FRAME_TYPE_PITCH: u32 = 1;
+/// `CUeglFrame::cu_format` of an 8-bit-per-channel plane (`CU_AD_FORMAT_UNSIGNED_INT8`).
+const CU_AD_FORMAT_U8: u32 = 1;
 
 /// A CUDA frame mapped from an EGLImage: the `cuGraphicsResourceGetMappedEglFrame` result
 /// describing the imported dmabuf's plane pointers, geometry, pitch and pixel format.
@@ -111,14 +120,13 @@ struct CudaFunctions {
     cuInit: unsafe extern "C" fn(flags: u32) -> CUresult,
     cuDeviceGet: unsafe extern "C" fn(device: *mut CUdevice, ordinal: i32) -> CUresult,
     cuDeviceGetByPCIBusId: unsafe extern "C" fn(dev: *mut CUdevice, pciBusId: *const c_char) -> CUresult,
-    cuCtxCreate_v2: unsafe extern "C" fn(
+    cuDevicePrimaryCtxRetain: unsafe extern "C" fn(
         pctx: *mut CUcontext,
-        flags: u32,
         dev: CUdevice,
     ) -> CUresult,
     cuCtxPushCurrent_v2: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
     cuCtxPopCurrent_v2: unsafe extern "C" fn(pctx: *mut CUcontext) -> CUresult,
-    cuCtxDestroy_v2: unsafe extern "C" fn(ctx: CUcontext) -> CUresult,
+    cuDevicePrimaryCtxRelease_v2: unsafe extern "C" fn(dev: CUdevice) -> CUresult,
     cuMemAlloc_v2: unsafe extern "C" fn(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult,
     cuMemAllocPitch_v2: unsafe extern "C" fn(
         dptr: *mut CUdeviceptr,
@@ -139,6 +147,8 @@ struct CudaFunctions {
         ByteCount: usize,
     ) -> CUresult,
     cuMemcpy2D_v2: unsafe extern "C" fn(pCopy: *const CUDA_MEMCPY2D) -> CUresult,
+    cuMemcpy2DAsync_v2: unsafe extern "C" fn(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) -> CUresult,
+    cuStreamSynchronize: unsafe extern "C" fn(hStream: CUstream) -> CUresult,
     cuMemHostRegister_v2: unsafe extern "C" fn(p: *mut c_void, bytesize: usize, flags: u32) -> CUresult,
     cuMemHostUnregister: unsafe extern "C" fn(p: *mut c_void) -> CUresult,
     cuGraphicsEGLRegisterImage: unsafe extern "C" fn(
@@ -206,6 +216,7 @@ enum NvStruct {
     CreateBitstreamBuffer,
     PicParams,
     LockBitstream,
+    CapsParam,
 }
 
 impl NvStruct {
@@ -255,6 +266,7 @@ impl NvStruct {
                 0xC0 => (2, false),
                 _ => (1, false),
             },
+            NvStruct::CapsParam => (1, false),
         }
     }
 }
@@ -371,12 +383,189 @@ fn nvenc_negotiate(lib: &NvencLibrary) {
 }
 
 /// Cached CUDA import of a dmabuf, keyed by fd so a recurring capture buffer is imported
-/// once: the `EGLImageKHR`, the CUDA graphics resource it registers as, and the mapped `CUeglFrame`.
-/// Torn down on drop / reconfigure.
+/// once: the `EGLImageKHR`, the CUDA graphics resource it registers as, the mapped `CUeglFrame`,
+/// and how that frame reaches NVENC. Torn down on drop / reconfigure, or evicted when the fd it is
+/// keyed by no longer names the same buffer (see `DmaBufIdentity`).
 struct CachedDmaBuf {
+    identity: DmaBufIdentity,
     egl_image: EGLImageKHR,
     cuda_resource: CUgraphicsResource,
     egl_frame: CUeglFrame,
+    input: DmaBufInput,
+}
+
+/// How a cached dmabuf import feeds the encoder.
+///
+/// `Direct` is the zero-copy case: the mapped frame's first plane is itself registered and mapped
+/// as an NVENC input — as a pitch-linear device pointer or as a CUDA array, per `DirectPlane` — so
+/// encoding reads the capture buffer in place. `Copy` covers the rest: a plane `direct_plane`
+/// rules out, one the driver declined to register, or the direct path switched off; the plane is
+/// then copied into the session's packed input surface each frame.
+#[derive(Clone, Copy)]
+enum DmaBufInput {
+    Direct {
+        registered: NV_ENC_REGISTERED_PTR,
+        mapped: NV_ENC_INPUT_PTR,
+        format: NV_ENC_BUFFER_FORMAT,
+    },
+    Copy,
+}
+
+/// The NVENC packed input format whose byte order is a dmabuf's: the XR24 / AR24 family is
+/// B,G,R,A in memory (NVENC's word-ordered `ARGB`), the XB24 / AB24 family R,G,B,A (`ABGR`).
+/// `None` for any other fourcc — nothing NVENC reads as packed 8-bit RGB.
+fn fourcc_nvenc_format(code: Fourcc) -> Option<NV_ENC_BUFFER_FORMAT> {
+    match code {
+        Fourcc::Argb8888 | Fourcc::Xrgb8888 => Some(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB),
+        Fourcc::Abgr8888 | Fourcc::Xbgr8888 => Some(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR),
+        _ => None,
+    }
+}
+
+/// How the first plane of a mapped `CUeglFrame` registers with NVENC in place: the
+/// `NV_ENC_REGISTER_RESOURCE` resource type and the `pitch` word that type expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectPlane {
+    /// Pitch-linear device memory, registered as a CUDA device pointer at this row pitch.
+    Pitch(u32),
+    /// A two-dimensional CUDA array of four 8-bit channels, registered as a CUDA array; the
+    /// value is the array's row width in bytes (`Width × NumChannels`), which is what NVENC
+    /// takes as the pitch of an array resource.
+    Array(u32),
+}
+
+/// Whether NVENC can read a mapped `CUeglFrame` in place, and how.
+///
+/// Either frame kind has to be usable as the session's `width × height` input: a first plane
+/// present and non-null, and a geometry of at least the session's. A pitch-linear plane also needs
+/// a row pitch covering `width * 4` bytes at the 4-byte alignment `NV_ENC_REGISTER_RESOURCE`
+/// requires; a CUDA-array plane has to be four 8-bit channels, the layout NVENC's packed formats
+/// describe. `None` sends the frame down the per-frame copy into the session's own input surface.
+fn direct_plane(frame: &CUeglFrame, width: u32, height: u32) -> Option<DirectPlane> {
+    if frame.plane_count < 1 || width == 0 || height == 0 {
+        return None;
+    }
+    if frame.width < width || frame.height < height {
+        return None;
+    }
+    match frame.frame_type {
+        CU_EGL_FRAME_TYPE_PITCH => {
+            let plane = unsafe { frame.frame.p_pitch[0] };
+            let pitch_ok = frame.pitch >= width.saturating_mul(4) && frame.pitch % 4 == 0;
+            (!plane.is_null() && pitch_ok).then_some(DirectPlane::Pitch(frame.pitch))
+        }
+        CU_EGL_FRAME_TYPE_ARRAY => {
+            let array = unsafe { frame.frame.p_array[0] };
+            let packed_8bit = frame.cu_format == CU_AD_FORMAT_U8 && frame.num_channels == 4;
+            (!array.is_null() && packed_8bit).then_some(DirectPlane::Array(frame.width * 4))
+        }
+        _ => None,
+    }
+}
+
+/// The stable identity of a dmabuf, so a cache keyed by the raw fd number cannot hand back a
+/// stale EGLImage after that fd was closed and recycled onto a different buffer.
+///
+/// The fd integer alone is not an identity: the host's slot renegotiation frees the backing buffer
+/// objects and the kernel reissues the same small fd numbers for the new ones. Since Linux 5.3 each
+/// dma-buf carries its own inode, so `(st_dev, st_ino)` distinguishes two buffers that reuse one fd
+/// number, and `size` reports the true allocation; the DRM format modifier and the geometry round
+/// out the identity for older kernels where the inode is shared. A cache hit requires every field to
+/// match, so a recycled fd whose buffer differs in any of them is re-imported instead of reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DmaBufIdentity {
+    dev: u64,
+    ino: u64,
+    size: i64,
+    modifier: u64,
+    width: u32,
+    height: u32,
+}
+
+impl DmaBufIdentity {
+    /// Read the identity of the buffer behind `fd`: `fstat` supplies the inode and allocation
+    /// size, and the caller supplies the modifier and geometry from the dmabuf descriptor. A failed
+    /// `fstat` leaves the inode/size zero, which still combines with the modifier and geometry.
+    fn probe(fd: i32, modifier: u64, width: u32, height: u32) -> Self {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let (dev, ino, size) = if unsafe { libc::fstat(fd, &mut st) } == 0 {
+            (st.st_dev as u64, st.st_ino as u64, st.st_size as i64)
+        } else {
+            (0, 0, 0)
+        };
+        Self { dev, ino, size, modifier, width, height }
+    }
+}
+
+/// The chroma format and dimensional feasibility a session settles on given the driver's
+/// reported capabilities, so init degrades cleanly instead of failing opaquely.
+///
+/// - `fullcolor` is the chroma actually used: 4:4:4 only when it was requested and the GPU carries
+///   it, otherwise 4:2:0.
+/// - `downgraded_color` records that a 4:4:4 request was met with 4:2:0, so the caller says so once.
+/// - `too_large` carries the driver's `(max_w, max_h)` when the requested geometry exceeds it; the
+///   caller then declines NVENC and falls back to software rather than failing to initialize.
+///
+/// A capability that could not be queried is `None` and does not gate: 4:4:4 stays as requested and
+/// the dimension test is skipped, so an unavailable answer never forces a false downgrade or refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapsDecision {
+    fullcolor: bool,
+    downgraded_color: bool,
+    too_large: Option<(i32, i32)>,
+}
+
+/// Resolve the requested chroma and geometry against the driver caps (`None` = unknown, ungated).
+fn decide_caps(
+    req_fullcolor: bool,
+    req_w: i32,
+    req_h: i32,
+    cap_yuv444: Option<i32>,
+    cap_width_max: Option<i32>,
+    cap_height_max: Option<i32>,
+) -> CapsDecision {
+    let downgraded_color = req_fullcolor && cap_yuv444 == Some(0);
+    let fullcolor = req_fullcolor && !downgraded_color;
+    let exceeds = |req: i32, cap: Option<i32>| cap.is_some_and(|m| m > 0 && req > m);
+    let too_large = if exceeds(req_w, cap_width_max) || exceeds(req_h, cap_height_max) {
+        Some((cap_width_max.unwrap_or(0), cap_height_max.unwrap_or(0)))
+    } else {
+        None
+    };
+    CapsDecision { fullcolor, downgraded_color, too_large }
+}
+
+/// The in-place resize headroom for one axis: the requested size lifted to `floor` (the 5.2
+/// ceiling the level is pinned at) but never past the driver's reported maximum, so initializing
+/// with headroom cannot itself exceed what the GPU supports.
+fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
+    let want = size.max(floor);
+    match cap {
+        Some(m) if m > 0 => want.min(m as u32),
+        _ => want,
+    }
+}
+
+/// Query one NVENC H.264 capability on an open session, returning the driver's integer answer or
+/// `None` when the entry point is absent or the query fails — `decide_caps` reads `None` as "do not
+/// gate", so a query failure never becomes a false refusal.
+unsafe fn query_cap(
+    funcs: &NV_ENCODE_API_FUNCTION_LIST,
+    session: *mut c_void,
+    cap: NV_ENC_CAPS,
+) -> Option<i32> {
+    let get = funcs.nvEncGetEncodeCaps?;
+    let mut param = NV_ENC_CAPS_PARAM {
+        version: sv(NvStruct::CapsParam),
+        capsToQuery: cap,
+        reserved: [0u32; 62],
+    };
+    let mut val: i32 = 0;
+    if get(session, NV_ENC_CODEC_H264_GUID, &mut param, &mut val) == NVENCSTATUS::NV_ENC_SUCCESS {
+        Some(val)
+    } else {
+        None
+    }
 }
 
 /// GUID selecting the H.264 **High** profile (4:2:0) for `NV_ENC_CONFIG::profileGUID`.
@@ -400,12 +589,17 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
 /// One instance owns a CUDA context bound to a specific GPU plus an NVENC session and everything
 /// the three input paths need:
 ///
-/// - **ARGB path**: a pitched device buffer (`input_device_ptr` / `input_pitch`) registered and
-///   mapped as the NVENC input (`registered_input_resource` / `mapped_input_buffer`), fed either by
-///   a dmabuf copy or a host→device ARGB upload.
+/// - **Packed path**: a pitched device buffer (`input_device_ptr` / `input_pitch`) registered and
+///   mapped as the NVENC input (`registered_input_resource` / `mapped_input_buffer`) in the byte
+///   order `input_format` names (re-registered in place when a source of the other order arrives),
+///   fed either by a host→device upload or by the copy arm of the dmabuf path.
 /// - **Raw planar path**: a lazily-allocated NV12 / YUV444 device buffer (the `nv12_*` fields),
 ///   created on first `encode_raw`.
-/// - **Zero-copy dmabuf path**: `dmabuf_cache` memoizes each fd's EGLImage → CUDA import.
+/// - **Zero-copy dmabuf path**: `dmabuf_cache` memoizes each fd's EGLImage → CUDA import, keyed by
+///   fd but validated against the buffer's `DmaBufIdentity` so a recycled fd re-imports; an import
+///   whose plane NVENC can take as it is — pitch-linear memory or a packed 8-bit CUDA array — is
+///   registered in place (`DmaBufInput::Direct`) unless `direct_dmabuf` was switched off, anything
+///   else is copied into the packed input each frame.
 ///
 /// `bitstream_buffers` is a small ring (`current_buffer_idx` cycles it) of output buffers.
 /// `pinned_hosts` maps each page-locked host upload source's base pointer to its registered length,
@@ -418,6 +612,7 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
 pub struct NvencEncoder {
     encoder_session: *mut c_void,
     cuda_context: CUcontext,
+    cuda_device: CUdevice,
     egl_display: EGLDisplay,
     width: u32,
     height: u32,
@@ -426,6 +621,7 @@ pub struct NvencEncoder {
     init_params: NV_ENC_INITIALIZE_PARAMS,
     input_device_ptr: CUdeviceptr,
     input_pitch: usize,
+    input_format: NV_ENC_BUFFER_FORMAT,
     registered_input_resource: NV_ENC_REGISTERED_PTR,
     mapped_input_buffer: NV_ENC_INPUT_PTR,
     nv12_device_ptr: Option<CUdeviceptr>,
@@ -442,6 +638,12 @@ pub struct NvencEncoder {
     nvenc_funcs: NV_ENCODE_API_FUNCTION_LIST,
     omit_stripe_headers: bool,
     node_index: i32,
+    /// Resolved once at init from `PIXELFLUX_NVENC_PIN`: page-lock the host upload sources so the
+    /// copy is a direct pinned DMA rather than a pageable copy staged through a bounce buffer.
+    pin_uploads: bool,
+    /// Resolved once at init from `PIXELFLUX_NVENC_DIRECT`: register pitch-linear dmabuf imports
+    /// with NVENC in place instead of copying them into the packed input each frame.
+    direct_dmabuf: bool,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -454,12 +656,14 @@ unsafe impl Send for NvencEncoder {}
 /// `cuGraphicsUnregisterResource` / `cuMemHostUnregister` calls each act on the *current* context —
 /// pop it first and the frees silently do nothing, leaking device memory. Within that, resources
 /// go inner-handle before the outer handle that owns it, since freeing an owner first orphans or
-/// faults on what still points into it: unmap the ARGB and raw-plane inputs before unregistering
-/// them, free their device buffers, destroy the bitstream buffers, and unregister-and-destroy every
-/// cached dmabuf import — all session-owned — before the encoder session itself, and destroy that
-/// session before the CUDA context it was opened against. The page-locked host sources are unpinned
-/// in the same pass, each only when its recorded length is non-zero (a `0` marks a registration that
-/// failed and so was never pinned).
+/// faults on what still points into it: unmap the packed and raw-plane inputs before unregistering
+/// them, free their device buffers, destroy the bitstream buffers, and release every cached dmabuf
+/// import (`release_dmabuf_import`: its NVENC mapping and registration, then the CUDA resource and
+/// the EGLImage) — all session-owned — before the encoder session itself, and destroy that
+/// session before releasing the device's primary CUDA context it was opened against (the retain is
+/// refcounted, so the context lives until the last session on that device releases it). The
+/// page-locked host sources are unpinned in the same pass, each only when its recorded length is
+/// non-zero (a `0` marks a registration that failed and so was never pinned).
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
         unsafe {
@@ -504,9 +708,9 @@ impl Drop for NvencEncoder {
                 );
             }
 
-            for (_, cache) in self.dmabuf_cache.drain() {
-                (self.cuda.cuGraphicsUnregisterResource)(cache.cuda_resource);
-                (self.egl.eglDestroyImageKHR)(self.egl_display, cache.egl_image);
+            let imports: Vec<CachedDmaBuf> = self.dmabuf_cache.drain().map(|(_, c)| c).collect();
+            for cache in imports {
+                self.release_dmabuf_import(cache);
             }
 
             for (base, len) in &self.pinned_hosts {
@@ -520,7 +724,7 @@ impl Drop for NvencEncoder {
             }
 
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-            (self.cuda.cuCtxDestroy_v2)(self.cuda_context);
+            (self.cuda.cuDevicePrimaryCtxRelease_v2)(self.cuda_device);
         }
     }
 }
@@ -612,16 +816,18 @@ impl NvencEncoder {
                 cuInit: load!(lib, b"cuInit\0"),
                 cuDeviceGet: load!(lib, b"cuDeviceGet\0"),
                 cuDeviceGetByPCIBusId: load!(lib, b"cuDeviceGetByPCIBusId\0"),
-                cuCtxCreate_v2: load!(lib, b"cuCtxCreate_v2\0"),
+                cuDevicePrimaryCtxRetain: load!(lib, b"cuDevicePrimaryCtxRetain\0"),
                 cuCtxPushCurrent_v2: load!(lib, b"cuCtxPushCurrent_v2\0"),
                 cuCtxPopCurrent_v2: load!(lib, b"cuCtxPopCurrent_v2\0"),
-                cuCtxDestroy_v2: load!(lib, b"cuCtxDestroy_v2\0"),
+                cuDevicePrimaryCtxRelease_v2: load!(lib, b"cuDevicePrimaryCtxRelease_v2\0"),
                 cuMemAlloc_v2: load!(lib, b"cuMemAlloc_v2\0"),
                 cuMemAllocPitch_v2: load!(lib, b"cuMemAllocPitch_v2\0"),
                 cuMemFree_v2: load!(lib, b"cuMemFree_v2\0"),
                 cuMemcpyHtoD_v2: load!(lib, b"cuMemcpyHtoD_v2\0"),
                 cuMemcpyDtoH_v2: load!(lib, b"cuMemcpyDtoH_v2\0"),
                 cuMemcpy2D_v2: load!(lib, b"cuMemcpy2D_v2\0"),
+                cuMemcpy2DAsync_v2: load!(lib, b"cuMemcpy2DAsync_v2\0"),
+                cuStreamSynchronize: load!(lib, b"cuStreamSynchronize\0"),
                 cuMemHostRegister_v2: load!(lib, b"cuMemHostRegister_v2\0"),
                 cuMemHostUnregister: load!(lib, b"cuMemHostUnregister\0"),
                 cuGraphicsEGLRegisterImage: load!(lib, b"cuGraphicsEGLRegisterImage\0"),
@@ -722,13 +928,16 @@ impl NvencEncoder {
     ///    the resolved function pointers stay valid for the program's life.
     /// 2. **Bind the device**: `cuInit`, then bind by the render node's PCI bus ID
     ///    (`encode_node_index`, with auto `<0` meaning device 0), falling back to CUDA device 0, and
-    ///    create the CUDA context.
+    ///    retain the device's primary CUDA context — shared and refcounted across every session on
+    ///    that device rather than a fresh 100-300 MiB context each — pushing it current.
     /// 3. **Allocate input**: a pitched ARGB device buffer (`cuMemAllocPitch`, 16-byte element
     ///    alignment) that hardware CSC turns into YUV.
-    /// 4. **Open the session**: create the function-list instance, open the session with the
-    ///    negotiated `apiVersion`, and pull a preset config (P4, ultra-low-latency). A failed preset
-    ///    lookup logs the driver's error string and proceeds with the zeroed default rather than
-    ///    aborting.
+    /// 4. **Open the session and query caps**: create the function-list instance, open the session
+    ///    with the negotiated `apiVersion`, and query `nvEncGetEncodeCaps` so init degrades rather
+    ///    than fails — a 4:4:4 request on a GPU without it drops to 4:2:0, and a capture beyond the
+    ///    encoder's max dimensions returns `Err` so the caller falls back to software. Then pull a
+    ///    preset config (P4, ultra-low-latency); a failed preset lookup logs the driver's error
+    ///    string and proceeds with the zeroed default rather than aborting.
     /// 5. **Configure the stream** (mutating the returned preset config, whose `version` word is
     ///    re-stamped while its embedded `rcParams` keeps the version the preset fill set): High or
     ///    High-4:4:4 profile; CBR (two-pass quarter-resolution for tighter per-frame rate adherence,
@@ -740,10 +949,11 @@ impl NvencEncoder {
     ///    hardware ARGB CSC; chroma 4:2:0 or 4:4:4; repeated SPS/PPS; CABAC; no AUD; strict GOP
     ///    target; and lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to at
-    ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place; this costs
-    ///    ~290 MiB of device memory, so a failed init retries at the exact size (in-place resize then
-    ///    falls back to a rebuild).
-    /// 7. **Register, map, and buffer**: register and map the ARGB input surface, and create a
+    ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place, but never
+    ///    past the driver's reported maximum; this costs ~290 MiB of device memory, so a failed init
+    ///    retries at the exact size (in-place resize then falls back to a rebuild).
+    /// 7. **Register, map, and buffer**: register and map the packed input surface (as `ARGB`;
+    ///    `set_input_format` re-registers it for an RGBA source), and create a
     ///    4-deep ring of bitstream output buffers.
     ///
     /// Every failure after the CUDA allocation unwinds the resources created so far — buffers,
@@ -801,10 +1011,19 @@ impl NvencEncoder {
                 }
             }
 
+            // One primary context per device, shared and refcounted across every session on that
+            // device, rather than a fresh 100-300 MiB context each: a second display or a rebuild
+            // retains the same context instead of allocating another. Retain does not make it
+            // current, so it is pushed here to run the allocations below and left current for the
+            // encode paths — matching the current-context state the removed cuCtxCreate produced.
             let mut cu_context: CUcontext = ptr::null_mut();
-            let res = (cuda.cuCtxCreate_v2)(&mut cu_context, 0, cu_device);
+            let res = (cuda.cuDevicePrimaryCtxRetain)(&mut cu_context, cu_device);
             if res != CUresult::CUDA_SUCCESS {
-                return Err("Failed to create CUDA Context".into());
+                return Err("Failed to retain the device's primary CUDA context".into());
+            }
+            if (cuda.cuCtxPushCurrent_v2)(cu_context) != CUresult::CUDA_SUCCESS {
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err("Failed to make the primary CUDA context current".into());
             }
 
             let width = settings.width as u32;
@@ -820,7 +1039,8 @@ impl NvencEncoder {
                 16,
             );
             if res != CUresult::CUDA_SUCCESS {
-                (cuda.cuCtxDestroy_v2)(cu_context);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("Failed to allocate ARGB input buffer on GPU".into());
             }
 
@@ -830,7 +1050,8 @@ impl NvencEncoder {
             };
             if (nvenc_lib.create_instance)(&mut function_list) != NVENCSTATUS::NV_ENC_SUCCESS {
                 (cuda.cuMemFree_v2)(input_device_ptr);
-                (cuda.cuCtxDestroy_v2)(cu_context);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("NvEncodeAPICreateInstance failed".into());
             }
 
@@ -846,11 +1067,45 @@ impl NvencEncoder {
             let open_fn = function_list.nvEncOpenEncodeSessionEx.unwrap();
             if open_fn(&mut session_params, &mut encoder_session) != NVENCSTATUS::NV_ENC_SUCCESS {
                 (cuda.cuMemFree_v2)(input_device_ptr);
-                (cuda.cuCtxDestroy_v2)(cu_context);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("Failed to open NVENC session".into());
             }
 
-            let is_444 = settings.video_fullcolor;
+            // Query caps so init degrades instead of failing opaquely: a 4:4:4 request on a GPU
+            // without it drops to 4:2:0, and a capture beyond the encoder's max dimensions declines
+            // NVENC so the caller falls back to software.
+            let caps_444 = query_cap(
+                &function_list,
+                encoder_session,
+                NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+            );
+            let caps_wmax =
+                query_cap(&function_list, encoder_session, NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
+            let caps_hmax =
+                query_cap(&function_list, encoder_session, NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
+            let caps = decide_caps(
+                settings.video_fullcolor,
+                width as i32,
+                height as i32,
+                caps_444,
+                caps_wmax,
+                caps_hmax,
+            );
+            if let Some((mw, mh)) = caps.too_large {
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                (cuda.cuMemFree_v2)(input_device_ptr);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err(format!(
+                    "NVENC maximum encode size {mw}x{mh} exceeded by {width}x{height}; using software"
+                ));
+            }
+            if caps.downgraded_color {
+                eprintln!("[NVENC] GPU does not support 4:4:4 (YUV444) encoding; encoding 4:2:0.");
+            }
+
+            let is_444 = caps.fullcolor;
             let profile_guid = if is_444 {
                 NV_ENC_H264_PROFILE_HIGH_444_GUID
             } else {
@@ -947,10 +1202,10 @@ impl NvencEncoder {
             config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix =
                 NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
             config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
-            // That same hardware CSC emits limited range in every chroma format. The
-            // host-planar path could encode full range, but a capture moves between the
-            // two at runtime when zero-copy demotes to readback, and the declared range
-            // has to hold across that, so every NVENC session declares limited.
+            // That same hardware CSC emits limited range in every chroma format, and both
+            // capture paths — dmabuf and host packed — go through it. Only the raw planar
+            // entry point could carry full range, and the VUI is per session, so every
+            // NVENC session declares limited.
             config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = 0;
             config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
             config.encodeCodecConfig.h264Config.entropyCodingMode =
@@ -973,8 +1228,8 @@ impl NvencEncoder {
                 frameRateDen: 1,
                 enablePTD: 1,
                 encodeConfig: &mut config,
-                maxEncodeWidth: width.max(4096),
-                maxEncodeHeight: height.max(2304),
+                maxEncodeWidth: nvenc_headroom(width, 4096, caps_wmax),
+                maxEncodeHeight: nvenc_headroom(height, 2304, caps_hmax),
                 ..Default::default()
             };
 
@@ -985,7 +1240,8 @@ impl NvencEncoder {
                 if init_fn(encoder_session, &mut init_params) != NVENCSTATUS::NV_ENC_SUCCESS {
                     (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
                     (cuda.cuMemFree_v2)(input_device_ptr);
-                    (cuda.cuCtxDestroy_v2)(cu_context);
+                    (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                     return Err("Failed to initialize encoder".into());
                 }
                 eprintln!("[NVENC] Init with resize headroom failed; running without it.");
@@ -1009,7 +1265,8 @@ impl NvencEncoder {
             if register_fn(encoder_session, &mut reg_res) != NVENCSTATUS::NV_ENC_SUCCESS {
                 (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
                 (cuda.cuMemFree_v2)(input_device_ptr);
-                (cuda.cuCtxDestroy_v2)(cu_context);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("Failed to register input buffer".into());
             }
 
@@ -1026,7 +1283,8 @@ impl NvencEncoder {
                 );
                 (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
                 (cuda.cuMemFree_v2)(input_device_ptr);
-                (cuda.cuCtxDestroy_v2)(cu_context);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("Failed to map input buffer".into());
             }
 
@@ -1053,7 +1311,8 @@ impl NvencEncoder {
                     );
                     (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
                     (cuda.cuMemFree_v2)(input_device_ptr);
-                    (cuda.cuCtxDestroy_v2)(cu_context);
+                    (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                     return Err("Failed to create bitstream buffer".into());
                 }
                 bitstream_buffers.push(bitstream_params.bitstreamBuffer);
@@ -1064,6 +1323,7 @@ impl NvencEncoder {
             Ok(Self {
                 encoder_session,
                 cuda_context: cu_context,
+                cuda_device: cu_device,
                 egl_display: egl_display as EGLDisplay,
                 width,
                 height,
@@ -1072,6 +1332,7 @@ impl NvencEncoder {
                 init_params,
                 input_device_ptr,
                 input_pitch,
+                input_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
                 registered_input_resource: reg_res.registeredResource,
                 mapped_input_buffer: map_params.mappedResource,
                 nv12_device_ptr: None,
@@ -1088,6 +1349,8 @@ impl NvencEncoder {
                 nvenc_funcs: function_list,
                 omit_stripe_headers: settings.omit_stripe_headers,
                 node_index: settings.encode_node_index.max(0),
+                pin_uploads: std::env::var("PIXELFLUX_NVENC_PIN").as_deref() != Ok("0"),
+                direct_dmabuf: std::env::var("PIXELFLUX_NVENC_DIRECT").as_deref() != Ok("0"),
             })
         }
     }
@@ -1103,7 +1366,8 @@ impl NvencEncoder {
     ///    `Err` so the caller rebuilds. Chroma and RC mode are read back from the live
     ///    `encode_config` (the H.264 arm of the codec-config union is the one this encoder fills).
     /// 2. **Release geometry-dependent state** under the pushed CUDA context: unmap / unregister /
-    ///    free the ARGB surface, the raw-plane buffer, every cached dmabuf import, and every pinned
+    ///    free the packed input surface, the raw-plane buffer, every cached dmabuf import (with
+    ///    the NVENC registration a direct import holds), and every pinned
     ///    host. The raw-plane buffer and dmabuf imports are re-created lazily by their encode paths;
     ///    pinned hosts are dropped because the source shm segments are recreated on resize and may
     ///    reuse the same base addresses.
@@ -1111,7 +1375,8 @@ impl NvencEncoder {
     ///    the ConstQP, and the new dimensions / DAR / frame rate, then `NvEncReconfigureEncoder` with
     ///    `resetEncoder` and `forceIDR` so the stream restarts cleanly at the new size. Driver
     ///    rejection returns `Err`.
-    /// 4. **Reallocate the ARGB input** at the new size and register + map it exactly as init does.
+    /// 4. **Reallocate the packed input** at the new size and register + map it as init does, in
+    ///    the byte order the session was last fed.
     ///
     /// On success the next encoded frame is a reset-RC IDR.
     pub fn reconfigure_resolution(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
@@ -1174,9 +1439,9 @@ impl NvencEncoder {
                 (self.cuda.cuMemFree_v2)(ptr);
             }
             self.nv12_pitch = 0;
-            for (_, cache) in self.dmabuf_cache.drain() {
-                (self.cuda.cuGraphicsUnregisterResource)(cache.cuda_resource);
-                (self.egl.eglDestroyImageKHR)(self.egl_display, cache.egl_image);
+            let imports: Vec<CachedDmaBuf> = self.dmabuf_cache.drain().map(|(_, c)| c).collect();
+            for cache in imports {
+                self.release_dmabuf_import(cache);
             }
             for (base, len) in self.pinned_hosts.drain() {
                 if len > 0 {
@@ -1247,7 +1512,7 @@ impl NvencEncoder {
                 height: new_h,
                 resourceToRegister: input_device_ptr as *mut c_void,
                 pitch: input_pitch as u32,
-                bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+                bufferFormat: self.input_format,
                 bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
                 ..Default::default()
             };
@@ -1282,6 +1547,17 @@ impl NvencEncoder {
         Ok(())
     }
 
+    /// Page-lock one host upload source's base address once, under the already-current CUDA
+    /// context, so the copy is a direct pinned DMA instead of a pageable copy staged through a driver
+    /// bounce buffer. A `0`-length entry records a failed registration so the address is never
+    /// re-probed; the persistent, bounded shm / reused planar sources make this a one-time cost.
+    unsafe fn pin_host_source(&mut self, base: usize, len: usize) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.pinned_hosts.entry(base) {
+            let st = (self.cuda.cuMemHostRegister_v2)(base as *mut c_void, len, 0);
+            e.insert(if st == CUresult::CUDA_SUCCESS { len } else { 0 });
+        }
+    }
+
     /// Drop every page-locked host registration, under the pushed CUDA context.
     ///
     /// Called when the capture's shm segments are recreated at unchanged dimensions: the new
@@ -1301,6 +1577,79 @@ impl NvencEncoder {
             }
             let _ = (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
+    }
+
+    /// Tear down one cached dmabuf import under the already-current CUDA context, inner handle
+    /// first: the NVENC mapping and registration a direct import holds, then the CUDA graphics
+    /// resource, then the EGLImage it was built from. The encode that last read the import has
+    /// completed (`submit_frame` waits for the bitstream), so nothing is still in flight on it.
+    unsafe fn release_dmabuf_import(&self, cache: CachedDmaBuf) {
+        if let DmaBufInput::Direct { registered, mapped, .. } = cache.input {
+            (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(self.encoder_session, mapped);
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(self.encoder_session, registered);
+        }
+        (self.cuda.cuGraphicsUnregisterResource)(cache.cuda_resource);
+        (self.egl.eglDestroyImageKHR)(self.egl_display, cache.egl_image);
+    }
+
+    /// Register the packed input surface with NVENC in the byte order `format` names, when it is
+    /// not already: the surface memory is unchanged, only its registration (and mapping) is
+    /// replaced, so a session fed first from one source order and then the other keeps one surface.
+    /// Runs under the already-current CUDA context; a failed re-registration leaves the surface
+    /// unregistered and returns `Err`, so the caller's encode fails visibly instead of encoding
+    /// swapped channels.
+    unsafe fn set_input_format(&mut self, format: NV_ENC_BUFFER_FORMAT) -> Result<(), String> {
+        if self.input_format == format && !self.registered_input_resource.is_null() {
+            return Ok(());
+        }
+        if !self.mapped_input_buffer.is_null() {
+            (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
+                self.encoder_session,
+                self.mapped_input_buffer,
+            );
+            self.mapped_input_buffer = ptr::null_mut();
+        }
+        if !self.registered_input_resource.is_null() {
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
+                self.encoder_session,
+                self.registered_input_resource,
+            );
+            self.registered_input_resource = ptr::null_mut();
+        }
+        let mut reg_res = NV_ENC_REGISTER_RESOURCE {
+            version: sv(NvStruct::RegisterResource),
+            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            width: self.width,
+            height: self.height,
+            resourceToRegister: self.input_device_ptr as *mut c_void,
+            pitch: self.input_pitch as u32,
+            bufferFormat: format,
+            bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+            ..Default::default()
+        };
+        if (self.nvenc_funcs.nvEncRegisterResource.unwrap())(self.encoder_session, &mut reg_res)
+            != NVENCSTATUS::NV_ENC_SUCCESS
+        {
+            return Err(format!("Failed to register input buffer as {format:?}"));
+        }
+        let mut map_params = NV_ENC_MAP_INPUT_RESOURCE {
+            version: sv(NvStruct::MapInputResource),
+            registeredResource: reg_res.registeredResource,
+            ..Default::default()
+        };
+        if (self.nvenc_funcs.nvEncMapInputResource.unwrap())(self.encoder_session, &mut map_params)
+            != NVENCSTATUS::NV_ENC_SUCCESS
+        {
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
+                self.encoder_session,
+                reg_res.registeredResource,
+            );
+            return Err(format!("Failed to map input buffer as {format:?}"));
+        }
+        self.registered_input_resource = reg_res.registeredResource;
+        self.mapped_input_buffer = map_params.mappedResource;
+        self.input_format = format;
+        Ok(())
     }
 
     /// Reconfigure the live session's ConstQP when `target_qp` differs from the current QP,
@@ -1485,18 +1834,28 @@ impl NvencEncoder {
         Ok(output)
     }
 
-    /// Encode a dmabuf frame zero-copy, by importing it through EGL into CUDA.
+    /// Encode a dmabuf frame zero-copy, by importing it through EGL into CUDA and, where the
+    /// driver allows, handing the mapped plane to NVENC as its input.
     ///
     /// Applies any pending ConstQP change, then works under the pushed CUDA context:
     ///
-    /// 1. **Import once, cache by fd**: on a cache miss, build an `EGLImageKHR` from the dmabuf's
-    ///    fd / offset / pitch / modifier, register it as a CUDA graphics resource, and map it to a
-    ///    `CUeglFrame`; the result is memoized in `dmabuf_cache` so a recurring capture buffer pays
-    ///    the import cost only once. Each failure destroys what it created and pops the context.
-    /// 2. **Copy into the ARGB input**: a `cuMemcpy2D` from the mapped frame — the array plane or the
-    ///    pitch-linear plane, per `frame_type` — into the registered ARGB surface, sanitizing pitch
-    ///    and format for NVENC.
-    /// 3. **Submit** the ARGB input via `submit_frame`, then pop the context.
+    /// 1. **Import once, cache by fd with an identity check**: the cache is keyed by the dmabuf fd
+    ///    but each entry stores the buffer's `DmaBufIdentity`; an entry whose identity no longer
+    ///    matches (a recycled fd) is released first. On a miss, build an `EGLImageKHR` from the
+    ///    dmabuf's fd / offset / pitch / modifier, register it as a CUDA graphics resource, map it to
+    ///    a `CUeglFrame`, and settle how it feeds the encoder: a first plane that `direct_plane`
+    ///    accepts (and `direct_dmabuf` on) is registered with NVENC in place — a pitch-linear plane
+    ///    as a CUDA device pointer at its own pitch, a four-channel 8-bit CUDA array as a CUDA
+    ///    array — in the byte order the dmabuf fourcc names, and mapped once (`DmaBufInput::Direct`);
+    ///    any other plane, or a registration the driver refuses, takes `DmaBufInput::Copy`. The
+    ///    result is memoized so a recurring capture buffer pays the import cost only once. Each
+    ///    failure destroys what it created and pops the context.
+    /// 2. **Feed the encoder**: a direct import is submitted as it is — no copy at all. A copy
+    ///    import is copied with `cuMemcpy2DAsync` on the default stream — the array plane or the
+    ///    pitch-linear plane, per `frame_type` — into the packed input surface, re-registered in the
+    ///    dmabuf's byte order when it differs; NVENC processes its input on that same stream, so the
+    ///    copy is ordered before the encode without a host wait.
+    /// 3. **Submit** via `submit_frame`, then pop the context.
     ///
     /// The dmabuf fd is read out before the context is pushed so an early `?` return cannot leave the
     /// CUDA context stack imbalanced.
@@ -1510,13 +1869,23 @@ impl NvencEncoder {
         unsafe {
             self.reconfigure_if_needed(target_qp);
             let fd = dmabuf.handles().next().ok_or("No handles")?.as_raw_fd();
+            let fmt = dmabuf.format();
+            let modifier: u64 = fmt.modifier.into();
+            let identity = DmaBufIdentity::probe(fd, modifier, self.width, self.height);
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+
+            // A raw fd number is not an identity: the host recycles fd numbers across slot
+            // renegotiations, so an entry whose stored identity no longer matches is torn down and
+            // re-imported rather than returning a stale EGLImage for a buffer the fd no longer names.
+            if self.dmabuf_cache.get(&fd).is_some_and(|c| c.identity != identity)
+                && let Some(stale) = self.dmabuf_cache.remove(&fd)
+            {
+                self.release_dmabuf_import(stale);
+            }
 
             if !self.dmabuf_cache.contains_key(&fd) {
                 let stride = dmabuf.strides().next().unwrap_or(0) as i32;
                 let offset = dmabuf.offsets().next().unwrap_or(0) as i32;
-                let fmt = dmabuf.format();
-                let modifier: u64 = fmt.modifier.into();
 
                 let attribs = [
                     EGL_WIDTH,
@@ -1573,80 +1942,206 @@ impl NvencEncoder {
                     return Err("Failed to map EGL frame".into());
                 }
 
+                let input = match (
+                    self.direct_dmabuf,
+                    direct_plane(&egl_frame, self.width, self.height),
+                    fourcc_nvenc_format(fmt.code),
+                ) {
+                    (true, Some(plane), Some(format)) => {
+                        self.register_direct_input(&egl_frame, plane, format)
+                    }
+                    _ => DmaBufInput::Copy,
+                };
+                println!(
+                    "[NVENC] dmabuf imported as a {} frame ({} planes, {}x{}, pitch {}, {} channels of element format {}): {}.",
+                    match egl_frame.frame_type {
+                        CU_EGL_FRAME_TYPE_PITCH => "pitch-linear",
+                        CU_EGL_FRAME_TYPE_ARRAY => "CUDA-array",
+                        _ => "unknown-kind",
+                    },
+                    egl_frame.plane_count,
+                    egl_frame.width,
+                    egl_frame.height,
+                    egl_frame.pitch,
+                    egl_frame.num_channels,
+                    egl_frame.cu_format,
+                    match input {
+                        DmaBufInput::Direct { .. } => "encoding in place",
+                        DmaBufInput::Copy => "copying per frame",
+                    }
+                );
+
                 self.dmabuf_cache.insert(
                     fd,
                     CachedDmaBuf {
+                        identity,
                         egl_image,
                         cuda_resource,
                         egl_frame,
+                        input,
                     },
                 );
             }
 
-            let cached = self.dmabuf_cache.get(&fd).unwrap();
-            let mut copy_params = CUDA_MEMCPY2D {
-                srcMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                srcHost: ptr::null(),
-                srcDevice: 0,
-                srcArray: ptr::null_mut(),
-                srcPitch: 0,
-                dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                dstHost: ptr::null_mut(),
-                dstDevice: self.input_device_ptr,
-                dstArray: ptr::null_mut(),
-                dstPitch: self.input_pitch,
-                WidthInBytes: (self.width * 4) as usize,
-                Height: self.height as usize,
-                ..Default::default()
+            let (egl_frame, input) = {
+                let cached = self.dmabuf_cache.get(&fd).unwrap();
+                (cached.egl_frame, cached.input)
+            };
+            let (mapped, format) = match input {
+                DmaBufInput::Direct { mapped, format, .. } => (mapped, format),
+                DmaBufInput::Copy => {
+                    let mut copy_params = CUDA_MEMCPY2D {
+                        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                        srcHost: ptr::null(),
+                        srcDevice: 0,
+                        srcArray: ptr::null_mut(),
+                        srcPitch: 0,
+                        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                        dstHost: ptr::null_mut(),
+                        dstDevice: self.input_device_ptr,
+                        dstArray: ptr::null_mut(),
+                        dstPitch: self.input_pitch,
+                        WidthInBytes: (self.width * 4) as usize,
+                        Height: self.height as usize,
+                        ..Default::default()
+                    };
+                    if egl_frame.frame_type == CU_EGL_FRAME_TYPE_ARRAY {
+                        copy_params.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_ARRAY;
+                        copy_params.srcArray = egl_frame.frame.p_array[0];
+                    } else {
+                        copy_params.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_DEVICE;
+                        copy_params.srcDevice = egl_frame.frame.p_pitch[0] as CUdeviceptr;
+                        copy_params.srcPitch = egl_frame.pitch as usize;
+                    }
+                    // A fourcc without a packed NVENC equivalent keeps the surface's current
+                    // registration; the copy still lands the bytes, as it always has.
+                    if let Some(format) = fourcc_nvenc_format(fmt.code)
+                        && let Err(e) = self.set_input_format(format)
+                    {
+                        (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                        return Err(e);
+                    }
+                    if (self.cuda.cuMemcpy2DAsync_v2)(&copy_params, ptr::null_mut())
+                        != CUresult::CUDA_SUCCESS
+                    {
+                        (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                        return Err("Sanitization copy failed".into());
+                    }
+                    (self.mapped_input_buffer, self.input_format)
+                }
             };
 
-            if cached.egl_frame.frame_type == 0 {
-                copy_params.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_ARRAY;
-                copy_params.srcArray = cached.egl_frame.frame.p_array[0];
-            } else {
-                copy_params.srcMemoryType = CUmemorytype::CU_MEMORYTYPE_DEVICE;
-                copy_params.srcDevice = cached.egl_frame.frame.p_pitch[0] as CUdeviceptr;
-                copy_params.srcPitch = cached.egl_frame.pitch as usize;
+            let result = self.submit_frame(mapped, format, frame_number, force_idr);
+            if result.is_err() {
+                (self.cuda.cuStreamSynchronize)(ptr::null_mut());
             }
-
-            if (self.cuda.cuMemcpy2D_v2)(&copy_params) != CUresult::CUDA_SUCCESS {
-                (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                return Err("Sanitization copy failed".into());
-            }
-
-            let result = self.submit_frame(
-                self.mapped_input_buffer,
-                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
-                frame_number,
-                force_idr,
-            );
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
     }
 
-    /// Encode a host ARGB frame by uploading it straight into the ARGB input surface, with no
-    /// CPU-side colour conversion. NVENC's hardware ARGB→YUV conversion is fixed at BT.601
-    /// limited range, which is what the session VUI declares; a CPU prepass to BT.709 would cost
-    /// this path its zero-copy property.
-    ///
-    /// The packed rows are copied host→device into the registered ARGB surface and NVENC's hardware
-    /// CSC produces the YUV. Bytes must be in NVENC ARGB order (`B,G,R,A` in memory) — the host BGRA
-    /// layout an XShm grab yields — and `src_stride` is the source row stride in bytes (`>= width*4`).
-    /// Steps, under the pushed CUDA context after any pending QP change:
-    ///
-    /// 1. **Bounds-check** the source against `stride × (rows-1) + width*4`, erroring rather than
-    ///    reading past a short buffer.
-    /// 2. **Pin the source once**: unless `PIXELFLUX_NVENC_PIN=0`, page-lock each distinct source
-    ///    base address (`cuMemHostRegister`) so the copy is a direct pinned DMA instead of a pageable
-    ///    copy staged through a driver bounce buffer. The persistent, bounded shm sources make this a
-    ///    one-time bounded cost; a failed registration is recorded as length `0` and never re-probed.
-    /// 3. **Copy and submit**: `cuMemcpy2D` the rows into the ARGB surface honoring `src_stride`,
-    ///    then `submit_frame`.
+    /// Register the first plane of a mapped dmabuf frame with NVENC in place — as a pitch-linear
+    /// CUDA device pointer or as a CUDA array, per `plane` — and map it as an input, under the
+    /// already-current CUDA context. Either step failing falls back to `DmaBufInput::Copy` — the
+    /// per-frame copy then serves that import for as long as it is cached, so a driver that declines
+    /// the direct path costs one failed registration, not a failed frame.
+    unsafe fn register_direct_input(
+        &mut self,
+        frame: &CUeglFrame,
+        plane: DirectPlane,
+        format: NV_ENC_BUFFER_FORMAT,
+    ) -> DmaBufInput {
+        let (resource_type, resource, pitch) = match plane {
+            DirectPlane::Pitch(pitch) => (
+                NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+                frame.frame.p_pitch[0],
+                pitch,
+            ),
+            DirectPlane::Array(row_bytes) => (
+                NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
+                frame.frame.p_array[0] as *mut c_void,
+                row_bytes,
+            ),
+        };
+        let mut reg_res = NV_ENC_REGISTER_RESOURCE {
+            version: sv(NvStruct::RegisterResource),
+            resourceType: resource_type,
+            width: self.width,
+            height: self.height,
+            resourceToRegister: resource,
+            pitch,
+            bufferFormat: format,
+            bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+            ..Default::default()
+        };
+        let st = (self.nvenc_funcs.nvEncRegisterResource.unwrap())(self.encoder_session, &mut reg_res);
+        if st != NVENCSTATUS::NV_ENC_SUCCESS {
+            eprintln!("[NVENC] dmabuf plane registration ({plane:?}) refused ({st:?}); copying per frame.");
+            return DmaBufInput::Copy;
+        }
+        let mut map_params = NV_ENC_MAP_INPUT_RESOURCE {
+            version: sv(NvStruct::MapInputResource),
+            registeredResource: reg_res.registeredResource,
+            ..Default::default()
+        };
+        let st = (self.nvenc_funcs.nvEncMapInputResource.unwrap())(self.encoder_session, &mut map_params);
+        if st != NVENCSTATUS::NV_ENC_SUCCESS {
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
+                self.encoder_session,
+                reg_res.registeredResource,
+            );
+            eprintln!("[NVENC] dmabuf plane mapping refused ({st:?}); copying per frame.");
+            return DmaBufInput::Copy;
+        }
+        DmaBufInput::Direct {
+            registered: reg_res.registeredResource,
+            mapped: map_params.mappedResource,
+            format,
+        }
+    }
+
+    /// Encode a host BGRA frame (B,G,R,A in memory, NVENC's word-ordered `ARGB` — the layout an
+    /// XShm grab or the pixman framebuffer yields) through `encode_cpu_packed`.
     pub fn encode_cpu_argb(
         &mut self,
         argb: &[u8],
         src_stride: usize,
+        frame_number: u64,
+        target_qp: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_cpu_packed(argb, src_stride, false, frame_number, target_qp, force_idr)
+    }
+
+    /// Encode a host packed-pixel frame by uploading it straight into the packed input surface,
+    /// with no CPU-side colour conversion: NVENC's hardware RGB→YUV conversion is fixed at BT.601
+    /// limited range, which is what the session VUI declares, and a CPU prepass to BT.709 would
+    /// cost this path its copy-free property.
+    ///
+    /// `rgba_input` names the byte order — `false` for B,G,R,A (X11 XShm, the pixman framebuffer),
+    /// `true` for R,G,B,A (a GLES readback) — and the input surface is registered with NVENC in
+    /// that order (`ARGB` / `ABGR`, re-registered in place when it changes), so both arrive at the
+    /// hardware CSC untouched. `src_stride` is the source row stride in bytes (`>= width*4`).
+    /// Steps, under the pushed CUDA context after any pending QP change:
+    ///
+    /// 1. **Bounds-check** the source against `stride × (rows-1) + width*4`, erroring rather than
+    ///    reading past a short buffer.
+    /// 2. **Pin the source once**: unless pinning was disabled at init (`PIXELFLUX_NVENC_PIN=0`, read
+    ///    once into `pin_uploads`), page-lock each distinct source base address via `pin_host_source`
+    ///    so the upload is a direct DMA from the caller's buffer instead of a pageable copy staged
+    ///    through a driver bounce buffer. The persistent, bounded shm / pool sources make this a
+    ///    one-time bounded cost.
+    /// 3. **Upload and submit**: `cuMemcpy2DAsync` the rows into the input surface on the default
+    ///    stream honoring `src_stride`, then `submit_frame`. NVENC processes its input on that same
+    ///    stream, so the upload is ordered before the encode without a host wait, and the blocking
+    ///    bitstream lock inside `submit_frame` (or the stream sync on its error path) guarantees the
+    ///    upload has finished reading `pixels` by the time this returns — the caller may reuse the
+    ///    buffer immediately.
+    pub fn encode_cpu_packed(
+        &mut self,
+        pixels: &[u8],
+        src_stride: usize,
+        rgba_input: bool,
         frame_number: u64,
         target_qp: u32,
         force_idr: bool,
@@ -1658,25 +2153,31 @@ impl NvencEncoder {
             let width_bytes = (self.width * 4) as usize;
             let rows = self.height as usize;
             let needed = if rows == 0 { 0 } else { src_stride * (rows - 1) + width_bytes };
-            if src_stride < width_bytes || argb.len() < needed {
+            if src_stride < width_bytes || pixels.len() < needed {
                 (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                 return Err(format!(
-                    "ARGB buffer too small: len={} need>={} (stride={}, {}x{})",
-                    argb.len(), needed, src_stride, self.width, self.height
+                    "packed buffer too small: len={} need>={} (stride={}, {}x{})",
+                    pixels.len(), needed, src_stride, self.width, self.height
                 ));
             }
 
-            if std::env::var("PIXELFLUX_NVENC_PIN").as_deref() != Ok("0") {
-                let base = argb.as_ptr() as usize;
-                if let std::collections::hash_map::Entry::Vacant(e) = self.pinned_hosts.entry(base) {
-                    let st = (self.cuda.cuMemHostRegister_v2)(argb.as_ptr() as *mut c_void, argb.len(), 0);
-                    e.insert(if st == CUresult::CUDA_SUCCESS { argb.len() } else { 0 });
-                }
+            let format = if rgba_input {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
+            } else {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+            };
+            if let Err(e) = self.set_input_format(format) {
+                (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                return Err(e);
+            }
+
+            if self.pin_uploads {
+                self.pin_host_source(pixels.as_ptr() as usize, pixels.len());
             }
 
             let copy = CUDA_MEMCPY2D {
                 srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                srcHost: argb.as_ptr() as *const c_void,
+                srcHost: pixels.as_ptr() as *const c_void,
                 srcPitch: src_stride,
                 dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
                 dstDevice: self.input_device_ptr,
@@ -1685,17 +2186,20 @@ impl NvencEncoder {
                 Height: rows,
                 ..Default::default()
             };
-            if (self.cuda.cuMemcpy2D_v2)(&copy) != CUresult::CUDA_SUCCESS {
+            if (self.cuda.cuMemcpy2DAsync_v2)(&copy, ptr::null_mut()) != CUresult::CUDA_SUCCESS {
                 (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                return Err("ARGB host->device copy failed".into());
+                return Err("packed host->device upload failed".into());
             }
 
             let result = self.submit_frame(
                 self.mapped_input_buffer,
-                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+                self.input_format,
                 frame_number,
                 force_idr,
             );
+            if result.is_err() {
+                (self.cuda.cuStreamSynchronize)(ptr::null_mut());
+            }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
@@ -1707,14 +2211,17 @@ impl NvencEncoder {
     /// YUV. The chroma format follows the session's `chromaFormatIDC` (3 ⇒ YUV444, else NV12). Flow
     /// under the pushed CUDA context after any pending QP change:
     ///
-    /// 1. **Lazily allocate** the planar device buffer on first use: a pitched allocation tall enough
+    /// 1. **Pin the source once** (unless disabled at init): the caller reuses one planar buffer
+    ///    across frames, so page-locking its base via `pin_host_source` turns each upload into a
+    ///    direct pinned DMA instead of a pageable copy through a bounce buffer.
+    /// 2. **Lazily allocate** the planar device buffer on first use: a pitched allocation tall enough
     ///    for three full planes (YUV444) or Y plus half-height interleaved UV (NV12), registered and
     ///    mapped with the matching buffer format.
-    /// 2. **Upload each plane** with its own `cuMemcpy2D`. Every copy is bounds-checked against the
+    /// 3. **Upload each plane** with its own `cuMemcpy2D`. Every copy is bounds-checked against the
     ///    host slice: the Y plane is required in full (a short buffer errors), and each chroma plane
     ///    is copied only if its **entire** span — not merely its start offset — is present, so a
     ///    truncated buffer never reads past its end.
-    /// 3. **Submit** the mapped planar input via `submit_frame`.
+    /// 4. **Submit** the mapped planar input via `submit_frame`.
     pub fn encode_raw(
         &mut self,
         raw_data: &[u8],
@@ -1725,6 +2232,10 @@ impl NvencEncoder {
         unsafe {
             self.reconfigure_if_needed(target_qp);
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+
+            if self.pin_uploads {
+                self.pin_host_source(raw_data.as_ptr() as usize, raw_data.len());
+            }
 
             let is_444 = self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3;
 
@@ -2129,6 +2640,368 @@ mod gpu_tests {
             .expect("encode portrait 4K");
         assert_eq!(wire_dims(&pkt), (2160, 4096));
     }
+
+    /// Thread CPU time, for the per-frame CPU cost of an encode path independent of how long
+    /// the thread waited on the GPU.
+    fn thread_cpu() -> std::time::Duration {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        std::time::Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    /// Test helper: run `f` `n` times and report wall and thread-CPU microseconds per call.
+    fn per_frame(label: &str, n: usize, mut f: impl FnMut(usize)) -> (f64, f64) {
+        let t0 = std::time::Instant::now();
+        let c0 = thread_cpu();
+        for i in 0..n {
+            f(i);
+        }
+        let wall = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let cpu = (thread_cpu() - c0).as_secs_f64() * 1e6 / n as f64;
+        println!("{label}: {wall:.0} us wall/frame, {cpu:.0} us cpu/frame ({n} frames)");
+        (wall, cpu)
+    }
+
+    /// Test helper: the raw GBM device and GLES renderer of the render node named by
+    /// `PIXELFLUX_TEST_RENDER_NODE` (default `/dev/dri/renderD128`), brought up exactly as the
+    /// compositor brings them up.
+    fn gpu_render() -> (gbm::Device<std::fs::File>, smithay::backend::renderer::gles::GlesRenderer) {
+        let node = std::env::var("PIXELFLUX_TEST_RENDER_NODE")
+            .unwrap_or_else(|_| "/dev/dri/renderD128".to_string());
+        crate::gpu_render_init(std::path::Path::new(&node)).expect("GPU render init")
+    }
+
+    /// Background and block colours painted into test dmabufs, as `Color32F` components.
+    const BG: [f32; 3] = [0.1, 0.2, 0.8];
+    const FG: [f32; 3] = [0.9, 0.3, 0.1];
+
+    /// BT.601 limited-range Y/Cb/Cr of an RGB triple in 0..1 — what NVENC's hardware CSC emits.
+    fn ycbcr_601(rgb: [f32; 3]) -> [f64; 3] {
+        let [r, g, b] = rgb.map(|c| c as f64);
+        [
+            16.0 + 219.0 * (0.299 * r + 0.587 * g + 0.114 * b),
+            128.0 + 224.0 * (-0.168736 * r - 0.331264 * g + 0.5 * b),
+            128.0 + 224.0 * (0.5 * r - 0.418688 * g - 0.081312 * b),
+        ]
+    }
+
+    /// Where the foreground block of a `seed`-painted `w×h` frame sits: a quarter-size block
+    /// whose origin moves with the seed.
+    fn block_rect(w: u32, h: u32, seed: u32) -> (i32, i32, i32, i32) {
+        let x = ((seed * 37) % (w / 2)) as i32 & !1;
+        let y = ((seed * 53) % (h / 2)) as i32 & !1;
+        (x, y, (w / 4) as i32 & !1, (h / 4) as i32 & !1)
+    }
+
+    /// Test helper: allocate a `w×h` ARGB8888 render-target dmabuf on `gbm` and paint it with
+    /// the GLES renderer — `BG` everywhere and an `FG` block at `block_rect(seed)` — waiting for
+    /// the render to land before returning, as the compositor does before encoding.
+    fn painted_dmabuf(
+        gbm: &gbm::Device<std::fs::File>,
+        renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
+        w: u32,
+        h: u32,
+        seed: u32,
+    ) -> (gbm::BufferObject<()>, Dmabuf) {
+        use gbm::{BufferObjectFlags, Format as GbmFormat};
+        use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
+        use smithay::utils::{Physical, Rectangle, Size, Transform};
+        let bo = gbm
+            .create_buffer_object::<()>(w, h, GbmFormat::Argb8888, BufferObjectFlags::RENDERING)
+            .expect("GBM buffer");
+        let mut dmabuf = crate::create_dmabuf_from_bo(&bo);
+        {
+            let mut fb = renderer.bind(&mut dmabuf).expect("bind dmabuf");
+            let size: Size<i32, Physical> = (w as i32, h as i32).into();
+            let mut frame = renderer.render(&mut fb, size, Transform::Normal).expect("render");
+            let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+            frame.clear(Color32F::new(BG[0], BG[1], BG[2], 1.0), &[full]).expect("clear");
+            let (x, y, bw, bh) = block_rect(w, h, seed);
+            let block: Rectangle<i32, Physical> = Rectangle::new((x, y).into(), (bw, bh).into());
+            frame
+                .draw_solid(
+                    block,
+                    &[Rectangle::from_size(block.size)],
+                    Color32F::new(FG[0], FG[1], FG[2], 1.0),
+                )
+                .expect("draw block");
+            let sync = frame.finish().expect("finish");
+            let _ = sync.wait();
+        }
+        (bo, dmabuf)
+    }
+
+    /// Test helper: decode one H.264 access unit (the bytes behind the 10-byte wire header)
+    /// with the crate's avcodec decoder and return the mean Y/Cb/Cr inside `rect` and outside it.
+    fn decoded_means(
+        dec: &mut crate::webcam::decode::AvDecoder,
+        pkt: &[u8],
+        rect: (i32, i32, i32, i32),
+    ) -> ([f64; 3], [f64; 3]) {
+        use crate::webcam::decode::Decoder;
+        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
+        let v = dec.frame().expect("decoded frame");
+        let (rx, ry, rw, rh) = rect;
+        let inside = |x: usize, y: usize| {
+            x as i32 >= rx && (x as i32) < rx + rw && y as i32 >= ry && (y as i32) < ry + rh
+        };
+        let mut acc = [[0f64; 3]; 2];
+        let mut cnt = [0f64; 2];
+        for y in 0..v.height {
+            for x in 0..v.width {
+                let k = if inside(x, y) { 0 } else { 1 };
+                acc[k][0] += v.y[y * v.y_stride + x] as f64;
+                acc[k][1] += v.u[(y / 2) * v.uv_stride + x / 2] as f64;
+                acc[k][2] += v.v[(y / 2) * v.uv_stride + x / 2] as f64;
+                cnt[k] += 1.0;
+            }
+        }
+        let mean = |k: usize| [acc[k][0] / cnt[k], acc[k][1] / cnt[k], acc[k][2] / cnt[k]];
+        (mean(0), mean(1))
+    }
+
+    /// Assert decoded region means sit within `tol` of the BT.601 limited-range values of the
+    /// painted colours — a wrong pitch, byte order or stale buffer lands far outside this.
+    fn assert_painted(label: &str, block: [f64; 3], bg: [f64; 3], tol: f64) {
+        let (eb, eg) = (ycbcr_601(FG), ycbcr_601(BG));
+        for i in 0..3 {
+            assert!(
+                (block[i] - eb[i]).abs() <= tol,
+                "{label}: block plane {i} = {:.1}, expected {:.1}",
+                block[i],
+                eb[i]
+            );
+            assert!(
+                (bg[i] - eg[i]).abs() <= tol,
+                "{label}: background plane {i} = {:.1}, expected {:.1}",
+                bg[i],
+                eg[i]
+            );
+        }
+    }
+
+    /// Whether every cached dmabuf import of `enc` is registered with NVENC in place.
+    fn all_direct(enc: &NvencEncoder) -> bool {
+        !enc.dmabuf_cache.is_empty()
+            && enc.dmabuf_cache.values().all(|c| matches!(c.input, DmaBufInput::Direct { .. }))
+    }
+
+    /// How the driver mapped the cached dmabuf imports of `enc`, for the test output.
+    fn mapped_kind(enc: &NvencEncoder) -> &'static str {
+        match enc.dmabuf_cache.values().next().map(|c| c.egl_frame.frame_type) {
+            Some(CU_EGL_FRAME_TYPE_PITCH) => "pitch-linear",
+            Some(CU_EGL_FRAME_TYPE_ARRAY) => "as a CUDA array",
+            _ => "in an unknown frame kind",
+        }
+    }
+
+    /// On a real GPU with a render node: two GLES-painted dmabufs encode through the dmabuf path
+    /// and decode to the painted colours at the painted positions, first with the direct
+    /// registration enabled (in place when the driver maps the import pitch-linear, otherwise the
+    /// copy arm) and then with it disabled — the two streams must agree, and the decoded content
+    /// of both must match the paint. Prints which path the driver gave. Ignored by default; needs
+    /// `PIXELFLUX_TEST_RENDER_NODE` or `/dev/dri/renderD128` backed by the NVIDIA GPU.
+    #[test]
+    #[ignore]
+    fn gpu_dmabuf_direct_and_copy_paths_decode_to_the_paint() {
+        use crate::webcam::decode::{AvDecoder, Codec};
+        let (w, h) = (1920u32, 1080u32);
+        let s = settings(w as i32, h as i32, 60.0);
+        let (gbm, mut renderer) = gpu_render();
+        let egl_display = renderer.egl_context().display().get_display_handle().handle;
+        let bufs: Vec<_> = (1..=2u32).map(|seed| (seed, painted_dmabuf(&gbm, &mut renderer, w, h, seed))).collect();
+        let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+
+        let run = |enc: &mut NvencEncoder, label: &str| -> Vec<Vec<u8>> {
+            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+            let mut out = Vec::new();
+            for i in 0..6u64 {
+                let (seed, (_, dmabuf)) = &bufs[(i % 2) as usize];
+                let pkt = enc.encode(dmabuf, i, 25, i == 0).expect("dmabuf encode");
+                assert_eq!(wire_dims(&pkt), (w as u16, h as u16));
+                let (block, bg) = decoded_means(&mut dec, &pkt, block_rect(w, h, *seed));
+                assert_painted(&format!("{label} frame {i}"), block, bg, 6.0);
+                out.push(pkt[10..].to_vec());
+            }
+            out
+        };
+
+        let direct = run(&mut enc, "direct");
+        println!(
+            "driver mapped the dmabuf {}: {}",
+            mapped_kind(&enc),
+            if all_direct(&enc) { "registered in place" } else { "direct registration unavailable, copy arm used" }
+        );
+
+        enc.direct_dmabuf = false;
+        enc.reconfigure_resolution(&s).expect("same-size reconfigure drains the import cache");
+        let copied = run(&mut enc, "copy");
+        assert!(!all_direct(&enc));
+        let identical = direct.iter().zip(&copied).all(|(a, b)| a == b);
+        println!(
+            "direct vs copy streams: {} ({} vs {} bytes)",
+            if identical { "byte-identical" } else { "differ" },
+            direct.iter().map(Vec::len).sum::<usize>(),
+            copied.iter().map(Vec::len).sum::<usize>()
+        );
+        if let Ok(dir) = std::env::var("NVENC_TEST_DUMP_DIR") {
+            std::fs::write(format!("{dir}/dmabuf-direct.h264"), direct.concat()).unwrap();
+            std::fs::write(format!("{dir}/dmabuf-copy.h264"), copied.concat()).unwrap();
+        }
+    }
+
+    /// On a real GPU: a host frame handed over as BGRA (`rgba_input = false`) and the same image
+    /// handed over as RGBA bytes (`rgba_input = true`) both decode to the painted colours — the
+    /// input surface is re-registered in the other byte order in place — and the session keeps
+    /// encoding across the switch. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_packed_bgra_and_rgba_inputs_agree() {
+        use crate::webcam::decode::{AvDecoder, Codec};
+        let (w, h) = (1280u32, 720u32);
+        let s = settings(w as i32, h as i32, 60.0);
+        let rect = block_rect(w, h, 3);
+        let paint = |rgba: bool| -> Vec<u8> {
+            let to_u8 = |c: f32| (c * 255.0).round() as u8;
+            let mut f = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let inside = x >= rect.0 && x < rect.0 + rect.2 && y >= rect.1 && y < rect.1 + rect.3;
+                    let c = if inside { FG } else { BG };
+                    let px = &mut f[((y as u32 * w + x as u32) * 4) as usize..][..4];
+                    let (r, g, b) = (to_u8(c[0]), to_u8(c[1]), to_u8(c[2]));
+                    if rgba {
+                        px.copy_from_slice(&[r, g, b, 255]);
+                    } else {
+                        px.copy_from_slice(&[b, g, r, 255]);
+                    }
+                }
+            }
+            f
+        };
+        let bgra = paint(false);
+        let rgba = paint(true);
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let stride = (w * 4) as usize;
+        for (i, (buf, is_rgba)) in [(&bgra, false), (&rgba, true), (&bgra, false), (&rgba, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let pkt = enc
+                .encode_cpu_packed(buf, stride, is_rgba, i as u64, 25, i == 0)
+                .expect("packed encode");
+            assert_eq!(
+                enc.input_format,
+                if is_rgba {
+                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
+                } else {
+                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+                }
+            );
+            let (block, bg) = decoded_means(&mut dec, &pkt, rect);
+            assert_painted(&format!("frame {i} rgba={is_rgba}"), block, bg, 6.0);
+        }
+    }
+
+    /// On a real GPU with a render node: per-frame wall and CPU cost of the dmabuf path with the
+    /// in-place registration (when the driver maps the import pitch-linear) against the per-frame
+    /// copy, 1080p, two painted buffers alternating. Prints both; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_dmabuf_paths() {
+        let (w, h) = (1920u32, 1080u32);
+        let n: usize = std::env::var("NVENC_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let s = settings(w as i32, h as i32, 60.0);
+        let (gbm, mut renderer) = gpu_render();
+        let egl_display = renderer.egl_context().display().get_display_handle().handle;
+        let bufs: Vec<_> = (1..=2u32).map(|seed| painted_dmabuf(&gbm, &mut renderer, w, h, seed).1).collect();
+        let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+        for pass in 0..2 {
+            enc.direct_dmabuf = pass == 0;
+            enc.reconfigure_resolution(&s).expect("reconfigure drains the import cache");
+            enc.encode(&bufs[0], 0, 25, true).expect("warm-up");
+            enc.encode(&bufs[1], 1, 25, false).expect("warm-up");
+            let label = if all_direct(&enc) {
+                format!("dmabuf registered in place ({})", mapped_kind(&enc))
+            } else if pass == 0 {
+                format!("dmabuf copy arm (direct registration unavailable, mapped {})", mapped_kind(&enc))
+            } else {
+                format!("dmabuf per-frame copy (mapped {})", mapped_kind(&enc))
+            };
+            per_frame(&label, n, |i| {
+                enc.encode(&bufs[i % 2], 2 + i as u64, 25, false).expect("encode");
+            });
+        }
+    }
+
+    /// On a real GPU: per-frame wall and CPU cost of the readback→NVENC hand-over, 1080p host
+    /// frames: the CPU NV12 conversion plus planar upload the readback path used to run, against
+    /// the packed upload with the hardware CSC (BGRA and RGBA), and that same packed upload as a
+    /// synchronous copy. Prints all; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_readback_upload() {
+        use yuv::{BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix};
+        let (w, h) = (1920u32, 1080u32);
+        let n: usize = std::env::var("NVENC_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+        let s = settings(w as i32, h as i32, 60.0);
+        let frames: Vec<Vec<u8>> = (0..4u8).map(|k| frame(w as usize, h as usize, 10 + 40 * k)).collect();
+        let stride = (w * 4) as usize;
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+
+        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
+        enc.encode_raw(&nv12, 0, 25, true).expect("warm-up");
+        per_frame("CPU NV12 conversion + encode_raw (former readback path)", n, |i| {
+            let (y, uv) = nv12.split_at_mut((w * h) as usize);
+            let mut planar = YuvBiPlanarImageMut {
+                y_plane: BufferStoreMut::Borrowed(y),
+                y_stride: w,
+                uv_plane: BufferStoreMut::Borrowed(uv),
+                uv_stride: w,
+                width: w,
+                height: h,
+            };
+            yuv::bgra_to_yuv_nv12(&mut planar, &frames[i % 4], w * 4, YuvRange::Limited, YuvStandardMatrix::Bt601, YuvConversionMode::Fast)
+                .expect("csc");
+            enc.encode_raw(&nv12, 1 + i as u64, 25, false).expect("encode_raw");
+        });
+
+        enc.reconfigure_resolution(&s).expect("reconfigure");
+        enc.encode_cpu_packed(&frames[0], stride, false, 0, 25, true).expect("warm-up");
+        per_frame("encode_cpu_packed BGRA (pinned, async upload, hardware CSC)", n, |i| {
+            enc.encode_cpu_packed(&frames[i % 4], stride, false, 1 + i as u64, 25, false).expect("packed");
+        });
+
+        enc.reconfigure_resolution(&s).expect("reconfigure");
+        enc.encode_cpu_packed(&frames[0], stride, true, 0, 25, true).expect("warm-up");
+        per_frame("encode_cpu_packed RGBA (pinned, async upload, hardware CSC)", n, |i| {
+            enc.encode_cpu_packed(&frames[i % 4], stride, true, 1 + i as u64, 25, false).expect("packed");
+        });
+
+        enc.reconfigure_resolution(&s).expect("reconfigure");
+        enc.encode_cpu_packed(&frames[0], stride, false, 0, 25, true).expect("warm-up");
+        per_frame("packed BGRA with a synchronous cuMemcpy2D upload", n, |i| unsafe {
+            let _ = (enc.cuda.cuCtxPushCurrent_v2)(enc.cuda_context);
+            let src = &frames[i % 4];
+            enc.pin_host_source(src.as_ptr() as usize, src.len());
+            let copy = CUDA_MEMCPY2D {
+                srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
+                srcHost: src.as_ptr() as *const c_void,
+                srcPitch: stride,
+                dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                dstDevice: enc.input_device_ptr,
+                dstPitch: enc.input_pitch,
+                WidthInBytes: stride,
+                Height: h as usize,
+                ..Default::default()
+            };
+            assert_eq!((enc.cuda.cuMemcpy2D_v2)(&copy), CUresult::CUDA_SUCCESS);
+            enc.submit_frame(enc.mapped_input_buffer, enc.input_format, 1 + i as u64, false)
+                .expect("submit");
+            (enc.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        });
+    }
 }
 
 #[cfg(test)]
@@ -2137,7 +3010,7 @@ mod version_tests {
 
     /// Every version-tagged struct, in one fixed order, paired with its pinned compile-time
     /// `NV_ENC_*_VER` constant — the reference both version tests iterate.
-    const ALL: [(NvStruct, u32); 12] = [
+    const ALL: [(NvStruct, u32); 13] = [
         (NvStruct::FunctionList, NV_ENCODE_API_FUNCTION_LIST_VER),
         (NvStruct::OpenSessionExParams, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER),
         (NvStruct::Config, NV_ENC_CONFIG_VER),
@@ -2150,6 +3023,7 @@ mod version_tests {
         (NvStruct::CreateBitstreamBuffer, NV_ENC_CREATE_BITSTREAM_BUFFER_VER),
         (NvStruct::PicParams, NV_ENC_PIC_PARAMS_VER),
         (NvStruct::LockBitstream, NV_ENC_LOCK_BITSTREAM_VER),
+        (NvStruct::CapsParam, NV_ENC_CAPS_PARAM_VER),
     ];
 
     /// For the pinned nvcodec-sys version, `nvenc_struct_ver` must reproduce every
@@ -2203,6 +3077,179 @@ mod version_tests {
                     min
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    /// A caps query that returns `Some(0)` means the GPU lacks 4:4:4, so a 4:4:4 request is met
+    /// with 4:2:0 and flagged as a downgrade; `Some(1)` keeps 4:4:4; an unqueryable cap (`None`)
+    /// leaves the request untouched rather than downgrading on missing information.
+    #[test]
+    fn caps_chroma_downgrade() {
+        let d = decide_caps(true, 1920, 1080, Some(0), None, None);
+        assert!(!d.fullcolor && d.downgraded_color && d.too_large.is_none());
+
+        let d = decide_caps(true, 1920, 1080, Some(1), None, None);
+        assert!(d.fullcolor && !d.downgraded_color);
+
+        let d = decide_caps(true, 1920, 1080, None, None, None);
+        assert!(d.fullcolor && !d.downgraded_color);
+
+        // A 4:2:0 request is never a downgrade whatever the cap says.
+        let d = decide_caps(false, 1920, 1080, Some(0), None, None);
+        assert!(!d.fullcolor && !d.downgraded_color);
+    }
+
+    /// A capture beyond the driver's reported maximum dimensions is flagged `too_large` (the
+    /// caller then declines NVENC and uses software); a capture within them, or one whose caps are
+    /// unknown, is not.
+    #[test]
+    fn caps_dimension_gate() {
+        assert_eq!(
+            decide_caps(false, 5120, 2160, None, Some(4096), Some(4096)).too_large,
+            Some((4096, 4096))
+        );
+        assert_eq!(
+            decide_caps(false, 3840, 4320, None, Some(4096), Some(4096)).too_large,
+            Some((4096, 4096))
+        );
+        assert!(decide_caps(false, 3840, 2160, None, Some(4096), Some(4096)).too_large.is_none());
+        assert!(decide_caps(false, 7680, 4320, None, None, None).too_large.is_none());
+        // A zero cap is treated as unknown, not as "everything is too large".
+        assert!(decide_caps(false, 3840, 2160, None, Some(0), Some(0)).too_large.is_none());
+    }
+
+    /// The resize headroom lifts the request to the 5.2-ceiling floor but never past the driver
+    /// maximum, so initializing with headroom cannot itself exceed what the GPU supports.
+    #[test]
+    fn headroom_is_floored_and_capped() {
+        assert_eq!(nvenc_headroom(1920, 4096, Some(8192)), 4096);
+        assert_eq!(nvenc_headroom(3840, 4096, Some(4096)), 4096);
+        assert_eq!(nvenc_headroom(6000, 4096, Some(8192)), 6000);
+        assert_eq!(nvenc_headroom(1920, 4096, None), 4096);
+        assert_eq!(nvenc_headroom(1920, 4096, Some(2048)), 2048);
+    }
+
+    /// Two buffers that reuse one fd number but differ in any identity field are distinct, so a
+    /// cache keyed by fd cannot return a stale import: a new inode (the kernel reissues one per
+    /// dma-buf since 5.3), a new size, or new geometry each breaks the match.
+    #[test]
+    fn dmabuf_identity_distinguishes_recycled_fd() {
+        let base = DmaBufIdentity { dev: 1, ino: 10, size: 100, modifier: 0, width: 1920, height: 1080 };
+        assert_eq!(base, base);
+        let mut new_ino = base;
+        new_ino.ino = 11;
+        assert_ne!(base, new_ino);
+        let mut new_size = base;
+        new_size.size = 200;
+        assert_ne!(base, new_size);
+        let mut new_mod = base;
+        new_mod.modifier = 1;
+        assert_ne!(base, new_mod);
+        let mut new_geom = base;
+        new_geom.width = 1280;
+        assert_ne!(base, new_geom);
+    }
+
+    /// `probe` reads a real fd deterministically and folds the modifier and geometry into the
+    /// identity: the same fd and parameters yield equal identities, and changing the modifier or the
+    /// geometry changes the identity even on the same fd.
+    #[test]
+    fn dmabuf_identity_probe_is_stable_and_parameterized() {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let fd = f.as_raw_fd();
+        let a = DmaBufIdentity::probe(fd, 0x1234, 1920, 1080);
+        assert_eq!(a, DmaBufIdentity::probe(fd, 0x1234, 1920, 1080));
+        assert_ne!(a, DmaBufIdentity::probe(fd, 0x9999, 1920, 1080));
+        assert_ne!(a, DmaBufIdentity::probe(fd, 0x1234, 1280, 720));
+    }
+
+    /// Test helper: a mapped `CUeglFrame` of one plane with the given kind, geometry and pitch,
+    /// its first plane at `plane` (a device pointer for the pitch kind, an array handle for the
+    /// array kind) in four 8-bit channels.
+    fn egl_frame(frame_type: u32, w: u32, h: u32, pitch: u32, plane: usize) -> CUeglFrame {
+        let mut f: CUeglFrame = unsafe { std::mem::zeroed() };
+        f.frame_type = frame_type;
+        f.plane_count = 1;
+        f.width = w;
+        f.height = h;
+        f.pitch = pitch;
+        f.num_channels = 4;
+        f.cu_format = CU_AD_FORMAT_U8;
+        f.frame.p_pitch = [plane as *mut c_void, ptr::null_mut(), ptr::null_mut()];
+        f
+    }
+
+    /// A pitch-linear mapping whose first plane covers the session geometry at a 4-byte-aligned
+    /// pitch of at least `width * 4` is registered with NVENC in place as a device pointer at its
+    /// own pitch; a null plane, a short or unaligned pitch, a frame smaller than the session, or a
+    /// frame without planes each take the per-frame copy.
+    #[test]
+    fn pitch_linear_frame_direct_registration_rules() {
+        let pitch_ok = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1920, 1080, 7680, 0x1000);
+        assert_eq!(direct_plane(&pitch_ok, 1920, 1080), Some(DirectPlane::Pitch(7680)));
+        let padded = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1920, 1080, 8192, 0x1000);
+        assert_eq!(direct_plane(&padded, 1920, 1080), Some(DirectPlane::Pitch(8192)));
+        let larger = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 2048, 1200, 8192, 0x1000);
+        assert_eq!(direct_plane(&larger, 1920, 1080), Some(DirectPlane::Pitch(8192)));
+
+        let null_plane = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1920, 1080, 7680, 0);
+        assert_eq!(direct_plane(&null_plane, 1920, 1080), None);
+        let short_pitch = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1920, 1080, 7676, 0x1000);
+        assert_eq!(direct_plane(&short_pitch, 1920, 1080), None);
+        let unaligned = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1920, 1080, 7682, 0x1000);
+        assert_eq!(direct_plane(&unaligned, 1920, 1080), None);
+        let smaller = egl_frame(CU_EGL_FRAME_TYPE_PITCH, 1280, 720, 7680, 0x1000);
+        assert_eq!(direct_plane(&smaller, 1920, 1080), None);
+        let mut no_planes = pitch_ok;
+        no_planes.plane_count = 0;
+        assert_eq!(direct_plane(&no_planes, 1920, 1080), None);
+        assert_eq!(direct_plane(&pitch_ok, 0, 1080), None);
+        let mut unknown_kind = pitch_ok;
+        unknown_kind.frame_type = 7;
+        assert_eq!(direct_plane(&unknown_kind, 1920, 1080), None);
+    }
+
+    /// A CUDA-array mapping of four 8-bit channels covering the session geometry is registered in
+    /// place as a CUDA array whose pitch word is the array's row width in bytes; an array of any
+    /// other element layout, a null array, or one smaller than the session takes the copy.
+    #[test]
+    fn cuda_array_frame_direct_registration_rules() {
+        let array = egl_frame(CU_EGL_FRAME_TYPE_ARRAY, 1920, 1080, 0, 0x2000);
+        assert_eq!(direct_plane(&array, 1920, 1080), Some(DirectPlane::Array(7680)));
+        let wider = egl_frame(CU_EGL_FRAME_TYPE_ARRAY, 2048, 1080, 0, 0x2000);
+        assert_eq!(direct_plane(&wider, 1920, 1080), Some(DirectPlane::Array(8192)));
+
+        let null_array = egl_frame(CU_EGL_FRAME_TYPE_ARRAY, 1920, 1080, 0, 0);
+        assert_eq!(direct_plane(&null_array, 1920, 1080), None);
+        let mut one_channel = array;
+        one_channel.num_channels = 1;
+        assert_eq!(direct_plane(&one_channel, 1920, 1080), None);
+        let mut wide_elements = array;
+        wide_elements.cu_format = 3;
+        assert_eq!(direct_plane(&wide_elements, 1920, 1080), None);
+        let smaller = egl_frame(CU_EGL_FRAME_TYPE_ARRAY, 1280, 720, 0, 0x2000);
+        assert_eq!(direct_plane(&smaller, 1920, 1080), None);
+    }
+
+    /// The dmabuf fourcc picks the NVENC packed format with the same byte order: XR24 / AR24 are
+    /// B,G,R,A in memory and so NVENC `ARGB`; XB24 / AB24 are R,G,B,A and so `ABGR`; anything else
+    /// has no packed 8-bit NVENC equivalent.
+    #[test]
+    fn fourcc_selects_nvenc_byte_order() {
+        for code in [Fourcc::Argb8888, Fourcc::Xrgb8888] {
+            assert_eq!(fourcc_nvenc_format(code), Some(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB));
+        }
+        for code in [Fourcc::Abgr8888, Fourcc::Xbgr8888] {
+            assert_eq!(fourcc_nvenc_format(code), Some(NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR));
+        }
+        for code in [Fourcc::Rgb565, Fourcc::Nv12, Fourcc::Argb2101010, Fourcc::Bgra8888, Fourcc::Rgba8888] {
+            assert_eq!(fourcc_nvenc_format(code), None, "{code:?}");
         }
     }
 }

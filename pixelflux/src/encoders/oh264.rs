@@ -4,14 +4,13 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Software H.264 encoder built on Cisco's OpenH264: the full-frame software path
-//! for H.264 output, opted into with `use_openh264`. Its reason to exist alongside
-//! the striped software x264 path is that it emits one continuous single-stream
-//! H.264 bitstream instead of independent per-stripe streams — that single stream
-//! records as-is and drives through one hardware decoder, so a host with no usable
-//! GPU encoder still looks to a client exactly like an NVENC/VAAPI session. Cisco's
-//! BSD license is what lets it ship redistributably; the price of admission is being
-//! 4:2:0-only and Annex-B.
+//! Software H.264 encoder built on Cisco's OpenH264: the software H.264 encoder of a
+//! build without the `gpl` feature, where it stands in for libx264 behind the same
+//! striped software path (`encode_cpu`) — one instance per stripe, or one full-frame
+//! instance when the session is full-frame — and emits the same wire framing, so a
+//! client cannot tell which library a GPL-free build encodes with. Cisco's BSD license
+//! is what lets it ship redistributably; the price of admission is being 4:2:0-only
+//! (a 4:4:4 request is encoded 4:2:0) and Annex-B.
 //!
 //! Keyframes are driven externally — an effectively infinite intra period plus
 //! on-demand `force_intra_frame`, never a fixed cadence — so a mostly-static screen
@@ -23,7 +22,7 @@ use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
     BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange,
-    RateControlMode, UsageType,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
@@ -48,15 +47,20 @@ const INFINITE_INTRA_PERIOD: u32 = 300_000;
 ///    ceiling first is what lets `set_live_bitrate` move the target freely.
 const BITRATE_CEILING_BPS: u32 = 100_000_000;
 
-/// One capture session's worth of OpenH264 state, kept alive between frames because the
-/// encoder's reference chain and rate-control state must persist across the whole session — and the
-/// I420 plane buffers are reused every frame to keep the per-frame hot path free of allocation.
+/// One stripe's (or one full frame's) worth of OpenH264 state, kept alive between frames because
+/// the encoder's reference chain and rate-control state must persist across the whole session —
+/// and the I420 plane buffers are reused every frame to keep the per-frame hot path free of
+/// allocation.
 ///
-/// Holds the live `Encoder`, the fixed frame dimensions, and the reusable I420 plane buffers
+/// Holds the live `Encoder`, the fixed dimensions, and the reusable I420 plane buffers
 /// (`y_buf` / `u_buf` / `v_buf`) that each frame's RGB-to-YUV conversion writes into before
-/// hand-off. `is_cbr` selects the rate-control mode: `true` is CBR (bitrate-mode RC driving a
-/// target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but with the QP pinned to a
-/// single value). `omit_stripe_headers` drops the 10-byte wire header for bare Annex-B output.
+/// hand-off. `threads`, `slices` and `csc_bands` are the parallelism policy fixed at open: a lone
+/// full-frame instance encodes with several threads over four slices and converts colour in four
+/// bands, while a stripe of the striped path is single-threaded and single-slice, its parallelism
+/// coming from the stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
+/// CBR (bitrate-mode RC driving a target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but
+/// with the QP pinned to a single value). `omit_stripe_headers` drops the 10-byte wire header for
+/// bare Annex-B output.
 ///
 /// The live rate-control state is mirrored so a change can be detected, rolled back, or carried
 /// across a rebuild: `current_bitrate_bps` is the currently-accepted CBR target, `current_fps` the
@@ -68,6 +72,9 @@ pub struct Openh264Encoder {
     settings: RustCaptureSettings,
     width: usize,
     height: usize,
+    threads: u16,
+    slices: u32,
+    csc_bands: usize,
     y_buf: Vec<u8>,
     u_buf: Vec<u8>,
     v_buf: Vec<u8>,
@@ -80,38 +87,57 @@ pub struct Openh264Encoder {
 }
 
 impl Openh264Encoder {
-    /// Build an OpenH264 encoder from the capture settings, or `None` on init failure.
+    /// Build a full-frame OpenH264 encoder from the capture settings (their width, height,
+    /// CRF and bitrate), or `None` on init failure: `new_stripe` with the whole-frame policy.
+    pub fn new(settings: &RustCaptureSettings) -> Option<Self> {
+        Self::new_stripe(
+            settings,
+            settings.width.max(2) as usize,
+            settings.height.max(2) as usize,
+            settings.video_crf,
+            settings.video_bitrate_kbps,
+            true,
+        )
+    }
+
+    /// Build the encoder behind one stripe of the striped software path (`encode_cpu`), or
+    /// `None` on init failure. Like the NVENC/VAAPI encoders, this one self-prepends the wire
+    /// header on the buffer it returns.
     ///
-    /// `None` lets the caller fall back to the x264 software stripe path. Like the NVENC/VAAPI
-    /// encoders, this one self-prepends the wire header on the buffer it returns.
+    /// `width` x `height` is the stripe's geometry, `crf` its constant quantizer and `bitrate_kbps`
+    /// its own CBR budget — the per-stripe share `stripe_rate_control` hands out, since every stripe
+    /// runs its own rate control. `fullframe` selects the parallelism policy: a lone full-frame
+    /// stripe encodes with `fullframe_threads` threads over four fixed slices (client decoders
+    /// slice-parallelize too) and converts colour in four bands, so a whole frame never serialises
+    /// on one core; one stripe of several is single-threaded and single-slice with a one-band
+    /// conversion, its parallelism coming from the stripes encoding concurrently.
     ///
     /// 1. **Geometry**: width and height are floored to even values (`& !1`, min 2) because 4:2:0
-    ///    chroma subsampling requires it. A 4:4:4 full-color request is only warned about —
-    ///    OpenH264 is 4:2:0-only, so it is encoded 4:2:0 regardless (NVENC/x264 honor full color).
+    ///    chroma subsampling requires it. A 4:4:4 request is encoded 4:2:0 regardless: OpenH264 is
+    ///    4:2:0-only (the caller reports that once, via `SOFTWARE_H264_FULLCOLOR`).
     ///
-    /// 2. **Thread count**: one fewer than the available parallelism — leaving headroom for capture
-    ///    and the rest of the pipeline — clamped to `[1, 4]`, since the frame is split into four
-    ///    slices and more encode threads than slices would buy nothing.
+    /// 2. **CRF floor**: `crf` is clamped to `[1, 51]`. The floor is 1, not 0, because a zero
+    ///    anywhere in the QP pair makes OpenH264's `ParamValidation` discard the *entire* range and
+    ///    substitute its screen-content defaults `[26, 35]`; explicit non-zero values are honored
+    ///    (the library clips the min up to its own floor of 12).
     ///
-    /// 3. **CRF floor**: `video_crf` is clamped to `[1, 51]`. The floor is 1, not 0, because a
-    ///    zero anywhere in the QP pair makes OpenH264's `ParamValidation` discard the *entire*
-    ///    range and substitute its screen-content defaults `[26, 35]`; explicit non-zero values
-    ///    are honored (the library clips the min up to its own floor of 12).
+    /// 3. **Base config** (shared by both rate modes): screen-content real-time usage, low
+    ///    complexity, an effectively infinite intra period, BT.709 limited-range VUI colour
+    ///    signaling (matching the RGB-to-YUV conversion; without it a WebRTC receiver infers the
+    ///    range from the SDP profile and can display the picture visibly darker), and the thread
+    ///    count. Frame skip is **enabled** so the rate controller can actually hold the target
+    ///    bitrate — skip-less bitrate control is only approximate. A skipped frame is not encoded
+    ///    and the next P-frame references the last *encoded* frame, so the reference chain stays
+    ///    intact. Adaptive quantization and background detection are set explicitly to `false` to
+    ///    silence the init warnings (both are auto-disabled for screen content anyway). Scene-change
+    ///    detection stays on: `ParamValidation` force-enables it for screen-content usage, so its
+    ///    content-adaptive IDRs are inherent to this encoder and the wire header labels them
+    ///    correctly. The internal stderr trace follows the capture's `debug_logging` flag
+    ///    (otherwise quiet).
     ///
-    /// 4. **Base config** (shared by both rate modes): screen-content real-time usage, low
-    ///    complexity, an effectively infinite intra period, and the thread count. Frame skip is
-    ///    **enabled** so the rate controller can actually hold the target bitrate — skip-less
-    ///    bitrate control is only approximate. A skipped frame is not encoded and the next P-frame
-    ///    references the last *encoded* frame, so the reference chain stays intact. Adaptive
-    ///    quantization and background detection are set explicitly to `false` to silence the init
-    ///    warnings (both are auto-disabled for screen content anyway). Scene-change detection stays
-    ///    on: `ParamValidation` force-enables it for screen-content usage, so its content-adaptive
-    ///    IDRs are inherent to this encoder and the wire header labels them correctly. The internal
-    ///    stderr trace follows the capture's `debug_logging` flag (otherwise quiet).
-    ///
-    /// 5. **Rate control**:
-    ///    - **CBR** (`video_cbr_mode`): bitrate-mode RC targeting `video_bitrate_kbps`, with the QP
-    ///      range made explicit (`video_min_qp`, and `video_max_qp` defaulting the max to 51). The
+    /// 4. **Rate control**:
+    ///    - **CBR** (`video_cbr_mode`): bitrate-mode RC targeting `bitrate_kbps`, with the QP range
+    ///      made explicit (`video_min_qp`, and `video_max_qp` defaulting the max to 51). The
     ///      explicit range dodges the same zero-substitution as the CRF floor, which would
     ///      otherwise cap the RC at QP 35 where hard content overshoots any target.
     ///    - **CRF/CQP** (default): the same bitrate-mode RC but with an oversized bitrate budget
@@ -120,19 +146,23 @@ impl Openh264Encoder {
     ///      CONSTQP / VAAPI CQP. Bitrate-mode with a pinned QP is what actually holds the QP
     ///      constant: RC_OFF ignores the QP range and RC_QUALITY rejects a `min == max` range.
     ///
-    /// After construction the encoder is primed for four fixed slices and VUI signaling via
-    /// `enable_four_slices`.
-    pub fn new(settings: &RustCaptureSettings) -> Option<Self> {
-        if settings.video_fullcolor {
-            eprintln!("[openh264] 4:4:4 full-color requested; OpenH264 is 4:2:0-only, encoding 4:2:0.");
-        }
-        let width = (settings.width.max(2) as usize) & !1;
-        let height = (settings.height.max(2) as usize) & !1;
-        let bps = (settings.video_bitrate_kbps.max(1) as u32).saturating_mul(1000);
+    /// A multi-threaded instance is then primed for its four fixed slices via `enable_slices`.
+    pub fn new_stripe(
+        settings: &RustCaptureSettings,
+        width: usize,
+        height: usize,
+        crf: i32,
+        bitrate_kbps: i32,
+        fullframe: bool,
+    ) -> Option<Self> {
+        let width = width.max(2) & !1;
+        let height = height.max(2) & !1;
+        let bps = (bitrate_kbps.max(1) as u32).saturating_mul(1000);
         let fps = Self::clamp_fps(settings.target_fps);
-        let crf = settings.video_crf.clamp(1, 51);
+        let crf = crf.clamp(1, 51);
+        let (threads, slices) = if fullframe { (Self::fullframe_threads(), 4) } else { (1, 1) };
 
-        let encoder = Self::build_encoder(settings, fps, bps, crf as u8)?;
+        let encoder = Self::build_encoder(settings, fps, bps, crf as u8, threads)?;
 
         let (cw, ch) = (width / 2, height / 2);
         let mut me = Self {
@@ -140,6 +170,9 @@ impl Openh264Encoder {
             settings: settings.clone(),
             width,
             height,
+            threads,
+            slices,
+            csc_bands: slices as usize,
             y_buf: vec![0u8; width * height],
             u_buf: vec![0u8; cw * ch],
             v_buf: vec![0u8; cw * ch],
@@ -150,8 +183,28 @@ impl Openh264Encoder {
             is_cbr: settings.video_cbr_mode,
             omit_stripe_headers: settings.omit_stripe_headers,
         };
-        me.enable_four_slices();
+        me.enable_slices();
         Some(me)
+    }
+
+    /// Encode threads for a lone full-frame instance: one fewer than the available
+    /// parallelism — leaving headroom for capture and the rest of the pipeline — clamped to
+    /// `[1, 4]`, since the frame is split into four slices and more encode threads than slices
+    /// would buy nothing. The x264 full-frame stripe follows the same policy.
+    pub fn fullframe_threads() -> u16 {
+        std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
+            .unwrap_or(1) as u16
+    }
+
+    /// Encoded width in pixels (the request floored to even).
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    /// Encoded height in pixels (the request floored to even).
+    pub fn height(&self) -> usize {
+        self.height
     }
 
     /// The frame rate OpenH264 is configured with: the requested rate, or 30 when the capture
@@ -164,21 +217,18 @@ impl Openh264Encoder {
         }
     }
 
-    /// Build one configured OpenH264 encoder, as described by `new`'s steps 2, 4 and 5. Separate
-    /// from `new` because `update_qp` rebuilds the encoder to move the pinned CRF/CQP quantizer, and
-    /// that rebuild has to reproduce the session's configuration exactly apart from the QP — hence
-    /// the live `fps` / `bitrate_bps` / `crf` arguments rather than reading the construction
-    /// settings for values a running session can have retuned.
+    /// Build one configured OpenH264 encoder, as described by `new_stripe`'s steps 3 and 4.
+    /// Separate from `new_stripe` because `update_qp` rebuilds the encoder to move the pinned
+    /// CRF/CQP quantizer, and that rebuild has to reproduce the session's configuration exactly
+    /// apart from the QP — hence the live `fps` / `bitrate_bps` / `crf` arguments rather than
+    /// reading the construction settings for values a running session can have retuned.
     fn build_encoder(
         settings: &RustCaptureSettings,
         fps: f32,
         bitrate_bps: u32,
         crf: u8,
+        threads: u16,
     ) -> Option<Encoder> {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(1).clamp(1, 4))
-            .unwrap_or(1) as u16;
-
         let base = EncoderConfig::new()
             .max_frame_rate(FrameRate::from_hz(fps))
             .usage_type(UsageType::ScreenContentRealTime)
@@ -192,6 +242,7 @@ impl Openh264Encoder {
             // `i_scenecut_threshold = 0` allows.
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
+            .vui(VuiConfig::bt709())
             .num_threads(threads);
         let config = if settings.video_cbr_mode {
             let min_qp = settings.video_min_qp.clamp(1, 51) as u8;
@@ -212,28 +263,22 @@ impl Openh264Encoder {
         Encoder::with_api_config(OpenH264API::from_source(), config).ok()
     }
 
-    /// Give every frame four fixed slices and explicit VUI colour signaling (BT.709, limited
-    /// range) — the two properties a streaming client depends on that OpenH264 will not produce on
-    /// its own: without the slices, encode and decode cannot parallelize; without VUI, the picture
-    /// can arrive visibly dark.
-    ///
-    /// 1. **Four fixed slices**: both the encoder threads and client decoders slice-parallelize,
-    ///    while more than four slices upsets some Chromium decoders, so the count is pinned to four
-    ///    (`SM_FIXEDSLCNUM_SLICE`, `uiSliceNum = 4`).
-    /// 2. **VUI colour signaling**: BT.709 primaries/transfer/matrix at limited range, matching the
-    ///    RGB-to-YUV conversion. Without VUI a WebRTC receiver falls back to the SDP profile to
-    ///    infer range, so a full-range-negotiated (4:4:4) session would display this encoder's
-    ///    limited-range output unexpanded — visibly darker; x264/NVENC write VUI, so only this
-    ///    encoder needs it set here.
+    /// Give every frame of a multi-threaded instance `slices` fixed slices, so its encoder
+    /// threads and the client's decoder can parallelize within the frame; more than four slices
+    /// upsets some Chromium decoders, so the count is pinned to four (`SM_FIXEDSLCNUM_SLICE`).
+    /// A single-threaded stripe instance keeps OpenH264's single slice and returns at once.
     ///
     /// The `openh264` crate initializes the underlying encoder lazily on the *first* encode and
-    /// exposes neither fixed slicing nor VUI through its config, so the routine primes the encoder
-    /// with one throwaway frame, patches the now-live `SEncParamExt` parameter set (slice mode plus
-    /// the VUI fields) via `set_option`, and lets the next encode re-init from it. It is
-    /// best-effort: any `get_option` / `set_option` failure returns early, leaving a working
-    /// single-slice encoder without VUI. Because the throwaway frame consumed the initial IDR, a
-    /// final `force_intra_frame` guarantees the first *delivered* frame is still an IDR.
-    fn enable_four_slices(&mut self) {
+    /// exposes no fixed slicing through its config, so the routine primes the encoder with one
+    /// throwaway frame, patches the now-live `SEncParamExt` parameter set via `set_option`, and
+    /// lets the next encode re-init from it. It is best-effort: any `get_option` / `set_option`
+    /// failure returns early, leaving a working single-slice encoder. Because the throwaway frame
+    /// consumed the initial IDR, a final `force_intra_frame` guarantees the first *delivered* frame
+    /// is still an IDR.
+    fn enable_slices(&mut self) {
+        if self.slices <= 1 {
+            return;
+        }
         let slices = YUVSlices::new(
             (&self.y_buf, &self.u_buf, &self.v_buf),
             (self.width, self.height),
@@ -254,23 +299,13 @@ impl Openh264Encoder {
             }
             params.sSpatialLayers[0].sSliceArgument.uiSliceMode =
                 openh264_sys2::SM_FIXEDSLCNUM_SLICE;
-            params.sSpatialLayers[0].sSliceArgument.uiSliceNum = 4;
-            {
-                let layer = &mut params.sSpatialLayers[0];
-                layer.bVideoSignalTypePresent = true;
-                layer.uiVideoFormat = 5;
-                layer.bFullRange = false;
-                layer.bColorDescriptionPresent = true;
-                layer.uiColorPrimaries = 1;
-                layer.uiTransferCharacteristics = 1;
-                layer.uiColorMatrix = 1;
-            }
+            params.sSpatialLayers[0].sSliceArgument.uiSliceNum = self.slices;
             let ret = raw.set_option(
                 openh264_sys2::ENCODER_OPTION_SVC_ENCODE_PARAM_EXT,
                 &mut params as *mut _ as *mut std::ffi::c_void,
             );
             if ret != 0 {
-                eprintln!("[openh264] stream-param re-init rejected ({ret}); staying single-slice without VUI");
+                eprintln!("[openh264] stream-param re-init rejected ({ret}); staying single-slice");
             }
         }
         self.encoder.force_intra_frame();
@@ -284,8 +319,10 @@ impl Openh264Encoder {
     /// preserved and the change takes effect mid-stream — this is what makes the web UI's bitrate
     /// slider work, like NVENC and x264. The bitrate is applied only in **CBR** mode, and only when
     /// it actually differs from the current target; the CRF/CQP quantizer moves through `update_qp`
-    /// instead. A framerate of at least 1 fps is pushed via the frame-rate option and mirrored in
-    /// `current_fps`, so a later `update_qp` rebuild keeps the live rate.
+    /// instead. A framerate of at least 1 fps that differs from the live one is pushed via the
+    /// frame-rate option and mirrored in `current_fps`, so a later `update_qp` rebuild keeps the
+    /// live rate. Both are self-gating, so the striped path's per-frame call is free when nothing
+    /// changed.
     pub fn reconfigure_rate(&mut self, bitrate_kbps: i32, fps: f64) {
         if self.is_cbr {
             let bps = bitrate_kbps.max(1).saturating_mul(1000);
@@ -293,7 +330,7 @@ impl Openh264Encoder {
                 self.set_live_bitrate(bps);
             }
         }
-        if fps >= 1.0 {
+        if fps >= 1.0 && fps as f32 != self.current_fps {
             let mut rate = fps as f32;
             unsafe {
                 self.encoder.raw_api().set_option(
@@ -346,11 +383,12 @@ impl Openh264Encoder {
             self.current_fps,
             self.current_bitrate_bps.max(1) as u32,
             qp as u8,
+            self.threads,
         ) {
             Some(encoder) => {
                 self.encoder = encoder;
                 self.current_qp = qp;
-                self.enable_four_slices();
+                self.enable_slices();
             }
             None => eprintln!(
                 "[openh264] rebuild for QP {qp} failed; staying at QP {}",
@@ -420,31 +458,48 @@ impl Openh264Encoder {
         unsafe { self.encoder.raw_api().set_option(option, std::ptr::addr_of_mut!(info).cast()) }
     }
 
-    /// Encode one host frame and return it framed exactly like the hardware full-frame
-    /// encoders, so the client demuxes this software path with the same code and cannot tell a
-    /// GPU-less session apart. Returns an empty buffer when the frame produced no payload.
-    ///
-    /// 1. **Keyframe**: when `force_idr` is set, `force_intra_frame` is called so this frame is
-    ///    emitted as an IDR.
-    /// 2. **Colour conversion**: `argb` (with `stride` bytes per row) is converted to I420 into the
-    ///    reusable Y/U/V plane buffers. `rgba_input` selects the source byte order — `false` is
-    ///    B,G,R,A (X11 XShm), `true` is R,G,B,A (Wayland GL readback).
-    /// 3. **Encode**: the planes are wrapped as borrowed `YUVSlices` and encoded.
-    /// 4. **Framing**: unless `omit_stripe_headers` is set, a 10-byte wire header is prepended —
-    ///    byte-for-byte the layout the NVENC/VAAPI/x264 full-frame paths emit, which is what lets a
-    ///    single client demuxer serve every encoder. Its type byte is read from the *actually
-    ///    encoded* picture type (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than from `force_idr`,
-    ///    because the encoder may re-type a frame, and the header must label a real decode entry
-    ///    point, not the request. It also carries the frame number, a zero y-start, and the
-    ///    width/height (all big-endian). With `omit_stripe_headers` the output is bare Annex-B.
-    /// 5. **Empty payload**: if the encoder produced no bitstream (e.g. a skipped frame), an empty
-    ///    vec is returned rather than a lone header — a header with no Annex-B behind it would be a
-    ///    malformed frame to the client, and the pipeline reads empty as "nothing to send".
+    /// Encode one full host frame: `encode_stripe_argb` at y-start 0, the framing the hardware
+    /// full-frame encoders emit.
     pub fn encode_host_argb(
         &mut self,
         argb: &[u8],
         stride: usize,
         frame_number: u64,
+        force_idr: bool,
+        rgba_input: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_stripe_argb(argb, stride, frame_number, 0, force_idr, rgba_input)
+    }
+
+    /// Encode one stripe's rows (or the whole frame, at `y_start` 0) and return them framed
+    /// exactly like the x264 stripes and the hardware full-frame encoders, so the client demuxes
+    /// this software path with the same code and cannot tell which library encoded it. Returns an
+    /// empty buffer when the frame produced no payload.
+    ///
+    /// 1. **Keyframe**: when `force_idr` is set, `force_intra_frame` is called so this frame is
+    ///    emitted as an IDR.
+    /// 2. **Colour conversion**: `argb` (with `stride` bytes per row, `height` rows) is converted
+    ///    to I420 into the reusable Y/U/V plane buffers, across `csc_bands` threads. `rgba_input`
+    ///    selects the source byte order — `false` is B,G,R,A (X11 XShm), `true` is R,G,B,A (Wayland
+    ///    GL readback).
+    /// 3. **Encode**: the planes are wrapped as borrowed `YUVSlices` and encoded.
+    /// 4. **Framing**: unless `omit_stripe_headers` is set, a 10-byte wire header is prepended —
+    ///    byte-for-byte the layout the NVENC/VAAPI/x264 paths emit, which is what lets a single
+    ///    client demuxer serve every encoder. Its type byte is read from the *actually encoded*
+    ///    picture type (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than from `force_idr`, because
+    ///    the encoder may re-type a frame, and the header must label a real decode entry point, not
+    ///    the request. It also carries the frame number, `y_start` (the stripe's top row within the
+    ///    frame), and the width/height (all big-endian). With `omit_stripe_headers` the output is
+    ///    bare Annex-B.
+    /// 5. **Empty payload**: if the encoder produced no bitstream (e.g. a skipped frame), an empty
+    ///    vec is returned rather than a lone header — a header with no Annex-B behind it would be a
+    ///    malformed frame to the client, and the pipeline reads empty as "nothing to send".
+    pub fn encode_stripe_argb(
+        &mut self,
+        argb: &[u8],
+        stride: usize,
+        frame_number: u64,
+        y_start: u16,
         force_idr: bool,
         rgba_input: bool,
     ) -> Result<Vec<u8>, String> {
@@ -462,7 +517,7 @@ impl Openh264Encoder {
             &mut self.y_buf,
             &mut self.u_buf,
             &mut self.v_buf,
-            4,
+            self.csc_bands,
         )
         .map_err(|e| format!("rgb-to-yuv420 failed: {e:?}"))?;
 
@@ -484,7 +539,7 @@ impl Openh264Encoder {
                     out.push(0x04);
                     out.push(type_hdr);
                     out.extend_from_slice(&(frame_number as u16).to_be_bytes());
-                    out.extend_from_slice(&0u16.to_be_bytes());
+                    out.extend_from_slice(&y_start.to_be_bytes());
                     out.extend_from_slice(&(self.width as u16).to_be_bytes());
                     out.extend_from_slice(&(self.height as u16).to_be_bytes());
                 }
@@ -764,8 +819,23 @@ mod tests {
 mod slice_tests {
     use super::*;
 
+    /// Number of Annex-B start codes in an encoded buffer, header included.
+    fn count_nals(out: &[u8]) -> usize {
+        let mut nals = 0;
+        let mut i = 0;
+        while i + 3 < out.len() {
+            if &out[i..i + 3] == b"\x00\x00\x01" {
+                nals += 1;
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        nals
+    }
+
     /// A single IDR frame carries at least six NALs (SPS + PPS + four IDR slices),
-    /// confirming the fixed four-slice configuration primed by `enable_four_slices`.
+    /// confirming the fixed four-slice configuration primed by `enable_slices`.
     #[test]
     fn four_slices_per_frame() {
         let s = RustCaptureSettings {
@@ -779,17 +849,45 @@ mod slice_tests {
         let mut enc = Openh264Encoder::new(&s).expect("encoder");
         let frame = vec![0x80u8; 640 * 480 * 4];
         let out = enc.encode_host_argb(&frame, 640 * 4, 0, true, false).expect("encode");
-        let mut nals = 0;
-        let mut i = 0;
-        while i + 3 < out.len() {
-            if &out[i..i + 3] == b"\x00\x00\x01" {
-                nals += 1;
-                i += 3;
-            } else {
-                i += 1;
-            }
-        }
+        let nals = count_nals(&out);
         assert!(nals >= 6, "expected 4-slice IDR (>=6 NALs), got {nals}");
+    }
+
+    /// One stripe of the striped path is a single-slice stream (SPS + PPS + one IDR slice:
+    /// three slices fewer than a four-slice full-frame IDR) whose wire header stamps the
+    /// caller's y-start, frame number and the stripe geometry — exactly what the x264 stripes
+    /// send, so the client's per-stripe decoders cannot tell the builds apart.
+    #[test]
+    fn stripe_instance_is_single_slice_and_stamps_y_start() {
+        let s = RustCaptureSettings {
+            width: 640,
+            height: 480,
+            output_mode: 1,
+            video_bitrate_kbps: 2000,
+            video_cbr_mode: true,
+            ..Default::default()
+        };
+        let mut full = Openh264Encoder::new(&s).expect("full-frame");
+        let full_out = full
+            .encode_host_argb(&vec![0x80u8; 640 * 480 * 4], 640 * 4, 3, true, false)
+            .expect("encode");
+        let frame = vec![0x80u8; 640 * 64 * 4];
+        let mut stripe = Openh264Encoder::new_stripe(&s, 640, 64, 25, 2000, false).expect("stripe");
+        let out = stripe.encode_stripe_argb(&frame, 640 * 4, 3, 320, true, false).expect("encode");
+        assert_eq!(out[0], 0x04);
+        assert_eq!(out[1], 0x01, "forced first stripe frame is an IDR");
+        assert_eq!(&out[2..4], &[0, 3], "frame number");
+        assert_eq!(&out[4..6], &320u16.to_be_bytes(), "y-start");
+        assert_eq!(&out[6..10], &[2, 128, 0, 64], "stripe geometry");
+        let (stripe_nals, full_nals) = (count_nals(&out), count_nals(&full_out));
+        assert!(stripe_nals >= 3, "SPS + PPS + IDR slice expected, got {stripe_nals}");
+        assert!(
+            stripe_nals + 3 <= full_nals,
+            "a stripe must be single-slice ({stripe_nals} NALs) against the four-slice full frame ({full_nals})"
+        );
+        let p = stripe.encode_stripe_argb(&frame, 640 * 4, 4, 320, false, false).expect("encode");
+        assert_eq!(p[1], 0x00, "an unforced static frame is a delta");
+        assert_eq!(&p[4..6], &320u16.to_be_bytes(), "y-start rides every frame");
     }
 
     /// Build a deterministic per-frame noise image — the worst case for rate control
@@ -872,7 +970,7 @@ mod slice_tests {
         assert!(qp51 * 4 < qp25, "QP pinning sanity: 51 must compress far harder than 25");
     }
 
-    /// The four-slice re-init in `enable_four_slices` preserves the CBR rate-control
+    /// The four-slice re-init in `enable_slices` preserves the CBR rate-control
     /// parameters: after construction the live `SEncParamExt` still shows the target bitrate, frame
     /// rate, QP headroom (max 51), and enabled frame-skip intact.
     #[test]
@@ -927,7 +1025,6 @@ mod rebuild_cost {
             width: 1920,
             height: 1080,
             output_mode: 1,
-            use_openh264: true,
             video_bitrate_kbps: 8000,
             ..Default::default()
         };

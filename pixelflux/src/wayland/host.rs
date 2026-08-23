@@ -31,7 +31,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gbm::{BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
@@ -105,19 +105,72 @@ pub struct HostCpuFrame {
     format: u32,
 }
 
+/// Source bytes-per-pixel and whether R and B swap to reach BGRA, for one announced wl_shm
+/// format. The consumers downstream all read BGRA (byte order B,G,R,A), so a format is mapped by
+/// where its red and blue land in memory under the little-endian byte order wayland.xml specifies:
+///
+/// - `Xrgb8888` / `Argb8888` (`[31:0] x:R:G:B` LE) are B,G,R,x in memory: already BGRA, no swap.
+/// - `Xbgr8888` / `Abgr8888` (`[31:0] x:B:G:R` LE) are R,G,B,x in memory: swap R/B.
+/// - `Bgr888` (`[23:0] B:G:R` LE) is R,G,B in memory: swap R/B (the 24-bit NVIDIA-GLES read path).
+/// - `Rgb888` (`[23:0] R:G:B` LE) is B,G,R in memory: already BGR order, no swap.
+///
+/// The empirical NVIDIA-GLES host could not be exercised here, so `Bgr888` follows the wl_shm
+/// definition literally: `[23:0] B:G:R little endian` places R in the low byte, so byte 0 is red and
+/// reaching BGRA swaps R and B — the opposite of a straight copy.
+fn shm_src_layout(format: u32) -> (usize, bool) {
+    match format {
+        f if f == wl_shm::Format::Xbgr8888 as u32 || f == wl_shm::Format::Abgr8888 as u32 => {
+            (4, true)
+        }
+        f if f == wl_shm::Format::Bgr888 as u32 => (3, true),
+        f if f == wl_shm::Format::Rgb888 as u32 => (3, false),
+        _ => (4, false),
+    }
+}
+
+/// Convert one source row to a BGRA destination row per `(src_bpp, swap_rb)` from
+/// `shm_src_layout`: a 4-byte source either copies straight or swaps R/B keeping alpha, a 3-byte
+/// source fills opaque alpha and swaps R/B only when the layout calls for it.
+fn convert_shm_row(src: &[u8], dst: &mut [u8], src_bpp: usize, swap_rb: bool) {
+    match (src_bpp, swap_rb) {
+        (4, false) => {
+            let n = dst.len().min(src.len());
+            dst[..n].copy_from_slice(&src[..n]);
+        }
+        (4, true) => {
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = s[3];
+            }
+        }
+        (_, true) => {
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                d[0] = s[2];
+                d[1] = s[1];
+                d[2] = s[0];
+                d[3] = 0xff;
+            }
+        }
+        (_, false) => {
+            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+                d[0] = s[0];
+                d[1] = s[1];
+                d[2] = s[2];
+                d[3] = 0xff;
+            }
+        }
+    }
+}
+
 impl HostCpuFrame {
-    /// Convert the frame into tight BGRA rows in `dst` (sized `w*4*h`); the
-    /// announced shm format decides the per-pixel conversion (compositors pick
-    /// their renderer's preferred read format, e.g. 24-bit BGR on NVIDIA GLES).
+    /// Convert the frame into tight BGRA rows in `dst` (sized `w*4*h`); the announced shm
+    /// format decides the per-pixel conversion (compositors pick their renderer's preferred read
+    /// format, e.g. 24-bit BGR on NVIDIA GLES).
     pub fn write_bgra(&self, w: i32, h: i32, dst: &mut [u8]) {
         let row = (w * 4) as usize;
-        let (src_bpp, swap_rb) = match self.format {
-            f if f == wl_shm::Format::Xbgr8888 as u32
-                || f == wl_shm::Format::Abgr8888 as u32 => (4usize, true),
-            f if f == wl_shm::Format::Bgr888 as u32 => (3, false),
-            // xrgb/argb: already BGRA byte order.
-            _ => (4, false),
-        };
+        let (src_bpp, swap_rb) = shm_src_layout(self.format);
         for y in 0..h as usize {
             let src_start = y * self.stride;
             let src_end = (src_start + src_bpp * w as usize).min(self.map.len());
@@ -126,28 +179,7 @@ impl HostCpuFrame {
             }
             let src_row = &self.map[src_start..src_end];
             let dst_row = &mut dst[y * row..(y + 1) * row];
-            match (src_bpp, swap_rb) {
-                (4, false) => {
-                    let n = row.min(src_row.len());
-                    dst_row[..n].copy_from_slice(&src_row[..n]);
-                }
-                (4, true) => {
-                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(4)) {
-                        d[0] = s[2];
-                        d[1] = s[1];
-                        d[2] = s[0];
-                        d[3] = s[3];
-                    }
-                }
-                _ => {
-                    for (d, s) in dst_row.chunks_exact_mut(4).zip(src_row.chunks_exact(3)) {
-                        d[0] = s[0];
-                        d[1] = s[1];
-                        d[2] = s[2];
-                        d[3] = 0xff;
-                    }
-                }
-            }
+            convert_shm_row(src_row, dst_row, src_bpp, swap_rb);
         }
     }
 }
@@ -163,18 +195,24 @@ struct LayoutSlot {
     /// The consumer imports dmabufs directly, so the compositor blits into GPU
     /// buffers. A CPU encode path clears this and takes shm frames instead.
     zero_copy: bool,
+    /// The host paints its cursor into the frames (the consumer's native cursor
+    /// rendering); off, the consumer draws the cursor itself from the sprite callback.
+    paint_cursor: bool,
 }
 
-/// What a capture thread is currently aiming at: the encoder's dimensions plus the
-/// buffer type its consumer can take. Either changing forces a slot renegotiation.
+/// What a capture thread is currently aiming at: the encoder's dimensions, the buffer
+/// type its consumer can take, and whether the host paints the cursor in. A size or
+/// buffer-type change forces a slot renegotiation; a cursor change reopens the ext
+/// session, whose option is fixed at creation.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Want {
     size: (i32, i32),
     zero_copy: bool,
+    paint_cursor: bool,
 }
 
 enum ToHost {
-    Start { width: i32, height: i32, zero_copy: bool },
+    Start { width: i32, height: i32, zero_copy: bool, paint_cursor: bool },
     /// Slot return; `generation` guards against slots recycled by a renegotiation
     /// while the consumer still held the frame.
     Release { generation: u64, slot: usize },
@@ -188,20 +226,42 @@ enum CtrlMsg {
 
 /// Outcome ledger for layout requests: every Apply carries an epoch, and the
 /// control thread records whether the newest one it processed was realized by
-/// the host. Waiters block on `decided` catching up to their epoch — a newer
-/// request subsumes an older one (same layout map), so `>=` is enough.
+/// the host. A request is answered once `decided` has caught up to its epoch;
+/// a newer request subsumes an older one (the layout map is cumulative), so
+/// the newest verdict stands for every epoch at or below it. Polled, never
+/// waited on: the session side reads it from its own loop.
 #[derive(Default)]
-struct LayoutOutcome {
+struct LayoutLedger {
     epoch: u64,
     decided: u64,
     realized: bool,
 }
 
-/// Bound for one layout negotiation, shared by the control thread's
-/// apply_layout and the session-side wait for its outcome; a host that
-/// answers even slower than this keeps the optimistic want, which is the
-/// pre-negotiation behavior.
-const LAYOUT_DEADLINE: Duration = Duration::from_secs(5);
+impl LayoutLedger {
+    /// Number the next request.
+    fn issue(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
+    }
+
+    /// Record the host's verdict on `epoch` (ignored if a newer one is already in).
+    fn decide(&mut self, epoch: u64, realized: bool) {
+        if epoch > self.decided {
+            self.decided = epoch;
+            self.realized = realized;
+        }
+    }
+
+    /// The verdict covering `epoch`: `None` while the host has not answered it yet.
+    fn outcome(&self, epoch: u64) -> Option<bool> {
+        (self.decided >= epoch).then_some(self.realized)
+    }
+}
+
+/// Bound for one layout application on the control thread: a host that has not
+/// answered by then counts as having kept its own mode, which the session then
+/// follows, the way a refusal is handled.
+pub const LAYOUT_DEADLINE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Control connection: seat + virtual input devices + wlr-output-management.
@@ -679,6 +739,22 @@ enum SlotBuffer {
     },
 }
 
+/// Release the host proxies a slot created. Dropping a wayland-client proxy sends no request,
+/// so without this every resize or buffer-type switch strands the slot's `wl_buffer` — and, on the
+/// shm path, its `wl_shm_pool` — in the host compositor for the connection's lifetime. The buffer is
+/// destroyed before the pool it was created from.
+impl Drop for SlotBuffer {
+    fn drop(&mut self) {
+        match self {
+            SlotBuffer::Gpu { wl, .. } => wl.destroy(),
+            SlotBuffer::Cpu { _pool, wl, .. } => {
+                wl.destroy();
+                _pool.destroy();
+            }
+        }
+    }
+}
+
 /// One host output's calloop-side handle: control channel, wake pipe, frames.
 struct OutputHandle {
     to_thread: Sender<ToHost>,
@@ -709,7 +785,7 @@ pub struct HostSession {
     /// Rank -> registry index, for looking a display's host output up in `sizes`.
     order: Vec<usize>,
     sizes: Arc<Mutex<Vec<(i32, i32)>>>,
-    layout_outcome: Arc<(Mutex<LayoutOutcome>, Condvar)>,
+    layouts: Arc<Mutex<LayoutLedger>>,
     alive: Arc<AtomicBool>,
 }
 
@@ -818,13 +894,19 @@ impl HostSession {
         let (ctrl_wake_rd, ctrl_wake) = wake_pipe()?;
         let order_for_session = state.order.clone();
         let sizes = state.sizes.clone();
-        let layout_outcome = Arc::new((Mutex::new(LayoutOutcome::default()), Condvar::new()));
+        let layouts = Arc::new(Mutex::new(LayoutLedger::default()));
         {
             let conn = conn.clone();
-            let outcome = layout_outcome.clone();
+            let ledger = layouts.clone();
+            let alive = alive.clone();
             std::thread::Builder::new()
                 .name("pf-host-ctrl".into())
-                .spawn(move || control_loop(conn, queue, state, ctrl_rx, ctrl_wake_rd, outcome))
+                .spawn(move || {
+                    control_loop(conn, queue, state, ctrl_rx, ctrl_wake_rd, ledger);
+                    // The primary connection carries the virtual keyboard and pointer: its
+                    // end is the session's end, whatever the capture threads still do.
+                    alive.store(false, Ordering::Relaxed);
+                })
                 .map_err(|e| format!("spawn: {e}"))?;
         }
 
@@ -839,7 +921,7 @@ impl HostSession {
             layout,
             order: order_for_session,
             sizes,
-            layout_outcome,
+            layouts,
             alive,
         })
     }
@@ -872,8 +954,9 @@ impl HostSession {
     }
 
     /// The current mode of the host output backing `display_id` (physical
-    /// pixels), as the host last announced it.
-    fn host_output_size(&self, display_id: u32) -> Option<(i32, i32)> {
+    /// pixels), as the host last announced it — what a capture follows when the
+    /// host keeps its own mode instead of taking the requested one.
+    pub fn current_output_size(&self, display_id: u32) -> Option<(i32, i32)> {
         let rank = self.output_index_for(display_id)?;
         let registry_idx = *self.order.get(rank)?;
         let size = *self.sizes.lock().unwrap().get(registry_idx)?;
@@ -882,53 +965,20 @@ impl HostSession {
 
     /// Number a layout request and hand it to the control thread.
     fn send_apply(&self, slots: Vec<LayoutSlot>) -> u64 {
-        let epoch = {
-            let (lock, _) = &*self.layout_outcome;
-            let mut o = lock.lock().unwrap();
-            o.epoch += 1;
-            o.epoch
-        };
+        let epoch = self.layouts.lock().unwrap().issue();
         let _ = self.ctrl_tx.send(CtrlMsg::Apply { epoch, slots });
         wake_write(self.ctrl_wake.as_raw_fd());
         epoch
     }
 
-    /// Ask the host for `display_id`'s wanted mode ahead of the capture start
-    /// and report what it realized: Some(size) when the host kept a different
-    /// size (it refused the layout, or offers no layout management at all),
-    /// None when the want was applied — or when no answer arrived in time,
-    /// keeping the optimistic want. A refused want is rewritten to the
-    /// realized size, so the pointer extent and the coming capture start
-    /// agree with what the host actually produces instead of gating forever
-    /// on a mode it declined.
-    pub fn negotiate_layout(&self, display_id: u32, width: i32, height: i32) -> Option<(i32, i32)> {
-        let slots = {
-            let mut layout = self.layout.lock().unwrap();
-            let slot = layout.entry(display_id).or_default();
-            slot.want = (width, height);
-            slot.active = true;
-            layout
-                .iter()
-                .filter(|(_, s)| s.active)
-                .map(|(_, s)| *s)
-                .take(self.outputs.len())
-                .collect::<Vec<_>>()
-        };
-        let epoch = self.send_apply(slots);
-        let (lock, cvar) = &*self.layout_outcome;
-        let (outcome, timeout) = cvar
-            .wait_timeout_while(lock.lock().unwrap(), LAYOUT_DEADLINE, |o| o.decided < epoch)
-            .unwrap();
-        if timeout.timed_out() || outcome.realized {
-            return None;
-        }
-        drop(outcome);
-        let realized = self.host_output_size(display_id)?;
-        if realized == (width, height) {
-            return None;
-        }
-        self.layout.lock().unwrap().entry(display_id).or_default().want = realized;
-        Some(realized)
+    /// The host's verdict on the layout request `epoch` (as returned by
+    /// [`start_capture`]): `Some(true)` once the host applied it, `Some(false)`
+    /// once it kept its own modes (refusal, no layout management at all — KWin —
+    /// or no answer within `LAYOUT_DEADLINE`), `None` while still unanswered.
+    /// Never blocks; the caller polls it from its own loop and, on `Some(false)`,
+    /// compares [`current_output_size`] with what it asked for.
+    pub fn layout_outcome(&self, epoch: u64) -> Option<bool> {
+        self.layouts.lock().unwrap().outcome(epoch)
     }
 
     /// Aim `display_id` at `width`x`height`: assigns every active display its
@@ -936,13 +986,22 @@ impl HostSession {
     /// atomic configuration, and points the capture threads at their sizes and
     /// buffer types; frames gate until the host applies them. `zero_copy` states
     /// whether this display's encoder imports dmabufs — a CPU consumer needs shm
-    /// frames it can read, and gets them even on a GPU-capable host.
-    pub fn start_capture(&self, display_id: u32, width: i32, height: i32, zero_copy: bool) {
+    /// frames it can read, and gets them even on a GPU-capable host. Returns the
+    /// layout request's epoch for [`layout_outcome`]; nothing here waits on the host.
+    pub fn start_capture(
+        &self,
+        display_id: u32,
+        width: i32,
+        height: i32,
+        zero_copy: bool,
+        paint_cursor: bool,
+    ) -> u64 {
         let assignments = {
             let mut layout = self.layout.lock().unwrap();
             let slot = layout.entry(display_id).or_default();
             slot.want = (width, height);
             slot.zero_copy = zero_copy;
+            slot.paint_cursor = paint_cursor;
             slot.active = true;
             let active: Vec<(u32, LayoutSlot)> = layout
                 .iter()
@@ -982,10 +1041,11 @@ impl HostSession {
                 width: slot.want.0,
                 height: slot.want.1,
                 zero_copy: slot.zero_copy,
+                paint_cursor: slot.paint_cursor,
             });
             by_output.push(*slot);
         }
-        self.send_apply(by_output);
+        self.send_apply(by_output)
     }
 
     /// Point `display_id`'s capture at dmabufs (`zero_copy`) or shm frames without touching its
@@ -1001,17 +1061,17 @@ impl HostSession {
                 return;
             }
             slot.zero_copy = zero_copy;
-            let (want, active) = (slot.want, slot.active);
+            let (want, active, paint_cursor) = (slot.want, slot.active, slot.paint_cursor);
             let rank = layout
                 .iter()
                 .filter(|(_, s)| s.active)
                 .position(|(id, _)| *id == display_id);
             match rank {
-                Some(r) if active && r < self.outputs.len() => (r, want),
+                Some(r) if active && r < self.outputs.len() => (r, want, paint_cursor),
                 _ => return,
             }
         };
-        let (idx, want) = target;
+        let (idx, want, paint_cursor) = target;
         // Same geometry, new buffer type: a retained dmabuf cannot be consumed
         // by the shm path (nor vice versa), so everything buffered goes back.
         self.drop_buffered_frames(idx);
@@ -1019,7 +1079,36 @@ impl HostSession {
             width: want.0,
             height: want.1,
             zero_copy,
+            paint_cursor,
         });
+    }
+
+    /// Switch every active capture between host-painted and consumer-drawn cursors
+    /// (the consumer's native cursor rendering toggle), keeping geometry and buffer type.
+    /// Frames already buffered stay valid either way. Idempotent.
+    pub fn set_cursor_painting(&self, paint_cursor: bool) {
+        let targets: Vec<(usize, LayoutSlot)> = {
+            let mut layout = self.layout.lock().unwrap();
+            let mut out = Vec::new();
+            for (rank, (_, slot)) in layout.iter_mut().filter(|(_, s)| s.active).enumerate() {
+                if rank >= self.outputs.len() {
+                    break;
+                }
+                if slot.paint_cursor != paint_cursor {
+                    slot.paint_cursor = paint_cursor;
+                    out.push((rank, *slot));
+                }
+            }
+            out
+        };
+        for (idx, slot) in targets {
+            self.outputs[idx].send(ToHost::Start {
+                width: slot.want.0,
+                height: slot.want.1,
+                zero_copy: slot.zero_copy,
+                paint_cursor,
+            });
+        }
     }
 
     /// Drop every buffered frame for an output: a mode or buffer-type change
@@ -1051,6 +1140,9 @@ impl HostSession {
         self.drop_buffered_frames(idx);
     }
 
+    /// False once the host connection is gone (the primary connection or the first
+    /// output's capture ended): the owner drops the session and reports its captures as
+    /// stopped, so they are rebuilt against a new connection instead of feeding a dead one.
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
@@ -1156,6 +1248,21 @@ impl HostSession {
         let _ = self.conn.flush();
     }
 
+    /// Relative motion in union-layout units, sent as the host's own relative motion: the
+    /// host moves its pointer by the delta and clamps it to its outputs, or, for a
+    /// pointer-locked client, passes the delta on without moving it. An absolute warp
+    /// against a position tracked here could not do the second: the locked host pointer
+    /// stays put, so every warp would read as the whole distance from the lock point.
+    pub fn pointer_motion_rel(&self, dx: f64, dy: f64) {
+        let Some(vp) = &self.vptr else { return };
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        vp.motion(0, dx, dy);
+        vp.frame();
+        let _ = self.conn.flush();
+    }
+
     pub fn pointer_button(&self, btn: u32, pressed: bool) {
         let Some(vp) = &self.vptr else { return };
         vp.button(
@@ -1167,13 +1274,29 @@ impl HostSession {
         let _ = self.conn.flush();
     }
 
+    /// Wheel scroll: the continuous value plus the discrete step count the seat path reports
+    /// as v120, so host clients that scroll by notches (terminals, games, GTK list views)
+    /// see the same steps as in nested mode; a value below one notch stays continuous. The
+    /// source follows each axis request, which is the axis it applies to on wlroots.
     pub fn pointer_axis(&self, dx: f64, dy: f64) {
         let Some(vp) = &self.vptr else { return };
-        if dy != 0.0 {
-            vp.axis(0, wl_pointer::Axis::VerticalScroll, dy);
+        if dx == 0.0 && dy == 0.0 {
+            return;
         }
-        if dx != 0.0 {
-            vp.axis(0, wl_pointer::Axis::HorizontalScroll, dx);
+        for (axis, value) in [
+            (wl_pointer::Axis::VerticalScroll, dy),
+            (wl_pointer::Axis::HorizontalScroll, dx),
+        ] {
+            if value == 0.0 {
+                continue;
+            }
+            let steps = (value * crate::SCROLL_V120_PER_UNIT / 120.0).round() as i32;
+            if steps != 0 {
+                vp.axis_discrete(0, axis, value, steps);
+            } else {
+                vp.axis(0, axis, value);
+            }
+            vp.axis_source(wl_pointer::AxisSource::Wheel);
         }
         vp.frame();
         let _ = self.conn.flush();
@@ -1194,7 +1317,7 @@ fn control_loop(
     mut state: CtrlState,
     ctrl_rx: Receiver<CtrlMsg>,
     wake_rd: OwnedFd,
-    outcome: Arc<(Mutex<LayoutOutcome>, Condvar)>,
+    ledger: Arc<Mutex<LayoutLedger>>,
 ) {
     let qh = queue.handle();
     loop {
@@ -1208,14 +1331,7 @@ fn control_loop(
         }
         if let Some((epoch, slots)) = pending {
             let realized = apply_layout(&conn, &mut queue, &mut state, &qh, &slots);
-            let (lock, cvar) = &*outcome;
-            let mut o = lock.lock().unwrap();
-            if epoch > o.decided {
-                o.decided = epoch;
-                o.realized = realized;
-            }
-            drop(o);
-            cvar.notify_all();
+            ledger.lock().unwrap().decide(epoch, realized);
         }
         if queue.dispatch_pending(&mut state).is_err() {
             return;
@@ -1246,10 +1362,10 @@ fn control_loop(
 /// Ask the host (wlr-output-management) to give every active output its wanted
 /// mode and layout position in one atomic configuration. Retries across a
 /// `cancelled` (stale serial). Returns whether the host realized the layout:
-/// on `false` (refusal, or no manager at all — KWin offers only its own
-/// kde_output_management protocol) the session falls the wants back to the
-/// host's actual sizes so capture follows the host instead of gating forever
-/// on a size it will never produce.
+/// on `false` (refusal, no answer by `LAYOUT_DEADLINE`, or no manager at all —
+/// KWin offers only its own kde_output_management protocol) the session owner
+/// re-sizes its capture to the host's actual mode so capture follows the host
+/// instead of gating forever on a size it will never produce.
 fn apply_layout(
     conn: &Connection,
     queue: &mut EventQueue<CtrlState>,
@@ -1565,11 +1681,14 @@ fn capture_loop(
     // persistent session with compositor-side damage gating; everything else takes
     // wlr-screencopy v3 below, unchanged. PIXELFLUX_HOST_CAPTURE=zwlr forces the
     // fallback for triage.
+    // The current aim outlives the ext attempt: a Start consumed while that session was
+    // being opened still drives the wlr-screencopy fallback.
+    let mut want: Option<Want> = None;
     let force = std::env::var("PIXELFLUX_HOST_CAPTURE").unwrap_or_default();
     if force != "zwlr" && state.ext_capture.is_some() && state.ext_source_mgr.is_some() {
         match capture_loop_ext(
             &conn, &mut queue, &mut state, &output, gbm.as_ref(), wake, index, &from_main,
-            &frame_tx,
+            &frame_tx, &mut want,
         ) {
             ExtOutcome::Finished => return Ok(()),
             ExtOutcome::Unavailable(e) => {
@@ -1586,7 +1705,6 @@ fn capture_loop(
     let mut announced: Option<(i32, i32)> = None;
     let mut warned_mismatch = false;
     let mut consecutive_failures = 0u32;
-    let mut want: Option<Want> = None;
     // Buffer type the currently allocated slots hold; None while none exist.
     let mut slot_zero_copy: Option<bool> = None;
     let mut gpu_refused = false;
@@ -1614,8 +1732,8 @@ fn capture_loop(
                     }
                 }
                 ToHost::Idle => want = None,
-                ToHost::Start { width, height, zero_copy } => {
-                    let next = Want { size: (width, height), zero_copy };
+                ToHost::Start { width, height, zero_copy, paint_cursor } => {
+                    let next = Want { size: (width, height), zero_copy, paint_cursor };
                     if want != Some(next) {
                         warned_mismatch = false;
                     }
@@ -1623,15 +1741,15 @@ fn capture_loop(
                 }
             }
         }
-        let (want_w, want_h, want_zero_copy) = match want {
-            Some(w) => (w.size.0, w.size.1, w.zero_copy),
+        let (want_w, want_h, want_zero_copy, want_paint) = match want {
+            Some(w) => (w.size.0, w.size.1, w.zero_copy, w.paint_cursor),
             None => continue,
         };
 
         // One frame: negotiate, attach our buffer, wait for damage. Control
         // messages (resize, idle, teardown) interrupt any of the waits.
         state.reset_frame();
-        let frame = screencopy.capture_output(1, &output, &qh, ());
+        let frame = screencopy.capture_output(i32::from(want_paint), &output, &qh, ());
         loop {
             match pump_until(&conn, &mut queue, &mut state, wake, None, |s| {
                 s.buffer_done || s.failed
@@ -1863,22 +1981,12 @@ fn capture_loop_ext(
     index: usize,
     from_main: &Receiver<ToHost>,
     frame_tx: &Sender<HostFrame>,
+    want: &mut Option<Want>,
 ) -> ExtOutcome {
     let qh = queue.handle();
-    let src_mgr = state.ext_source_mgr.clone().expect("checked by caller");
-    let mgr = state.ext_capture.clone().expect("checked by caller");
-    let source = src_mgr.create_source(output, &qh, ());
-    let session = mgr.create_session(
-        &source,
-        ext_image_copy_capture_manager_v1::Options::PaintCursors,
-        &qh,
-        (),
-    );
-
     let mut slots: Vec<Option<SlotBuffer>> = (0..SLOTS).map(|_| None).collect();
     let mut free: Vec<usize> = (0..SLOTS).collect();
     let mut generation: u64 = 0;
-    let mut want: Option<Want> = None;
     let mut slot_zero_copy: Option<bool> = None;
     let mut gpu_refused = false;
     let mut seen_serial: u64 = 0;
@@ -1890,41 +1998,16 @@ fn capture_loop_ext(
         source.destroy();
     };
 
-    // The first constraint set decides whether this protocol works here at all.
-    loop {
-        match pump_until(conn, queue, state, wake, Some(Duration::from_secs(5)), |s| {
-            s.ext_serial > 0 || s.ext_stopped
-        }) {
-            Ok(Pump::Done) => break,
-            Ok(Pump::Control) => {
-                match drain_ctl(from_main, generation, &mut free, &mut want) {
-                    Ctl::Dead => {
-                        teardown(&session, &source);
-                        return ExtOutcome::Finished;
-                    }
-                    _ => continue,
-                }
-            }
-            Ok(Pump::Timeout) => {
-                teardown(&session, &source);
-                return ExtOutcome::Unavailable("no buffer constraints within 5s".into());
-            }
-            Err(e) => {
-                teardown(&session, &source);
-                return ExtOutcome::Unavailable(e);
-            }
-        }
-    }
-    if state.ext_stopped {
-        teardown(&session, &source);
-        return ExtOutcome::Unavailable("session stopped before constraints".into());
-    }
-    eprintln!(
-        "[HostCapture] output {index} ext session: {:?} dma_formats={} shm_formats={}",
-        state.ext_size,
-        state.ext_dma_formats.len(),
-        state.ext_shm_formats.len(),
-    );
+    // The session opens with the cursor option of the first Start, which may already be
+    // queued; before any Start the consumer's default (drawing the cursor itself) applies.
+    let mut session_paints = false;
+    let (mut source, mut session) = match open_ext_session(
+        conn, queue, state, output, wake, index, from_main, session_paints, generation,
+        &mut free, want,
+    ) {
+        Ok(opened) => opened,
+        Err(outcome) => return outcome,
+    };
 
     'main: loop {
         // Drain control; block while idle or out of slots.
@@ -1954,24 +2037,38 @@ fn capture_loop_ext(
                         free.push(slot);
                     }
                 }
-                ToHost::Idle => want = None,
-                ToHost::Start { width, height, zero_copy } => {
-                    let next = Want { size: (width, height), zero_copy };
-                    if want != Some(next) {
+                ToHost::Idle => *want = None,
+                ToHost::Start { width, height, zero_copy, paint_cursor } => {
+                    let next = Want { size: (width, height), zero_copy, paint_cursor };
+                    if *want != Some(next) {
                         warned_mismatch = false;
                     }
-                    want = Some(next);
+                    *want = Some(next);
                 }
             }
         }
-        let (want_w, want_h, want_zero_copy) = match want {
-            Some(w) => (w.size.0, w.size.1, w.zero_copy),
+        let (want_w, want_h, want_zero_copy, want_paint) = match *want {
+            Some(w) => (w.size.0, w.size.1, w.zero_copy, w.paint_cursor),
             None => continue,
         };
         if state.ext_stopped {
             // The output is going away; nothing else on this connection will revive it.
             teardown(&session, &source);
             return ExtOutcome::Finished;
+        }
+        if want_paint != session_paints {
+            // The cursor option is fixed per session: reopen with the wanted one. Its
+            // constraints arrive under a new serial, which reallocates the slots below.
+            teardown(&session, &source);
+            (source, session) = match open_ext_session(
+                conn, queue, state, output, wake, index, from_main, want_paint, generation,
+                &mut free, want,
+            ) {
+                Ok(opened) => opened,
+                Err(outcome) => return outcome,
+            };
+            session_paints = want_paint;
+            continue;
         }
 
         // Fresh constraints obsolete every allocated buffer.
@@ -2093,7 +2190,7 @@ fn capture_loop_ext(
                 s.ready || s.failed || s.ext_stopped || s.ext_serial != seen_serial
             }) {
                 Ok(Pump::Done) => break,
-                Ok(Pump::Control) => match drain_ctl(from_main, generation, &mut free, &mut want) {
+                Ok(Pump::Control) => match drain_ctl(from_main, generation, &mut free, want) {
                     Ctl::None => {}
                     Ctl::Renegotiate | Ctl::Idle => {
                         aborted = true;
@@ -2172,6 +2269,80 @@ fn capture_loop_ext(
     }
 }
 
+/// Open an ext capture session on `output`, with or without the host painting its cursor
+/// into the frames, and wait for its first buffer constraints: the point that decides
+/// whether this protocol works here at all. A session's cursor option is fixed at
+/// creation, so a toggle closes the session and opens another through here.
+#[allow(clippy::too_many_arguments)]
+fn open_ext_session(
+    conn: &Connection,
+    queue: &mut EventQueue<CaptureState>,
+    state: &mut CaptureState,
+    output: &wl_output::WlOutput,
+    wake: RawFd,
+    index: usize,
+    from_main: &Receiver<ToHost>,
+    paint_cursor: bool,
+    generation: u64,
+    free: &mut Vec<usize>,
+    want: &mut Option<Want>,
+) -> Result<(ExtImageCaptureSourceV1, ExtImageCopyCaptureSessionV1), ExtOutcome> {
+    let qh = queue.handle();
+    let src_mgr = state.ext_source_mgr.clone().expect("checked by caller");
+    let mgr = state.ext_capture.clone().expect("checked by caller");
+    let source = src_mgr.create_source(output, &qh, ());
+    let options = if paint_cursor {
+        ext_image_copy_capture_manager_v1::Options::PaintCursors
+    } else {
+        ext_image_copy_capture_manager_v1::Options::empty()
+    };
+    let session = mgr.create_session(&source, options, &qh, ());
+    let teardown = |session: &ExtImageCopyCaptureSessionV1, source: &ExtImageCaptureSourceV1| {
+        session.destroy();
+        source.destroy();
+    };
+    // A previous session's stop or half-streamed constraints must not pass for this one's.
+    state.ext_stopped = false;
+    state.ext_pending_size = None;
+    state.ext_pending_shm.clear();
+    state.ext_pending_dma.clear();
+    let before = state.ext_serial;
+    loop {
+        match pump_until(conn, queue, state, wake, Some(Duration::from_secs(5)), |s| {
+            s.ext_serial > before || s.ext_stopped
+        }) {
+            Ok(Pump::Done) => break,
+            Ok(Pump::Control) => match drain_ctl(from_main, generation, free, want) {
+                Ctl::Dead => {
+                    teardown(&session, &source);
+                    return Err(ExtOutcome::Finished);
+                }
+                _ => continue,
+            },
+            Ok(Pump::Timeout) => {
+                teardown(&session, &source);
+                return Err(ExtOutcome::Unavailable("no buffer constraints within 5s".into()));
+            }
+            Err(e) => {
+                teardown(&session, &source);
+                return Err(ExtOutcome::Unavailable(e));
+            }
+        }
+    }
+    if state.ext_stopped {
+        teardown(&session, &source);
+        return Err(ExtOutcome::Unavailable("session stopped before constraints".into()));
+    }
+    eprintln!(
+        "[HostCapture] output {index} ext session: {:?} dma_formats={} shm_formats={} cursor={}",
+        state.ext_size,
+        state.ext_dma_formats.len(),
+        state.ext_shm_formats.len(),
+        if paint_cursor { "painted" } else { "consumer" },
+    );
+    Ok((source, session))
+}
+
 /// Drain the control channel from inside a capture wait: releases are applied
 /// (generation-checked), and the newest Start/Idle decides the wait's fate.
 fn drain_ctl(
@@ -2188,8 +2359,8 @@ fn drain_ctl(
                     free.push(slot);
                 }
             }
-            Ok(ToHost::Start { width, height, zero_copy }) => {
-                let next = Want { size: (width, height), zero_copy };
+            Ok(ToHost::Start { width, height, zero_copy, paint_cursor }) => {
+                let next = Want { size: (width, height), zero_copy, paint_cursor };
                 if *want != Some(next) {
                     *want = Some(next);
                     out = Ctl::Renegotiate;
@@ -2202,5 +2373,93 @@ fn drain_ctl(
             Err(TryRecvError::Empty) => return out,
             Err(TryRecvError::Disconnected) => return Ctl::Dead,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shm-format table maps each announced format to the right BGRA conversion. The
+    /// wl_shm definitions are little-endian, so `Bgr888` (`[23:0] B:G:R`) is red-first in memory and
+    /// must swap R/B, while `Rgb888` (`[23:0] R:G:B`) is already blue-first and copies straight.
+    #[test]
+    fn shm_layout_matches_wl_shm_definitions() {
+        assert_eq!(shm_src_layout(wl_shm::Format::Bgr888 as u32), (3, true));
+        assert_eq!(shm_src_layout(wl_shm::Format::Rgb888 as u32), (3, false));
+        assert_eq!(shm_src_layout(wl_shm::Format::Xbgr8888 as u32), (4, true));
+        assert_eq!(shm_src_layout(wl_shm::Format::Abgr8888 as u32), (4, true));
+        assert_eq!(shm_src_layout(wl_shm::Format::Xrgb8888 as u32), (4, false));
+        assert_eq!(shm_src_layout(wl_shm::Format::Argb8888 as u32), (4, false));
+    }
+
+    /// A known pixel round-trips to BGRA. The logical colour is R=0x11, G=0x22, B=0x33; in a
+    /// `Bgr888` buffer its little-endian bytes are R,G,B (0x11,0x22,0x33) and the destination must be
+    /// B,G,R,A (0x33,0x22,0x11,0xff). Without the R/B swap this path produced 0x11,0x22,0x33 —
+    /// red and blue transposed.
+    #[test]
+    fn bgr888_known_pixel_swaps_red_and_blue() {
+        let (bpp, swap) = shm_src_layout(wl_shm::Format::Bgr888 as u32);
+        let src = [0x11u8, 0x22, 0x33];
+        let mut dst = [0u8; 4];
+        convert_shm_row(&src, &mut dst, bpp, swap);
+        assert_eq!(dst, [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    /// The same logical colour in an `Rgb888` buffer is already B,G,R in memory
+    /// (0x33,0x22,0x11), so it copies straight to B,G,R,A with an opaque alpha and no swap.
+    #[test]
+    fn rgb888_known_pixel_copies_straight() {
+        let (bpp, swap) = shm_src_layout(wl_shm::Format::Rgb888 as u32);
+        let src = [0x33u8, 0x22, 0x11];
+        let mut dst = [0u8; 4];
+        convert_shm_row(&src, &mut dst, bpp, swap);
+        assert_eq!(dst, [0x33, 0x22, 0x11, 0xff]);
+    }
+
+    /// The 32-bit `Xbgr8888` source (R,G,B,x in memory) swaps R/B and preserves the fourth
+    /// byte, and `Xrgb8888` (B,G,R,x) copies straight.
+    fn convert(format: wl_shm::Format, src: &[u8]) -> [u8; 4] {
+        let (bpp, swap) = shm_src_layout(format as u32);
+        let mut dst = [0u8; 4];
+        convert_shm_row(src, &mut dst, bpp, swap);
+        dst
+    }
+
+    #[test]
+    fn four_byte_formats_convert_to_bgra() {
+        assert_eq!(convert(wl_shm::Format::Xbgr8888, &[0x11, 0x22, 0x33, 0x44]), [0x33, 0x22, 0x11, 0x44]);
+        assert_eq!(convert(wl_shm::Format::Xrgb8888, &[0x33, 0x22, 0x11, 0x44]), [0x33, 0x22, 0x11, 0x44]);
+    }
+
+    /// The layout ledger the calloop polls: a request is unanswered until the control
+    /// thread decides an epoch at or past it, the newest verdict stands for every
+    /// older request (the layout map is cumulative), and a stale verdict arriving
+    /// after a newer one cannot overwrite it.
+    #[test]
+    fn layout_ledger_answers_by_epoch() {
+        let mut ledger = LayoutLedger::default();
+        let first = ledger.issue();
+        let second = ledger.issue();
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(ledger.outcome(first), None);
+        assert_eq!(ledger.outcome(second), None);
+
+        ledger.decide(first, true);
+        assert_eq!(ledger.outcome(first), Some(true));
+        assert_eq!(ledger.outcome(second), None);
+
+        // The control thread coalesces queued requests and answers only the newest;
+        // that verdict covers the older epoch too.
+        let third = ledger.issue();
+        ledger.decide(third, false);
+        assert_eq!(ledger.outcome(second), Some(false));
+        assert_eq!(ledger.outcome(third), Some(false));
+
+        // A late verdict for an older epoch does not roll the ledger back.
+        ledger.decide(second, true);
+        assert_eq!(ledger.outcome(third), Some(false));
+        let fourth = ledger.issue();
+        assert_eq!(ledger.outcome(fourth), None);
     }
 }

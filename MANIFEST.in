@@ -6,6 +6,7 @@ recursive-exclude pixelflux *.so *.pyc
 prune pixelflux/target
 prune pixelflux/nvcodec-sys/target
 include LICENSE
+include LICENSES.md
 include pyproject.toml
 include README.md
 include setup.py
