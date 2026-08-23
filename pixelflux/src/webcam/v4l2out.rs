@@ -71,7 +71,7 @@ const VIDIOC_S_FMT: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, b'V', 5, mem::size
 
 fn query_cap(fd: libc::c_int) -> io::Result<V4l2Capability> {
     let mut cap: V4l2Capability = unsafe { mem::zeroed() };
-    if unsafe { libc::ioctl(fd, VIDIOC_QUERYCAP, &mut cap as *mut V4l2Capability) } != 0 {
+    if unsafe { libc::ioctl(fd, VIDIOC_QUERYCAP as _, &mut cap as *mut V4l2Capability) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(cap)
@@ -123,7 +123,7 @@ impl V4l2Output {
             quantization: 0,
             xfer_func: 0,
         };
-        if unsafe { libc::ioctl(fd.as_raw_fd(), VIDIOC_S_FMT, &mut f as *mut V4l2Format) } != 0 {
+        if unsafe { libc::ioctl(fd.as_raw_fd(), VIDIOC_S_FMT as _, &mut f as *mut V4l2Format) } != 0 {
             return Err(format!("VIDIOC_S_FMT({}): {}", path, io::Error::last_os_error()));
         }
         if f.pix.pixelformat != fmt.fourcc || f.pix.width != fmt.width || f.pix.height != fmt.height {
