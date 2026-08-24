@@ -33,7 +33,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use convert::{DeviceFormat, Normalizer};
+use convert::{orient_i420, DeviceFormat, Normalizer, Orientation};
 use decode::{new_decoder, sniff_keyframe, Codec, DecodeError, Decoder};
 use pipewire::PipeWireSink;
 use ring::{Ring, RingFormat};
@@ -123,11 +123,13 @@ struct Stats {
     input_width: AtomicU32,
     input_height: AtomicU32,
     input_codec: AtomicU32,
+    input_rotation: AtomicU32,
 }
 
 struct Job {
     codec: Codec,
     keyframe: bool,
+    orientation: Orientation,
     data: Vec<u8>,
 }
 
@@ -293,6 +295,7 @@ fn worker(cfg: WorkerConfig) {
     let fmt = *ring.format();
     let dev = DeviceFormat { width: fmt.width as usize, height: fmt.height as usize, fourcc: fmt.fourcc };
     let mut normalizer = Normalizer::new();
+    let mut oriented = convert::I420Buffer::new(2, 2);
     let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut need_keyframe = true;
     let mut last_error_log = Instant::now() - Duration::from_secs(60);
@@ -316,9 +319,9 @@ fn worker(cfg: WorkerConfig) {
     };
 
     while let Some(job) = queue.pop() {
-        if mjpeg_device && job.codec == Codec::Mjpeg {
-            // The device speaks the uplink's own format: a frame of the device's size is
-            // published as received, undecoded; any other size goes through decode and fit.
+        if mjpeg_device && job.codec == Codec::Mjpeg && job.orientation.is_upright() {
+            // The device speaks the uplink's own format: an upright frame of the device's
+            // size is published as received, undecoded; any other goes through decode and fit.
             if let Ok(hdr) = turbojpeg::read_header(&job.data) {
                 stats.input_width.store(hdr.width as u32, Ordering::Relaxed);
                 stats.input_height.store(hdr.height as u32, Ordering::Relaxed);
@@ -365,6 +368,12 @@ fn worker(cfg: WorkerConfig) {
                 if let Some(view) = dec.frame() {
                     stats.input_width.store(view.width as u32, Ordering::Relaxed);
                     stats.input_height.store(view.height as u32, Ordering::Relaxed);
+                    let view = if job.orientation.is_upright() {
+                        view
+                    } else {
+                        orient_i420(&view, job.orientation, &mut oriented);
+                        oriented.view(view.full_range)
+                    };
                     let ts = monotonic_ns();
                     let published = ring.publish(ts, |slot| match jpeg_out.as_mut() {
                         Some(enc) => enc.write_frame(&mut normalizer, &view, &dev, slot),
@@ -508,11 +517,19 @@ impl VirtualCamera {
     }
 
     /// Hand one encoded frame to the decoder. `data` is any buffer-protocol object; the encoded
-    /// payload starts at `offset`. Returns a bit set (`KEYFRAME_WANTED`) the caller relays to the
-    /// client. Raises when the camera is not running or the codec id is unknown.
-    #[pyo3(signature = (data, codec, keyframe = false, offset = 0))]
-    fn push(&self, py: Python<'_>, data: PyBuffer<u8>, codec: u32, keyframe: bool, offset: usize) -> PyResult<u32> {
+    /// payload starts at `offset`. `rotation` (clockwise degrees: 0, 90, 180 or 270) and `flip`
+    /// (a horizontal mirror applied after the rotation) carry the frame's upright transform when
+    /// the client's encoder left it as metadata instead of baking it into the pixels; the decoded
+    /// picture is oriented before it is fitted. Returns a bit set (`KEYFRAME_WANTED`) the caller
+    /// relays to the client. Raises when the camera is not running, the codec id is unknown or the
+    /// rotation is not a quarter turn.
+    #[pyo3(signature = (data, codec, keyframe = false, offset = 0, rotation = 0, flip = false))]
+    fn push(&self, py: Python<'_>, data: PyBuffer<u8>, codec: u32, keyframe: bool, offset: usize, rotation: u32, flip: bool) -> PyResult<u32> {
         let codec = Codec::from_id(codec).ok_or_else(|| PyValueError::new_err(format!("unknown codec id {}", codec)))?;
+        if rotation % 90 != 0 || rotation >= 360 {
+            return Err(PyValueError::new_err("rotation must be 0, 90, 180 or 270"));
+        }
+        let orientation = Orientation { quarter_turns: (rotation / 90) as u8, hflip: flip };
         if !data.is_c_contiguous() {
             return Err(PyValueError::new_err("frame buffer must be contiguous"));
         }
@@ -528,7 +545,8 @@ impl VirtualCamera {
         let _ = py;
         self.stats.pushed.fetch_add(1, Ordering::Relaxed);
         self.stats.input_codec.store(codec as u32, Ordering::Relaxed);
-        if let Some(evicted) = running.queue.push(Job { codec, keyframe, data: buf }) {
+        self.stats.input_rotation.store(rotation, Ordering::Relaxed);
+        if let Some(evicted) = running.queue.push(Job { codec, keyframe, orientation, data: buf }) {
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             if evicted.codec.is_inter_coded() {
                 running.keyframe_wanted.store(true, Ordering::Relaxed);
@@ -592,6 +610,7 @@ impl VirtualCamera {
         d.set_item("errors", s.errors.load(Ordering::Relaxed))?;
         d.set_item("input_width", s.input_width.load(Ordering::Relaxed))?;
         d.set_item("input_height", s.input_height.load(Ordering::Relaxed))?;
+        d.set_item("input_rotation", s.input_rotation.load(Ordering::Relaxed))?;
         let codec = s.input_codec.load(Ordering::Relaxed);
         d.set_item("input_codec", Codec::from_id(codec).map(|c| c.name()).unwrap_or(""))?;
         let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -661,9 +680,9 @@ mod tests {
     #[test]
     fn queue_drops_oldest() {
         let q = Queue::new(2);
-        assert!(q.push(Job { codec: Codec::H264, keyframe: true, data: vec![1] }).is_none());
-        assert!(q.push(Job { codec: Codec::H264, keyframe: false, data: vec![2] }).is_none());
-        let evicted = q.push(Job { codec: Codec::H264, keyframe: false, data: vec![3] }).unwrap();
+        assert!(q.push(Job { codec: Codec::H264, keyframe: true, orientation: Orientation::UPRIGHT, data: vec![1] }).is_none());
+        assert!(q.push(Job { codec: Codec::H264, keyframe: false, orientation: Orientation::UPRIGHT, data: vec![2] }).is_none());
+        let evicted = q.push(Job { codec: Codec::H264, keyframe: false, orientation: Orientation::UPRIGHT, data: vec![3] }).unwrap();
         assert_eq!(evicted.data, vec![1]);
         assert_eq!(q.pop().unwrap().data, vec![2]);
         assert_eq!(q.pop().unwrap().data, vec![3]);

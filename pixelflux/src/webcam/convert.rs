@@ -318,6 +318,66 @@ impl Default for Normalizer {
     }
 }
 
+/// One upright transform: clockwise quarter turns, then a horizontal mirror.
+///
+/// Clients encode the camera's pixels as captured and relay the upright
+/// transform with each frame; it is applied here, right after decode, where
+/// the fit step already absorbs the size swap of odd turns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Orientation {
+    /// Clockwise quarter turns (0..=3) that make the frame upright.
+    pub quarter_turns: u8,
+    /// Horizontal mirror, applied after the rotation.
+    pub hflip: bool,
+}
+
+impl Orientation {
+    pub const UPRIGHT: Orientation = Orientation { quarter_turns: 0, hflip: false };
+
+    pub fn is_upright(&self) -> bool {
+        self.quarter_turns % 4 == 0 && !self.hflip
+    }
+}
+
+/// Rotate one plane clockwise into a tightly packed destination (whose width is
+/// `h` for odd turn counts), mirroring each destination row for `hflip`.
+fn orient_plane(src: &[u8], stride: usize, w: usize, h: usize, o: Orientation, dst: &mut [u8]) {
+    let q = o.quarter_turns % 4;
+    let (dw, dh) = if q % 2 == 1 { (h, w) } else { (w, h) };
+    for dy in 0..dh {
+        let row = &mut dst[dy * dw..(dy + 1) * dw];
+        for (dx, out) in row.iter_mut().enumerate() {
+            let (sx, sy) = match q {
+                1 => (dy, h - 1 - dx),
+                2 => (w - 1 - dx, h - 1 - dy),
+                3 => (w - 1 - dy, dx),
+                _ => (dx, dy),
+            };
+            *out = src[sy * stride + sx];
+        }
+        if o.hflip {
+            row.reverse();
+        }
+    }
+}
+
+/// Apply `o` to `src`, producing a tightly packed upright copy in `out`. The
+/// chroma planes of the rotated picture are exactly the rotated chroma planes
+/// (odd-turn chroma dimensions transpose with them), so each plane is oriented
+/// independently.
+pub fn orient_i420(src: &I420View<'_>, o: Orientation, out: &mut I420Buffer) {
+    let q = o.quarter_turns % 4;
+    let (dw, dh) = if q % 2 == 1 { (src.height, src.width) } else { (src.width, src.height) };
+    out.resize(dw, dh);
+    let y_len = out.y_len();
+    let uv_len = out.uv_len();
+    let (yp, rest) = out.data.split_at_mut(y_len);
+    let (up, vp) = rest.split_at_mut(uv_len);
+    orient_plane(src.y, src.y_stride, src.width, src.height, o, yp);
+    orient_plane(src.u, src.uv_stride, src.chroma_width(), src.chroma_height(), o, up);
+    orient_plane(src.v, src.uv_stride, src.chroma_width(), src.chroma_height(), o, vp);
+}
+
 /// Largest even-aligned size of `sw` x `sh` that fits into `dw` x `dh` preserving aspect, and the
 /// even-aligned offsets that center it.
 pub fn fit(sw: usize, sh: usize, dw: usize, dh: usize) -> (usize, usize, usize, usize) {
@@ -523,6 +583,40 @@ mod tests {
         assert_eq!(out[uv + 8 * 4 + 2 + 8 * 2], 160);
         assert_eq!(n.write_frame(&src.view(false), &dev, &mut out), dev.frame_bytes());
         assert_eq!(out[4 + 3 * 16], 200);
+    }
+
+    #[test]
+    fn orient_rotates_clockwise_then_mirrors() {
+        let mut src = I420Buffer::new(2, 2);
+        src.data[..4].copy_from_slice(&[1, 2, 3, 4]);
+        src.data[4] = 10;
+        src.data[5] = 20;
+        let mut out = I420Buffer::new(2, 2);
+        let v = src.view(false);
+        orient_i420(&v, Orientation { quarter_turns: 1, hflip: false }, &mut out);
+        assert_eq!(&out.data[..4], &[3, 1, 4, 2]);
+        orient_i420(&v, Orientation { quarter_turns: 2, hflip: false }, &mut out);
+        assert_eq!(&out.data[..4], &[4, 3, 2, 1]);
+        orient_i420(&v, Orientation { quarter_turns: 3, hflip: false }, &mut out);
+        assert_eq!(&out.data[..4], &[2, 4, 1, 3]);
+        orient_i420(&v, Orientation { quarter_turns: 0, hflip: true }, &mut out);
+        assert_eq!(&out.data[..4], &[2, 1, 4, 3]);
+        assert_eq!((out.data[4], out.data[5]), (10, 20));
+        assert!(Orientation::UPRIGHT.is_upright());
+        assert!(!Orientation { quarter_turns: 2, hflip: false }.is_upright());
+    }
+
+    #[test]
+    fn orient_swaps_dimensions_for_odd_turns() {
+        let mut src = I420Buffer::new(4, 2);
+        for (i, b) in src.data[..8].iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let mut out = I420Buffer::new(2, 2);
+        orient_i420(&src.view(true), Orientation { quarter_turns: 1, hflip: false }, &mut out);
+        assert_eq!((out.width, out.height), (2, 4));
+        assert_eq!(&out.data[..8], &[4, 0, 5, 1, 6, 2, 7, 3]);
+        assert!(out.view(true).full_range);
     }
 
     #[test]
