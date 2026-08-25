@@ -11,36 +11,29 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # One job per interpreter rather than one per (arch, libc) building the
-      # whole cp39-cp314 ladder in sequence: the ladder is what set the wall
-      # clock, and the interpreters share nothing but the container image.
+      # One job per (arch, libc): an extra interpreter rebuilds only the PyO3
+      # layer and the extension, so splitting them would duplicate before-all
+      # for far less than it costs.
       matrix:
-        python: [cp39, cp310, cp311, cp312, cp313, cp314]
+        platform: [manylinux, musllinux]
         target:
           - arch: x86_64
             runner: ubuntu-latest
-            platform: manylinux
-          - arch: x86_64
-            runner: ubuntu-latest
-            platform: musllinux
           - arch: aarch64
             runner: ubuntu-24.04-arm
-            platform: manylinux
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            platform: musllinux
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build the wheel (${{ matrix.python }}-${{ matrix.target.platform }}_${{ matrix.target.arch }})
+      - name: Build wheels (${{ matrix.platform }}_${{ matrix.target.arch }})
         uses: pypa/cibuildwheel@v4.2.0
         env:
-          CIBW_BUILD: ${{ matrix.python }}-${{ matrix.target.platform }}_${{ matrix.target.arch }}
+          # Every interpreter cibuildwheel offers, floored by python_requires.
+          CIBW_BUILD: "*-${{ matrix.platform }}_${{ matrix.target.arch }}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.target.arch }}-${{ matrix.target.platform }}-${{ matrix.python }}
+          name: wheels-${{ matrix.target.arch }}-${{ matrix.platform }}
           path: wheelhouse/*.whl
           # A wheel is a deflated zip already, so the archive this is wrapped in
           # cannot compress it further: levelling off spends no CPU re-deflating
