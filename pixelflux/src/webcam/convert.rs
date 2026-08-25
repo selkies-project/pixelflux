@@ -339,24 +339,45 @@ impl Orientation {
     }
 }
 
+/// Destination square a quarter turn is taken in, so the source rows it gathers
+/// from stay in the innermost cache across the whole square.
+const ORIENT_TILE: usize = 32;
+
 /// Rotate one plane clockwise into a tightly packed destination (whose width is
 /// `h` for odd turn counts), mirroring each destination row for `hflip`.
+///
+/// Half turns keep rows as rows and are copied as such. A quarter turn gathers a
+/// source column per destination row, so it is taken in tiles: a whole-row pass
+/// touches every source row once per output row and spills the cache on any
+/// frame that does not fit in it.
 fn orient_plane(src: &[u8], stride: usize, w: usize, h: usize, o: Orientation, dst: &mut [u8]) {
     let q = o.quarter_turns % 4;
     let (dw, dh) = if q % 2 == 1 { (h, w) } else { (w, h) };
-    for dy in 0..dh {
-        let row = &mut dst[dy * dw..(dy + 1) * dw];
-        for (dx, out) in row.iter_mut().enumerate() {
-            let (sx, sy) = match q {
-                1 => (dy, h - 1 - dx),
-                2 => (w - 1 - dx, h - 1 - dy),
-                3 => (w - 1 - dy, dx),
-                _ => (dx, dy),
-            };
-            *out = src[sy * stride + sx];
+    if q % 2 == 0 {
+        let reversed = (q == 2) != o.hflip;
+        for dy in 0..dh {
+            let sy = if q == 2 { h - 1 - dy } else { dy };
+            let row = &src[sy * stride..sy * stride + w];
+            let out = &mut dst[dy * dw..dy * dw + dw];
+            if reversed {
+                for (dx, o) in out.iter_mut().enumerate() {
+                    *o = row[w - 1 - dx];
+                }
+            } else {
+                out.copy_from_slice(row);
+            }
         }
-        if o.hflip {
-            row.reverse();
+        return;
+    }
+    for ty in (0..dh).step_by(ORIENT_TILE) {
+        for tx in (0..dw).step_by(ORIENT_TILE) {
+            for dy in ty..(ty + ORIENT_TILE).min(dh) {
+                let row = &mut dst[dy * dw..(dy + 1) * dw];
+                for dx in tx..(tx + ORIENT_TILE).min(dw) {
+                    let (sx, sy) = if q == 1 { (dy, h - 1 - dx) } else { (w - 1 - dy, dx) };
+                    row[if o.hflip { dw - 1 - dx } else { dx }] = src[sy * stride + sx];
+                }
+            }
         }
     }
 }
@@ -604,6 +625,31 @@ mod tests {
         assert_eq!((out.data[4], out.data[5]), (10, 20));
         assert!(Orientation::UPRIGHT.is_upright());
         assert!(!Orientation { quarter_turns: 2, hflip: false }.is_upright());
+    }
+
+    #[test]
+    fn orient_quarter_turn_spans_tiles() {
+        // Wider and taller than one tile, so the gather is checked across tile
+        // boundaries rather than inside a single square.
+        let (w, h) = (ORIENT_TILE * 2 + 6, ORIENT_TILE + 8);
+        let mut src = I420Buffer::new(w, h);
+        for (i, b) in src.data[..w * h].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let v = src.view(false);
+        let mut out = I420Buffer::new(2, 2);
+        for (q, hflip) in [(1u8, false), (1, true), (3, false), (3, true)] {
+            orient_i420(&v, Orientation { quarter_turns: q, hflip }, &mut out);
+            assert_eq!((out.width, out.height), (h, w));
+            for dy in 0..w {
+                for dx in 0..h {
+                    let (sx, sy) = if q == 1 { (dy, h - 1 - dx) } else { (w - 1 - dy, dx) };
+                    let dst_x = if hflip { h - 1 - dx } else { dx };
+                    assert_eq!(out.data[dy * h + dst_x], v.y[sy * v.y_stride + sx],
+                               "q={} hflip={} dx={} dy={}", q, hflip, dx, dy);
+                }
+            }
+        }
     }
 
     #[test]

@@ -451,14 +451,17 @@ impl PipeWireSink {
     /// when the library or the daemon is missing or the format has no PipeWire equivalent.
     pub fn connect(node_name: &str, description: &str, fmt: &RingFormat) -> Result<Self, String> {
         let api = *api()?;
+        // The node name reaches here from Python, and a C string is what PipeWire takes.
+        let node_name = CString::new(node_name).map_err(|_| "node.name must not contain NUL bytes".to_string())?;
+        let description =
+            CString::new(description).map_err(|_| "node.description must not contain NUL bytes".to_string())?;
         let spa_format = if fmt.fourcc == V4L2_PIX_FMT_MJPEG {
             None
         } else {
             Some(spa_video_format(fmt.fourcc).ok_or_else(|| "pixel format has no PipeWire equivalent".to_string())?)
         };
         unsafe {
-            let loop_name = CString::new("pixelflux-webcam-pw").unwrap();
-            let thread_loop = (api.thread_loop_new)(loop_name.as_ptr(), ptr::null());
+            let thread_loop = (api.thread_loop_new)(c"pixelflux-webcam-pw".as_ptr(), ptr::null());
             if thread_loop.is_null() {
                 return Err("pw_thread_loop_new failed".into());
             }
@@ -516,18 +519,15 @@ impl PipeWireSink {
                     return Err("pw_properties_new failed".into());
                 }
                 for (k, v) in [
-                    ("media.class", "Video/Source"),
-                    ("media.role", "Camera"),
-                    ("node.name", node_name),
-                    ("node.description", description),
-                    ("node.virtual", "true"),
+                    (c"media.class", c"Video/Source" as &CStr),
+                    (c"media.role", c"Camera"),
+                    (c"node.name", node_name.as_c_str()),
+                    (c"node.description", description.as_c_str()),
+                    (c"node.virtual", c"true"),
                 ] {
-                    let ck = CString::new(k).unwrap();
-                    let cv = CString::new(v).unwrap();
-                    (api.properties_set)(props, ck.as_ptr(), cv.as_ptr());
+                    (api.properties_set)(props, k.as_ptr(), v.as_ptr());
                 }
-                let sname = CString::new(description).unwrap();
-                sink.stream = (api.stream_new)(sink.core, sname.as_ptr(), props);
+                sink.stream = (api.stream_new)(sink.core, description.as_ptr(), props);
                 if sink.stream.is_null() {
                     return Err("pw_stream_new failed".into());
                 }
