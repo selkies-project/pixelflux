@@ -124,6 +124,10 @@ struct Stats {
     input_height: AtomicU32,
     input_codec: AtomicU32,
     input_rotation: AtomicU32,
+    /// Whether a PipeWire consumer was linked at the last fan-out. The interposer counts its
+    /// own clients and a kernel device's openers are the kernel's to know, so this is the one
+    /// sink whose consumers only it can see.
+    pipewire_streaming: AtomicBool,
 }
 
 struct Job {
@@ -267,7 +271,7 @@ impl MjpegEncoder {
 
 /// After a publish: wake the socket clients and mirror the frame into the kernel device and the
 /// PipeWire node where those sinks are up, retiring a sink that failed.
-fn fan_out(ring: &Ring, server: &Server, v4l2out: &mut Option<V4l2Output>, device_path: &Mutex<String>, pipewire: &mut Option<PipeWireSink>, ts: u64) {
+fn fan_out(ring: &Ring, server: &Server, v4l2out: &mut Option<V4l2Output>, device_path: &Mutex<String>, pipewire: &mut Option<PipeWireSink>, ts: u64, stats: &Stats) {
     server.ring_doorbell();
     if let Some(frame) = ring.latest_frame() {
         if let Some(out) = v4l2out.as_mut() {
@@ -279,9 +283,11 @@ fn fan_out(ring: &Ring, server: &Server, v4l2out: &mut Option<V4l2Output>, devic
         }
         if let Some(pw) = pipewire.as_mut() {
             pw.publish(frame, ts);
+            stats.pipewire_streaming.store(pw.is_streaming(), Ordering::Relaxed);
             if pw.is_failed() {
                 eprintln!("[webcam] PipeWire node stopped; PipeWire sink disabled");
                 *pipewire = None;
+                stats.pipewire_streaming.store(false, Ordering::Relaxed);
             }
         }
     }
@@ -334,7 +340,7 @@ fn worker(cfg: WorkerConfig) {
                     }) {
                         stats.passthrough.fetch_add(1, Ordering::Relaxed);
                         stats.published.fetch_add(1, Ordering::Relaxed);
-                        fan_out(&ring, &server, &mut v4l2out, &device_path, &mut pipewire, ts);
+                        fan_out(&ring, &server, &mut v4l2out, &device_path, &mut pipewire, ts, &stats);
                     }
                     pool.put(job.data);
                     continue;
@@ -382,7 +388,7 @@ fn worker(cfg: WorkerConfig) {
                     });
                     if published {
                         stats.published.fetch_add(1, Ordering::Relaxed);
-                        fan_out(&ring, &server, &mut v4l2out, &device_path, &mut pipewire, ts);
+                        fan_out(&ring, &server, &mut v4l2out, &device_path, &mut pipewire, ts, &stats);
                     }
                 }
             }
@@ -624,6 +630,7 @@ impl VirtualCamera {
             d.set_item("socket_path", r.server.path())?;
             d.set_item("device_path", r.device_path.lock().unwrap_or_else(|e| e.into_inner()).clone())?;
             d.set_item("pipewire", r.pipewire)?;
+        d.set_item("pipewire_streaming", s.pipewire_streaming.load(Ordering::Relaxed))?;
         } else {
             d.set_item("clients", 0)?;
         }
