@@ -285,7 +285,14 @@ impl WlCapture {
 pub struct OutputNode {
     pub id: u32,
     pub output: Output,
-    pub global: GlobalId,
+    /// The wl_output global this node published, and `None` for a view: a view
+    /// captures a rectangle of another node's output rather than a screen of its
+    /// own, so it publishes nothing and the session sees one screen for all the
+    /// views over it. That is what keeps a pointer grab -- a window drag -- inside
+    /// one surface as it crosses from one display to the next.
+    pub global: Option<GlobalId>,
+    /// The node whose output this one is a view of; `None` when it owns its output.
+    pub owner: Option<u32>,
     /// Layout offset: the output's logical position in the Space AND its physical offset
     /// for absolute input injection. The two coincide at scale 1; with mixed scales the
     /// caller must place outputs so neither the logical nor the physical rectangles
@@ -972,6 +979,22 @@ impl AppState {
 
     pub(crate) fn node_idx_for_id(&self, id: u32) -> Option<usize> {
         self.output_nodes.iter().position(|n| n.id == id)
+    }
+
+    /// The ids of the views onto `id`'s output.
+    pub(crate) fn view_ids_of(&self, id: u32) -> Vec<u32> {
+        self.output_nodes
+            .iter()
+            .filter(|n| n.owner == Some(id))
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// The node whose output `id` draws from: itself, or the node it views.
+    pub(crate) fn screen_id_of(&self, id: u32) -> u32 {
+        self.node_idx_for_id(id)
+            .and_then(|i| self.output_nodes[i].owner)
+            .unwrap_or(id)
     }
 
     /// Index of the node whose LOGICAL rect contains `p`.

@@ -661,6 +661,18 @@ pub enum ThreadCommand {
         scale: f64,
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// Create a view: another display over a rectangle of `owner`'s output, capturing it
+    /// without publishing a screen of its own. Replies false when the id is taken, the
+    /// owner is unknown or itself a view, or the rectangle leaves the owner's output.
+    CreateView {
+        id: u32,
+        owner: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
     /// Destroy a secondary output: its capture ends, its windows relocate to the primary
     /// output. Replies false for the primary (id 0) or an unknown id.
     DestroyOutput { id: u32, reply: std::sync::mpsc::Sender<bool> },
@@ -2095,7 +2107,11 @@ fn start_capture_on_display(
         host.set_layout(display_id, node.pos.0, node.pos.1);
     }
 
-    {
+    // A view captures a rectangle of a screen it does not own, so its size is the
+    // rectangle's and the screen keeps the mode its owner gave it. Resizing here would
+    // shrink the session to one display's worth of desk, which is the whole point of
+    // cutting several out of one screen.
+    if node.owner.is_none() {
         // Never panic the compositor thread: an output momentarily without a current
         // mode falls back to the requested geometry so the reconfigure below is a
         // no-op for size/refresh instead of unwrap-panicking.
@@ -2791,7 +2807,7 @@ fn render_node_tick(
                 && Instant::now() < deadline
                 && !wayland::frontend::output_content_covers(
                     &state.space,
-                    node.id,
+                    node.owner.unwrap_or(node.id),
                     logical_w,
                     logical_h,
                 ) =>
@@ -3424,6 +3440,18 @@ fn render_node_tick(
 
     if render_success {
         node.target_seeded = true;
+    }
+    // Views share one output, so its clients are driven once a frame, by the
+    // lowest-numbered display capturing that screen -- a client asked to draw once
+    // per view would render as many times a frame as there are displays over it,
+    // and one asked by nobody (the screen itself is often captured by views alone)
+    // would freeze on the frame it first painted.
+    let screen = node.owner.unwrap_or(node.id);
+    let drives_screen = !state
+        .output_nodes
+        .iter()
+        .any(|n| n.owner.unwrap_or(n.id) == screen && n.capture.is_some() && n.id < node.id);
+    if render_success && drives_screen {
         let time = state.clock.now();
         // The composited frame is what the capture consumes, so this render is also the
         // presentation moment for wp_presentation feedback.
@@ -3834,7 +3862,8 @@ fn create_output_on(
     state.output_nodes.push(wayland::frontend::OutputNode {
         id,
         output,
-        global,
+        global: Some(global),
+        owner: None,
         pos: (x, y),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -3976,16 +4005,106 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
                 meta.output.store(0, Ordering::Relaxed);
             }
     }
+    // A view holds no screen of its own, so only the node that published the
+    // output unmaps it; destroying that node takes its views with it.
+    for view in state.view_ids_of(id) {
+        if let Some(vidx) = state.node_idx_for_id(view) {
+            state.output_nodes.remove(vidx);
+        }
+    }
     let idx = state.node_idx_for_id(id).unwrap();
     let node = state.output_nodes.remove(idx);
-    state.space.unmap_output(&node.output);
-    state.dh.remove_global::<AppState>(node.global);
+    if let Some(global) = node.global {
+        state.space.unmap_output(&node.output);
+        state.dh.remove_global::<AppState>(global);
+    }
     println!(
         "[Wayland] Output {id} destroyed; {} window(s) relocated to primary.",
         windows.len()
     );
     true
 }
+/// Add a view: a display over a rectangle of `owner`'s output.
+///
+/// A view renders and encodes on its own -- its own damage tracker, frame buffer and
+/// capture -- but publishes no `wl_output`, so the session sees one screen however many
+/// displays the client is shown. That is what a window drag needs: the pointer grab it
+/// runs under stays inside one surface across the whole desk, where separate screens
+/// stop it at the edge of the one it began on.
+fn create_view_on(
+    state: &mut AppState,
+    id: u32,
+    owner: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> bool {
+    if state.node_idx_for_id(id).is_some() || width <= 0 || height <= 0 || x < 0 || y < 0 {
+        return false;
+    }
+    let Some(oidx) = state.node_idx_for_id(owner) else { return false };
+    if state.output_nodes[oidx].owner.is_some() {
+        eprintln!("[Wayland] CreateView {id}: rejected, output {owner} is itself a view.");
+        return false;
+    }
+    let output = state.output_nodes[oidx].output.clone();
+    let scale = output.current_scale().fractional_scale();
+    let Some(mode) = output.current_mode() else { return false };
+    if x + width > mode.size.w || y + height > mode.size.h {
+        eprintln!(
+            "[Wayland] CreateView {id}: rejected, {width}x{height}+{x}+{y} leaves output \
+             {owner}'s {}x{}.",
+            mode.size.w, mode.size.h
+        );
+        return false;
+    }
+    let mut offscreen = None;
+    if state.use_gpu {
+        let Some(gbm) = state.gbm_device.as_mut() else { return false };
+        match gbm.create_buffer_object(
+            width as u32,
+            height as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::RENDERING,
+        ) {
+            Ok(bo) => {
+                let dmabuf = create_dmabuf_from_bo(&bo);
+                offscreen = Some((bo, dmabuf));
+            }
+            Err(e) => {
+                eprintln!("[Wayland] CreateView {id}: GBM allocation {width}x{height} failed ({e:?}).");
+                return false;
+            }
+        }
+    }
+    let pos = state.output_nodes[oidx].pos;
+    let origin = (pos.0 + x, pos.1 + y);
+    // Static rather than tied to the output: the tracker follows the view's rectangle,
+    // not the whole screen the view is cut from.
+    let damage_tracker =
+        OutputDamageTracker::new((width, height), scale, Transform::Normal);
+    println!(
+        "[Wayland] View {id} created over output {owner}: {width}x{height} @ ({x}, {y})."
+    );
+    state.output_nodes.push(wayland::frontend::OutputNode {
+        id,
+        output,
+        global: None,
+        owner: Some(owner),
+        pos: origin,
+        damage_tracker,
+        frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
+        offscreen_buffer: offscreen,
+        overlay_state: OverlayState::default(),
+        capture: None,
+        frame_seq: 0,
+        target_seeded: false,
+        content_hold_until: None,
+    });
+    true
+}
+
 /// Startup inputs for the compositor thread: its two calloop channels, the sender it hands
 /// to computer-use, the initial geometry, and the GPU / cursor policy.
 struct WaylandThreadConfig {
@@ -4363,7 +4482,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     state.output_nodes.push(wayland::frontend::OutputNode {
         id: 0,
         output,
-        global,
+        global: Some(global),
+        owner: None,
         pos: (0, 0),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -4407,7 +4527,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     /// wait out an already-armed long idle deadline.
     fn send_idle_frame_callbacks(state: &mut AppState) {
         let time = state.clock.now();
-        for node in &state.output_nodes {
+        for node in state.output_nodes.iter().filter(|n| n.owner.is_none()) {
             let mut feedback = OutputPresentationFeedback::new(&node.output);
             for window in state.space.elements_for_output(&node.output) {
                 window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
@@ -4454,6 +4574,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 ThreadCommand::CreateOutput { id, width, height, x, y, scale, reply } => {
                     let _ = reply.send(create_output_on(state, id, width, height, x, y, scale));
                 }
+                ThreadCommand::CreateView { id, owner, x, y, width, height, reply } => {
+                    let _ = reply.send(create_view_on(state, id, owner, x, y, width, height));
+                }
                 ThreadCommand::DestroyOutput { id, reply } => {
                     let _ = reply.send(destroy_output_on(state, id));
                 }
@@ -4469,11 +4592,16 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         .output_nodes
                         .iter()
                         .map(|n| {
-                            let (w, h) = n
-                                .output
-                                .current_mode()
-                                .map(|m| (m.size.w, m.size.h))
-                                .unwrap_or((0, 0));
+                            // A view's size is its own rectangle, not the screen it is
+                            // cut from, which is the size a caller lays displays out by.
+                            let (w, h) = match n.capture.as_ref().filter(|_| n.owner.is_some()) {
+                                Some(c) => (c.settings.width, c.settings.height),
+                                None => n
+                                    .output
+                                    .current_mode()
+                                    .map(|m| (m.size.w, m.size.h))
+                                    .unwrap_or((0, 0)),
+                            };
                             (
                                 n.id,
                                 n.pos.0,
@@ -5337,6 +5465,33 @@ impl WaylandBackend {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
         self.send(ThreadCommand::CreateOutput { id, width, height, x, y, scale, reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create output: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Add a display over a rectangle of an existing output, capturing that rectangle
+    /// without publishing a screen of its own.
+    ///
+    /// The session then sees one screen where the client sees several, which is what a
+    /// window drag needs: a pointer grab stays inside the one surface as it crosses from
+    /// one display to the next, instead of stopping at the edge of the screen it started
+    /// on. `x` and `y` are relative to `owner`'s output. False when the id is taken, the
+    /// owner is unknown or itself a view, or the rectangle leaves the owner's output.
+    #[pyo3(signature = (id, owner, x, y, width, height))]
+    fn create_view(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        owner: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::CreateView { id, owner, x, y, width, height, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create view: {}", e)))?;
         Ok(py
             .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
             .unwrap_or(false))
@@ -6863,6 +7018,23 @@ impl ScreenCapture {
     ) -> PyResult<bool> {
         wayland_backend_running(py).map_or(Ok(false), |be| {
             be.bind(py).borrow().create_output(py, id, width, height, x, y, scale)
+        })
+    }
+    /// Add a display over a rectangle of an existing Wayland output (see
+    /// `WaylandBackend.create_view`); false when no backend runs.
+    #[pyo3(signature = (id, owner, x, y, width, height))]
+    fn create_view(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        owner: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> PyResult<bool> {
+        wayland_backend_running(py).map_or(Ok(false), |be| {
+            be.bind(py).borrow().create_view(py, id, owner, x, y, width, height)
         })
     }
     /// Destroy a secondary Wayland output; false when no backend runs.
