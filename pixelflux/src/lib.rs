@@ -3152,7 +3152,7 @@ fn render_node_tick(
                             draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
                         }
 
-                        for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
+                        for window in state.space.elements_for_output(&output).rev() {
                             let window_loc = state.space.element_location(window).unwrap_or_default() - origin;
 
                             if let Some(surface) = window.wl_surface() {
@@ -3345,7 +3345,7 @@ fn render_node_tick(
                                 draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
                             }
 
-                            for window in state.space.elements_for_output(&output).collect::<Vec<_>>().into_iter().rev() {
+                            for window in state.space.elements_for_output(&output).rev() {
                                 let loc = state.space.element_location(window).unwrap_or_default() - origin;
 
                                 if let Some(surface) = window.wl_surface() {
@@ -3428,7 +3428,7 @@ fn render_node_tick(
         // The composited frame is what the capture consumes, so this render is also the
         // presentation moment for wp_presentation feedback.
         let mut feedback = OutputPresentationFeedback::new(&output);
-        for window in state.space.elements_for_output(&output).cloned().collect::<Vec<_>>() {
+        for window in state.space.elements_for_output(&output) {
             window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
             window.take_presentation_feedback(
                 &mut feedback,
@@ -4409,12 +4409,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         let time = state.clock.now();
         for node in &state.output_nodes {
             let mut feedback = OutputPresentationFeedback::new(&node.output);
-            for window in state
-                .space
-                .elements_for_output(&node.output)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
+            for window in state.space.elements_for_output(&node.output) {
                 window.send_frame(&node.output, time, Some(Duration::ZERO), |_, _| {
                     Some(node.output.clone())
                 });
