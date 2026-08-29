@@ -6613,6 +6613,36 @@ impl ScreenCapture {
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
+    /// Lay the app compositor's screens out at `rects` — `(x, y, width, height)`
+    /// per screen in screen order — so the session arranges its desktop the way
+    /// the capture outputs were placed rather than by its own default rule.
+    /// Returns how many were positioned; 0 = that compositor manages no outputs
+    /// for clients (KWin, which offers `kde_output_management_v2` instead), and
+    /// its arrangement is left as it chose.
+    fn set_app_screen_layout(
+        &self,
+        py: Python<'_>,
+        display: String,
+        rects: Vec<(i32, i32, i32, i32)>,
+    ) -> PyResult<usize> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::set_screen_layout(&path, rects)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// The app compositor's enabled screens as `(name, x, y)` in screen order,
+    /// which is what it did with a layout rather than what it was asked for.
+    /// Empty = that compositor manages no outputs for clients.
+    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32)>> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::list_screens(&path)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
     /// Hold the app compositor's screens past the first `keep` at a small size,
     /// so a session that opened more screens than there are capture outputs does
     /// not lay its desktop out across one nobody sees. Returns how many were
