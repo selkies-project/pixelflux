@@ -501,6 +501,113 @@ impl X11Pipeline {
 mod tests {
     use super::*;
 
+    /// A settings block for the hardware full-frame policy: paint-over on and clearly
+    /// cheaper than normal, a short burst, and no scheduled IDR unless a case asks for one.
+    fn hw_settings() -> RustCaptureSettings {
+        RustCaptureSettings {
+            output_mode: 1,
+            video_crf: 25,
+            video_paintover_crf: 10,
+            video_paintover_burst_frames: 3,
+            paint_over_trigger_frames: 2,
+            use_paint_over_quality: true,
+            video_streaming_mode: false,
+            keyframe_interval_s: 0.0,
+            target_fps: 60.0,
+            ..Default::default()
+        }
+    }
+
+    /// The policy both hardware encoders share, in the priority order it documents: a static
+    /// screen is silent until the paint-over trigger, motion sends at normal quality without a
+    /// keyframe nobody asked for, and a requested IDR sends a keyframe and opens the burst.
+    #[test]
+    fn hw_fullframe_is_quiet_on_a_static_screen_until_the_paint_over_trigger() {
+        let s = hw_settings();
+        let mut st = StripeState::default();
+
+        let first = decide_hw_fullframe(&mut st, &s, 1, false, false, false);
+        assert!(!first.send, "a static screen sends nothing before the trigger");
+        assert_eq!(st.no_motion_frame_count, 1);
+
+        // The second static frame reaches paint_over_trigger_frames.
+        let refresh = decide_hw_fullframe(&mut st, &s, 2, false, false, false);
+        assert!(refresh.send, "the paint-over refresh sends");
+        assert!(!refresh.force_idr, "a refresh is not a keyframe");
+        assert_eq!(refresh.target_qp, s.video_paintover_crf as u32, "and sends at paint-over quality");
+        assert!(st.paint_over_sent);
+
+        // Sent once: the screen is still static, so nothing follows it but the burst.
+        let after = decide_hw_fullframe(&mut st, &s, 3, false, false, false);
+        assert!(after.send, "the burst keeps streaming after the refresh");
+        let burst_left = st.h264_burst_frames_remaining;
+        for _ in 0..burst_left {
+            let _ = decide_hw_fullframe(&mut st, &s, 4, false, false, false);
+        }
+        assert!(!decide_hw_fullframe(&mut st, &s, 5, false, false, false).send,
+                "the screen goes quiet again once the burst is spent");
+    }
+
+    /// Motion outranks the paint-over bookkeeping: it sends at normal quality, drops a burst
+    /// that was in flight, and forces no keyframe of its own.
+    #[test]
+    fn hw_fullframe_motion_sends_at_normal_quality_and_cancels_the_burst() {
+        let s = hw_settings();
+        let mut st = StripeState::default();
+        st.h264_burst_frames_remaining = 3;
+        st.paint_over_sent = true;
+        st.no_motion_frame_count = 9;
+
+        let d = decide_hw_fullframe(&mut st, &s, 1, true, false, false);
+        assert!(d.send);
+        assert!(!d.force_idr, "motion alone is not a keyframe");
+        assert_eq!(d.target_qp, s.video_crf as u32);
+        assert_eq!(st.h264_burst_frames_remaining, 0, "the burst is dropped");
+        assert_eq!(st.no_motion_frame_count, 0);
+        assert!(!st.paint_over_sent);
+    }
+
+    /// A requested IDR on a static screen sends a keyframe and opens the recovery burst; the
+    /// same request with motion sends the keyframe without one.
+    #[test]
+    fn hw_fullframe_requested_idr_opens_a_recovery_burst_only_when_static() {
+        let s = hw_settings();
+        let mut st = StripeState::default();
+        let quiet = decide_hw_fullframe(&mut st, &s, 1, false, false, true);
+        assert!(quiet.send && quiet.force_idr);
+        assert_eq!(st.h264_burst_frames_remaining, s.video_paintover_burst_frames,
+                   "a keyframe on a static screen is followed by the burst");
+
+        let mut moving = StripeState::default();
+        let dirty = decide_hw_fullframe(&mut moving, &s, 1, true, false, true);
+        assert!(dirty.send && dirty.force_idr);
+        assert_eq!(moving.h264_burst_frames_remaining, 0,
+                   "motion carries the refinement, so no burst is opened");
+    }
+
+    /// Streaming and animated modes send every frame, and a scheduled interval forces the
+    /// keyframe `periodic_idr_due` picks even with nothing else happening.
+    #[test]
+    fn hw_fullframe_streaming_and_scheduled_keyframes_send_unconditionally() {
+        let mut s = hw_settings();
+        s.video_streaming_mode = true;
+        let mut st = StripeState::default();
+        assert!(decide_hw_fullframe(&mut st, &s, 1, false, false, false).send,
+                "streaming mode sends a static frame");
+
+        s.video_streaming_mode = false;
+        let mut animated = StripeState::default();
+        assert!(decide_hw_fullframe(&mut animated, &s, 1, false, true, false).send,
+                "an animated overlay sends a static frame");
+
+        // 1 s at 60 fps: frame 60 is due, 61 is not.
+        s.keyframe_interval_s = 1.0;
+        let mut scheduled = StripeState::default();
+        assert!(decide_hw_fullframe(&mut scheduled, &s, 60, false, false, false).force_idr);
+        let mut off_beat = StripeState::default();
+        assert!(!decide_hw_fullframe(&mut off_beat, &s, 61, false, false, false).force_idr);
+    }
+
     /// Software JPEG path emits on change and stays silent while static: the first frame
     /// sends every stripe (all dirty vs init), an identical static frame sends nothing, and a
     /// frame with changed top rows re-sends the dirty stripes. `use_cpu` forces the software path
