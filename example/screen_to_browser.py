@@ -37,6 +37,10 @@ from pixelflux import CaptureSettings, ScreenCapture, ensure_wayland_display
 # ==============================================================================
 HTTP_PORT = 9001
 WS_PORT = 9000
+# WebSockets are not subject to CORS, so any page a browser visits could otherwise
+# open this socket and receive the screen. Only the page this server itself hands
+# out may; None keeps non-browser clients, which send no Origin, working.
+ALLOWED_ORIGINS = [f"http://localhost:{HTTP_PORT}", f"http://127.0.0.1:{HTTP_PORT}", None]
 
 # Send-side bounds, mirroring selkies' per-client video relay: the queue holds
 # at most ~2 seconds of stream at 60 fps; keyframe requests triggered by
@@ -373,6 +377,12 @@ async def websocket_handler(websocket):
         ACTIVE_CLIENTS.pop(websocket, None)
         print(f"Cleanup complete for client {client_id}. Active clients: {len(ACTIVE_CLIENTS)}")
 
+def _read_file(path):
+    """Read a static file; run off the loop, so a slow read cannot stall the stream."""
+    with open(path, 'rb') as handle:
+        return handle.read()
+
+
 def _resolve_static_path(script_dir, request_path):
     """Return the real path of request_path under script_dir, or None if it
     escapes. realpath canonicalizes '..'/symlinks and the root+os.sep boundary
@@ -399,7 +409,11 @@ async def handle_http_request(reader, writer):
             writer.write(b'HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
             return
 
-        path = parts[1].decode().split('#')[0] # Ignore hash part
+        try:
+            path = parts[1].decode().split('#')[0]  # Ignore hash part
+        except UnicodeDecodeError:
+            writer.write(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            return
         if path == '/':
             path = '/index.html'
 
@@ -412,8 +426,7 @@ async def handle_http_request(reader, writer):
             return
 
         if os.path.isfile(full_path):
-            with open(full_path, 'rb') as f:
-                content = f.read()
+            content = await asyncio.to_thread(_read_file, full_path)
             content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
             headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n'
             writer.write(headers.encode())
@@ -446,7 +459,8 @@ async def main():
 
     ws_server = None
     try:
-        ws_server = await ws_async.serve(websocket_handler, 'localhost', WS_PORT, compression=None)
+        ws_server = await ws_async.serve(websocket_handler, 'localhost', WS_PORT,
+                                         compression=None, origins=ALLOWED_ORIGINS)
         print(f"WebSocket server started on ws://localhost:{WS_PORT}")
         print("Waiting for client connections... Press Ctrl+C to stop.")
         await asyncio.Event().wait()
