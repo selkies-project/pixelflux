@@ -7230,8 +7230,6 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScreenCapture>()?;
     m.add_class::<webcam::VirtualCamera>()?;
     m.add_class::<webcam::VirtualCameraSettings>()?;
-    // Feature probe for consumers: this build delivers X11 cursors via set_cursor_callback.
-    m.add("X11_CURSOR_CALLBACK", true)?;
     // The software H.264 encoder this build resolved to ("x264" | "openh264"): what a CPU
     // H.264 session encodes with, so a consumer can pick rate-control defaults and name it.
     m.add("SOFTWARE_H264_ENCODER", encoders::SOFTWARE_H264_ENCODER)?;
