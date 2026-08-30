@@ -863,13 +863,22 @@ impl CompositorHandler for AppState {
                 // there. `create_output` hands it the output it is waiting for.
                 let mut park = false;
                 if self.would_cover_screen(&window, target_id) {
-                    let empty = self.output_nodes.iter().map(|n| n.id).find(|oid| {
-                        !self
-                            .space
-                            .elements()
-                            .chain(self.pending_windows.iter())
-                            .any(|w| window_output_id(w) == *oid)
-                    });
+                    // Screens only: a view is a capture over someone else's
+                    // screen, and no window is ever tagged to one, so a view
+                    // always reads as empty and would swallow the screen-like
+                    // toplevel that `create_output` later needs parked.
+                    let empty = self
+                        .output_nodes
+                        .iter()
+                        .filter(|n| n.owner.is_none())
+                        .map(|n| n.id)
+                        .find(|oid| {
+                            !self
+                                .space
+                                .elements()
+                                .chain(self.pending_windows.iter())
+                                .any(|w| window_output_id(w) == *oid)
+                        });
                     match empty {
                         Some(oid) => target_id = oid,
                         None => park = true,

@@ -2225,6 +2225,61 @@ fn start_capture_on_display(
         configure_windows_for_mode(
             state, display_id, &out, settings.width, settings.height, settings.scale,
         );
+    } else if state.use_gpu {
+        // A view keeps the rectangle its capture asks for, and its GPU render
+        // target has to follow: it was allocated at the view's creation size,
+        // and a zero-copy encoder handed a stale-size dmabuf fails every frame
+        // (the EGLImage and VAAPI imports both refuse it) while readback
+        // delivers the old rectangle's content. Same degrade-to-no-resize
+        // semantics as the screen branch above.
+        let have = node
+            .offscreen_buffer
+            .as_ref()
+            .map(|(bo, _)| (bo.width() as i32, bo.height() as i32));
+        if have != Some((settings.width, settings.height))
+            && let Some(gbm) = state.gbm_device.as_mut() {
+                match gbm.create_buffer_object(
+                    settings.width as u32,
+                    settings.height as u32,
+                    GbmFormat::Argb8888,
+                    BufferObjectFlags::RENDERING,
+                ) {
+                    Ok(bo) => {
+                        let dmabuf = create_dmabuf_from_bo(&bo);
+                        node.offscreen_buffer = Some((bo, dmabuf));
+                        node.damage_tracker = OutputDamageTracker::new(
+                            (settings.width, settings.height),
+                            settings.scale,
+                            Transform::Normal,
+                        );
+                        node.view_size = (settings.width, settings.height);
+                        node.frame_buffer = vec![
+                            0u8;
+                            (settings.width.max(0) as usize)
+                                * (settings.height.max(0) as usize)
+                                * 4
+                        ];
+                        node.target_seeded = false;
+                        println!(
+                            "[Wayland] View {display_id} render target resized to {}x{}.",
+                            settings.width, settings.height
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[Wayland] GBM view buffer resize to {}x{} failed ({:?}); keeping previous target.",
+                            settings.width, settings.height, e
+                        );
+                        set_wayland_capture_err(
+                            display_id,
+                            Some(format!(
+                                "GPU view buffer resize to {}x{} refused",
+                                settings.width, settings.height
+                            )),
+                        );
+                    }
+                }
+            }
     }
 
     let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
@@ -3969,7 +4024,17 @@ fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
         );
         return false;
     }
+    let (old_x, old_y) = state.output_nodes[idx].pos;
     state.output_nodes[idx].pos = (x, y);
+    // A view is placed in layout coordinates over the screen it is cut from,
+    // so the screen's move carries every view along: one left behind would
+    // fall outside its screen and capture nothing.
+    for view in state.output_nodes.iter_mut().filter(|n| n.owner == Some(id)) {
+        view.pos = (view.pos.0 + x - old_x, view.pos.1 + y - old_y);
+        if let Some(cap) = view.capture.as_mut() {
+            cap.needs_full_render = true;
+        }
+    }
     if let Some(host) = state.host.as_ref() {
         host.set_layout(id, x, y);
     }
@@ -6943,24 +7008,32 @@ impl ScreenCapture {
             }
         })
     }
-    /// Scale the app compositor's screen, so its applications draw larger while
-    /// the capture keeps its full resolution. False when that compositor manages
-    /// no outputs for clients (KWin), whose scale follows the capture output's
-    /// instead.
-    fn set_app_output_scale(&self, py: Python<'_>, display: String, scale: f64) -> PyResult<bool> {
+    /// Scale the app compositor's `index`-th screen, so its applications draw
+    /// larger while the capture keeps its full resolution. False when that
+    /// compositor manages no outputs for clients (KWin), whose scale follows
+    /// the capture output's instead.
+    #[pyo3(signature = (display, scale, index = 0))]
+    fn set_app_output_scale(
+        &self,
+        py: Python<'_>,
+        display: String,
+        scale: f64,
+        index: usize,
+    ) -> PyResult<bool> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::set_output_scale(&path, scale)
+            crate::wayland::outclient::set_output_scale(&path, index, scale)
         })
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
-    /// Give the app compositor's screen this mode and scale in one configuration,
-    /// so the session lays its desktop out once. Setting them separately exposes a
-    /// geometry that never exists — the pre-connect mode at the new scale — and a
-    /// client that does not lay out again keeps it. False = that compositor
-    /// manages no outputs for clients.
+    /// Give the app compositor's `index`-th screen this mode and scale in one
+    /// configuration, so the session lays its desktop out once. Setting them
+    /// separately exposes a geometry that never exists — the pre-connect mode at
+    /// the new scale — and a client that does not lay out again keeps it.
+    /// False = that compositor manages no outputs for clients.
+    #[pyo3(signature = (display, width, height, scale, index = 0))]
     fn set_app_screen_geometry(
         &self,
         py: Python<'_>,
@@ -6968,13 +7041,63 @@ impl ScreenCapture {
         width: i32,
         height: i32,
         scale: f64,
+        index: usize,
     ) -> PyResult<bool> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::set_screen_geometry(&path, (width, height), scale)
+            crate::wayland::outclient::set_screen_geometry(&path, index, (width, height), scale)
         })
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Lay the app compositor's screens out at `rects` — `(x, y, width, height)`
+    /// per screen in screen order — so the session arranges its desktop the way
+    /// the capture outputs were placed rather than by its own default rule.
+    /// Returns how many were positioned; 0 = that compositor manages no outputs
+    /// for clients (KWin, which offers `kde_output_management_v2` instead), and
+    /// its arrangement is left as it chose.
+    fn set_app_screen_layout(
+        &self,
+        py: Python<'_>,
+        display: String,
+        rects: Vec<(i32, i32, i32, i32)>,
+    ) -> PyResult<usize> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::set_screen_layout(&path, rects)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// The app compositor's enabled screens as `(name, x, y)` in screen order,
+    /// which is what it did with a layout rather than what it was asked for.
+    /// Empty = that compositor manages no outputs for clients.
+    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32)>> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::list_screens(&path)
+        })
+        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+    /// Hold the app compositor's screens past the first `keep` at a small size,
+    /// so a session that opened more screens than there are capture outputs does
+    /// not lay its desktop out across one nobody sees. Returns how many were
+    /// resized (0 = that compositor manages no outputs for clients).
+    fn hold_spare_app_screens(
+        &self,
+        py: Python<'_>,
+        display: String,
+        keep: usize,
+        width: i32,
+        height: i32,
+    ) -> PyResult<usize> {
+        py.detach(move || {
+            let path = crate::wayland::wlclient::socket_path(&display)
+                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
+            crate::wayland::outclient::hold_spare_screens(&path, keep, (width, height))
+        })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
