@@ -4097,7 +4097,13 @@ fn resize_output_on(
         return false;
     }
     let base = state.output_nodes[idx].pos;
-    for view in state.output_nodes.iter().filter(|n| n.owner == Some(id)) {
+    // Only a view that is showing something can be orphaned by the resize; one
+    // without a capture is placed by whoever starts it, against the new size.
+    for view in state
+        .output_nodes
+        .iter()
+        .filter(|n| n.owner == Some(id) && n.capture.is_some())
+    {
         let (vw, vh) = view.view_size;
         if view.pos.0 - base.0 + vw > width || view.pos.1 - base.1 + vh > height {
             eprintln!(
@@ -4175,6 +4181,10 @@ fn resize_output_on(
     println!("[Wayland] Output {id} resized to {width}x{height} scale {scale:.2}.");
     true
 }
+
+/// The view every screen carries from the start, covering it: the display a
+/// consumer gets without asking for a layout at all.
+const DEFAULT_VIEW_ID: u32 = 1;
 
 /// Add a view: a display over a rectangle of `owner`'s output.
 ///
@@ -4648,6 +4658,10 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         target_seeded: false,
         content_hold_until: None,
     });
+    // The screen always carries one view covering it, so a consumer that asks for
+    // nothing but a single display finds one there: the screen itself is never
+    // captured, only the views cut from it are.
+    create_view_on(&mut state, DEFAULT_VIEW_ID, 0, 0, 0, width, height);
 
     /// Apply every queued control command in FIFO order. Sends wake the loop through the
     /// separate wake channel, and the render tick ALSO drains before starting its work, so
