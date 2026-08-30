@@ -3780,8 +3780,8 @@ fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
 /// pair matched and rect is `(x, y, width, height)`.
 type OutputOverlap = (u32, &'static str, (i32, i32, i32, i32));
 
-/// The first live output (excluding `skip_id`) whose rectangle overlaps a candidate
-/// placement. Both rectangle flavors are checked — logical
+/// The first live screen (excluding `skip_id`; views stand behind their owner's
+/// rectangle) whose rectangle overlaps a candidate placement. Both rectangle flavors are checked — logical
 /// (Space layout, scale-divided) and physical (mode pixels at the same origin) — because
 /// input injection and cursor compositing key off the physical rects while window layout
 /// keys off the logical ones, and neither may overlap.
@@ -3793,6 +3793,9 @@ fn find_output_overlap(
 ) -> Option<OutputOverlap> {
     for n in nodes {
         if Some(n.id) == skip_id {
+            continue;
+        }
+        if n.owner.is_some() {
             continue;
         }
         if let Some(geo) = n.logical_geometry() {
