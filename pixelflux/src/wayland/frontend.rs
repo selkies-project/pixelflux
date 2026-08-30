@@ -293,6 +293,9 @@ pub struct OutputNode {
     pub global: Option<GlobalId>,
     /// The node whose output this one is a view of; `None` when it owns its output.
     pub owner: Option<u32>,
+    /// The rectangle size a view's damage tracker was built for, so a display that
+    /// changes resolution rebuilds it rather than tracking damage for the old one.
+    pub view_size: (i32, i32),
     /// Layout offset: the output's logical position in the Space AND its physical offset
     /// for absolute input injection. The two coincide at scale 1; with mixed scales the
     /// caller must place outputs so neither the logical nor the physical rectangles

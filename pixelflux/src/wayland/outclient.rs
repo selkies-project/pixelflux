@@ -139,29 +139,21 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for OutState {
 delegate_noop!(OutState: ignore ZwlrOutputModeV1);
 delegate_noop!(OutState: ZwlrOutputConfigurationHeadV1);
 
-/// Set the scale of the `index`-th screen of the compositor on `socket_path`,
-/// leaving its mode and position alone. Blocking; call off the compositor's
-/// calloop thread.
-pub fn set_output_scale(
-    socket_path: &str,
-    index: usize,
-    scale: f64,
-) -> Result<ScaleOutcome, String> {
+/// Set the scale of the screen of the compositor on `socket_path`, leaving its
+/// mode and position alone. Blocking; call off the compositor's calloop thread.
+pub fn set_output_scale(socket_path: &str, scale: f64) -> Result<ScaleOutcome, String> {
     if !(0.1..=16.0).contains(&scale) {
         return Err(format!("scale {scale} out of range"));
     }
     configure(socket_path, |heads| {
-        let target = heads
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("no enabled screen at index {index}"))?;
+        let target = heads.first().cloned().ok_or("the session has no enabled screen")?;
         Ok(vec![(target, Plan { scale: Some(scale), ..Plan::default() })])
     })
     .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
 }
 
-/// Give the `index`-th screen of the compositor on `socket_path` this mode and
-/// scale in one configuration.
+/// Give the screen of the compositor on `socket_path` this mode and scale in one
+/// configuration.
 ///
 /// A session lays its desktop out once per applied configuration, so setting the
 /// two separately leaves it briefly at a geometry that never exists — a screen
@@ -169,7 +161,6 @@ pub fn set_output_scale(
 /// final size, and a client that does not lay out again keeps that size.
 pub fn set_screen_geometry(
     socket_path: &str,
-    index: usize,
     size: (i32, i32),
     scale: f64,
 ) -> Result<ScaleOutcome, String> {
@@ -180,92 +171,10 @@ pub fn set_screen_geometry(
         return Err(format!("size {}x{} out of range", size.0, size.1));
     }
     configure(socket_path, move |heads| {
-        let target = heads
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("no enabled screen at index {index}"))?;
+        let target = heads.first().cloned().ok_or("the session has no enabled screen")?;
         Ok(vec![(target, Plan { mode: Some(size), scale: Some(scale), ..Plan::default() })])
     })
     .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
-}
-
-/// The session's enabled screens as `(name, x, y)`, in screen order — what the
-/// compositor actually did with a layout, which is not always what it was asked
-/// for. Empty when the compositor manages no outputs for clients.
-pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32)>, String> {
-    let stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
-    let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
-    let mut queue: EventQueue<OutState> = conn.new_event_queue();
-    let qh = queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-    let mut state = OutState::default();
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let Some(manager) = state.manager.clone() else {
-        return Ok(Vec::new());
-    };
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let mut screens: Vec<(String, i32, i32)> = state
-        .heads
-        .iter()
-        .filter(|(_, _, on, _)| *on)
-        .map(|(_, name, _, pos)| (name.clone().unwrap_or_default(), pos.0, pos.1))
-        .collect();
-    screens.sort_by_key(|(name, _, _)| (trailing_number(name), name.clone()));
-    manager.stop();
-    let _ = queue.flush();
-    Ok(screens)
-}
-
-/// Lay the session's screens out at `rects`, one `(x, y, width, height)` per
-/// screen in screen order, so its own layout matches the arrangement the capture
-/// outputs were placed in.
-///
-/// A session compositor arranges the screens it opens by its own rule — wlroots
-/// puts them side by side in the order they appear — and that layout, not the
-/// capture one, is what places windows and carries the pointer between screens.
-/// Every screen is positioned in one configuration: applied one at a time, an
-/// intermediate state overlaps two screens and the compositor reflows around it.
-///
-/// Returns how many screens were positioned; 0 when the compositor manages no
-/// outputs for clients, which is where a session on KWin lands (it offers
-/// `kde_output_management_v2` instead) and where the arrangement stays whatever
-/// that compositor chose.
-pub fn set_screen_layout(
-    socket_path: &str,
-    rects: Vec<(i32, i32, i32, i32)>,
-) -> Result<usize, String> {
-    if rects.iter().any(|(_, _, w, h)| *w <= 0 || *h <= 0) {
-        return Err("a screen rectangle has a non-positive size".to_string());
-    }
-    configure(socket_path, move |heads| {
-        Ok(heads
-            .iter()
-            .zip(rects.iter())
-            .map(|(h, (x, y, w, hgt))| {
-                (h.clone(), Plan { mode: Some((*w, *hgt)), position: Some((*x, *y)), ..Plan::default() })
-            })
-            .collect())
-    })
-}
-
-/// Hold every screen past the first `keep` at `size`. A session compositor opens
-/// the screens it was started with whether or not anything watches them, and one
-/// held at a real screen's size stretches the session's coordinate space onto a
-/// screen nobody sees. Returns how many were resized.
-pub fn hold_spare_screens(
-    socket_path: &str,
-    keep: usize,
-    size: (i32, i32),
-) -> Result<usize, String> {
-    configure(socket_path, move |heads| {
-        Ok(heads
-            .iter()
-            .skip(keep)
-            .cloned()
-            .map(|h| (h, Plan { mode: Some(size), ..Plan::default() }))
-            .collect())
-    })
 }
 
 /// The number a screen's name ends in (WL-2 -> 2), or none, which sorts first.

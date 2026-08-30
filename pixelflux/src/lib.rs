@@ -673,6 +673,15 @@ pub enum ThreadCommand {
         height: i32,
         reply: std::sync::mpsc::Sender<bool>,
     },
+    /// Resize a screen's output in place, keeping its position. Replies false for a view,
+    /// an unknown id, or a size that would leave one of the screen's views outside it.
+    ResizeOutput {
+        id: u32,
+        width: i32,
+        height: i32,
+        scale: f64,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
     /// Destroy a secondary output: its capture ends, its windows relocate to the primary
     /// output. Replies false for the primary (id 0) or an unknown id.
     DestroyOutput { id: u32, reply: std::sync::mpsc::Sender<bool> },
@@ -2793,6 +2802,16 @@ fn render_node_tick(
     if node.frame_buffer.len() < (width as usize) * (height as usize) * 4 {
         node.frame_buffer = vec![0u8; (width as usize) * (height as usize) * 4];
     }
+    // A view's tracker is static, so a display that changed resolution needs a new
+    // one; a screen's follows its output on its own.
+    if node.owner.is_some() && node.view_size != (width, height) {
+        node.damage_tracker = OutputDamageTracker::new(
+            (width, height),
+            output_scale_val,
+            Transform::Normal,
+        );
+        node.view_size = (width, height);
+    }
     let logical_w = (width as f64 / output_scale_val).round();
     let logical_h = (height as f64 / output_scale_val).round();
 
@@ -3864,6 +3883,7 @@ fn create_output_on(
         output,
         global: Some(global),
         owner: None,
+        view_size: (width, height),
         pos: (x, y),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -3928,6 +3948,37 @@ fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
     let Some(idx) = state.node_idx_for_id(id) else { return false };
     let output = state.output_nodes[idx].output.clone();
     if state.output_nodes[idx].pos == (x, y) {
+        return true;
+    }
+    // A view moves within the screen it is cut from: no output to remap and no
+    // windows to carry, since the screen and everything on it stay where they are.
+    if let Some(owner) = state.output_nodes[idx].owner {
+        let base = state
+            .node_idx_for_id(owner)
+            .map(|o| state.output_nodes[o].pos)
+            .unwrap_or((0, 0));
+        let mode = output.current_mode().map(|m| (m.size.w, m.size.h)).unwrap_or((0, 0));
+        let size = state.output_nodes[idx]
+            .capture
+            .as_ref()
+            .map(|c| (c.settings.width, c.settings.height))
+            .unwrap_or(mode);
+        if x < base.0 || y < base.1
+            || x - base.0 + size.0 > mode.0
+            || y - base.1 + size.1 > mode.1
+        {
+            eprintln!(
+                "[Wayland] RepositionOutput {id}: rejected, {}x{}+{x}+{y} leaves output \
+                 {owner}'s {}x{}.",
+                size.0, size.1, mode.0, mode.1
+            );
+            return false;
+        }
+        state.output_nodes[idx].pos = (x, y);
+        if let Some(cap) = state.output_nodes[idx].capture.as_mut() {
+            cap.needs_full_render = true;
+        }
+        println!("[Wayland] View {id} moved to ({x}, {y}).");
         return true;
     }
     let logical_size = state.output_nodes[idx]
@@ -4024,6 +4075,107 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     );
     true
 }
+/// Resize a screen's output, keeping its position, so the displays cut out of it can be
+/// laid out over a different desk.
+///
+/// Refused for a view (it has no output of its own) and for a size that would leave one of
+/// the screen's views outside it -- the caller grows the screen before moving views onto
+/// the new area and shrinks it after taking them off, so no view is ever orphaned.
+fn resize_output_on(
+    state: &mut AppState,
+    id: u32,
+    width: i32,
+    height: i32,
+    scale: f64,
+) -> bool {
+    if width <= 0 || height <= 0 || scale <= 0.0 {
+        return false;
+    }
+    let Some(idx) = state.node_idx_for_id(id) else { return false };
+    if state.output_nodes[idx].owner.is_some() {
+        eprintln!("[Wayland] ResizeOutput {id}: rejected, {id} is a view of another output.");
+        return false;
+    }
+    let base = state.output_nodes[idx].pos;
+    for view in state.output_nodes.iter().filter(|n| n.owner == Some(id)) {
+        let (vw, vh) = view.view_size;
+        if view.pos.0 - base.0 + vw > width || view.pos.1 - base.1 + vh > height {
+            eprintln!(
+                "[Wayland] ResizeOutput {id}: rejected, view {} would fall outside {width}x{height}.",
+                view.id
+            );
+            return false;
+        }
+    }
+    let output = state.output_nodes[idx].output.clone();
+    let refresh = output.current_mode().map(|m| m.refresh).unwrap_or(60_000);
+    if output.current_mode().map(|m| (m.size.w, m.size.h)) == Some((width, height))
+        && (output.current_scale().fractional_scale() - scale).abs() <= 0.001
+    {
+        return true;
+    }
+    // The GPU target is allocated before anything is committed: a driver that refuses the
+    // new dimensions leaves the previous mode and buffers live rather than a half-resized
+    // output.
+    let mut new_offscreen = None;
+    if state.use_gpu {
+        let Some(gbm) = state.gbm_device.as_mut() else { return false };
+        match gbm.create_buffer_object(
+            width as u32,
+            height as u32,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::RENDERING,
+        ) {
+            Ok(bo) => {
+                let dmabuf = create_dmabuf_from_bo(&bo);
+                new_offscreen = Some((bo, dmabuf));
+            }
+            Err(e) => {
+                eprintln!("[Wayland] ResizeOutput {id}: GBM allocation {width}x{height} failed ({e:?}).");
+                return false;
+            }
+        }
+    }
+    let mode = OutputMode { size: (width, height).into(), refresh };
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        Some(OutputScale::Fractional(scale)),
+        Some(Point::from(base)),
+    );
+    output.set_preferred(mode);
+    state.space.map_output(&output, base);
+    // Capture clients allocate to the announced size; a stale one fails validation on
+    // every frame they submit from here on.
+    for cs in state
+        .copy_sessions
+        .iter()
+        .filter(|cs| cs.output.upgrade().as_ref() == Some(&output))
+    {
+        if let Some(c) = wayland::frontend::output_capture_constraints(
+            &output,
+            state.gles_renderer.as_ref(),
+            &state.render_node_path,
+        ) {
+            cs.session.update_constraints(c);
+        }
+    }
+    let node = &mut state.output_nodes[idx];
+    node.frame_buffer = vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4];
+    node.view_size = (width, height);
+    node.target_seeded = false;
+    if let Some(off) = new_offscreen.take() {
+        node.offscreen_buffer = Some(off);
+    }
+    for n in state.output_nodes.iter_mut().filter(|n| n.id == id || n.owner == Some(id)) {
+        if let Some(cap) = n.capture.as_mut() {
+            cap.needs_full_render = true;
+        }
+    }
+    println!("[Wayland] Output {id} resized to {width}x{height} scale {scale:.2}.");
+    true
+}
+
 /// Add a view: a display over a rectangle of `owner`'s output.
 ///
 /// A view renders and encodes on its own -- its own damage tracker, frame buffer and
@@ -4092,6 +4244,7 @@ fn create_view_on(
         output,
         global: None,
         owner: Some(owner),
+        view_size: (width, height),
         pos: origin,
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -4484,6 +4637,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         output,
         global: Some(global),
         owner: None,
+        view_size: (width, height),
         pos: (0, 0),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -4576,6 +4730,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 }
                 ThreadCommand::CreateView { id, owner, x, y, width, height, reply } => {
                     let _ = reply.send(create_view_on(state, id, owner, x, y, width, height));
+                }
+                ThreadCommand::ResizeOutput { id, width, height, scale, reply } => {
+                    let _ = reply.send(resize_output_on(state, id, width, height, scale));
                 }
                 ThreadCommand::DestroyOutput { id, reply } => {
                     let _ = reply.send(destroy_output_on(state, id));
@@ -5492,6 +5649,26 @@ impl WaylandBackend {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
         self.send(ThreadCommand::CreateView { id, owner, x, y, width, height, reply: reply_tx })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create view: {}", e)))?;
+        Ok(py
+            .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
+            .unwrap_or(false))
+    }
+
+    /// Resize a screen's output in place, keeping its position: the desk the displays cut
+    /// out of it are laid over. False for a view, an unknown id, or a size that would leave
+    /// one of the screen's views outside it.
+    #[pyo3(signature = (id, width, height, scale = 1.0))]
+    fn resize_output(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) -> PyResult<bool> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<bool>();
+        self.send(ThreadCommand::ResizeOutput { id, width, height, scale, reply: reply_tx })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to resize output: {}", e)))?;
         Ok(py
             .detach(move || reply_rx.recv_timeout(Duration::from_secs(2)))
             .unwrap_or(false))
@@ -6722,35 +6899,28 @@ impl ScreenCapture {
             }
         })
     }
-    /// Scale the app compositor's `index`-th screen, so its applications draw
-    /// larger while the capture keeps its full resolution. False when that
-    /// compositor manages no outputs for clients (KWin), whose scale follows
-    /// the capture output's instead.
-    fn set_app_output_scale(
-        &self,
-        py: Python<'_>,
-        display: String,
-        index: usize,
-        scale: f64,
-    ) -> PyResult<bool> {
+    /// Scale the app compositor's screen, so its applications draw larger while
+    /// the capture keeps its full resolution. False when that compositor manages
+    /// no outputs for clients (KWin), whose scale follows the capture output's
+    /// instead.
+    fn set_app_output_scale(&self, py: Python<'_>, display: String, scale: f64) -> PyResult<bool> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::set_output_scale(&path, index, scale)
+            crate::wayland::outclient::set_output_scale(&path, scale)
         })
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
-    /// Give the app compositor's `index`-th screen this mode and scale in one
-    /// configuration, so the session lays its desktop out once. Setting them
-    /// separately exposes a geometry that never exists — the pre-connect mode at
-    /// the new scale — and a client that does not lay out again keeps it.
-    /// False = that compositor manages no outputs for clients.
+    /// Give the app compositor's screen this mode and scale in one configuration,
+    /// so the session lays its desktop out once. Setting them separately exposes a
+    /// geometry that never exists — the pre-connect mode at the new scale — and a
+    /// client that does not lay out again keeps it. False = that compositor
+    /// manages no outputs for clients.
     fn set_app_screen_geometry(
         &self,
         py: Python<'_>,
         display: String,
-        index: usize,
         width: i32,
         height: i32,
         scale: f64,
@@ -6758,58 +6928,9 @@ impl ScreenCapture {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::set_screen_geometry(&path, index, (width, height), scale)
+            crate::wayland::outclient::set_screen_geometry(&path, (width, height), scale)
         })
         .map(|outcome| matches!(outcome, crate::wayland::outclient::ScaleOutcome::Applied))
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
-    /// Lay the app compositor's screens out at `rects` — `(x, y, width, height)`
-    /// per screen in screen order — so the session arranges its desktop the way
-    /// the capture outputs were placed rather than by its own default rule.
-    /// Returns how many were positioned; 0 = that compositor manages no outputs
-    /// for clients (KWin, which offers `kde_output_management_v2` instead), and
-    /// its arrangement is left as it chose.
-    fn set_app_screen_layout(
-        &self,
-        py: Python<'_>,
-        display: String,
-        rects: Vec<(i32, i32, i32, i32)>,
-    ) -> PyResult<usize> {
-        py.detach(move || {
-            let path = crate::wayland::wlclient::socket_path(&display)
-                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::set_screen_layout(&path, rects)
-        })
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
-    /// The app compositor's enabled screens as `(name, x, y)` in screen order,
-    /// which is what it did with a layout rather than what it was asked for.
-    /// Empty = that compositor manages no outputs for clients.
-    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32)>> {
-        py.detach(move || {
-            let path = crate::wayland::wlclient::socket_path(&display)
-                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::list_screens(&path)
-        })
-        .map_err(pyo3::exceptions::PyRuntimeError::new_err)
-    }
-    /// Hold the app compositor's screens past the first `keep` at a small size,
-    /// so a session that opened more screens than there are capture outputs does
-    /// not lay its desktop out across one nobody sees. Returns how many were
-    /// resized (0 = that compositor manages no outputs for clients).
-    fn hold_spare_app_screens(
-        &self,
-        py: Python<'_>,
-        display: String,
-        keep: usize,
-        width: i32,
-        height: i32,
-    ) -> PyResult<usize> {
-        py.detach(move || {
-            let path = crate::wayland::wlclient::socket_path(&display)
-                .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::outclient::hold_spare_screens(&path, keep, (width, height))
-        })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
@@ -7035,6 +7156,21 @@ impl ScreenCapture {
     ) -> PyResult<bool> {
         wayland_backend_running(py).map_or(Ok(false), |be| {
             be.bind(py).borrow().create_view(py, id, owner, x, y, width, height)
+        })
+    }
+    /// Resize a Wayland screen's output in place (see `WaylandBackend.resize_output`);
+    /// false when no backend runs.
+    #[pyo3(signature = (id, width, height, scale = 1.0))]
+    fn resize_output(
+        &self,
+        py: Python<'_>,
+        id: u32,
+        width: i32,
+        height: i32,
+        scale: f64,
+    ) -> PyResult<bool> {
+        wayland_backend_running(py).map_or(Ok(false), |be| {
+            be.bind(py).borrow().resize_output(py, id, width, height, scale)
         })
     }
     /// Destroy a secondary Wayland output; false when no backend runs.
