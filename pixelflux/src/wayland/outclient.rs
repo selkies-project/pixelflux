@@ -36,9 +36,9 @@ pub enum ScaleOutcome {
 #[derive(Default)]
 struct OutState {
     manager: Option<ZwlrOutputManagerV1>,
-    /// Announced heads with their name, enabled state and layout position. The
-    /// manager's order is its own; screens are addressed by name below.
-    heads: Vec<(ZwlrOutputHeadV1, Option<String>, bool, (i32, i32))>,
+    /// Announced heads with their name and enabled state. The manager's order
+    /// is its own; screens are addressed by name below.
+    heads: Vec<(ZwlrOutputHeadV1, Option<String>, bool)>,
     serial: Option<u32>,
     applied: Option<bool>,
     sync_done: bool,
@@ -79,7 +79,7 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for OutState {
     ) {
         match event {
             zwlr_output_manager_v1::Event::Head { head } => {
-                state.heads.push((head, None, false, (0, 0)))
+                state.heads.push((head, None, false))
             }
             // Every configuration is built against the serial of the state it
             // was read from; a stale one is refused by the compositor.
@@ -102,13 +102,12 @@ impl Dispatch<ZwlrOutputHeadV1, ()> for OutState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let Some(entry) = state.heads.iter_mut().find(|(h, _, _, _)| h == head) else {
+        let Some(entry) = state.heads.iter_mut().find(|(h, _, _)| h == head) else {
             return;
         };
         match event {
             zwlr_output_head_v1::Event::Name { name } => entry.1 = Some(name),
             zwlr_output_head_v1::Event::Enabled { enabled } => entry.2 = enabled != 0,
-            zwlr_output_head_v1::Event::Position { x, y } => entry.3 = (x, y),
             _ => {}
         }
     }
@@ -188,7 +187,6 @@ fn trailing_number(name: &str) -> u32 {
 struct Plan {
     mode: Option<(i32, i32)>,
     scale: Option<f64>,
-    position: Option<(i32, i32)>,
 }
 
 /// Apply `plan` to the compositor's enabled heads. `plan` receives them in
@@ -219,8 +217,8 @@ where
     let mut named: Vec<(ZwlrOutputHeadV1, String)> = state
         .heads
         .iter()
-        .filter(|(_, _, on, _)| *on)
-        .map(|(h, name, _, _)| (h.clone(), name.clone().unwrap_or_default()))
+        .filter(|(_, _, on)| *on)
+        .map(|(h, name, _)| (h.clone(), name.clone().unwrap_or_default()))
         .collect();
     named.sort_by_key(|(_, name)| (trailing_number(name), name.clone()));
     let enabled: Vec<ZwlrOutputHeadV1> = named.into_iter().map(|(h, _)| h).collect();
@@ -241,9 +239,6 @@ where
             }
             if let Some(scale) = want.scale {
                 cfg_head.set_scale(scale);
-            }
-            if let Some((x, y)) = want.position {
-                cfg_head.set_position(x, y);
             }
         }
     }
