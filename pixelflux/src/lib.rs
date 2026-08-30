@@ -2011,8 +2011,6 @@ fn start_capture_on_display(
     cb: Option<Arc<Py<PyAny>>>,
     mut settings: RustCaptureSettings,
 ) {
-    use smithay::wayland::fractional_scale::with_fractional_scale;
-
     // The cursor worker outlives individual captures, so the starting settings have to
     // reach it here — same point X11 applies the cap — or it keeps the previous capture's.
     let _ = state.cursor_tx.send(CursorJob::SetSizeCap(settings.cursor_size_cap));
@@ -2223,44 +2221,10 @@ fn start_capture_on_display(
             }
         }
 
-        let scale = settings.scale.max(0.1);
-        let logical_width = (settings.width as f64 / scale).round() as i32;
-        let logical_height = (settings.height as f64 / scale).round() as i32;
-
-        for window in state.space.elements() {
-            if wayland::frontend::window_output_id(window) != display_id {
-                continue;
-            }
-            // A parked screen is tagged for this display but composited on none: it
-            // holds PARKED_LOGICAL_SIZE until `create_output` gives it one. Resizing it
-            // here would double the session's coordinate space onto a screen nobody
-            // watches, which is where a window that centres itself then lands.
-            if wayland::frontend::window_meta(window)
-                .is_some_and(|meta| meta.parked.load(Ordering::Relaxed))
-            {
-                continue;
-            }
-            if let Some(surface) = window.wl_surface() {
-                node.output.enter(&surface);
-                with_states(&surface, |states| {
-                    smithay::wayland::compositor::send_surface_state(
-                        &surface, states, scale.ceil() as i32, Transform::Normal,
-                    );
-                    with_fractional_scale(states, |fs| {
-                        fs.set_preferred_scale(scale);
-                    });
-                });
-            }
-            if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|state| {
-                    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-                    state.states.set(State::Fullscreen);
-                    state.states.set(State::Activated);
-                    state.size = Some((logical_width, logical_height).into());
-                });
-                toplevel.send_configure();
-            }
-        }
+        let out = node.output.clone();
+        configure_windows_for_mode(
+            state, display_id, &out, settings.width, settings.height, settings.scale,
+        );
     }
 
     let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
@@ -3461,15 +3425,20 @@ fn render_node_tick(
         node.target_seeded = true;
     }
     // Views share one output, so its clients are driven once a frame, by the
-    // lowest-numbered display capturing that screen -- a client asked to draw once
-    // per view would render as many times a frame as there are displays over it,
-    // and one asked by nobody (the screen itself is often captured by views alone)
-    // would freeze on the frame it first painted.
+    // fastest display capturing that screen (ties go to the lowest number) -- a
+    // client asked to draw once per view would render as many times a frame as
+    // there are displays over it, one asked by nobody (the screen itself is often
+    // captured by views alone) would freeze on the frame it first painted, and one
+    // driven by a slower sibling would stream stale frames on the faster display.
     let screen = node.owner.unwrap_or(node.id);
-    let drives_screen = !state
-        .output_nodes
-        .iter()
-        .any(|n| n.owner.unwrap_or(n.id) == screen && n.capture.is_some() && n.id < node.id);
+    let own_fps = node.capture.as_ref().map(|c| c.settings.target_fps).unwrap_or(0.0);
+    let own_id = node.id;
+    let drives_screen = !state.output_nodes.iter().any(|n| {
+        let fps = n.capture.as_ref().map(|c| c.settings.target_fps).unwrap_or(0.0);
+        n.owner.unwrap_or(n.id) == screen
+            && n.capture.is_some()
+            && (fps > own_fps || (fps == own_fps && n.id < own_id))
+    });
     if render_success && drives_screen {
         let time = state.clock.now();
         // The composited frame is what the capture consumes, so this render is also the
@@ -3962,7 +3931,7 @@ fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
             .capture
             .as_ref()
             .map(|c| (c.settings.width, c.settings.height))
-            .unwrap_or(mode);
+            .unwrap_or(state.output_nodes[idx].view_size);
         if x < base.0 || y < base.1
             || x - base.0 + size.0 > mode.0
             || y - base.1 + size.1 > mode.1
@@ -4057,8 +4026,11 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
             }
     }
     // A view holds no screen of its own, so only the node that published the
-    // output unmaps it; destroying that node takes its views with it.
+    // output unmaps it; destroying that node takes its views with it, captures
+    // and encoders included.
     for view in state.view_ids_of(id) {
+        stop_capture_on_display(state, view);
+        wayland_owners().lock().unwrap().remove(&view);
         if let Some(vidx) = state.node_idx_for_id(view) {
             state.output_nodes.remove(vidx);
         }
@@ -4081,6 +4053,56 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
 /// Refused for a view (it has no output of its own) and for a size that would leave one of
 /// the screen's views outside it -- the caller grows the screen before moving views onto
 /// the new area and shrinks it after taking them off, so no view is ever orphaned.
+/// Send every non-parked window on `display_id`'s output a fullscreen configure
+/// for the new mode, with the scale each surface should render at. Without this
+/// a live session keeps drawing at the old size under the resized screen.
+fn configure_windows_for_mode(
+    state: &AppState,
+    display_id: u32,
+    output: &Output,
+    width: i32,
+    height: i32,
+    scale: f64,
+) {
+    let scale = scale.max(0.1);
+    let logical_width = (width as f64 / scale).round() as i32;
+    let logical_height = (height as f64 / scale).round() as i32;
+    for window in state.space.elements() {
+        if wayland::frontend::window_output_id(window) != display_id {
+            continue;
+        }
+        // A parked screen is tagged for this display but composited on none: it
+        // holds PARKED_LOGICAL_SIZE until `create_output` gives it one. Resizing it
+        // here would double the session's coordinate space onto a screen nobody
+        // watches, which is where a window that centres itself then lands.
+        if wayland::frontend::window_meta(window)
+            .is_some_and(|meta| meta.parked.load(Ordering::Relaxed))
+        {
+            continue;
+        }
+        if let Some(surface) = window.wl_surface() {
+            output.enter(&surface);
+            with_states(&surface, |states| {
+                smithay::wayland::compositor::send_surface_state(
+                    &surface, states, scale.ceil() as i32, Transform::Normal,
+                );
+                smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
+                    fs.set_preferred_scale(scale);
+                });
+            });
+        }
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
+                state.states.set(State::Fullscreen);
+                state.states.set(State::Activated);
+                state.size = Some((logical_width, logical_height).into());
+            });
+            toplevel.send_configure();
+        }
+    }
+}
+
 fn resize_output_on(
     state: &mut AppState,
     id: u32,
@@ -4104,7 +4126,11 @@ fn resize_output_on(
         .iter()
         .filter(|n| n.owner == Some(id) && n.capture.is_some())
     {
-        let (vw, vh) = view.view_size;
+        let (vw, vh) = view
+            .capture
+            .as_ref()
+            .map(|c| (c.settings.width, c.settings.height))
+            .unwrap_or(view.view_size);
         if view.pos.0 - base.0 + vw > width || view.pos.1 - base.1 + vh > height {
             eprintln!(
                 "[Wayland] ResizeOutput {id}: rejected, view {} would fall outside {width}x{height}.",
@@ -4178,6 +4204,7 @@ fn resize_output_on(
             cap.needs_full_render = true;
         }
     }
+    configure_windows_for_mode(state, id, &output, width, height, scale);
     println!("[Wayland] Output {id} resized to {width}x{height} scale {scale:.2}.");
     true
 }
@@ -4765,13 +4792,16 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         .map(|n| {
                             // A view's size is its own rectangle, not the screen it is
                             // cut from, which is the size a caller lays displays out by.
-                            let (w, h) = match n.capture.as_ref().filter(|_| n.owner.is_some()) {
-                                Some(c) => (c.settings.width, c.settings.height),
-                                None => n
-                                    .output
+                            let (w, h) = if n.owner.is_some() {
+                                n.capture
+                                    .as_ref()
+                                    .map(|c| (c.settings.width, c.settings.height))
+                                    .unwrap_or(n.view_size)
+                            } else {
+                                n.output
                                     .current_mode()
                                     .map(|m| (m.size.w, m.size.h))
-                                    .unwrap_or((0, 0)),
+                                    .unwrap_or((0, 0))
                             };
                             (
                                 n.id,

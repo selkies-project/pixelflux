@@ -375,15 +375,24 @@ pub fn output_content_covers(
 
 impl OutputNode {
     /// The output's logical geometry in layout coordinates: origin plus mode/scale-derived
-    /// logical size.
+    /// logical size. A view's size is its own rectangle -- the mode belongs to the
+    /// screen it is cut from.
     pub fn logical_geometry(&self) -> Option<Rectangle<i32, Logical>> {
-        let mode = self.output.current_mode()?;
         let scale = self.output.current_scale().fractional_scale();
+        let (w, h) = if self.owner.is_some() {
+            self.capture
+                .as_ref()
+                .map(|c| (c.settings.width, c.settings.height))
+                .unwrap_or(self.view_size)
+        } else {
+            let mode = self.output.current_mode()?;
+            (mode.size.w, mode.size.h)
+        };
         Some(Rectangle::new(
             Point::from(self.pos),
             (
-                (mode.size.w as f64 / scale).round() as i32,
-                (mode.size.h as f64 / scale).round() as i32,
+                (w as f64 / scale).round() as i32,
+                (h as f64 / scale).round() as i32,
             )
                 .into(),
         ))
@@ -1015,7 +1024,7 @@ impl AppState {
     /// pointer can never leave the layout.
     pub(crate) fn layout_physical_to_logical(&self, x: f64, y: f64) -> Point<f64, Logical> {
         let mut best: Option<(f64, Point<f64, Logical>)> = None;
-        for node in &self.output_nodes {
+        for node in self.output_nodes.iter().filter(|n| n.owner.is_none()) {
             let Some(mode) = node.output.current_mode() else { continue };
             let scale = node.output.current_scale().fractional_scale();
             let (px, py) = (node.pos.0 as f64, node.pos.1 as f64);
@@ -1036,7 +1045,7 @@ impl AppState {
     /// Clamp a logical layout point into the nearest output's logical rectangle.
     pub(crate) fn clamp_logical(&self, p: Point<f64, Logical>) -> Point<f64, Logical> {
         let mut best: Option<(f64, Point<f64, Logical>)> = None;
-        for node in &self.output_nodes {
+        for node in self.output_nodes.iter().filter(|n| n.owner.is_none()) {
             let Some(geo) = node.logical_geometry() else { continue };
             let scale = node.output.current_scale().fractional_scale();
             let g = geo.to_f64();
