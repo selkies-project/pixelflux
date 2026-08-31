@@ -5163,7 +5163,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             ]);
                         }
 
-                        pointer.motion(state, under, &MotionEvent { location: p, serial, time });
+                        let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
+                        pointer.motion(state, under.clone(), &MotionEvent { location: p, serial, time });
+                        // A nested wlroots session takes its cursor position from motion
+                        // events alone, so the position the enter carried must be repeated
+                        // or its cursor stays behind until the next move -- and a button
+                        // landing first presses at that stale spot.
+                        if entered && under.is_some() {
+                            pointer.motion(state, under, &MotionEvent {
+                                location: p, serial: next_serial(), time,
+                            });
+                        }
                         pointer.frame(state);
                     }
                 }
@@ -5186,6 +5196,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             (FocusTarget::Window(window.clone()), loc.to_f64())
                         });
 
+                        let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
                         pointer.motion(
                             state, 
                             under.clone(), 
@@ -5195,6 +5206,13 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                                 time 
                             }
                         );
+                        // Same repeat as the absolute arm: an entered nested session
+                        // learns the position only from a motion event.
+                        if entered && under.is_some() {
+                            pointer.motion(state, under.clone(), &MotionEvent {
+                                location: new_pos, serial: next_serial(), time,
+                            });
+                        }
 
                         let event = RelativeMotionEvent {
                             utime,
