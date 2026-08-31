@@ -969,10 +969,10 @@ impl VaapiEncoder {
     ///
     /// The network `output` gets each packet wrapped in the 10-byte stripe header the client demuxer
     /// expects, so a full frame can ride the exact same path as the striped modes — it is simply
-    /// described to the client as one full-height stripe: tag `0x04`, a keyframe flag (`0x01`/`0x00`
-    /// from `AV_PKT_FLAG_KEY`), the frame number as a big-endian `u16`, a `0` y-start (a whole frame
-    /// starts at the top), then width and height as big-endian `u16`s, followed by the raw Annex-B
-    /// payload.
+    /// described to the client as one full-height stripe: tag `0x04`, a picture-type byte read from
+    /// the produced bitstream like every other encoder's (IDR = `0x01`, I = `0x02`, P = `0x00`), the
+    /// frame number as a big-endian `u16`, a `0` y-start (a whole frame starts at the top), then
+    /// width and height as big-endian `u16`s, followed by the raw Annex-B payload.
     /// `omit_stripe_headers` drops the header on the network path too, for a consumer that already
     /// wants raw Annex-B. The loop drains `avcodec_receive_packet` until the encoder is empty,
     /// unref'ing each packet before the next iteration.
@@ -980,20 +980,19 @@ impl VaapiEncoder {
         while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) == 0 {
             let size = (*self.packet).size as usize;
             let data = (*self.packet).data;
-            let is_key = ((*self.packet).flags & ff::AV_PKT_FLAG_KEY) != 0;
+            let slice = std::slice::from_raw_parts(data, size);
 
             let header_sz = if self.omit_stripe_headers { 0 } else { 10 };
             output.reserve(header_sz + size);
             if !self.omit_stripe_headers {
                 output.push(0x04);
-                output.push(if is_key { 0x01 } else { 0x00 });
+                output.push(crate::encoders::annexb_frame_type(slice));
                 output.extend_from_slice(&(frame_number as u16).to_be_bytes());
                 output.extend_from_slice(&0u16.to_be_bytes());
                 output.extend_from_slice(&(self.width as u16).to_be_bytes());
                 output.extend_from_slice(&(self.height as u16).to_be_bytes());
             }
 
-            let slice = std::slice::from_raw_parts(data, size);
             output.extend_from_slice(slice);
 
             ff::av_packet_unref(self.packet);
