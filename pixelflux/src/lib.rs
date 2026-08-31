@@ -3941,17 +3941,22 @@ fn create_output_on(
             .max_by_key(|w| wayland::frontend::window_meta(w).map(|m| m.id).unwrap_or(0))
             .cloned()
     };
-    let adopt = newest(&|w| {
+    let parked = |w: &smithay::desktop::Window| {
         wayland::frontend::window_meta(w)
             .map(|m| m.parked.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(false)
-    })
-    .or_else(|| {
-        newest(&|w| {
-            let oid = wayland::frontend::window_output_id(w);
-            counts.iter().any(|(o, c)| *o == oid && *c >= 2)
-        })
-    });
+    };
+    // A recreated output takes back the window it held before -- parked windows
+    // carry the id of the output they came from, and the tag outlives it -- so
+    // windows never swap displays however a bulk relayout orders its creates.
+    let adopt = newest(&|w| parked(w) && wayland::frontend::window_output_id(w) == id)
+        .or_else(|| newest(&parked))
+        .or_else(|| {
+            newest(&|w| {
+                let oid = wayland::frontend::window_output_id(w);
+                counts.iter().any(|(o, c)| *o == oid && *c >= 2)
+            })
+        });
     if let Some(window) = adopt {
         state.place_window_on_output(&window, id);
         println!(
@@ -4080,9 +4085,10 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
         .collect();
     for window in &windows {
         // The primary keeps whichever screen it already shows: a nested session's
-        // second screen parks again rather than covering the first.
+        // second screen parks again rather than covering the first, tagged with
+        // the output it came from so recreating that output takes it back.
         if state.would_cover_screen(window, 0) {
-            state.park_window(window, 0);
+            state.park_window(window, id);
         } else {
             state.place_window_on_output(window, 0);
         }
