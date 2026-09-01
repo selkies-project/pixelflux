@@ -7191,10 +7191,12 @@ impl ScreenCapture {
         })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
-    /// The app compositor's enabled screens as `(name, x, y)` in screen order,
-    /// which is what it did with a layout rather than what it was asked for.
-    /// Empty = that compositor manages no outputs for clients.
-    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32)>> {
+    /// The app compositor's enabled screens as `(name, x, y, width, height)` in
+    /// screen order, which is what it did with a layout and a mode rather than
+    /// what it was asked for — the readback `set_app_screen_geometry` has no
+    /// other way to be checked against. Empty = that compositor manages no
+    /// outputs for clients.
+    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32, i32, i32)>> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;

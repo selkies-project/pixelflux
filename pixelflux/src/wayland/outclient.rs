@@ -31,7 +31,7 @@ use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
     zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
     zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
-    zwlr_output_mode_v1::ZwlrOutputModeV1,
+    zwlr_output_mode_v1::{self, ZwlrOutputModeV1},
 };
 
 use crate::wayland::wlclient::{bounded_roundtrip, impl_sync_callback, SyncState, IO_TIMEOUT};
@@ -49,6 +49,10 @@ struct OutState {
     /// Announced heads with their name, enabled state and layout position. The
     /// manager's order is its own; screens are addressed by name below.
     heads: Vec<(ZwlrOutputHeadV1, Option<String>, bool, (i32, i32))>,
+    /// Size per announced mode object, and the mode each head currently holds:
+    /// a head carries no size of its own, so the two are joined to report one.
+    modes: Vec<(ZwlrOutputModeV1, (i32, i32))>,
+    current: Vec<(ZwlrOutputHeadV1, ZwlrOutputModeV1)>,
     serial: Option<u32>,
     applied: Option<bool>,
     sync_done: bool,
@@ -119,6 +123,11 @@ impl Dispatch<ZwlrOutputHeadV1, ()> for OutState {
             zwlr_output_head_v1::Event::Name { name } => entry.1 = Some(name),
             zwlr_output_head_v1::Event::Enabled { enabled } => entry.2 = enabled != 0,
             zwlr_output_head_v1::Event::Position { x, y } => entry.3 = (x, y),
+            zwlr_output_head_v1::Event::CurrentMode { mode } => {
+                let head = head.clone();
+                state.current.retain(|(h, _)| *h != head);
+                state.current.push((head, mode));
+            }
             _ => {}
         }
     }
@@ -146,7 +155,22 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for OutState {
     }
 }
 
-delegate_noop!(OutState: ignore ZwlrOutputModeV1);
+impl Dispatch<ZwlrOutputModeV1, ()> for OutState {
+    fn event(
+        state: &mut Self,
+        mode: &ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let zwlr_output_mode_v1::Event::Size { width, height } = event {
+            let mode = mode.clone();
+            state.modes.retain(|(m, _)| *m != mode);
+            state.modes.push((mode, (width, height)));
+        }
+    }
+}
 delegate_noop!(OutState: ZwlrOutputConfigurationHeadV1);
 
 /// Set the scale of the `index`-th screen of the compositor on `socket_path`,
@@ -199,10 +223,12 @@ pub fn set_screen_geometry(
     .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
 }
 
-/// The session's enabled screens as `(name, x, y)`, in screen order — what the
-/// compositor actually did with a layout, which is not always what it was asked
-/// for. Empty when the compositor manages no outputs for clients.
-pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32)>, String> {
+/// The session's enabled screens as `(name, x, y, width, height)`, in screen
+/// order — what the compositor actually did with a layout and a mode, which is
+/// not always what it was asked for. A head carries no size itself, so the size
+/// is its current mode's; `(0, 0)` where it announced none. Empty when the
+/// compositor manages no outputs for clients.
+pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32, i32, i32)>, String> {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
@@ -215,13 +241,25 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32)>, String
         return Ok(Vec::new());
     };
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let mut screens: Vec<(String, i32, i32)> = state
+    let size_of = |head: &ZwlrOutputHeadV1| -> (i32, i32) {
+        state
+            .current
+            .iter()
+            .find(|(h, _)| h == head)
+            .and_then(|(_, mode)| state.modes.iter().find(|(m, _)| m == mode))
+            .map(|(_, size)| *size)
+            .unwrap_or((0, 0))
+    };
+    let mut screens: Vec<(String, i32, i32, i32, i32)> = state
         .heads
         .iter()
         .filter(|(_, _, on, _)| *on)
-        .map(|(_, name, _, pos)| (name.clone().unwrap_or_default(), pos.0, pos.1))
+        .map(|(head, name, _, pos)| {
+            let (w, h) = size_of(head);
+            (name.clone().unwrap_or_default(), pos.0, pos.1, w, h)
+        })
         .collect();
-    screens.sort_by_key(|(name, _, _)| (trailing_number(name), name.clone()));
+    screens.sort_by_key(|(name, _, _, _, _)| (trailing_number(name), name.clone()));
     manager.stop();
     let _ = queue.flush();
     Ok(screens)
