@@ -23,5 +23,9 @@ pub mod wlclient;
 pub mod dcclient;
 /// Output-management client scaling a nested app compositor's screens.
 pub mod outclient;
+/// KDE client growing, removing and arranging a nested KWin session's screens.
+pub mod kdeclient;
+/// Generated bindings for the KDE output protocols vendored under `protocols/`.
+pub mod kdeproto;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;

@@ -1188,6 +1188,7 @@ name = "pixelflux"
 version = "2.1.0"
 dependencies = [
  "base64",
+ "bitflags",
  "calloop",
  "cfg-if",
  "crossbeam-channel",
@@ -1207,10 +1208,13 @@ dependencies = [
  "smithay",
  "tiny_http",
  "turbojpeg",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-misc",
+ "wayland-protocols-plasma",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "wayland-server",
  "x11rb",
  "x264-sys",
@@ -2199,6 +2203,19 @@ dependencies = [
  "wayland-protocols",
  "wayland-scanner",
  "wayland-server",
+]
+
+[[package]]
+name = "wayland-protocols-plasma"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b6d8cf1eb2c1c31ed1f5643c88a6e53538129d4af80030c8cabd1f9fa884d91"
+dependencies = [
+ "bitflags",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
 ]
 
 [[package]]

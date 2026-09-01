@@ -16,10 +16,11 @@
 //! screen nobody sees. Screens are addressed by position in name order
 //! (WL-1, WL-2, ...), the order the session opened them in.
 //!
-//! Compositors without the protocol (KWin offers `kde_output_management_v2`)
-//! report [`ScaleOutcome::Unsupported`] and position nothing; their scale comes
-//! from the capture output, which they follow. Blocking, off the compositor
-//! thread, with every round-trip deadline-bounded.
+//! Compositors without the protocol report [`ScaleOutcome::Unsupported`] and
+//! position nothing here; their scale comes from the capture output, which
+//! they follow, and a KWin session's arrangement lands through `kdeclient`
+//! (`kde_output_management_v2`) instead. Blocking, off the compositor thread,
+//! with every round-trip deadline-bounded.
 
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -324,7 +325,7 @@ pub fn hold_spare_screens(
 }
 
 /// The number a screen's name ends in (WL-2 -> 2), or none, which sorts first.
-fn trailing_number(name: &str) -> u32 {
+pub(crate) fn trailing_number(name: &str) -> u32 {
     let digits: String = name.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
     digits.chars().rev().collect::<String>().parse().unwrap_or(0)
 }
