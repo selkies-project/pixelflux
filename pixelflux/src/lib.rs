@@ -84,7 +84,7 @@ use smithay::{
             },
             gles::GlesRenderer,
             pixman::PixmanRenderer,
-            Bind, ImportAll, ImportEgl, ImportMem,
+            Bind, ImportAll, ImportEgl, ImportMem, Renderer,
         },
     },
     desktop::{space::SpaceRenderElements, Space},
@@ -2388,6 +2388,18 @@ fn run_wayland_thread(
             }
 
             if !state.is_capturing && state.pending_screenshot.is_none() {
+                // While capture is stopped the render tick early-outs
+                // without finishing a Frame, so Smithay never drains its
+                // deferred texture-destruction queue: GPU buffers imported
+                // from nested clients that keep rendering accumulate and are
+                // only released on the next start_capture(). Drain the cache
+                // here so an idle session does not grow unbounded. On an
+                // integrated GPU these buffers are system RAM, so the leak
+                // surfaces as RSS growth and eventual OOM.
+                // Upstream: linuxserver/pixelflux#26, smithay#1747.
+                if let Some(renderer) = state.gles_renderer.as_mut() {
+                    let _ = renderer.cleanup_texture_cache();
+                }
                 return TimeoutAction::ToDuration(Duration::from_millis(16));
             }
 
