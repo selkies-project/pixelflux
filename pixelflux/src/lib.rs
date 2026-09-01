@@ -790,7 +790,7 @@ pub enum ThreadCommand {
     MoveWindowToOutput { window_id: u32, output_id: u32, reply: std::sync::mpsc::Sender<bool> },
     /// Reply with every mapped window as `(window_id, title, app_id, output_id)`.
     ListWindows { reply: std::sync::mpsc::Sender<Vec<WindowDesc>> },
-    SetCursorCallback(Py<PyAny>),
+    SetCursorCallback(Option<Py<PyAny>>),
     SetClipboardCallback(Py<PyAny>),
     /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
     /// `mime` (plus text aliases) to pasting clients.
@@ -5065,16 +5065,15 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     state.current_selection_mime = None;
                 }
                 ThreadCommand::SetCursorCallback(cb) => {
+                    state.cursor_callback_set = cb.is_some();
                     let _ = state.cursor_tx.send(CursorJob::SetCallback(cb));
-                    state.cursor_callback_set = true;
-                    if let Some(icon) = state.current_cursor_icon.clone() {
+                    if state.cursor_callback_set {
+                        // With no client cursor yet the default theme sprite stands in, the
+                        // same one the render path draws for None, so a consumer registering
+                        // before the first client cursor event still sees a pointer.
+                        let icon = state.current_cursor_icon.clone()
+                            .unwrap_or(CursorImageStatus::Named(Default::default()));
                         state.send_cursor_image(&icon);
-                    } else {
-                        // No client has set a cursor yet. The render path treats
-                        // None as the default theme cursor, so the first consumer
-                        // must receive that same sprite instead of a blank pointer
-                        // until the first client cursor event.
-                        state.send_cursor_image(&CursorImageStatus::Named(Default::default()));
                     }
                 }
                 ThreadCommand::KeyboardKeys { events } => {
@@ -5972,10 +5971,15 @@ impl WaylandBackend {
             .unwrap_or_default())
     }
 
-    fn set_cursor_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+    /// cb(msg_type: str, png: bytes, hot_x: int, hot_y: int); `None` withdraws it.
+    fn set_cursor_callback(&self, callback: Option<Py<PyAny>>) -> PyResult<()> {
         self.send(ThreadCommand::SetCursorCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set cursor callback: {}", e)))?;
         Ok(())
+    }
+
+    fn clear_cursor_callback(&self) -> PyResult<()> {
+        self.set_cursor_callback(None)
     }
 
     /// Recreate the cursor theme at `size` pixels — no restart: subsequent named-cursor
@@ -6510,7 +6514,7 @@ fn ensure_wayland_backend(
             WaylandBackend::new(width, height, node, auto_gpu_selected, cursor_size),
         )?;
         if let Some(cb) = PENDING_CURSOR_CALLBACK.lock().unwrap().take() {
-            let _ = be.bind(py).borrow().set_cursor_callback(cb);
+            let _ = be.bind(py).borrow().set_cursor_callback(Some(cb));
         }
         *g = Some(be);
     }
@@ -7305,19 +7309,27 @@ impl ScreenCapture {
     /// registration), and the Wayland backend takes it directly — or stashes it in
     /// `PENDING_CURSOR_CALLBACK`, applied by `ensure_wayland_backend` at creation; the
     /// backend slot lock is held across the check so a concurrent creation cannot miss the
-    /// stash.
-    fn set_cursor_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
-        crate::x11::cursor::set_callback(callback.clone_ref(py));
+    /// stash. Both slots are process-wide and outlive the capture that set them, so `None`
+    /// withdraws the callback and releases whatever it holds.
+    fn set_cursor_callback(&self, py: Python<'_>, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        crate::x11::cursor::set_callback(callback.as_ref().map(|c| c.clone_ref(py)));
         let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
         let g = slot.lock().unwrap();
         match g.as_ref() {
             Some(be) => be.bind(py).borrow().set_cursor_callback(callback),
             None => {
-                *PENDING_CURSOR_CALLBACK.lock().unwrap() = Some(callback);
+                *PENDING_CURSOR_CALLBACK.lock().unwrap() = callback;
                 Ok(())
             }
         }
     }
+
+    /// Withdraw the cursor callback, releasing what it holds. Present only where
+    /// the slots can be emptied, so a consumer can probe for it by name.
+    fn clear_cursor_callback(&self, py: Python<'_>) -> PyResult<()> {
+        self.set_cursor_callback(py, None)
+    }
+
     fn get_xkb_keymap_string(&self, py: Python<'_>) -> PyResult<String> {
         wayland_backend_running(py)
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))

@@ -59,9 +59,15 @@ struct Slot {
 
 static SLOT: Mutex<Slot> = Mutex::new(Slot { users: 0, monitor: None });
 
-/// Register/replace the callback and re-deliver the current cursor to it.
-pub fn set_callback(cb: Py<PyAny>) {
-    *CALLBACK.lock().unwrap() = Some(cb);
+/// Register/replace the callback and re-deliver the current cursor to it. `None` withdraws
+/// it, releasing what the callback holds: the slot is process-wide and outlives the capture
+/// that set it, so a consumer that is going away has no other way to let go.
+pub fn set_callback(cb: Option<Py<PyAny>>) {
+    let registered = cb.is_some();
+    *CALLBACK.lock().unwrap() = cb;
+    if !registered {
+        return;
+    }
     let slot = SLOT.lock().unwrap();
     if let Some(m) = slot.monitor.as_ref() {
         REPLAY.store(true, Ordering::Release);

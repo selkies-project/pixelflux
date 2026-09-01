@@ -26,7 +26,8 @@ use xcursor::{
 /// call so none of that latency lands on the input/render thread. One channel keeps cursor
 /// updates ordered with callback (re)registration.
 pub enum CursorJob {
-    SetCallback(Py<PyAny>),
+    /// `None` withdraws the callback, releasing what it holds.
+    SetCallback(Option<Py<PyAny>>),
     /// Reload the worker's theme handle at a new pixel size; later `Named` jobs render at it.
     SetSize(i32),
     /// Cap the longest delivered cursor edge in pixels; larger sprites are downscaled with
@@ -58,8 +59,8 @@ pub enum CursorJob {
 }
 
 /// Spawn the cursor delivery worker; returns its job channel. The worker owns its own
-/// theme handle, the PNG cache, and the Python callback for the life of the process (like the
-/// compositor thread itself); `PY_SHUTDOWN` gates every Python call.
+/// theme handle, the PNG cache, and the Python callback until one replaces or withdraws it
+/// (like the compositor thread itself); `PY_SHUTDOWN` gates every Python call.
 pub fn spawn_cursor_worker(cursor_size: i32, size_cap: i32) -> std::sync::mpsc::Sender<CursorJob> {
     let (tx, rx) = std::sync::mpsc::channel::<CursorJob>();
     let _ = std::thread::Builder::new().name("wl-cursor".into()).spawn(move || {
@@ -70,7 +71,10 @@ pub fn spawn_cursor_worker(cursor_size: i32, size_cap: i32) -> std::sync::mpsc::
         while let Ok(job) = rx.recv() {
             let (msg_type, data, hot_x, hot_y): (&str, Vec<u8>, i32, i32) = match job {
                 CursorJob::SetCallback(cb) => {
-                    callback = Some(cb);
+                    // Attached for the swap: dropping the old callback without the
+                    // GIL defers its decref to this thread's next attach, which a
+                    // withdrawal means may never come.
+                    Python::attach(|_| callback = cb);
                     continue;
                 }
                 CursorJob::SetSize(size) => {
