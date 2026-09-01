@@ -55,6 +55,10 @@ struct OutState {
     current: Vec<(ZwlrOutputHeadV1, ZwlrOutputModeV1)>,
     serial: Option<u32>,
     applied: Option<bool>,
+    /// The refusal was a cancellation: the configuration went stale under a
+    /// state change of the compositor's own, so the same plan on a fresh
+    /// serial can still land.
+    cancelled: bool,
     sync_done: bool,
 }
 
@@ -148,8 +152,11 @@ impl Dispatch<ZwlrOutputConfigurationV1, ()> for OutState {
     ) {
         match event {
             zwlr_output_configuration_v1::Event::Succeeded => state.applied = Some(true),
-            zwlr_output_configuration_v1::Event::Failed
-            | zwlr_output_configuration_v1::Event::Cancelled => state.applied = Some(false),
+            zwlr_output_configuration_v1::Event::Failed => state.applied = Some(false),
+            zwlr_output_configuration_v1::Event::Cancelled => {
+                state.cancelled = true;
+                state.applied = Some(false);
+            }
             _ => {}
         }
     }
@@ -330,13 +337,51 @@ struct Plan {
     position: Option<(i32, i32)>,
 }
 
-/// Apply `plan` to the compositor's enabled heads. `plan` receives them in
-/// announcement order and answers with the ones to change; heads it leaves out
-/// keep their configuration. 0 = the compositor manages no outputs, or the plan
-/// asked for nothing.
+/// Why a configuration did not land.
+enum ConfigErr {
+    /// The compositor cancelled it, which says only that its own state moved
+    /// while the configuration was alive. The serial is what went stale, not
+    /// the plan.
+    Stale,
+    Other(String),
+}
+
+impl From<String> for ConfigErr {
+    fn from(e: String) -> Self {
+        ConfigErr::Other(e)
+    }
+}
+
+/// Rebuilds a cancelled configuration this many times before giving up. A
+/// screen arriving or leaving cancels whatever is in flight, and that is the
+/// same moment a display's mode and scale are being applied.
+const CONFIGURE_ATTEMPTS: usize = 4;
+
+/// Apply `plan` to the compositor's enabled heads, retrying while the
+/// compositor cancels. `plan` receives them in announcement order and answers
+/// with the ones to change; heads it leaves out keep their configuration. It is
+/// called once per attempt, against the heads of that attempt. 0 = the
+/// compositor manages no outputs, or the plan asked for nothing.
 fn configure<F>(socket_path: &str, plan: F) -> Result<usize, String>
 where
-    F: FnOnce(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
+    F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
+{
+    let mut stale = 0;
+    for _ in 0..CONFIGURE_ATTEMPTS {
+        match configure_once(socket_path, &plan) {
+            Ok(applied) => return Ok(applied),
+            Err(ConfigErr::Other(e)) => return Err(e),
+            Err(ConfigErr::Stale) => stale += 1,
+        }
+    }
+    Err(format!("the compositor cancelled the configuration {stale} times"))
+}
+
+/// One attempt: a connection of its own, the heads and the serial that
+/// stamps them, and `plan` applied against that state.
+fn configure_once<F>(socket_path: &str, plan: &F) -> Result<usize, ConfigErr>
+where
+    F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
 {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
@@ -351,7 +396,9 @@ where
     };
     // The heads and the serial that stamps them arrive after the bind.
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let serial = state.serial.ok_or("output manager sent no state serial")?;
+    let serial = state
+        .serial
+        .ok_or_else(|| "output manager sent no state serial".to_string())?;
     // Screens in the order their names put them (WL-1, WL-2, ...), which is the
     // order a session opens them in and so the order they map to displays; the
     // manager's own announcement order carries no such promise.
@@ -398,6 +445,9 @@ where
     let _ = queue.flush();
     match state.applied {
         Some(true) => Ok(wanted.len()),
-        _ => Err("the compositor refused the configuration".to_string()),
+        _ if state.cancelled => Err(ConfigErr::Stale),
+        _ => Err(ConfigErr::Other(
+            "the compositor refused the configuration".to_string(),
+        )),
     }
 }
