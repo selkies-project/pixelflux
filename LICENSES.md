@@ -54,6 +54,7 @@ contains it.
 | libxcb, libX11 | not linked | - | - | `x11rb` is pure Rust and opens the X socket itself; no libxcb/libX11 symbol is linked (the `auditwheel --exclude` entries for them are harmless) | X11 capture, XTEST, XFixes cursor |
 | NVIDIA NVENC (`libnvidia-encode.so.1`) and CUDA driver API (`libcuda.so.1`) | proprietary (NVIDIA driver) | - | both | `dlopen` at run time, never linked, never shipped; only present on hosts with the NVIDIA driver | NVENC encoder |
 | NVIDIA SDK headers (`pixelflux/nvcodec-sys/headers/nvEncodeAPI.h`, NVENCAPI 13.0 from FFmpeg's nv-codec-headers) | MIT | permissive | both | vendored header; the committed `src/bindgen/nvenc.rs` is generated from it | the crate `nvcodec-sys` is MIT OR Apache-2.0 |
+| KDE plasma-wayland-protocols XMLs (`pixelflux/protocols/kde-output-device-v2.xml`, `kde-output-management-v2.xml`) | MIT-CMU | permissive | both | vendored protocol descriptions compiled to Rust by `wayland-scanner` at build time; nothing is linked | newer than the copies `wayland-protocols-plasma` bundles, which KWin outgrew (`src/wayland/kdeproto.rs`) |
 | CUDA driver API declarations (`pixelflux/nvcodec-sys/src/bindgen/cuda.rs`) | bindgen output of the CUDA toolkit `cuda.h` declarations (the 31 functions pixelflux calls); the toolkit header is under the NVIDIA CUDA Toolkit EULA | - | both | committed FFI declarations only, as cudarc/cuda-sys ship; the toolkit is not needed to build and nothing from it is redistributed | regenerated only with the `regen` feature |
 | Linux kernel ABI (`linux-raw-sys`) | Linux-syscall-note (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT for the crate) | permissive | both | syscall numbers and structs as Rust constants | rustix backend |
 | CPython (`libpython`) | PSF-2.0 | permissive | both | extension module: symbols come from the hosting interpreter, nothing is linked | `pyo3` with `extension-module` |
@@ -271,6 +272,7 @@ table below.
 | wayland-client | 0.31.15 | MIT | permissive | both |  |
 | wayland-protocols | 0.32.13 | MIT | permissive | both |  |
 | wayland-protocols-misc | 0.3.12 | MIT | permissive | both |  |
+| wayland-protocols-plasma | 0.3.12 | MIT | permissive | both |  |
 | wayland-protocols-wlr | 0.3.12 | MIT | permissive | both |  |
 | wayland-scanner | 0.31.11 | MIT | permissive | both |  |
 | wayland-server | 0.31.14 | MIT | permissive | both |  |
