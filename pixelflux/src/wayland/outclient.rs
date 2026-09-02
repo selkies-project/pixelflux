@@ -23,7 +23,7 @@
 //! with every round-trip deadline-bounded.
 
 use std::os::unix::net::UnixStream;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use wayland_client::protocol::wl_registry;
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
@@ -353,10 +353,15 @@ impl From<String> for ConfigErr {
     }
 }
 
-/// Rebuilds a cancelled configuration this many times before giving up. A
-/// screen arriving or leaving cancels whatever is in flight, and that is the
-/// same moment a display's mode and scale are being applied.
-const CONFIGURE_ATTEMPTS: usize = 4;
+/// Rebuilds a cancelled configuration until this much time is spent. A screen
+/// arriving or leaving cancels whatever is in flight, and that is the same
+/// moment a display's mode and scale are being applied. Cancellations arrive in
+/// bursts, so the budget is a duration rather than a count of attempts: a count
+/// that outlasts a burst on one machine is spent inside one on a busier machine,
+/// where the attempts slow down and the burst does not. It can be generous
+/// because the caller is off the event loop with the GIL released, while giving
+/// up leaves the display on a capture-side scale until something asks again.
+const CONFIGURE_BUDGET: Duration = Duration::from_secs(1);
 
 /// Apply `plan` to the compositor's enabled heads, retrying while the
 /// compositor cancels. `plan` receives them in announcement order and answers
@@ -367,19 +372,27 @@ fn configure<F>(socket_path: &str, plan: F) -> Result<usize, String>
 where
     F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
 {
+    let deadline = Instant::now() + CONFIGURE_BUDGET;
     let mut stale = 0;
-    for _ in 0..CONFIGURE_ATTEMPTS {
+    loop {
         match configure_once(socket_path, &plan) {
             Ok(applied) => return Ok(applied),
             Err(ConfigErr::Other(e)) => return Err(e),
             Err(ConfigErr::Stale) => stale += 1,
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the compositor cancelled the configuration {stale} times"
+            ));
+        }
     }
-    Err(format!("the compositor cancelled the configuration {stale} times"))
 }
 
 /// One attempt: a connection of its own, the heads and the serial that
-/// stamps them, and `plan` applied against that state.
+/// stamps them, and `plan` applied against that state. A retry reconnects
+/// rather than waiting for a fresh serial on the one it has, because the change
+/// that cancelled it is often a head arriving or leaving, and the heads a kept
+/// connection holds do not survive that.
 fn configure_once<F>(socket_path: &str, plan: &F) -> Result<usize, ConfigErr>
 where
     F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
