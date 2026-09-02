@@ -25,7 +25,9 @@
 //! is no state serial and a configuration is a delta — a device left out
 //! keeps its state — and modes come from the advertised list only, never
 //! custom, so [`set_screen_layout`] positions screens and leaves their size
-//! to the capture side. Screens are addressed by position in name order,
+//! to the capture side; their scale is not set here either, because a nested
+//! KWin accepts one and ignores it, following the host window's preferred
+//! fractional scale instead. Screens are addressed by position in name order,
 //! matching `outclient`. Blocking, off the compositor thread, with every
 //! round-trip deadline-bounded.
 
@@ -410,16 +412,29 @@ pub fn set_screen_layout(
     for (dev, (x, y)) in &placed {
         config.position(dev, *x, *y);
     }
+    apply_configuration(&conn, &mut queue, &mut state, config)?;
+    Ok(placed.len())
+}
+
+/// Apply a configuration and wait, deadline-bounded, for the compositor's
+/// verdict on it; the configuration object is released either way.
+fn apply_configuration(
+    conn: &Connection,
+    queue: &mut EventQueue<KdeOutState>,
+    state: &mut KdeOutState,
+    config: KdeOutputConfigurationV2,
+) -> Result<(), String> {
+    state.applied = None;
     config.apply();
     queue.flush().map_err(|e| format!("flush configuration: {e}"))?;
     let deadline = Instant::now() + IO_TIMEOUT;
     while state.applied.is_none() && Instant::now() < deadline {
-        bounded_roundtrip(&conn, &mut queue, &mut state)?;
+        bounded_roundtrip(conn, queue, state)?;
     }
     config.destroy();
     let _ = queue.flush();
     match state.applied {
-        Some(true) => Ok(placed.len()),
+        Some(true) => Ok(()),
         Some(false) => Err("the compositor refused the configuration".to_string()),
         None => Err("timed out waiting for the configuration".to_string()),
     }

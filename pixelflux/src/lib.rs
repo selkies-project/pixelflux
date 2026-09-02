@@ -7153,7 +7153,10 @@ impl ScreenCapture {
     /// configuration, so the session lays its desktop out once. Setting them
     /// separately exposes a geometry that never exists — the pre-connect mode at
     /// the new scale — and a client that does not lay out again keeps it.
-    /// False = that compositor manages no outputs for clients.
+    /// False = that compositor manages no outputs for clients: a nested KWin
+    /// accepts a scale over its own output management and then ignores it, its
+    /// screens taking their scale from the host window's preferred fractional
+    /// scale, which is the capture output's.
     #[pyo3(signature = (display, width, height, scale, index = 0))]
     fn set_app_screen_geometry(
         &self,
