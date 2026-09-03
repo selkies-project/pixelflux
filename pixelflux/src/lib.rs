@@ -575,7 +575,7 @@ impl Default for RustCaptureSettings {
             video_fullframe: false,
             video_streaming_mode: false,
             capture_cursor: false,
-            cursor_size_cap: 32,
+            cursor_size_cap: 128,
             watermark_path: String::new(),
             watermark_location_enum: 0,
             encode_node_index: -2,
@@ -6323,7 +6323,7 @@ impl CaptureSettings {
             encode_node_path: py.None(),
             render_node_path: py.None(), auto_gpu: py.None(), use_wayland: py.None(),
             recording_socket: py.None(), wayland_host_display: py.None(),
-            cursor_size: -1, cursor_size_cap: 32,
+            cursor_size: -1, cursor_size_cap: 128,
         }
     }
 }

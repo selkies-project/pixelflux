@@ -418,3 +418,20 @@ fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
     }
     Ok(imgs)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_keeps_a_sprite_within_it_and_shrinks_one_past_it() {
+        let whole = RgbaImage::from_pixel(128, 128, image::Rgba([0, 0, 0, 255]));
+        let sprite = cap_and_encode(whole, 128).unwrap();
+        let img = image::load_from_memory(&sprite.png).unwrap();
+        assert_eq!((img.width(), img.height()), (128, 128));
+        let big = RgbaImage::from_pixel(256, 64, image::Rgba([0, 0, 0, 255]));
+        let sprite = cap_and_encode(big, 128).unwrap();
+        let img = image::load_from_memory(&sprite.png).unwrap();
+        assert_eq!((img.width(), img.height()), (128, 32));
+    }
+}

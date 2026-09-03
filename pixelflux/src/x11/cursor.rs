@@ -39,7 +39,8 @@ use x11rb::rust_connection::RustConnection;
 /// The Python cursor callback from `set_cursor_callback`, shared by every X11 capture.
 static CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
 /// Longest delivered cursor edge; larger images are downscaled (`<= 0` = uncapped).
-static SIZE_CAP: AtomicI32 = AtomicI32::new(32);
+/// 128 is what a browser shows as a cursor, so an application's own sprite travels whole.
+static SIZE_CAP: AtomicI32 = AtomicI32::new(128);
 /// Deliver the current cursor on the next wake (a callback registered mid-run).
 static REPLAY: AtomicBool = AtomicBool::new(false);
 
@@ -432,6 +433,21 @@ mod tests {
     /// The image is cropped to its visible bbox and the hotspot re-based to the crop:
     /// a 2x2 visible block at (1,1)..(2,2) with hotspot (2,2) yields a 2x2 PNG with
     /// hotspot (1,1).
+    #[test]
+    fn application_sprite_travels_whole_within_the_cap() {
+        // A 128px sprite, a game's own pointer, at the default cap: delivered at 128.
+        let opaque = vec![0xff00_0000u32; 128 * 128];
+        let (t, data, _, _) = cursor_to_png(&reply(128, 128, 0, 0, opaque.clone()), 128);
+        assert_eq!(t, "png");
+        let img = image::load_from_memory(&data).unwrap();
+        assert_eq!((img.width(), img.height()), (128, 128));
+        // Past the cap, the longest edge is brought to it.
+        let big = vec![0xff00_0000u32; 256 * 256];
+        let (_, data, _, _) = cursor_to_png(&reply(256, 256, 0, 0, big), 128);
+        let img = image::load_from_memory(&data).unwrap();
+        assert_eq!((img.width(), img.height()), (128, 128));
+    }
+
     #[test]
     fn crop_rebases_hotspot() {
         let mut px = vec![0u32; 16];
