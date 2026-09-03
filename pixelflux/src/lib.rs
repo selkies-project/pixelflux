@@ -667,7 +667,7 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .getattr("cursor_size_cap")
             .ok()
             .and_then(|v| v.extract::<i32>().ok())
-            .unwrap_or(32),
+            .unwrap_or(RustCaptureSettings::default().cursor_size_cap),
         watermark_path,
         watermark_location_enum: settings.getattr("watermark_location_enum")?.extract()?,
         encode_node_index: settings.getattr("encode_node_index")?.extract()?,

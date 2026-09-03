@@ -222,10 +222,15 @@ fn capped_job(
     ("png", sprite.png.clone(), sx, sy)
 }
 
+/// Longest side of a cursor surface still read: an application's own pointer can be
+/// well past what is delivered (the cap downscales it), but a surface this large is not
+/// a cursor at all and its copy is skipped.
+const MAX_SPRITE_SIDE: i32 = 1024;
+
 /// Read a wl_shm BGRA/XRGB sprite sub-image into a premultiplied RGBA image, the form
 /// `cap_and_encode` must resize before it unpremultiplies. Stride/offset are clamped
 /// non-negative with checked arithmetic so a garbage descriptor skips pixels instead of
-/// panicking; sprites larger than 128x128 are ignored (never a hardware cursor).
+/// panicking; a sprite past `MAX_SPRITE_SIDE` is ignored.
 fn decode_shm_cursor(
     width: i32,
     height: i32,
@@ -234,7 +239,7 @@ fn decode_shm_cursor(
     opaque: bool,
     raw_bytes: &[u8],
 ) -> Option<RgbaImage> {
-    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+    if width <= 0 || height <= 0 || width > MAX_SPRITE_SIDE || height > MAX_SPRITE_SIDE || raw_bytes.is_empty() {
         return None;
     }
     let mut img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(width as u32, height as u32);
@@ -266,7 +271,7 @@ fn decode_shm_cursor(
 /// Read a dmabuf sprite's RGBA readback (stride recovered from the mapping length) into a
 /// premultiplied RGBA image.
 fn decode_gles_cursor(width: i32, height: i32, raw_bytes: &[u8]) -> Option<RgbaImage> {
-    if width <= 0 || height <= 0 || width > 128 || height > 128 || raw_bytes.is_empty() {
+    if width <= 0 || height <= 0 || width > MAX_SPRITE_SIDE || height > MAX_SPRITE_SIDE || raw_bytes.is_empty() {
         return None;
     }
     let stride = super::frontend::rgba_readback_stride(
@@ -422,6 +427,21 @@ fn load_icon(theme: &CursorTheme, name: &str) -> Result<Vec<Image>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_cursor_surface_is_read_and_capped() {
+        // An application's 256px pointer as a wl_shm surface: read whole, then
+        // brought down to the cap; a surface too large to be a cursor is skipped.
+        let side = 256;
+        let raw = vec![0xffu8; (side * side * 4) as usize];
+        let img = decode_shm_cursor(side, side, side * 4, 0, false, &raw).unwrap();
+        assert_eq!((img.width(), img.height()), (256, 256));
+        let sprite = cap_and_encode(img, 128).unwrap();
+        let png = image::load_from_memory(&sprite.png).unwrap();
+        assert_eq!((png.width(), png.height()), (128, 128));
+        assert!(decode_shm_cursor(2048, 2048, 2048 * 4, 0, false, &raw).is_none());
+        assert!(decode_gles_cursor(2048, 2048, &raw).is_none());
+    }
 
     #[test]
     fn cap_keeps_a_sprite_within_it_and_shrinks_one_past_it() {
