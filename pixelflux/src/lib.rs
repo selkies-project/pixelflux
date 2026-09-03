@@ -7221,7 +7221,9 @@ impl ScreenCapture {
     }
     /// Whether the app compositor grows screens on demand through KWin's
     /// `zkde_screencast_unstable_v1` virtual outputs — the rung selkies probes
-    /// when the session serves no control socket.
+    /// when the session serves no control socket. Proven by growing a
+    /// token-sized probe screen and giving it back: a stock kwin serves the
+    /// request but never registers the output. Once per session is enough.
     fn app_screen_control_available(&self, py: Python<'_>, display: String) -> PyResult<bool> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
