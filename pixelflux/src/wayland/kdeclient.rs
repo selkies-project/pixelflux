@@ -19,6 +19,9 @@
 //! therefore parks one open connection in a process-wide registry; nothing
 //! dispatches it afterwards, because holding the socket open is the entire
 //! contract, and [`remove_screen`] closes the stream to give the screen back.
+//! A stock kwin serves the same request and creates an output it never
+//! registers, so whether screens can be grown is proven, not inferred:
+//! [`screen_control_available`] grows a probe screen and gives it back.
 //!
 //! Arrangement rides `kde_output_management_v2` over the per-output
 //! `kde_output_device_v2` globals. Unlike `zwlr_output_management_v1` there
@@ -134,18 +137,78 @@ impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for CastState {
     }
 }
 
-/// Whether the compositor on `socket_path` grows screens on demand: true when
-/// it serves `zkde_screencast_unstable_v1` at the virtual-output revision.
-pub fn screen_control_available(socket_path: &str) -> Result<bool, String> {
-    let stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
-    let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
+/// Why a screen could not be grown: the compositor was unreachable, or it
+/// answered and refused. A probe reports the first and answers "no" to the
+/// second.
+enum GrowError {
+    Unreachable(String),
+    Refused(String),
+}
+
+/// Grow a screen named `name` on the compositor at `socket_path` and return
+/// its keep-alive; the screen lives until that is dropped or its stream closed.
+fn grow(socket_path: &str, name: &str, size: (i32, i32), scale: f64) -> Result<HeldScreen, GrowError> {
+    let stream = UnixStream::connect(socket_path)
+        .map_err(|e| GrowError::Unreachable(format!("connect {socket_path}: {e}")))?;
+    let conn = Connection::from_socket(stream)
+        .map_err(|e| GrowError::Unreachable(format!("wayland setup: {e}")))?;
     let mut queue: EventQueue<CastState> = conn.new_event_queue();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
     let mut state = CastState::default();
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    Ok(state.manager.is_some())
+    bounded_roundtrip(&conn, &mut queue, &mut state).map_err(GrowError::Unreachable)?;
+    let Some(manager) = state.manager.clone() else {
+        return Err(GrowError::Refused("the compositor offers no zkde_screencast_unstable_v1".to_string()));
+    };
+    let stream =
+        manager.stream_virtual_output(name.to_string(), size.0, size.1, scale, POINTER_HIDDEN, &qh, ());
+    queue.flush().map_err(|e| GrowError::Unreachable(format!("flush: {e}")))?;
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while state.outcome.is_none() && Instant::now() < deadline {
+        bounded_roundtrip(&conn, &mut queue, &mut state).map_err(GrowError::Unreachable)?;
+    }
+    if !matches!(state.outcome, Some(Ok(()))) {
+        let present = list_screens(socket_path)
+            .map_err(GrowError::Unreachable)?
+            .iter()
+            .any(|(n, ..)| n == name);
+        if !present {
+            return Err(GrowError::Refused(match state.outcome.take() {
+                Some(Err(e)) => format!("virtual screen '{name}' refused: {e}"),
+                _ => format!("virtual screen '{name}' produced no output device"),
+            }));
+        }
+    }
+    Ok(HeldScreen { conn, _queue: queue, _state: state, stream })
+}
+
+/// Name and size of the screen [`screen_control_available`] grows to prove
+/// the compositor can: a token size, and a name no display's screen takes.
+const PROBE_SCREEN: (&str, (i32, i32)) = ("SELKIES-PROBE", (320, 240));
+
+/// Whether the compositor on `socket_path` grows screens on demand, proven by
+/// growing one: `zkde_screencast_unstable_v1` answers on a stock kwin too,
+/// but only a kwin that registers a nested virtual output turns the request
+/// into a screen. The probe screen is given back before the answer, and its
+/// removal is waited for, so the session is left as it was found. Err only
+/// when the compositor is unreachable.
+pub fn screen_control_available(socket_path: &str) -> Result<bool, String> {
+    let (name, size) = PROBE_SCREEN;
+    let held = match grow(socket_path, name, size, 1.0) {
+        Ok(held) => held,
+        Err(GrowError::Refused(_)) => return Ok(false),
+        Err(GrowError::Unreachable(e)) => return Err(e),
+    };
+    held.stream.close();
+    let _ = held.conn.flush();
+    drop(held);
+    let deadline = Instant::now() + IO_TIMEOUT;
+    while Instant::now() < deadline
+        && list_screens(socket_path)?.iter().any(|(n, ..)| n == name)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(true)
 }
 
 /// Grow a screen named `name` on the compositor at `socket_path`, holding it
@@ -173,37 +236,10 @@ pub fn add_screen(
     if held_screens().lock().unwrap().contains_key(name) {
         return Ok(());
     }
-    let stream =
-        UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
-    let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
-    let mut queue: EventQueue<CastState> = conn.new_event_queue();
-    let qh = queue.handle();
-    let _registry = conn.display().get_registry(&qh, ());
-    let mut state = CastState::default();
-    bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let Some(manager) = state.manager.clone() else {
-        return Err("the compositor offers no zkde_screencast_unstable_v1".to_string());
-    };
-    let stream =
-        manager.stream_virtual_output(name.to_string(), size.0, size.1, scale, POINTER_HIDDEN, &qh, ());
-    queue.flush().map_err(|e| format!("flush: {e}"))?;
-    let deadline = Instant::now() + IO_TIMEOUT;
-    while state.outcome.is_none() && Instant::now() < deadline {
-        bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    }
-    if !matches!(state.outcome, Some(Ok(()))) {
-        let present = list_screens(socket_path)?.iter().any(|(n, ..)| n == name);
-        if !present {
-            return Err(match state.outcome.take() {
-                Some(Err(e)) => format!("virtual screen '{name}' refused: {e}"),
-                _ => format!("virtual screen '{name}' produced no output device"),
-            });
-        }
-    }
-    held_screens()
-        .lock()
-        .unwrap()
-        .insert(name.to_string(), HeldScreen { conn, _queue: queue, _state: state, stream });
+    let held = grow(socket_path, name, size, scale).map_err(|e| match e {
+        GrowError::Unreachable(e) | GrowError::Refused(e) => e,
+    })?;
+    held_screens().lock().unwrap().insert(name.to_string(), held);
     Ok(())
 }
 
