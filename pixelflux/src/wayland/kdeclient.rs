@@ -19,7 +19,7 @@
 //! therefore parks one open connection in a process-wide registry; nothing
 //! dispatches it afterwards, because holding the socket open is the entire
 //! contract, and [`remove_screen`] closes the stream to give the screen back.
-//! A stock kwin serves the same request and creates an output it never
+//! A stock KWin serves the same request and creates an output it never
 //! registers, so whether screens can be grown is proven, not inferred:
 //! [`screen_control_available`] grows a probe screen and gives it back.
 //!
@@ -167,34 +167,36 @@ fn grow(socket_path: &str, name: &str, size: (i32, i32), scale: f64) -> Result<H
     while state.outcome.is_none() && Instant::now() < deadline {
         bounded_roundtrip(&conn, &mut queue, &mut state).map_err(GrowError::Unreachable)?;
     }
-    if !matches!(state.outcome, Some(Ok(()))) {
-        let present = list_screens(socket_path)
-            .map_err(GrowError::Unreachable)?
-            .iter()
-            .any(|(n, ..)| n == name);
-        if !present {
-            return Err(GrowError::Refused(match state.outcome.take() {
-                Some(Err(e)) => format!("virtual screen '{name}' refused: {e}"),
-                _ => format!("virtual screen '{name}' produced no output device"),
-            }));
-        }
+    // The stream's verdict is the PipeWire stream's; the screen is confirmed
+    // against the output-device globals whatever it said.
+    if !screen_present(socket_path, name).map_err(GrowError::Unreachable)? {
+        return Err(GrowError::Refused(match state.outcome.take() {
+            Some(Err(e)) => format!("virtual screen '{name}' refused: {e}"),
+            _ => format!("virtual screen '{name}' produced no output device"),
+        }));
     }
     Ok(HeldScreen { conn, _queue: queue, _state: state, stream })
 }
 
-/// Name and size of the screen [`screen_control_available`] grows to prove
-/// the compositor can: a token size, and a name no display's screen takes.
-const PROBE_SCREEN: (&str, (i32, i32)) = ("SELKIES-PROBE", (320, 240));
+/// Whether an enabled screen named `name` is among the compositor's output devices.
+fn screen_present(socket_path: &str, name: &str) -> Result<bool, String> {
+    Ok(list_screens(socket_path)?.iter().any(|(n, ..)| n == name))
+}
 
-/// Whether the compositor on `socket_path` grows screens on demand, proven by
-/// growing one: `zkde_screencast_unstable_v1` answers on a stock kwin too,
-/// but only a kwin that registers a nested virtual output turns the request
-/// into a screen. The probe screen is given back before the answer, and its
-/// removal is waited for, so the session is left as it was found. Err only
-/// when the compositor is unreachable.
+/// Size of the screen [`screen_control_available`] grows to prove the
+/// compositor can: a token size, at a name no display's screen takes.
+const PROBE_SIZE: (i32, i32) = (320, 240);
+
+/// Whether the compositor on `socket_path` grows screens on demand and gives
+/// them back, proven by doing both: `zkde_screencast_unstable_v1` answers on
+/// a stock KWin too, but only a KWin that registers a nested virtual output
+/// turns the request into a screen. The probe screen is named for this
+/// process, so probes from two do not read each other's, and it is gone
+/// before the answer; one that cannot be given back is no screen control
+/// either. Err only when the compositor is unreachable.
 pub fn screen_control_available(socket_path: &str) -> Result<bool, String> {
-    let (name, size) = PROBE_SCREEN;
-    let held = match grow(socket_path, name, size, 1.0) {
+    let name = format!("SELKIES-PROBE-{}", std::process::id());
+    let held = match grow(socket_path, &name, PROBE_SIZE, 1.0) {
         Ok(held) => held,
         Err(GrowError::Refused(_)) => return Ok(false),
         Err(GrowError::Unreachable(e)) => return Err(e),
@@ -203,10 +205,11 @@ pub fn screen_control_available(socket_path: &str) -> Result<bool, String> {
     let _ = held.conn.flush();
     drop(held);
     let deadline = Instant::now() + IO_TIMEOUT;
-    while Instant::now() < deadline
-        && list_screens(socket_path)?.iter().any(|(n, ..)| n == name)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    while screen_present(socket_path, &name)? {
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Ok(true)
 }
