@@ -296,6 +296,8 @@ pub struct OutputNode {
     /// The rectangle size a view's damage tracker was built for, so a display that
     /// changes resolution rebuilds it rather than tracking damage for the old one.
     pub view_size: (i32, i32),
+    /// The scale the view's tracker maps windows with; a screen's tracker follows its output.
+    pub view_scale: f64,
     /// Layout offset: the output's logical position in the Space AND its physical offset
     /// for absolute input injection. The two coincide at scale 1; with mixed scales the
     /// caller must place outputs so neither the logical nor the physical rectangles

@@ -2343,6 +2343,7 @@ fn start_capture_on_display(
                             Transform::Normal,
                         );
                         node.view_size = (settings.width, settings.height);
+                        node.view_scale = settings.scale;
                         node.frame_buffer = vec![
                             0u8;
                             (settings.width.max(0) as usize)
@@ -2911,15 +2912,18 @@ fn render_node_tick(
     if node.frame_buffer.len() < (width as usize) * (height as usize) * 4 {
         node.frame_buffer = vec![0u8; (width as usize) * (height as usize) * 4];
     }
-    // A view's tracker is static, so a display that changed resolution needs a new
-    // one; a screen's follows its output on its own.
-    if node.owner.is_some() && node.view_size != (width, height) {
+    // A view's tracker is static, so a display that changed resolution, or whose
+    // screen changed scale, needs a new one; a screen's follows its output on its own.
+    if node.owner.is_some()
+        && (node.view_size != (width, height) || (node.view_scale - output_scale_val).abs() > 1e-6)
+    {
         node.damage_tracker = OutputDamageTracker::new(
             (width, height),
             output_scale_val,
             Transform::Normal,
         );
         node.view_size = (width, height);
+        node.view_scale = output_scale_val;
     }
     let logical_w = (width as f64 / output_scale_val).round();
     let logical_h = (height as f64 / output_scale_val).round();
@@ -4001,6 +4005,7 @@ fn create_output_on(
         global: Some(global),
         owner: None,
         view_size: (width, height),
+        view_scale: 0.0,
         pos: (x, y),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -4446,6 +4451,7 @@ fn create_view_on(
         global: None,
         owner: Some(owner),
         view_size: (width, height),
+        view_scale: 0.0,
         pos: origin,
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
@@ -4839,6 +4845,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         global: Some(global),
         owner: None,
         view_size: (width, height),
+        view_scale: 0.0,
         pos: (0, 0),
         damage_tracker,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
