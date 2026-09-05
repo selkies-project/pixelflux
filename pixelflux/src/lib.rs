@@ -130,7 +130,7 @@ use smithay::{
         foreign_toplevel_list::ForeignToplevelListState,
         shell::xdg::decoration::XdgDecorationState,
     },
-    desktop::{layer_map_for_output, PopupManager},
+    desktop::{layer_map_for_output, LayerMap, PopupManager},
     wayland::shell::wlr_layer::WlrLayerShellState,
     wayland::xdg_activation::XdgActivationState,
     wayland::selection::primary_selection::PrimarySelectionState,
@@ -407,6 +407,36 @@ smithay::backend::renderer::element::render_elements! {
     Window=Wrap<E>,
     Cursor=MemoryRenderBufferRenderElement<R>,
     Surface=WaylandSurfaceRenderElement<R>,
+}
+
+/// Push an output's wlr-layer surfaces on `target_layer` into `elements`, top-most first, the
+/// order `layer_map.layers()` reversed gives. Shared by both renderers and by both of a frame's
+/// layer passes, which differ only in the layers they name.
+fn push_layer_elements<R>(
+    renderer: &mut R,
+    elements: &mut Vec<CompositionElements<R, WaylandSurfaceRenderElement<R>>>,
+    layer_map: &LayerMap,
+    target_layer: smithay::wayland::shell::wlr_layer::Layer,
+    scale: f64,
+) where
+    R: smithay::backend::renderer::Renderer + ImportAll + ImportMem,
+    R::TextureId: Clone + 'static,
+{
+    for surface in layer_map.layers().rev() {
+        if surface.layer() == target_layer
+            && let Some(geo) = layer_map.layer_geometry(surface) {
+                let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+                    WaylandSurfaceRenderElement::from_surface(
+                        renderer, surface.wl_surface(), states,
+                        geo.loc.to_physical_precise_round(scale), 1.0,
+                        smithay::backend::renderer::element::Kind::Unspecified
+                    )
+                });
+                if let Ok(Some(e)) = elem {
+                    elements.push(CompositionElements::Surface(e));
+                }
+            }
+    }
 }
 
 /// Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
@@ -3277,27 +3307,8 @@ fn render_node_tick(
                         {
                             let layer_map = layer_map_for_output(&output);
 
-                            let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                for surface in layer_map.layers().rev() {
-                                    let current_layer = surface.layer();
-                                    if current_layer == target_layer
-                                        && let Some(geo) = layer_map.layer_geometry(surface) {
-                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                WaylandSurfaceRenderElement::from_surface(
-                                                    renderer, surface.wl_surface(), states,
-                                                    geo.loc.to_physical_precise_round(output_scale_val), 1.0,
-                                                    smithay::backend::renderer::element::Kind::Unspecified
-                                                )
-                                            });
-                                            if let Ok(Some(e)) = elem {
-                                                elements.push(CompositionElements::Surface(e));
-                                            }
-                                        }
-                                }
-                            };
-
-                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
-                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
+                            push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Overlay, output_scale_val);
+                            push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Top, output_scale_val);
                         }
 
                         for window in state.space.elements_for_output(&output).rev() {
@@ -3330,27 +3341,8 @@ fn render_node_tick(
                         {
                             let layer_map = layer_map_for_output(&output);
 
-                            let draw_layer = |renderer: &mut GlesRenderer, elements: &mut Vec<CompositionElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                for surface in layer_map.layers().rev() {
-                                    let current_layer = surface.layer();
-                                    if current_layer == target_layer
-                                        && let Some(geo) = layer_map.layer_geometry(surface) {
-                                            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                WaylandSurfaceRenderElement::from_surface(
-                                                    renderer, surface.wl_surface(), states,
-                                                    geo.loc.to_physical_precise_round(output_scale_val), 1.0,
-                                                    smithay::backend::renderer::element::Kind::Unspecified
-                                                )
-                                            });
-                                            if let Ok(Some(e)) = elem {
-                                                elements.push(CompositionElements::Surface(e));
-                                            }
-                                        }
-                                }
-                            };
-
-                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
-                            draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
+                            push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Bottom, output_scale_val);
+                            push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Background, output_scale_val);
                         }
                         match node.damage_tracker.render_output(renderer, &mut frame, render_age, &elements, [0.1, 0.1, 0.1, 1.0]) {
                             Ok(result) => {
@@ -3470,27 +3462,8 @@ fn render_node_tick(
                             {
                                 let layer_map = layer_map_for_output(&output);
 
-                                let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                    for surface in layer_map.layers().rev() {
-                                        let current_layer = surface.layer();
-                                        if current_layer == target_layer
-                                            && let Some(geo) = layer_map.layer_geometry(surface) {
-                                                let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                    WaylandSurfaceRenderElement::from_surface(
-                                                        renderer, surface.wl_surface(), states,
-                                                        geo.loc.to_physical_precise_round(output_scale_val), 1.0,
-                                                        smithay::backend::renderer::element::Kind::Unspecified
-                                                    )
-                                                });
-                                                if let Ok(Some(e)) = elem {
-                                                    elements.push(CompositionElements::Surface(e));
-                                                }
-                                            }
-                                    }
-                                };
-
-                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Overlay);
-                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Top);
+                                push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Overlay, output_scale_val);
+                                push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Top, output_scale_val);
                             }
 
                             for window in state.space.elements_for_output(&output).rev() {
@@ -3524,27 +3497,8 @@ fn render_node_tick(
                             {
                                 let layer_map = layer_map_for_output(&output);
 
-                                let draw_layer = |renderer: &mut PixmanRenderer, elements: &mut Vec<CompositionElements<PixmanRenderer, WaylandSurfaceRenderElement<PixmanRenderer>>>, target_layer: smithay::wayland::shell::wlr_layer::Layer| {
-                                    for surface in layer_map.layers().rev() {
-                                        let current_layer = surface.layer();
-                                        if current_layer == target_layer
-                                            && let Some(geo) = layer_map.layer_geometry(surface) {
-                                                let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                                                    WaylandSurfaceRenderElement::from_surface(
-                                                        renderer, surface.wl_surface(), states,
-                                                        geo.loc.to_physical_precise_round(output_scale_val), 1.0,
-                                                        smithay::backend::renderer::element::Kind::Unspecified
-                                                    )
-                                                });
-                                                if let Ok(Some(e)) = elem {
-                                                    elements.push(CompositionElements::Surface(e));
-                                                }
-                                            }
-                                    }
-                                };
-
-                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Bottom);
-                                draw_layer(renderer, &mut elements, smithay::wayland::shell::wlr_layer::Layer::Background);
+                                push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Bottom, output_scale_val);
+                                push_layer_elements(renderer, &mut elements, &layer_map, smithay::wayland::shell::wlr_layer::Layer::Background, output_scale_val);
                             }
 
                     let render_age = if node.overlay_state.is_animated() || needs_full { 0 } else { buf_age };
