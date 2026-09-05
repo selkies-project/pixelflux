@@ -1,8 +1,10 @@
-//! Unix-socket H.264 fan-out for external recording.
+//! Unix-socket video fan-out for external recording.
 //!
 //! Frames are intercepted at the delivery layer (not inside each encoder), so the tap works
-//! uniformly for every full-frame encoder. The 10-byte pixelflux wire header is skipped so
-//! consumers receive a plain Annex-B elementary stream that is directly muxable.
+//! uniformly for every full-frame encoder. The pixelflux wire header is skipped so consumers
+//! receive a plain elementary stream that is directly muxable: Annex-B for H.264 and H.265,
+//! a temporal-unit OBU stream for AV1 (each unit opened by a temporal delimiter), and IVF for
+//! VP8 and VP9, whose raw frames carry no framing of their own.
 //!
 //! The tap must never perturb the live viewer transport, and it never copies frame bytes:
 //! stripe payloads are `Arc`-shared, so the encode thread only clones a handle into a bounded
@@ -20,6 +22,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Sender, TrySendError};
 
+use crate::encoders::codec::{Codec, VIDEO_HEADER_LEN, WIRE_VIDEO};
 use crate::encoders::software::EncodedStripe;
 
 /// Per-write timeout on a client stream; a stalled write surfaces as a soft error that
@@ -33,18 +36,26 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// allowed to grow memory or push back on the shared encode thread.
 const CLIENT_QUEUE_CAP: usize = 256;
 
-/// A queued frame: the `Arc`-shared payload plus the byte offset where the recordable
-/// Annex-B stream starts (past the wire header, or `0` when the payload is bare).
-type QueuedFrame = (Arc<Vec<u8>>, usize);
+/// A queued frame: the container bytes the stream needs ahead of it (an IVF file or frame
+/// header, an AV1 temporal delimiter; usually nothing), the `Arc`-shared payload, and the
+/// byte offset where the recordable stream starts (past the wire header, or `0` when the
+/// payload is bare).
+struct QueuedFrame {
+    prefix: Vec<u8>,
+    data: Arc<Vec<u8>>,
+    offset: usize,
+}
 
-/// The sink's handle to one connected recorder: the feed end of its bounded queue and a kill
-/// switch for its writer thread. The socket itself is owned solely by that writer thread.
+/// The sink's handle to one connected recorder: the feed end of its bounded queue, a kill
+/// switch for its writer thread, and how many frames it has been sent (the IVF frame index).
+/// The socket itself is owned solely by that writer thread.
 struct ClientHandle {
     tx: Sender<QueuedFrame>,
     stop: Arc<AtomicBool>,
+    frames: u64,
 }
 
-/// Unix-socket fan-out that broadcasts every encoded H.264 frame to connected consumers.
+/// Unix-socket fan-out that broadcasts every encoded video frame to connected consumers.
 ///
 /// A listener thread accepts connections and gives each its own bounded queue and writer thread
 /// (see [`ClientHandle`]) so one slow reader cannot stall the others or the encode thread.
@@ -59,19 +70,21 @@ pub struct RecordingSink {
     ///
     /// [`should_force_idr`]: RecordingSink::should_force_idr
     client_connected: Arc<AtomicBool>,
-    /// One-time notice that the session's H.264 frames are striped and unrecordable.
+    /// One-time notice that the session's video frames are striped and unrecordable.
     warned_unrecordable: AtomicBool,
+    /// The capture frame rate an IVF header declares.
+    fps: u32,
 }
 
 impl RecordingSink {
     /// Bind a Unix socket at `settings_path`, or return `None` when no path is configured or the
     /// bind fails. Recording is an optional tap that must never take the pipeline down, so a bind
     /// error is logged and swallowed.
-    pub fn try_bind(settings_path: &str) -> Option<Arc<Self>> {
+    pub fn try_bind(settings_path: &str, fps: f64) -> Option<Arc<Self>> {
         if settings_path.is_empty() {
             return None;
         }
-        match Self::bind(settings_path.to_string()) {
+        match Self::bind(settings_path.to_string(), fps.round().max(1.0) as u32) {
             Ok(sink) => Some(Arc::new(sink)),
             Err(e) => {
                 eprintln!("[recording_sink] bind failed: {:?}", e);
@@ -82,7 +95,7 @@ impl RecordingSink {
 
     /// Create the socket and spawn the accept thread. Each accepted connection gets a write
     /// timeout, a bounded queue, and a writer thread; the sink keeps only the feed handle.
-    fn bind(path: String) -> std::io::Result<Self> {
+    fn bind(path: String, fps: u32) -> std::io::Result<Self> {
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
@@ -111,13 +124,18 @@ impl RecordingSink {
                         let stop_writer = stop.clone();
                         thread::spawn(move || {
                             let mut stream = stream;
-                            for (buf, offset) in rx.iter() {
+                            for QueuedFrame { prefix, data, offset } in rx.iter() {
                                 if stop_writer.load(Ordering::Relaxed) {
                                     break;
                                 }
-                                if let Err(e) =
-                                    write_all_frame(&mut stream, &buf[offset..], &stop_writer)
-                                {
+                                let written = if prefix.is_empty() {
+                                    write_all_frame(&mut stream, &data[offset..], &stop_writer)
+                                } else {
+                                    write_all_frame(&mut stream, &prefix, &stop_writer).and_then(
+                                        |()| write_all_frame(&mut stream, &data[offset..], &stop_writer),
+                                    )
+                                };
+                                if let Err(e) = written {
                                     eprintln!(
                                         "[recording_sink] writer thread exiting; write failed: {:?}",
                                         e
@@ -128,7 +146,7 @@ impl RecordingSink {
                         });
 
                         let mut guard = clients_acc.lock().unwrap();
-                        guard.push(ClientHandle { tx, stop });
+                        guard.push(ClientHandle { tx, stop, frames: 0 });
                         client_connected_acc.store(true, Ordering::Relaxed);
                         eprintln!("[recording_sink] client connected; total {}", guard.len());
                     }
@@ -150,6 +168,7 @@ impl RecordingSink {
             shutdown,
             client_connected,
             warned_unrecordable: AtomicBool::new(false),
+            fps,
         })
     }
 
@@ -159,49 +178,60 @@ impl RecordingSink {
         self.client_connected.swap(false, Ordering::Relaxed)
     }
 
-    /// Delivery-layer tap for one encoded frame. The socket carries a single H.264
-    /// elementary stream, so only a lone full-height stripe (`data_type == 2`) is
-    /// recordable: striped CPU encodes are N independent per-stripe streams, and
-    /// interleaving them would produce an undecodable file — those are skipped with a
-    /// one-time notice (live streaming is unaffected). The 10-byte wire header
-    /// (`0x04` tag) is skipped via the queued offset so consumers receive plain
-    /// Annex-B.
+    /// Delivery-layer tap for one encoded frame. The socket carries a single elementary
+    /// stream, so only a lone full-height video stripe is recordable: striped CPU encodes
+    /// are N independent per-stripe streams, and interleaving them would produce an
+    /// undecodable file — those are skipped with a one-time notice (live streaming is
+    /// unaffected). The wire header is skipped via the queued offset, and the container
+    /// bytes the codec's stream needs are prefixed per client: an IVF file header on a
+    /// VP8/VP9 client's first frame and an IVF frame header on every one, a temporal
+    /// delimiter ahead of an AV1 unit that lacks one.
     ///
-    /// Never blocks and never copies: the `Arc` payload is cloned into each client's
-    /// bounded queue with `try_send`, and a client whose queue is full or whose
-    /// writer died is dropped.
-    pub fn write_frame(&self, stripes: &[EncodedStripe], full_height: i32) {
-        let mut h264 = stripes
+    /// Never blocks and never copies the payload: the `Arc` is cloned into each client's
+    /// bounded queue with `try_send`, and a client whose queue is full or whose writer
+    /// died is dropped.
+    pub fn write_frame(&self, stripes: &[EncodedStripe], full_width: i32, full_height: i32) {
+        let mut video = stripes
             .iter()
-            .filter(|s| s.data_type == 2 && !s.data.is_empty());
-        let Some(stripe) = h264.next() else { return };
-        if h264.next().is_some() || stripe.stripe_y_start != 0 || stripe.stripe_height != full_height
+            .filter(|s| s.codec.is_video() && !s.data.is_empty());
+        let Some(stripe) = video.next() else { return };
+        if video.next().is_some() || stripe.stripe_y_start != 0 || stripe.stripe_height != full_height
         {
             if !self.warned_unrecordable.swap(true, Ordering::Relaxed) {
                 eprintln!(
-                    "[recording_sink] WARNING: striped H.264 frames are not recordable \
+                    "[recording_sink] WARNING: striped video frames are not recordable \
                      (the socket carries one elementary stream); use a full-frame encoder \
                      to record this session"
                 );
             }
             return;
         }
-        let offset = if stripe.data.len() >= 10 && stripe.data[0] == 0x04 {
-            10
+        let offset = if stripe.data.len() >= VIDEO_HEADER_LEN && stripe.data[0] == WIRE_VIDEO {
+            VIDEO_HEADER_LEN
         } else {
             0
         };
         if stripe.data.len() == offset {
             return;
         }
+        let payload = &stripe.data[offset..];
 
         let mut clients = self.clients.lock().unwrap();
         if clients.is_empty() {
             return;
         }
         let mut to_remove: Vec<usize> = Vec::new();
-        for (idx, client) in clients.iter().enumerate() {
-            match client.tx.try_send((stripe.data.clone(), offset)) {
+        for (idx, client) in clients.iter_mut().enumerate() {
+            let prefix = stream_prefix(
+                stripe.codec,
+                payload,
+                client.frames,
+                (full_width as u16, full_height as u16),
+                self.fps,
+            );
+            client.frames += 1;
+            let queued = QueuedFrame { prefix, data: stripe.data.clone(), offset };
+            match client.tx.try_send(queued) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     eprintln!("[recording_sink] dropping slow client (idx {})", idx);
@@ -234,9 +264,37 @@ impl Drop for RecordingSink {
     }
 }
 
+/// The container bytes a client's stream needs ahead of its `index`th frame: an IVF file
+/// header (on the first frame) and frame header for VP8 and VP9, a temporal delimiter for an
+/// AV1 unit that does not open with one, nothing for the Annex-B codecs.
+fn stream_prefix(codec: Codec, payload: &[u8], index: u64, size: (u16, u16), fps: u32) -> Vec<u8> {
+    match codec {
+        Codec::Vp8 | Codec::Vp9 => {
+            let mut prefix = Vec::with_capacity(44);
+            if index == 0 {
+                prefix.extend_from_slice(b"DKIF");
+                prefix.extend_from_slice(&0u16.to_le_bytes());
+                prefix.extend_from_slice(&32u16.to_le_bytes());
+                prefix.extend_from_slice(if codec == Codec::Vp8 { b"VP80" } else { b"VP90" });
+                prefix.extend_from_slice(&size.0.to_le_bytes());
+                prefix.extend_from_slice(&size.1.to_le_bytes());
+                prefix.extend_from_slice(&fps.to_le_bytes());
+                prefix.extend_from_slice(&1u32.to_le_bytes());
+                prefix.extend_from_slice(&0u32.to_le_bytes());
+                prefix.extend_from_slice(&0u32.to_le_bytes());
+            }
+            prefix.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            prefix.extend_from_slice(&index.to_le_bytes());
+            prefix
+        }
+        Codec::Av1 if payload.first().is_none_or(|&b| (b >> 3) & 0x0f != 2) => vec![0x12, 0x00],
+        _ => Vec::new(),
+    }
+}
+
 /// Write one whole frame to a recorder's socket, resuming across the soft timeouts a slow reader
-/// induces so a partial Annex-B NAL is never left behind. Aborts if `stop` is set (the client was
-/// dropped by [`RecordingSink::write_encoded_frame`]) or a hard error occurs.
+/// induces so a partial NAL or OBU is never left behind. Aborts if `stop` is set (the client was
+/// dropped by [`RecordingSink::write_frame`]) or a hard error occurs.
 fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> std::io::Result<()> {
     let mut written = 0usize;
     while written < buf.len() {
@@ -263,6 +321,39 @@ fn write_all_frame<W: Write>(stream: &mut W, buf: &[u8], stop: &AtomicBool) -> s
 }
 
 #[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    /// The Annex-B codecs need nothing ahead of a frame; VP8 and VP9 get an IVF file header
+    /// on a client's first frame and a frame header on every one, carrying the size and the
+    /// frame index; an AV1 unit is opened with a temporal delimiter only when it lacks one.
+    #[test]
+    fn prefixes_follow_the_codec() {
+        assert!(stream_prefix(Codec::H264, &[0, 0, 1, 0x65], 0, (1280, 720), 60).is_empty());
+        assert!(stream_prefix(Codec::H265, &[0, 0, 1, 0x26, 1], 3, (1280, 720), 60).is_empty());
+
+        let first = stream_prefix(Codec::Vp9, &[0x82, 0x49, 0x83], 0, (1280, 720), 60);
+        assert_eq!(first.len(), 44);
+        assert_eq!(&first[..4], b"DKIF");
+        assert_eq!(&first[8..12], b"VP90");
+        assert_eq!(u16::from_le_bytes([first[12], first[13]]), 1280);
+        assert_eq!(u16::from_le_bytes([first[14], first[15]]), 720);
+        assert_eq!(u32::from_le_bytes([first[16], first[17], first[18], first[19]]), 60);
+        assert_eq!(u32::from_le_bytes([first[32], first[33], first[34], first[35]]), 3);
+        assert_eq!(u64::from_le_bytes(first[36..44].try_into().unwrap()), 0);
+        let later = stream_prefix(Codec::Vp8, &[0u8; 100], 7, (1280, 720), 60);
+        assert_eq!(later.len(), 12);
+        assert_eq!(u32::from_le_bytes(later[..4].try_into().unwrap()), 100);
+        assert_eq!(u64::from_le_bytes(later[4..].try_into().unwrap()), 7);
+        assert_eq!(&stream_prefix(Codec::Vp8, &[], 0, (64, 64), 30)[8..12], b"VP80");
+
+        assert!(stream_prefix(Codec::Av1, &[0x12, 0x00, 0x32, 0x01, 0x10], 0, (64, 64), 30).is_empty());
+        assert_eq!(stream_prefix(Codec::Av1, &[0x32, 0x01, 0x10], 0, (64, 64), 30), vec![0x12, 0x00]);
+        assert_eq!(stream_prefix(Codec::Av1, &[], 0, (64, 64), 30), vec![0x12, 0x00]);
+    }
+}
+
+#[cfg(test)]
 mod cost_tests {
     //! The sink's isolation contract, measured: feeding a frame must cost nothing when no
     //! recorder is connected (empty-clients early return), microseconds when a healthy
@@ -277,10 +368,10 @@ mod cost_tests {
 
     fn frame(len: usize) -> EncodedStripe {
         let mut data = vec![0u8; len];
-        data[0] = 0x04; // wire-header tag so the 10-byte strip path runs
+        data[0] = WIRE_VIDEO;
         EncodedStripe {
             data: Arc::new(data),
-            data_type: 2,
+            codec: Codec::H264,
             stripe_y_start: 0,
             stripe_height: 720,
             frame_id: 0,
@@ -293,7 +384,7 @@ mod cost_tests {
         let mut total_us = 0f64;
         for _ in 0..n {
             let t = Instant::now();
-            sink.write_frame(std::slice::from_ref(&f), 720);
+            sink.write_frame(std::slice::from_ref(&f), 1280, 720);
             let us = t.elapsed().as_secs_f64() * 1e6;
             total_us += us;
             max_us = max_us.max(us);
@@ -305,7 +396,7 @@ mod cost_tests {
     #[test]
     fn stalled_recorder_isolation_cost() {
         let path = format!("/tmp/pf-sink-cost-{}.sock", std::process::id());
-        let sink = RecordingSink::try_bind(&path).expect("bind");
+        let sink = RecordingSink::try_bind(&path, 60.0).expect("bind");
 
         // Idle: no client connected.
         let (idle_mean, idle_max) = feed_timed(&sink, 500, 100_000);

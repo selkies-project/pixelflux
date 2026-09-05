@@ -19,13 +19,15 @@ may be under any license) and is grouped with the permissive licenses here.
 
 ## Build configurations
 
-| Configuration | How it is selected | Software H.264 encoder | Cargo features |
-| --- | --- | --- | --- |
-| default (GPL) | `pip install pixelflux` / the published wheels | libx264 (GPL-2.0-or-later) | `gpl` (default) |
-| non-GPL | `PIXELFLUX_ENABLE_GPL=0 pip install .` | Cisco OpenH264 (BSD-2-Clause, compiled from vendored source) | `--no-default-features --features openh264` |
+| Configuration | How it is selected | Software H.264 encoder | Software H.265 encoder | Cargo features |
+| --- | --- | --- | --- | --- |
+| default (GPL) | `pip install pixelflux` / the published wheels | libx264 (GPL-2.0-or-later) | x265 (GPL-2.0-or-later), through FFmpeg | `gpl` (default) |
+| non-GPL | `PIXELFLUX_ENABLE_GPL=0 pip install .` | Cisco OpenH264 (BSD-2-Clause, compiled from vendored source) | kvazaar (BSD-3-Clause), through FFmpeg | `--no-default-features --features openh264` |
 
-Both configurations share everything else: JPEG, NVENC, VA-API, capture,
-compositor and virtual camera. A build with neither feature does not compile.
+Both configurations share everything else: JPEG, the VP8/VP9 (libvpx) and AV1
+(SVT-AV1) software encoders reached through FFmpeg, NVENC, VA-API, capture,
+compositor and virtual camera. A build with neither feature does not compile;
+a build whose FFmpeg carries x265 but not the `gpl` feature never selects it.
 
 ## Native libraries and vendored code
 
@@ -38,7 +40,12 @@ contains it.
 | --- | --- | --- | --- | --- | --- |
 | libx264 (via `x264-sys`) | GPL-2.0-or-later | copyleft | GPL only | linked shared library (`NEEDED libx264.so.*`); auditwheel bundles it into the manylinux wheel, the musllinux wheel takes Alpine's package | Striped software H.264. The only GPL component of pixelflux itself; the `x264-sys` crate is MIT but has no purpose without libx264. |
 | Cisco OpenH264 2.6 (via `openh264-sys2`) | BSD-2-Clause | permissive | non-GPL only | compiled from the source vendored in the crate (needs a C++ toolchain and nasm) and linked statically; no binary download | Software H.264 without GPL. Cisco's royalty-covered binary module is irrelevant to a source build; the AVC patent pool applies to any H.264 encoder and is the deployer's concern. Pulls `libstdc++` in as the only C++ code. |
-| FFmpeg libavcodec, libavfilter, libavutil (via `ffmpeg-sys-next`), plus libswresample, libswscale and libavformat they depend on | LGPL-2.1-or-later as built for the manylinux wheels (n8.1, `--enable-shared --disable-static --disable-programs`, no `--enable-gpl`, no `--enable-libx264`; the libraries report "LGPL version 2.1 or later"); whatever the system FFmpeg is when building from source | weak copyleft | both | linked shared libraries; the manylinux wheels bundle them, a source build links the system FFmpeg | `h264_vaapi` encoder and filters. A GPL-built system FFmpeg (Debian/Ubuntu, Alpine, conda-forge's `gpl_*` variant) makes the linked set GPL: see [Distribution notes](#distribution-notes). |
+| FFmpeg libavcodec, libavfilter, libavutil (via `ffmpeg-sys-next`), plus libswresample, libswscale and libavformat they depend on | LGPL-2.1-or-later as built for the non-GPL wheels (n8.1, `--enable-shared --disable-static --disable-programs`, no `--enable-gpl`; the libraries report "LGPL version 2.1 or later"); GPL-2.0-or-later as built for the GPL wheels (`--enable-gpl --enable-libx265`); whatever the system FFmpeg is when building from source | weak copyleft (non-GPL wheel), copyleft (GPL wheel) | both | linked shared libraries; the wheels bundle them, a source build links the system FFmpeg | the VA-API encoders (`h264_vaapi`, `hevc_vaapi`, `vp8_vaapi`, `vp9_vaapi`, `av1_vaapi`) and filters, and the software encoders below. A GPL-built system FFmpeg (Debian/Ubuntu, Alpine, conda-forge's `gpl_*` variant) makes the linked set GPL: see [Distribution notes](#distribution-notes). |
+| x265 | GPL-2.0-or-later | copyleft | GPL only | linked by libavcodec (`libx265`); bundled into the GPL wheels | software H.265 (incl. 4:4:4) |
+| kvazaar | BSD-3-Clause | permissive | both | linked by libavcodec (`libkvazaar`); bundled into the wheels | software H.265 of a GPL-free build (4:2:0) |
+| libvpx | BSD-3-Clause | permissive | both | linked by libavcodec (`libvpx`, `libvpx-vp9`); bundled into the wheels | software VP8 and VP9 |
+| SVT-AV1 | BSD-3-Clause-Clear (with the Alliance for Open Media patent license) | permissive | both | linked by libavcodec (`libsvtav1`); bundled into the wheels | software AV1 |
+| dav1d | BSD-2-Clause | permissive | both | linked by libavcodec (`libdav1d`); bundled into the wheels | the virtual camera's AV1 decoder |
 | libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec, not by pixelflux; excluded from the wheel (`auditwheel --exclude`), the host's copy is used | VA-API |
 | libdrm | MIT | permissive | both | linked by libavutil; excluded from the wheel. `drm-sys`/`drm-ffi` only carry bindings and issue the ioctls themselves, no libdrm symbol is linked by pixelflux | DRM/KMS |
 | libgbm (Mesa) | MIT | permissive | both | linked shared library (`gbm-sys`); excluded from the wheel | GPU buffer allocation |
@@ -144,7 +151,7 @@ table below.
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
 | fax | 0.2.7 | MIT | permissive | both |  |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | permissive | both |  |
-| ffmpeg-sys-next | 8.1.0 | WTFPL | permissive | both | FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, libswscale, libavformat they pull in): LGPL-2.1-or-later (weak copyleft) |
+| ffmpeg-sys-next | 9.0.0 | WTFPL | permissive | both | FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, libswscale, libavformat they pull in): LGPL-2.1-or-later (weak copyleft), and through them the codec libraries listed above |
 | flate2 | 1.1.9 | MIT OR Apache-2.0 | permissive | both |  |
 | gbm | 0.18.0 | MIT | permissive | both |  |
 | gbm-sys | 0.4.0 | MIT | permissive | both | libgbm (Mesa): MIT (permissive) |
@@ -306,25 +313,29 @@ table below.
   OpenH264 and libjpeg-turbo compiled from vendored BSD/IJG source;
 - linked: FFmpeg libavcodec/libavfilter/libavutil (+ swresample, swscale,
   avformat) under LGPL-2.1-or-later when FFmpeg is built without
-  `--enable-gpl`, libgbm, libpixman-1, libxkbcommon (MIT), the C and C++
+  `--enable-gpl`, and through it kvazaar, libvpx, SVT-AV1 and dav1d (BSD),
+  libgbm, libpixman-1, libxkbcommon (MIT), the C and C++
   runtimes (glibc LGPL-2.1-or-later or musl MIT; libgcc_s/libstdc++ with the
   GCC runtime exception), and through FFmpeg libva/libdrm/libX11 (MIT);
 - loaded at run time only when present: libwayland-server, libEGL,
   libpipewire-0.3 (MIT), and the NVIDIA driver's libcuda/libnvidia-encode
   (proprietary, never shipped);
 - no GPL code. The build is only as GPL-free as the FFmpeg it links: the
-  project's manylinux wheel recipe builds FFmpeg n8.1 without `--enable-gpl`,
+  project's non-GPL wheel recipe builds FFmpeg n8.1 without `--enable-gpl`,
   a source build against a distribution FFmpeg that was configured with
   `--enable-gpl` (Debian, Ubuntu, Alpine, conda-forge's `gpl_*` builds of `ffmpeg`, which is the default variant)
-  links a GPL libavcodec even though pixelflux contains no x264 code.
+  links a GPL libavcodec even though pixelflux contains no x264 code, and a
+  build without the `gpl` feature never selects that FFmpeg's `libx265`.
 
 ## What the GPL build adds
 
 The default build (`gpl` feature, what the published wheels and
-`pip install pixelflux` give you) swaps the software H.264 encoder:
+`pip install pixelflux` give you) swaps the software H.264 and H.265 encoders:
 
 - adds `x264-sys` and links libx264 (GPL-2.0-or-later); the manylinux wheels
   bundle `libx264.so`;
+- selects x265 (GPL-2.0-or-later) through FFmpeg for software H.265, in place
+  of kvazaar; the wheels' FFmpeg is built `--enable-gpl --enable-libx265`;
 - removes the OpenH264 crates and `safe_arch`/`wide` from the binary (they stay
   dev-dependencies for the tests);
 - the resulting binary is a combination of MPL-2.0, permissive and GPL code and
@@ -334,21 +345,17 @@ The default build (`gpl` feature, what the published wheels and
 
 ## Distribution notes
 
-- manylinux wheels (cibuildwheel, `pyproject.toml`): FFmpeg n8.1 and x264 are
-  built from source in the image; auditwheel bundles `libx264.so`,
-  `libavcodec`, `libavfilter`, `libavformat`, `libavutil`, `libswresample`,
-  `libswscale` into `pixelflux.libs/` and leaves libva, libdrm, libgbm, libEGL,
-  libxkbcommon, libpixman-1, libX11/libxcb, zlib, liblzma and the GCC runtime
-  to the host (`repair-wheel-command` excludes). The FFmpeg in the published
-  2.0.0 wheel reports `LGPL version 2.1 or later` and its configuration
-  contains no `--enable-gpl`.
-- musllinux wheels: the recipe installs Alpine's `x264-dev` and `ffmpeg-dev`.
-  Alpine's FFmpeg is configured with `--enable-gpl --enable-version3
-  --enable-libx264 --enable-libx265` (package license "GPL-2.0-or-later AND
-  LGPL-2.1-or-later"), so the FFmpeg libraries auditwheel bundles into a
-  musllinux wheel are a GPL build, and that holds for `PIXELFLUX_ENABLE_GPL=0`
-  as well. An LGPL-only musllinux wheel needs FFmpeg built from source in the
-  `apk` branch the way the `dnf` branch does it.
+- manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): FFmpeg
+  n8.1, kvazaar, libvpx, SVT-AV1 and dav1d — plus x264 and x265 for the GPL
+  wheel — are built from source in the image; auditwheel bundles them
+  (`libx264.so`, `libx265.so`, `libkvazaar.so`, `libvpx.so`, `libSvtAv1Enc.so`,
+  `libdav1d.so`, `libavcodec`, `libavfilter`, `libavformat`, `libavutil`,
+  `libswresample`, `libswscale`) into `pixelflux.libs/` and leaves libva,
+  libdrm, libgbm, libEGL, libxkbcommon, libpixman-1, libX11/libxcb, zlib,
+  liblzma and the GCC runtime to the host (`repair-wheel-command` excludes).
+  The non-GPL wheel's FFmpeg reports `LGPL version 2.1 or later` and its
+  configuration contains no `--enable-gpl`; the GPL wheel's is built
+  `--enable-gpl --enable-libx265`.
 - The wheels carry pixelflux's own LICENSE only. The statically linked OpenH264
   (BSD-2-Clause) and libjpeg-turbo (IJG/BSD-3-Clause/Zlib) and the bundled
   libx264/FFmpeg notices are not included in the wheel; this file is the
