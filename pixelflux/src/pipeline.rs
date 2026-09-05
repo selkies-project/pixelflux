@@ -10,13 +10,12 @@
 //! which one produced a frame — a paint-over refresh or a recovery keyframe has to behave
 //! identically either way. Keeping the decision logic here, source-agnostic, is what guarantees it.
 
-use crate::encoders::nvenc::NvencEncoder;
 use crate::encoders::software::{encode_cpu, EncodedStripe, StripeState};
-use crate::encoders::vaapi::VaapiEncoder;
+use crate::encoders::{self, Codec, FrameEncoder, FrameSource};
 use crate::RustCaptureSettings;
 use std::sync::Arc;
 
-/// Outcome of the full-frame H.264 send decision produced by `decide_hw_fullframe`.
+/// Outcome of the full-frame send decision produced by `decide_hw_fullframe`.
 pub struct HwFrameDecision {
     pub send: bool,
     pub force_idr: bool,
@@ -46,13 +45,13 @@ pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> b
     (frame_counter as u64).is_multiple_of(interval)
 }
 
-/// The send / quality / keyframe policy every full-frame H.264 encoder obeys.
+/// The send / quality / keyframe policy every full-frame encoder obeys.
 ///
 /// A static screen costs almost nothing to stream; a client that just joined or reset can always
 /// recover a clean picture. The GOP is left infinite and an IDR is forced only when a consumer
 /// genuinely needs a fresh decode entry point. Every forced IDR is followed by a short "recovery
-/// burst" that keeps streaming until rate control converges. Both hardware encoders (NVENC /
-/// VAAPI) share this one function so they cannot drift apart; the software path applies the same
+/// burst" that keeps streaming until rate control converges. Every full-frame encoder shares
+/// this one function so they cannot drift apart; the striped software path applies the same
 /// policy per stripe inside `encode_cpu`.
 ///
 /// Priority order: (1) recovery burst in progress, (2) always-on streaming/animated modes,
@@ -145,69 +144,12 @@ pub fn decide_hw_fullframe(
     HwFrameDecision { send: send_frame, force_idr, target_qp }
 }
 
-/// Hardware encoder bound to the X11 (host-ARGB) pipeline. The software path (JPEG, and H.264
-/// through the build's software encoder — `SOFTWARE_H264_ENCODER`) needs no persistent encoder
-/// object here: `encode_cpu` owns its per-stripe state, so it is `None`.
-#[allow(clippy::large_enum_variant)]
-enum X11Encoder {
-    None,
-    Nvenc(NvencEncoder),
-    Vaapi(VaapiEncoder),
-}
-
-/// Choose the full-frame encoder for the X11 host-ARGB path, following the settings and the
-/// effective encode device. Used both at construction and when a live session has to be rebuilt
-/// after a streak of encode failures.
-fn select_encoder(settings: &RustCaptureSettings) -> X11Encoder {
-    if settings.output_mode == 1 && !settings.use_cpu && settings.encode_node_index != -1 {
-        let encode_driver = crate::get_gpu_driver(settings.encode_node_index.max(0));
-        println!(
-            "[x11] Encode Node Index: {} | Driver: {}",
-            settings.encode_node_index.max(0), encode_driver
-        );
-        if !crate::driver_selects_nvenc(&encode_driver) {
-            println!("[x11] Initializing Unified VAAPI Encoder...");
-            match VaapiEncoder::new_host(settings) {
-                Ok(e) => {
-                    println!(
-                        "[x11] VAAPI Encoder initialized successfully ({}).",
-                        if e.is_fullcolor() { "4:4:4" } else { "4:2:0" }
-                    );
-                    return X11Encoder::Vaapi(e);
-                }
-                Err(err) => {
-                    eprintln!("[x11] Failed to init VAAPI: {err}. Falling back to CPU ({}).", crate::encoders::SOFTWARE_H264_ENCODER);
-                    return X11Encoder::None;
-                }
-            }
-        }
-        println!("[x11] Nvidia Encoder detected. Initializing NVENC...");
-        return match NvencEncoder::new(settings, std::ptr::null()) {
-            Ok(e) => {
-                println!("[x11] NVENC Encoder initialized successfully.");
-                X11Encoder::Nvenc(e)
-            }
-            Err(err) => {
-                eprintln!("[x11] Failed to init NVENC: {err}. Falling back to CPU ({}).", crate::encoders::SOFTWARE_H264_ENCODER);
-                X11Encoder::None
-            }
-        };
-    }
-    if settings.output_mode == 1 {
-        println!(
-            "[x11] No GPU Encoder available -> Using CPU Software Encoding ({}).",
-            crate::encoders::SOFTWARE_H264_ENCODER
-        );
-    }
-    X11Encoder::None
-}
-
 /// Everything the X11 host-ARGB path has to remember between frames.
 ///
 /// Unlike the Wayland backend, X11 capture has no compositor to report what changed, so this
 /// context exists to hold the state that stands in for that missing damage signal: the per-stripe
 /// hashes and the persistent encoder session that let `process()` discover damage by comparing
-/// content frame-to-frame. Hardware full-frame H.264 runs through `decide_hw_fullframe`; the
+/// content frame-to-frame. A full-frame encoder runs through `decide_hw_fullframe`; the striped
 /// software path (JPEG, striped or full-frame software H.264) runs through `encode_cpu` with
 /// `hash_damage=true`.
 ///
@@ -218,7 +160,8 @@ pub struct X11Pipeline {
     stripes: Vec<StripeState>,
     /// Smoothed number of stripes carrying the encode budget (see `stripe_rate_control`).
     stripes_carrying: f32,
-    hw: X11Encoder,
+    /// The full-frame encoder, or `None` for the striped software path.
+    hw: Option<FrameEncoder>,
     hw_state: StripeState,
     frame_counter: u16,
     pending_force_idr: bool,
@@ -229,25 +172,12 @@ pub struct X11Pipeline {
 }
 
 impl X11Pipeline {
-    /// Build the context, choosing the full-frame encoder for the X11 host-ARGB path.
-    ///
-    /// # Arguments
-    ///
-    /// * `settings` - Capture configuration. The `output_mode`, `use_cpu`, and
-    ///   `encode_node_index` fields drive encoder selection.
-    ///
-    /// # Encoder selection
-    ///
-    /// 1. **NVENC** — on an NVIDIA driver (or no detectable GPU, since the attempt is cheap).
-    /// 2. **VA-API** — on any other GPU driver. A 4:4:4 request is carried into the attempt, so a
-    ///    device that cannot encode 4:4:4 fails here and falls through rather than being ruled out
-    ///    in advance.
-    /// 3. **Software** — `X11Encoder::None`: the striped (or, with `video_fullframe`, full-frame)
-    ///    software path inside `encode_cpu`, encoding with the build's software H.264 encoder
-    ///    (`SOFTWARE_H264_ENCODER`). This is also where a 4:4:4 request lands when no hardware
-    ///    encoder can carry it; libx264 carries it, OpenH264 encodes it 4:2:0.
-    pub fn new(settings: RustCaptureSettings) -> Self {
-        let hw = select_encoder(&settings);
+    /// Build the context, choosing the full-frame encoder for the X11 host-BGRA path through
+    /// the shared ladder (`select_frame_encoder`): the hardware backend the encode node's driver
+    /// selects, then the codec's software encoder, or the striped software path for JPEG and
+    /// H.264. A codec no backend serves demotes the pipeline to H.264.
+    pub fn new(mut settings: RustCaptureSettings) -> Self {
+        let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "x11");
         Self {
             settings,
             stripes: Vec::new(),
@@ -279,11 +209,13 @@ impl X11Pipeline {
             // The broken session is released before its replacement is built: these failures
             // are usually device memory pressure, and holding both at once is what would make
             // the replacement fail too.
-            self.hw = X11Encoder::None;
+            self.hw = None;
+            self.settings.use_cpu = true;
+            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "x11");
         } else {
             eprintln!("[x11] rebuilding HW encoder after repeated encode errors.");
-            self.hw = X11Encoder::None;
-            self.hw = select_encoder(&self.settings);
+            self.hw = None;
+            self.hw = encoders::select_frame_encoder(&mut self.settings, FrameSource::Host { rgba: false }, None, "x11");
             self.hw_rebuilt = true;
         }
         self.hw_state = StripeState::default();
@@ -296,27 +228,32 @@ impl X11Pipeline {
         self.pending_force_idr = true;
     }
 
-    /// Return a human-readable encoder type string for logging.
-    pub fn encoder_name(&self) -> &str {
+    /// The encoder's name for the stream log: the hardware backend, the software library of a
+    /// full-frame session, or `CPU` for the striped software path.
+    pub fn encoder_name(&self) -> String {
         match &self.hw {
-            X11Encoder::Nvenc(_) => "NVENC",
-            X11Encoder::Vaapi(_) => "VAAPI",
-            X11Encoder::None => "CPU",
+            Some(enc) if enc.is_hardware() => enc.backend_name().to_string(),
+            Some(enc) => format!("CPU ({})", enc.backend_name()),
+            None => format!("CPU ({})", crate::encoders::SOFTWARE_H264_ENCODER),
         }
     }
 
+    /// The codec the pipeline actually emits, after any demotion.
+    pub fn codec(&self) -> Codec {
+        self.settings.codec
+    }
+
+    /// Whether the pipeline encodes on a GPU.
+    pub fn is_hardware(&self) -> bool {
+        self.hw.as_ref().is_some_and(|enc| enc.is_hardware())
+    }
+
     /// The `Colorspace:` field for this pipeline's stream log, describing what its encoder settled
-    /// on: VA-API only reaches 4:4:4 when the driver and FFmpeg build carry it, and the software
-    /// encoder only when the build's one does (`SOFTWARE_H264_FULLCOLOR`).
+    /// on: a hardware session only reaches 4:4:4 when the device carries it, the software path
+    /// only when the build's encoder for the codec does.
     pub fn colorspace_desc(&self) -> &'static str {
-        let fullcolor = match &self.hw {
-            X11Encoder::Vaapi(enc) => enc.is_fullcolor(),
-            X11Encoder::Nvenc(_) => self.settings.video_fullcolor,
-            X11Encoder::None => {
-                self.settings.video_fullcolor && crate::encoders::SOFTWARE_H264_FULLCOLOR
-            }
-        };
-        crate::encoders::colorspace_desc(fullcolor, matches!(self.hw, X11Encoder::None))
+        let fullcolor = encoders::session_fullcolor(self.hw.as_ref(), &self.settings);
+        crate::encoders::colorspace_desc(fullcolor, !self.is_hardware())
     }
 
     /// Adapt the live pipeline to recreated capture surfaces without rebuilding it.
@@ -332,23 +269,25 @@ impl X11Pipeline {
     /// cannot follow (VAAPI on resize) and the caller must rebuild.
     pub fn reshape(&mut self, settings: &RustCaptureSettings, size_changed: bool) -> bool {
         if !size_changed {
-            if let X11Encoder::Nvenc(enc) = &mut self.hw {
+            if let Some(FrameEncoder::Nvenc(enc)) = &mut self.hw {
                 enc.release_pinned_hosts();
             }
             self.settings = settings.clone();
             return true;
         }
         match &mut self.hw {
-            X11Encoder::Nvenc(enc) => {
+            Some(FrameEncoder::Nvenc(enc)) => {
                 if let Err(e) = enc.reconfigure_resolution(settings) {
                     eprintln!("[x11] NVENC in-place resize unavailable ({e}); rebuilding");
                     return false;
                 }
             }
-            X11Encoder::None => {}
+            None => {}
             _ => return false,
         }
+        let codec = self.settings.codec;
         self.settings = settings.clone();
+        self.settings.codec = codec;
         self.stripes.clear();
         self.hw_state = StripeState::default();
         true
@@ -356,27 +295,21 @@ impl X11Pipeline {
 
     /// Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
     /// kb; ignored unless CBR is active) and the target fps. NVENC reconfigures its live session
-    /// immediately; VAAPI re-opens its codec context to apply the new rate; the software path picks
-    /// the new values up on the next `process()` (encode_cpu reads the updated settings and
-    /// reconfigures each stripe's encoder).
+    /// immediately; a libavcodec session re-opens its codec context to apply the new rate; the
+    /// striped software path picks the new values up on the next `process()` (encode_cpu reads
+    /// the updated settings and reconfigures each stripe's encoder).
     pub fn update_rate(&mut self, bitrate_kbps: i32, vbv_multiplier: f64, fps: f64) {
         self.settings.video_bitrate_kbps = bitrate_kbps;
         self.settings.video_vbv_multiplier = vbv_multiplier;
         if fps > 0.0 {
             self.settings.target_fps = fps;
         }
-        let rate_error = match &mut self.hw {
-            X11Encoder::Nvenc(enc) => {
-                enc.reconfigure_rate(&self.settings);
-                None
-            }
-            X11Encoder::Vaapi(enc) => enc.reconfigure_rate(&self.settings).err(),
-            X11Encoder::None => None,
-        };
-        if let Some(e) = rate_error {
-            // The failed re-open left the VA-API session without a codec context, so it goes
+        if let Some(enc) = self.hw.as_mut()
+            && let Err(e) = enc.reconfigure_rate(&self.settings)
+        {
+            // The failed re-open left the session without a codec context, so it goes
             // through the rebuild-or-demote ladder instead of being encoded into.
-            eprintln!("[x11] VAAPI rate reconfigure failed: {e}");
+            eprintln!("[x11] rate reconfigure failed: {e}");
             self.recover_hw();
         }
     }
@@ -404,7 +337,7 @@ impl X11Pipeline {
         let threshold = self.settings.damage_block_threshold;
         let duration = self.settings.damage_block_duration as i32;
 
-        let out = if !matches!(self.hw, X11Encoder::None) {
+        let out = if self.hw.is_some() {
             let is_dirty = if self.settings.video_streaming_mode {
                 false
             } else {
@@ -421,22 +354,15 @@ impl X11Pipeline {
             if d.send {
                 let fc = self.frame_counter as u64;
                 let force_idr = d.force_idr;
-                let res = match &mut self.hw {
-                    X11Encoder::Nvenc(enc) => {
-                        enc.encode_cpu_argb(argb, stride, fc, d.target_qp, force_idr)
-                    }
-                    X11Encoder::Vaapi(enc) => {
-                        enc.encode_host_argb(argb, stride, fc, d.target_qp, force_idr)
-                    }
-                    X11Encoder::None => unreachable!(),
-                };
+                let enc = self.hw.as_mut().unwrap();
+                let res = enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr);
                 match res {
                     Ok(data) if !data.is_empty() => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
                         vec![EncodedStripe {
                             data: Arc::new(data),
-                            data_type: 2,
+                            codec: self.settings.codec,
                             stripe_y_start: 0,
                             stripe_height: height,
                             frame_id: self.frame_counter as i32,
@@ -470,7 +396,7 @@ impl X11Pipeline {
                 "software encode path assumes tightly-packed rows (stride == width*4)"
             );
             let force_idr_all = requested
-                || (self.settings.output_mode == 1
+                || (self.settings.codec.is_video()
                     && periodic_idr_due(&self.settings, self.frame_counter));
             encode_cpu(
                 &mut self.stripes,
@@ -505,7 +431,7 @@ mod tests {
     /// cheaper than normal, a short burst, and no scheduled IDR unless a case asks for one.
     fn hw_settings() -> RustCaptureSettings {
         RustCaptureSettings {
-            output_mode: 1,
+            codec: Codec::H264,
             video_crf: 25,
             video_paintover_crf: 10,
             video_paintover_burst_frames: 3,
@@ -617,7 +543,7 @@ mod tests {
         let s = RustCaptureSettings {
             width: 128,
             height: 128,
-            output_mode: 0,
+            codec: Codec::Jpeg,
             use_cpu: true,
             jpeg_quality: 60,
             use_paint_over_quality: false,
@@ -647,7 +573,7 @@ mod tests {
         let s = RustCaptureSettings {
             width: 128,
             height: 128,
-            output_mode: 1,
+            codec: Codec::H264,
             use_cpu: true,
             video_crf: 25,
             video_paintover_burst_frames: 5,
@@ -686,12 +612,12 @@ mod tests {
             let p = X11Pipeline::new(RustCaptureSettings {
                 width: 64,
                 height: 64,
-                output_mode: 1,
+                codec: Codec::H264,
                 use_cpu: true,
                 video_fullcolor: fullcolor,
                 ..Default::default()
             });
-            assert_eq!(p.encoder_name(), "CPU");
+            assert_eq!(p.encoder_name(), format!("CPU ({})", crate::encoders::SOFTWARE_H264_ENCODER));
             assert_eq!(p.colorspace_desc(), expected);
             assert_eq!(
                 p.colorspace_desc(),

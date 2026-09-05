@@ -179,11 +179,15 @@ NATIVE: Dict[str, Dict[str, object]] = {
         note="striped software H.264; the only GPL component, default feature `gpl`"),
     "ffmpeg-sys-next": dict(
         library="FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, "
-                "libswscale, libavformat they pull in)",
+                "libswscale, libavformat they pull in), and through libavcodec the "
+                "codec libraries it wraps: kvazaar, libvpx, SVT-AV1, dav1d (BSD) on "
+                "every wheel, x265 (GPL-2.0-or-later) on the GPL wheel",
         license="LGPL-2.1-or-later", rank=WEAK,
-        how="linked shared libraries (the wheels bundle FFmpeg n8.1 built without "
-            "--enable-gpl; a GPL-built system FFmpeg makes the linked set GPL)",
-        note="h264_vaapi encoder and filters; crate itself is WTFPL"),
+        how="linked shared libraries (the non-GPL wheels bundle FFmpeg n8.1 built without "
+            "--enable-gpl, the GPL wheels one built --enable-gpl --enable-libx265; a "
+            "GPL-built system FFmpeg makes the linked set GPL)",
+        note="VA-API encoders and filters, the software HEVC/VP8/VP9/AV1 encoders, the "
+             "virtual camera's decoders; crate itself is WTFPL"),
     "openh264-sys2": dict(
         library="Cisco OpenH264 2.6 (vendored source)", license="BSD-2-Clause",
         rank=PERMISSIVE, how="compiled from vendored source and linked statically",

@@ -17,86 +17,33 @@ use super::convert::{I420Buffer, I420View};
 
 /// Input codecs, by wire id. The ids are part of the Selkies WebSocket framing and are exported to
 /// Python as `VirtualCamera.CODEC_*`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Codec {
-    Mjpeg = 0,
-    H264 = 1,
-    Vp8 = 2,
-    Vp9 = 3,
-    Av1 = 4,
-    Hevc = 5,
-}
+pub use crate::encoders::codec::Codec;
+use crate::encoders::codec::{av1_is_key, h264_frame_type, h265_frame_type, vp8_is_key, vp9_is_key, FRAME_KEY};
 
 impl Codec {
-    pub fn from_id(id: u32) -> Option<Self> {
-        Some(match id {
-            0 => Codec::Mjpeg,
-            1 => Codec::H264,
-            2 => Codec::Vp8,
-            3 => Codec::Vp9,
-            4 => Codec::Av1,
-            5 => Codec::Hevc,
-            _ => return None,
-        })
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Codec::Mjpeg => "mjpeg",
-            Codec::H264 => "h264",
-            Codec::Vp8 => "vp8",
-            Codec::Vp9 => "vp9",
-            Codec::Av1 => "av1",
-            Codec::Hevc => "hevc",
-        }
-    }
-
-    /// Whether frames depend on earlier ones, so a dropped frame forces a wait for a keyframe.
-    pub fn is_inter_coded(self) -> bool {
-        !matches!(self, Codec::Mjpeg)
-    }
-
     fn av_codec_id(self) -> ff::AVCodecID {
         match self {
-            Codec::Mjpeg => ff::AVCodecID::AV_CODEC_ID_MJPEG,
+            Codec::Jpeg => ff::AVCodecID::AV_CODEC_ID_MJPEG,
             Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
             Codec::Vp8 => ff::AVCodecID::AV_CODEC_ID_VP8,
             Codec::Vp9 => ff::AVCodecID::AV_CODEC_ID_VP9,
             Codec::Av1 => ff::AVCodecID::AV_CODEC_ID_AV1,
-            Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
+            Codec::H265 => ff::AVCodecID::AV_CODEC_ID_HEVC,
         }
     }
 }
 
-/// Cheap bitstream inspection for the codecs whose keyframes can be recognized without a full
-/// parse; `None` when the codec gives no such signal and the caller's flag must be trusted.
+/// Whether an encoded frame is a key frame, read from the bitstream itself: every codec here
+/// declares it in its first bytes or NAL types.
 pub fn sniff_keyframe(codec: Codec, data: &[u8]) -> Option<bool> {
-    match codec {
-        Codec::Mjpeg => Some(true),
-        Codec::H264 => {
-            let mut i = 0;
-            let mut idr = false;
-            while i + 3 < data.len() {
-                if data[i] == 0 && data[i + 1] == 0 && (data[i + 2] == 1 || (data[i + 2] == 0 && i + 4 <= data.len() && data[i + 3] == 1)) {
-                    let off = if data[i + 2] == 1 { 3 } else { 4 };
-                    if i + off < data.len() {
-                        let nal_type = data[i + off] & 0x1F;
-                        if nal_type == 5 {
-                            idr = true;
-                            break;
-                        }
-                    }
-                    i += off;
-                } else {
-                    i += 1;
-                }
-            }
-            Some(idr)
-        }
-        Codec::Vp8 => data.first().map(|b| b & 1 == 0),
-        Codec::Vp9 | Codec::Av1 | Codec::Hevc => None,
-    }
+    Some(match codec {
+        Codec::Jpeg => true,
+        Codec::H264 => h264_frame_type(data) == FRAME_KEY,
+        Codec::H265 => h265_frame_type(data) == FRAME_KEY,
+        Codec::Vp8 => vp8_is_key(data),
+        Codec::Vp9 => vp9_is_key(data),
+        Codec::Av1 => av1_is_key(data),
+    })
 }
 
 /// Padding avcodec requires past the end of any packet it parses.
@@ -119,7 +66,7 @@ pub trait Decoder {
 
 pub fn new_decoder(codec: Codec) -> Result<Box<dyn Decoder>, String> {
     match codec {
-        Codec::Mjpeg => Ok(Box::new(JpegDecoder::new()?)),
+        Codec::Jpeg => Ok(Box::new(JpegDecoder::new()?)),
         _ => Ok(Box::new(AvDecoder::new(codec)?)),
     }
 }
@@ -376,7 +323,7 @@ impl JpegDecoder {
 
 impl Decoder for JpegDecoder {
     fn codec(&self) -> Codec {
-        Codec::Mjpeg
+        Codec::Jpeg
     }
 
     fn decode(&mut self, data: &[u8]) -> Result<bool, DecodeError> {
@@ -445,7 +392,12 @@ mod tests {
         assert_eq!(sniff_keyframe(Codec::H264, &p), Some(false));
         assert_eq!(sniff_keyframe(Codec::Vp8, &[0x10, 0, 0]), Some(true));
         assert_eq!(sniff_keyframe(Codec::Vp8, &[0x11, 0, 0]), Some(false));
-        assert_eq!(sniff_keyframe(Codec::Vp9, &[0]), None);
+        assert_eq!(sniff_keyframe(Codec::Vp9, &[0x82, 0x49, 0x83]), Some(true));
+        assert_eq!(sniff_keyframe(Codec::Vp9, &[0x86, 0]), Some(false));
+        assert_eq!(sniff_keyframe(Codec::H265, &[0, 0, 1, 0x26, 0x01]), Some(true));
+        assert_eq!(sniff_keyframe(Codec::H265, &[0, 0, 1, 0x02, 0x01]), Some(false));
+        assert_eq!(sniff_keyframe(Codec::Av1, &[0x12, 0, 0x32, 0x01, 0x10]), Some(true));
+        assert_eq!(sniff_keyframe(Codec::Av1, &[0x32, 0x01, 0x30]), Some(false));
     }
 
     #[test]

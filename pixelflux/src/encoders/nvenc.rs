@@ -4,18 +4,20 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! NVENC hardware H.264 encoder: CUDA-bound sessions that encode ARGB — or raw NV12 / YUV444 —
-//! frames from the X11 host-ARGB and Wayland dmabuf capture paths.
+//! NVENC hardware H.264 / HEVC / AV1 encoder: CUDA-bound sessions that encode packed BGRA or
+//! RGBA frames from the X11 host and Wayland readback paths, or Wayland dmabufs in place.
 //!
 //! The module dynamically loads `libcuda`, `libnvidia-encode` and `libEGL` at runtime, negotiates
 //! the NVENC API version against the installed driver (set-once per process), and stamps every
 //! NVENCAPI struct with the exact `NV_ENC_*_VER` word the negotiated SDK defines, so one binary
-//! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU three ways: a
+//! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU two ways: a
 //! zero-copy dmabuf import (EGLImage → CUDA, the mapped plane registered with NVENC in place as
-//! pitch-linear memory or as a CUDA array), a pinned host→device upload of packed BGRA / RGBA that
-//! the hardware CSC converts, and a raw planar upload. Sessions reconfigure resolution and rate
-//! control in place, so a resize or bitrate change costs a few milliseconds instead of a full
-//! rebuild.
+//! pitch-linear memory or as a CUDA array), and a pinned host→device upload of packed BGRA / RGBA
+//! that the hardware CSC converts. The codec is a session parameter: the same rate control,
+//! GOP, VUI and latency posture is programmed into whichever of the three codec configurations
+//! the device offers, and a codec the device lacks (AV1 before Ada) is refused at open so the
+//! caller falls back. Sessions reconfigure resolution and rate control in place, so a resize or
+//! bitrate change costs a few milliseconds instead of a full rebuild.
 
 // The NVENC and CUDA entry points are called through function pointers
 // resolved at runtime, so the safety contract is carried by the function
@@ -34,6 +36,10 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer, Fourcc};
 
+use super::codec::{
+    av1_level, h264_level, h265_level, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY,
+    VIDEO_HEADER_LEN,
+};
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -546,12 +552,13 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     }
 }
 
-/// Query one NVENC H.264 capability on an open session, returning the driver's integer answer or
-/// `None` when the entry point is absent or the query fails — `decide_caps` reads `None` as "do not
-/// gate", so a query failure never becomes a false refusal.
+/// Query one NVENC capability of `codec` on an open session, returning the driver's integer
+/// answer or `None` when the entry point is absent or the query fails — `decide_caps` reads
+/// `None` as "do not gate", so a query failure never becomes a false refusal.
 unsafe fn query_cap(
     funcs: &NV_ENCODE_API_FUNCTION_LIST,
     session: *mut c_void,
+    codec: GUID,
     cap: NV_ENC_CAPS,
 ) -> Option<i32> {
     let get = funcs.nvEncGetEncodeCaps?;
@@ -561,7 +568,7 @@ unsafe fn query_cap(
         reserved: [0u32; 62],
     };
     let mut val: i32 = 0;
-    if get(session, NV_ENC_CODEC_H264_GUID, &mut param, &mut val) == NVENCSTATUS::NV_ENC_SUCCESS {
+    if get(session, codec, &mut param, &mut val) == NVENCSTATUS::NV_ENC_SUCCESS {
         Some(val)
     } else {
         None
@@ -584,17 +591,43 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
     Data4: [0xb8, 0x44, 0x33, 0x9b, 0x26, 0x1a, 0x7d, 0x5c],
 };
 
-/// A live NVENC H.264 encoder session with its CUDA context and interop resources.
+/// Whether two GUIDs are the same.
+fn guid_eq(a: &GUID, b: &GUID) -> bool {
+    a.Data1 == b.Data1 && a.Data2 == b.Data2 && a.Data3 == b.Data3 && a.Data4 == b.Data4
+}
+
+/// The NVENC codec GUID of a codec the encoder serves, or `None` for one NVENC has no engine
+/// for.
+fn codec_guid(codec: Codec) -> Option<GUID> {
+    match codec {
+        Codec::H264 => Some(NV_ENC_CODEC_H264_GUID),
+        Codec::H265 => Some(NV_ENC_CODEC_HEVC_GUID),
+        Codec::Av1 => Some(NV_ENC_CODEC_AV1_GUID),
+        Codec::Jpeg | Codec::Vp8 | Codec::Vp9 => None,
+    }
+}
+
+/// The profile of a session: the 4:2:0 profile of the codec, or its 4:4:4 one where the codec
+/// has it.
+fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
+    match (codec, fullcolor) {
+        (Codec::H264, true) => NV_ENC_H264_PROFILE_HIGH_444_GUID,
+        (Codec::H264, false) => NV_ENC_H264_PROFILE_HIGH_GUID,
+        (Codec::H265, true) => NV_ENC_HEVC_PROFILE_FREXT_GUID,
+        (Codec::H265, false) => NV_ENC_HEVC_PROFILE_MAIN_GUID,
+        _ => NV_ENC_AV1_PROFILE_MAIN_GUID,
+    }
+}
+
+/// A live NVENC encoder session with its CUDA context and interop resources.
 ///
 /// One instance owns a CUDA context bound to a specific GPU plus an NVENC session and everything
-/// the three input paths need:
+/// the two input paths need:
 ///
 /// - **Packed path**: a pitched device buffer (`input_device_ptr` / `input_pitch`) registered and
 ///   mapped as the NVENC input (`registered_input_resource` / `mapped_input_buffer`) in the byte
 ///   order `input_format` names (re-registered in place when a source of the other order arrives),
 ///   fed either by a host→device upload or by the copy arm of the dmabuf path.
-/// - **Raw planar path**: a lazily-allocated NV12 / YUV444 device buffer (the `nv12_*` fields),
-///   created on first `encode_raw`.
 /// - **Zero-copy dmabuf path**: `dmabuf_cache` memoizes each fd's EGLImage → CUDA import, keyed by
 ///   fd but validated against the buffer's `DmaBufIdentity` so a recycled fd re-imports; an import
 ///   whose plane NVENC can take as it is — pitch-linear memory or a packed 8-bit CUDA array — is
@@ -604,8 +637,9 @@ const NV_ENC_H264_PROFILE_HIGH_444_GUID: GUID = GUID {
 /// `bitstream_buffers` is a small ring (`current_buffer_idx` cycles it) of output buffers.
 /// `pinned_hosts` maps each page-locked host upload source's base pointer to its registered length,
 /// with a `0` length recording a failed registration so that address is never re-pinned.
-/// `current_qp` tracks the live ConstQP so a paint-over reconfigure is skipped when unchanged.
-/// `encode_config` and `init_params` are retained so in-place reconfigure can resubmit them.
+/// `codec` and `fullcolor` name the session's codec and negotiated chroma; `current_qp` tracks the
+/// live ConstQP so a paint-over reconfigure is skipped when unchanged. `encode_config` and
+/// `init_params` are retained so in-place reconfigure can resubmit them.
 /// `omit_stripe_headers` drops the 10-byte wire
 /// header, and `node_index` is the effective CUDA device this session is bound to — a reuse across
 /// captures that now targets a different device must rebuild rather than reconfigure.
@@ -614,6 +648,8 @@ pub struct NvencEncoder {
     cuda_context: CUcontext,
     cuda_device: CUdevice,
     egl_display: EGLDisplay,
+    codec: Codec,
+    fullcolor: bool,
     width: u32,
     height: u32,
     current_qp: u32,
@@ -624,10 +660,6 @@ pub struct NvencEncoder {
     input_format: NV_ENC_BUFFER_FORMAT,
     registered_input_resource: NV_ENC_REGISTERED_PTR,
     mapped_input_buffer: NV_ENC_INPUT_PTR,
-    nv12_device_ptr: Option<CUdeviceptr>,
-    nv12_pitch: usize,
-    nv12_registered_resource: Option<NV_ENC_REGISTERED_PTR>,
-    nv12_mapped_buffer: Option<NV_ENC_INPUT_PTR>,
     bitstream_buffers: Vec<NV_ENC_OUTPUT_PTR>,
     current_buffer_idx: usize,
     dmabuf_cache: HashMap<i32, CachedDmaBuf>,
@@ -656,8 +688,8 @@ unsafe impl Send for NvencEncoder {}
 /// `cuGraphicsUnregisterResource` / `cuMemHostUnregister` calls each act on the *current* context —
 /// pop it first and the frees silently do nothing, leaking device memory. Within that, resources
 /// go inner-handle before the outer handle that owns it, since freeing an owner first orphans or
-/// faults on what still points into it: unmap the packed and raw-plane inputs before unregistering
-/// them, free their device buffers, destroy the bitstream buffers, and release every cached dmabuf
+/// faults on what still points into it: unmap the packed input before unregistering it, free its
+/// device buffer, destroy the bitstream buffers, and release every cached dmabuf
 /// import (`release_dmabuf_import`: its NVENC mapping and registration, then the CUDA resource and
 /// the EGLImage) — all session-owned — before the encoder session itself, and destroy that
 /// session before releasing the device's primary CUDA context it was opened against (the retain is
@@ -683,22 +715,6 @@ impl Drop for NvencEncoder {
             }
             if self.input_device_ptr != 0 {
                 (self.cuda.cuMemFree_v2)(self.input_device_ptr);
-            }
-
-            if let Some(mapped) = self.nv12_mapped_buffer {
-                (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
-                    self.encoder_session,
-                    mapped,
-                );
-            }
-            if let Some(registered) = self.nv12_registered_resource {
-                (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
-                    self.encoder_session,
-                    registered,
-                );
-            }
-            if let Some(ptr) = self.nv12_device_ptr {
-                (self.cuda.cuMemFree_v2)(ptr);
             }
 
             for &bs in &self.bitstream_buffers {
@@ -729,18 +745,21 @@ impl Drop for NvencEncoder {
     }
 }
 
-use super::min_h264_level;
-
-/// The level an NVENC session advertises for this geometry, floored at 5.2 (`NV_ENC_LEVEL`
-/// shares level_idc's numbering: 52/60/61/62 for 5.2/6.0/6.1/6.2).
+/// The level an NVENC session advertises for this geometry, floored at the level that spans
+/// the in-place resize headroom (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc
+/// for H.264, general_level_idc for HEVC, seq_level_idx for AV1).
 ///
 /// `reconfigure_resolution` resizes a live session in place, so the level has to cover every
 /// geometry that session can still reach — a level bump mid-GOP forces some hardware decoders to
-/// re-initialize. 5.2's MaxFS of 36864 macroblocks (≈ 4096×2304) spans everything up to 4K, so
-/// pinning that floor makes the whole range resolve to High@5.2; only beyond 4K does the shared
-/// ladder step up to 6.0 / 6.1 / 6.2.
-fn nvenc_h264_level(width: u32, height: u32, fps: u32) -> u32 {
-    min_h264_level(width, height, fps).max(52)
+/// re-initialize. The floors (H.264 5.2, HEVC 5.2, AV1 5.0) span everything up to 4096×2304 at
+/// 60 fps, so the whole range resolves to one level; only beyond it does the shared ladder step
+/// up.
+fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32) -> u32 {
+    match codec {
+        Codec::H265 => h265_level(width, height, fps).max(156),
+        Codec::Av1 => av1_level(width, height, fps).max(12),
+        _ => h264_level(width, height, fps).max(52),
+    }
 }
 
 impl NvencEncoder {
@@ -915,8 +934,8 @@ impl NvencEncoder {
         None
     }
 
-    /// Build a live NVENC session: bind CUDA to the target GPU, open and configure the H.264
-    /// encoder, and allocate its input and output buffers.
+    /// Build a live NVENC session for the settings' codec: bind CUDA to the target GPU, open and
+    /// configure the encoder, and allocate its input and output buffers.
     ///
     /// The sequence:
     ///
@@ -933,21 +952,23 @@ impl NvencEncoder {
     /// 3. **Allocate input**: a pitched ARGB device buffer (`cuMemAllocPitch`, 16-byte element
     ///    alignment) that hardware CSC turns into YUV.
     /// 4. **Open the session and query caps**: create the function-list instance, open the session
-    ///    with the negotiated `apiVersion`, and query `nvEncGetEncodeCaps` so init degrades rather
-    ///    than fails — a 4:4:4 request on a GPU without it drops to 4:2:0, and a capture beyond the
-    ///    encoder's max dimensions returns `Err` so the caller falls back to software. Then pull a
-    ///    preset config (P4, ultra-low-latency); a failed preset lookup logs the driver's error
-    ///    string and proceeds with the zeroed default rather than aborting.
+    ///    with the negotiated `apiVersion`, refuse a codec the device lists no engine for, and
+    ///    query `nvEncGetEncodeCaps` so init degrades rather than fails — a 4:4:4 request on a GPU
+    ///    or codec without it drops to 4:2:0, and a capture beyond the encoder's max dimensions
+    ///    returns `Err` so the caller falls back to software. Then pull a preset config (P4,
+    ///    ultra-low-latency); a failed preset lookup logs the driver's error string and proceeds
+    ///    with the zeroed default rather than aborting.
     /// 5. **Configure the stream** (mutating the returned preset config, whose `version` word is
-    ///    re-stamped while its embedded `rcParams` keeps the version the preset fill set): High or
-    ///    High-4:4:4 profile; CBR (two-pass quarter-resolution for tighter per-frame rate adherence,
-    ///    VBV sizing, optional min/max QP clamps) or ConstQP; infinite GOP (`gopLength` / `idrPeriod`
-    ///    = `0xFFFFFFFF`); `zeroReorderDelay` plus a bitstream-restriction VUI (`max_num_reorder_frames=0`)
-    ///    so no-reorder decoders don't buffer; an explicit Annex-A level from `nvenc_h264_level`
-    ///    pinned from frame 1 so the level never bumps mid-stream; BT.709 VUI primaries and
-    ///    transfer for the sRGB source, with an SMPTE170M matrix and limited range to match the
-    ///    hardware ARGB CSC; chroma 4:2:0 or 4:4:4; repeated SPS/PPS; CABAC; no AUD; strict GOP
-    ///    target; and lookahead disabled for real-time latency.
+    ///    re-stamped while its embedded `rcParams` keeps the version the preset fill set): the
+    ///    codec's 4:2:0 or 4:4:4 profile; CBR (two-pass quarter-resolution for tighter per-frame
+    ///    rate adherence, VBV sizing, optional min/max QP clamps in the codec's quantizer domain)
+    ///    or ConstQP; infinite GOP (`gopLength` / `idrPeriod` = `0xFFFFFFFF`); `zeroReorderDelay`
+    ///    and, for H.264, a bitstream-restriction VUI (`max_num_reorder_frames=0`) so no-reorder
+    ///    decoders don't buffer; an explicit level from `nvenc_level` pinned from frame 1 so the
+    ///    level never bumps mid-stream; BT.709 primaries and transfer for the sRGB source, with an
+    ///    SMPTE170M matrix and limited range to match the hardware ARGB CSC; repeated parameter
+    ///    sets on every key frame; H.264 CABAC; no AUD; one AV1 tile; strict GOP target; and
+    ///    lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to at
     ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place, but never
     ///    past the driver's reported maximum; this costs ~290 MiB of device memory, so a failed init
@@ -966,7 +987,10 @@ impl NvencEncoder {
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
     ) -> Result<Self, String> {
-        println!("[NVENC] Initializing...");
+        let codec = settings.codec;
+        let codec_guid = codec_guid(codec)
+            .ok_or_else(|| format!("NVENC has no {} encoder", codec.display()))?;
+        println!("[NVENC] Initializing {}...", codec.display());
 
         let egl = Arc::new(Self::load_egl()?);
         let cuda = Arc::new(Self::load_cuda()?);
@@ -1072,18 +1096,33 @@ impl NvencEncoder {
                 return Err("Failed to open NVENC session".into());
             }
 
+            // The device's engine list decides whether the codec exists here at all (AV1
+            // arrived with Ada), and a refusal has to name that rather than fail an init.
+            if !Self::device_encodes(&function_list, encoder_session, &codec_guid) {
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                (cuda.cuMemFree_v2)(input_device_ptr);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err(format!("this GPU's NVENC has no {} engine", codec.display()));
+            }
+
             // Query caps so init degrades instead of failing opaquely: a 4:4:4 request on a GPU
-            // without it drops to 4:2:0, and a capture beyond the encoder's max dimensions declines
-            // NVENC so the caller falls back to software.
-            let caps_444 = query_cap(
-                &function_list,
-                encoder_session,
-                NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
-            );
+            // or codec without it drops to 4:2:0, and a capture beyond the encoder's max
+            // dimensions declines NVENC so the caller falls back to software.
+            let caps_444 = if codec.fullcolor() {
+                query_cap(
+                    &function_list,
+                    encoder_session,
+                    codec_guid,
+                    NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+                )
+            } else {
+                Some(0)
+            };
             let caps_wmax =
-                query_cap(&function_list, encoder_session, NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
+                query_cap(&function_list, encoder_session, codec_guid, NV_ENC_CAPS::NV_ENC_CAPS_WIDTH_MAX);
             let caps_hmax =
-                query_cap(&function_list, encoder_session, NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
+                query_cap(&function_list, encoder_session, codec_guid, NV_ENC_CAPS::NV_ENC_CAPS_HEIGHT_MAX);
             let caps = decide_caps(
                 settings.video_fullcolor,
                 width as i32,
@@ -1102,15 +1141,13 @@ impl NvencEncoder {
                 ));
             }
             if caps.downgraded_color {
-                eprintln!("[NVENC] GPU does not support 4:4:4 (YUV444) encoding; encoding 4:2:0.");
+                eprintln!(
+                    "[NVENC] {} 4:4:4 (YUV444) encoding unsupported on this GPU; encoding 4:2:0.",
+                    codec.display()
+                );
             }
 
             let is_444 = caps.fullcolor;
-            let profile_guid = if is_444 {
-                NV_ENC_H264_PROFILE_HIGH_444_GUID
-            } else {
-                NV_ENC_H264_PROFILE_HIGH_GUID
-            };
 
             let mut config = NV_ENC_CONFIG {
                 version: sv(NvStruct::Config),
@@ -1125,7 +1162,7 @@ impl NvencEncoder {
             let get_preset_ex = function_list.nvEncGetEncodePresetConfigEx.unwrap();
             let preset_status = get_preset_ex(
                 encoder_session,
-                NV_ENC_CODEC_H264_GUID,
+                codec_guid,
                 NV_ENC_PRESET_P4_GUID,
                 NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset_config,
@@ -1147,7 +1184,7 @@ impl NvencEncoder {
 
             config = preset_config.presetCfg;
             config.version = sv(NvStruct::Config);
-            config.profileGUID = profile_guid;
+            config.profileGUID = profile_guid(codec, is_444);
             if settings.video_cbr_mode {
                 let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
@@ -1160,64 +1197,38 @@ impl NvencEncoder {
                     settings.keyframe_interval_s,
                     settings.video_vbv_multiplier,
                 );
-                if settings.video_min_qp > 0 {
-                    let q = settings.video_min_qp.min(51) as u32;
+                let lo = codec.quantizer_bound(settings.video_min_qp);
+                if lo > 0 {
                     config.rcParams.set_enableMinQP(1);
-                    config.rcParams.minQP.qpInterP = q;
-                    config.rcParams.minQP.qpInterB = q;
-                    config.rcParams.minQP.qpIntra = q;
+                    config.rcParams.minQP.qpInterP = lo;
+                    config.rcParams.minQP.qpInterB = lo;
+                    config.rcParams.minQP.qpIntra = lo;
                 }
-                if settings.video_max_qp > 0 {
-                    let q = settings.video_max_qp.min(51) as u32;
+                let hi = codec.quantizer_bound(settings.video_max_qp);
+                if hi > 0 {
                     config.rcParams.set_enableMaxQP(1);
-                    config.rcParams.maxQP.qpInterP = q;
-                    config.rcParams.maxQP.qpInterB = q;
-                    config.rcParams.maxQP.qpIntra = q;
+                    config.rcParams.maxQP.qpInterP = hi;
+                    config.rcParams.maxQP.qpInterB = hi;
+                    config.rcParams.maxQP.qpIntra = hi;
                 }
             } else {
+                let q = codec.quantizer(settings.video_crf);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
-                config.rcParams.constQP.qpInterP = settings.video_crf as u32;
-                config.rcParams.constQP.qpInterB = settings.video_crf as u32;
-                config.rcParams.constQP.qpIntra = settings.video_crf as u32;
+                config.rcParams.constQP.qpInterP = q;
+                config.rcParams.constQP.qpInterB = q;
+                config.rcParams.constQP.qpIntra = q;
             }
             config.frameIntervalP = 1;
             config.gopLength = 0xFFFFFFFF;
             config.rcParams.set_zeroReorderDelay(1);
-            config.encodeCodecConfig.h264Config.h264VUIParameters.bitstreamRestrictionFlag = 1;
-            config.encodeCodecConfig.h264Config.level =
-                nvenc_h264_level(width, height, settings.target_fps as u32);
-            config.encodeCodecConfig.h264Config.idrPeriod = 0xFFFFFFFF;
-            config.encodeCodecConfig.h264Config.h264VUIParameters.videoSignalTypePresentFlag = 1;
-            config.encodeCodecConfig.h264Config.h264VUIParameters.videoFormat =
-                NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-            config.encodeCodecConfig.h264Config.h264VUIParameters.colourDescriptionPresentFlag = 1;
-            // Primaries and transfer describe the source, which is sRGB desktop pixels —
-            // sRGB shares BT.709's primaries and transfer function. Only the matrix follows
-            // the encoder: NVENC's ARGB hardware CSC is fixed at BT.601, so a client that
-            // inverts BT.709 shifts saturated colour badly.
-            config.encodeCodecConfig.h264Config.h264VUIParameters.colourPrimaries =
-                NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-            config.encodeCodecConfig.h264Config.h264VUIParameters.transferCharacteristics =
-                NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-            config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix =
-                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
-            config.encodeCodecConfig.h264Config.chromaFormatIDC = if is_444 { 3 } else { 1 };
-            // That same hardware CSC emits limited range in every chroma format, and both
-            // capture paths — dmabuf and host packed — go through it. Only the raw planar
-            // entry point could carry full range, and the VUI is per session, so every
-            // NVENC session declares limited.
-            config.encodeCodecConfig.h264Config.h264VUIParameters.videoFullRangeFlag = 0;
-            config.encodeCodecConfig.h264Config.set_repeatSPSPPS(1);
-            config.encodeCodecConfig.h264Config.entropyCodingMode =
-                NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
-            config.encodeCodecConfig.h264Config.set_outputAUD(0);
             config.rcParams.set_strictGOPTarget(1);
             config.rcParams.set_enableLookahead(0);
             config.rcParams.lookaheadDepth = 0;
+            Self::configure_codec(&mut config, codec, is_444, width, height, settings.target_fps as u32);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
-                encodeGUID: NV_ENC_CODEC_H264_GUID,
+                encodeGUID: codec_guid,
                 presetGUID: NV_ENC_PRESET_P4_GUID,
                 tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 encodeWidth: width,
@@ -1318,16 +1329,18 @@ impl NvencEncoder {
                 bitstream_buffers.push(bitstream_params.bitstreamBuffer);
             }
 
-            println!("[NVENC] Initialized successfully (4:4:4 mode: {}).", is_444);
+            println!("[NVENC] {} initialized (4:4:4 mode: {}).", codec.display(), is_444);
 
             Ok(Self {
                 encoder_session,
                 cuda_context: cu_context,
                 cuda_device: cu_device,
                 egl_display: egl_display as EGLDisplay,
+                codec,
+                fullcolor: is_444,
                 width,
                 height,
-                current_qp: settings.video_crf as u32,
+                current_qp: codec.quantizer(settings.video_crf),
                 encode_config: config,
                 init_params,
                 input_device_ptr,
@@ -1335,10 +1348,6 @@ impl NvencEncoder {
                 input_format: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
                 registered_input_resource: reg_res.registeredResource,
                 mapped_input_buffer: map_params.mappedResource,
-                nv12_device_ptr: None,
-                nv12_pitch: 0,
-                nv12_registered_resource: None,
-                nv12_mapped_buffer: None,
                 bitstream_buffers,
                 current_buffer_idx: 0,
                 dmabuf_cache: HashMap::new(),
@@ -1355,22 +1364,129 @@ impl NvencEncoder {
         }
     }
 
+    /// Whether the open session's device lists an encode engine for `codec`.
+    unsafe fn device_encodes(funcs: &NV_ENCODE_API_FUNCTION_LIST, session: *mut c_void, codec: &GUID) -> bool {
+        let (Some(count_fn), Some(list_fn)) = (funcs.nvEncGetEncodeGUIDCount, funcs.nvEncGetEncodeGUIDs) else {
+            return true;
+        };
+        let mut count = 0u32;
+        if count_fn(session, &mut count) != NVENCSTATUS::NV_ENC_SUCCESS || count == 0 {
+            return false;
+        }
+        let mut guids = vec![GUID::default(); count as usize];
+        let mut listed = 0u32;
+        if list_fn(session, guids.as_mut_ptr(), count, &mut listed) != NVENCSTATUS::NV_ENC_SUCCESS {
+            return false;
+        }
+        guids.iter().take(listed as usize).any(|g| guid_eq(g, codec))
+    }
+
+    /// Program the codec-specific arm of `config`: the level for the geometry, an infinite IDR
+    /// period, the chroma format, 8-bit input and output, parameter sets repeated on every key
+    /// frame, and the colour description of the hardware CSC.
+    ///
+    /// Primaries and transfer describe the source, which is sRGB desktop pixels — sRGB shares
+    /// BT.709's primaries and transfer function. Only the matrix follows the encoder: NVENC's
+    /// ARGB hardware CSC is fixed at BT.601, so a client that inverts BT.709 shifts saturated
+    /// colour badly; that same CSC emits limited range in every chroma format, and both capture
+    /// paths go through it, so every session declares limited. H.264 additionally restricts
+    /// reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC; AV1 keeps
+    /// one tile, since tiles cost bitrate and buy no quality.
+    fn configure_codec(config: &mut NV_ENC_CONFIG, codec: Codec, fullcolor: bool, width: u32, height: u32, fps: u32) {
+        let level = nvenc_level(codec, width, height, fps);
+        let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+        let transfer = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+        let matrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
+        let vui = |vui: &mut NV_ENC_CONFIG_H264_VUI_PARAMETERS| {
+            vui.videoSignalTypePresentFlag = 1;
+            vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+            vui.colourDescriptionPresentFlag = 1;
+            vui.colourPrimaries = primaries;
+            vui.transferCharacteristics = transfer;
+            vui.colourMatrix = matrix;
+            vui.videoFullRangeFlag = 0;
+        };
+        unsafe {
+            match codec {
+                Codec::H265 => {
+                    let c = &mut config.encodeCodecConfig.hevcConfig;
+                    c.level = level;
+                    c.tier = 0;
+                    c.idrPeriod = 0xFFFFFFFF;
+                    c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
+                    c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.set_repeatSPSPPS(1);
+                    c.set_outputAUD(0);
+                    vui(&mut c.hevcVUIParameters);
+                }
+                Codec::Av1 => {
+                    let c = &mut config.encodeCodecConfig.av1Config;
+                    c.level = level;
+                    c.tier = 0;
+                    c.idrPeriod = 0xFFFFFFFF;
+                    c.set_chromaFormatIDC(1);
+                    c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.set_repeatSeqHdr(1);
+                    c.set_outputAnnexBFormat(0);
+                    c.set_enableBitstreamPadding(0);
+                    c.numTileColumns = 1;
+                    c.numTileRows = 1;
+                    c.colorPrimaries = primaries;
+                    c.transferCharacteristics = transfer;
+                    c.matrixCoefficients = matrix;
+                    c.colorRange = 0;
+                }
+                _ => {
+                    let c = &mut config.encodeCodecConfig.h264Config;
+                    c.level = level;
+                    c.idrPeriod = 0xFFFFFFFF;
+                    c.chromaFormatIDC = if fullcolor { 3 } else { 1 };
+                    c.set_repeatSPSPPS(1);
+                    c.entropyCodingMode = NV_ENC_H264_ENTROPY_CODING_MODE::NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
+                    c.set_outputAUD(0);
+                    c.h264VUIParameters.bitstreamRestrictionFlag = 1;
+                    vui(&mut c.h264VUIParameters);
+                }
+            }
+        }
+    }
+
+    /// Write the level for a new geometry or frame rate into the live config's codec arm.
+    fn set_level(&mut self, width: u32, height: u32, fps: u32) {
+        let level = nvenc_level(self.codec, width, height, fps);
+        match self.codec {
+            Codec::H265 => self.encode_config.encodeCodecConfig.hevcConfig.level = level,
+            Codec::Av1 => self.encode_config.encodeCodecConfig.av1Config.level = level,
+            _ => self.encode_config.encodeCodecConfig.h264Config.level = level,
+        }
+    }
+
+    /// The codec the session emits.
+    pub fn codec(&self) -> Codec {
+        self.codec
+    }
+
+    /// Whether the session negotiated 4:4:4 chroma.
+    pub fn is_fullcolor(&self) -> bool {
+        self.fullcolor
+    }
+
     /// Resize the live session to `settings` in place, folding in the current rate / QP /
     /// fps, without tearing it down.
     ///
     /// The NVENC session, CUDA context and bitstream buffers survive, so a resize costs a few
     /// milliseconds instead of a full rebuild. Flow:
     ///
-    /// 1. **Reject the unchangeable**: a different encode device, a chroma-format flip (4:4:4), an
-    ///    RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode` headroom all return
-    ///    `Err` so the caller rebuilds. Chroma and RC mode are read back from the live
-    ///    `encode_config` (the H.264 arm of the codec-config union is the one this encoder fills).
+    /// 1. **Reject the unchangeable**: a different encode device or codec, a chroma-format flip
+    ///    (4:4:4), an RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode`
+    ///    headroom all return `Err` so the caller rebuilds.
     /// 2. **Release geometry-dependent state** under the pushed CUDA context: unmap / unregister /
-    ///    free the packed input surface, the raw-plane buffer, every cached dmabuf import (with
-    ///    the NVENC registration a direct import holds), and every pinned
-    ///    host. The raw-plane buffer and dmabuf imports are re-created lazily by their encode paths;
-    ///    pinned hosts are dropped because the source shm segments are recreated on resize and may
-    ///    reuse the same base addresses.
+    ///    free the packed input surface, every cached dmabuf import (with the NVENC registration a
+    ///    direct import holds), and every pinned host. The dmabuf imports are re-created lazily by
+    ///    the encode path; pinned hosts are dropped because the source shm segments are recreated
+    ///    on resize and may reuse the same base addresses.
     /// 3. **Reconfigure the session**: update the level for the new size, the CBR bitrate + VBV or
     ///    the ConstQP, and the new dimensions / DAR / frame rate, then `NvEncReconfigureEncoder` with
     ///    `resetEncoder` and `forceIDR` so the stream restarts cleanly at the new size. Driver
@@ -1382,14 +1498,15 @@ impl NvencEncoder {
     pub fn reconfigure_resolution(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         let new_w = settings.width as u32;
         let new_h = settings.height as u32;
-        let is_444 =
-            unsafe { self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3 };
         let is_cbr = self.encode_config.rcParams.rateControlMode
             == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
         if settings.encode_node_index.max(0) != self.node_index {
             return Err("encode device changed".into());
         }
-        if settings.video_fullcolor != is_444 {
+        if settings.codec != self.codec {
+            return Err("codec changed".into());
+        }
+        if (settings.video_fullcolor && self.codec.fullcolor()) != self.fullcolor {
             return Err("chroma format changed".into());
         }
         if settings.video_cbr_mode != is_cbr {
@@ -1426,19 +1543,6 @@ impl NvencEncoder {
                 (self.cuda.cuMemFree_v2)(self.input_device_ptr);
                 self.input_device_ptr = 0;
             }
-            if let Some(mapped) = self.nv12_mapped_buffer.take() {
-                (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(self.encoder_session, mapped);
-            }
-            if let Some(registered) = self.nv12_registered_resource.take() {
-                (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
-                    self.encoder_session,
-                    registered,
-                );
-            }
-            if let Some(ptr) = self.nv12_device_ptr.take() {
-                (self.cuda.cuMemFree_v2)(ptr);
-            }
-            self.nv12_pitch = 0;
             let imports: Vec<CachedDmaBuf> = self.dmabuf_cache.drain().map(|(_, c)| c).collect();
             for cache in imports {
                 self.release_dmabuf_import(cache);
@@ -1449,8 +1553,7 @@ impl NvencEncoder {
                 }
             }
 
-            self.encode_config.encodeCodecConfig.h264Config.level =
-                nvenc_h264_level(new_w, new_h, settings.target_fps as u32);
+            self.set_level(new_w, new_h, settings.target_fps as u32);
             if is_cbr {
                 let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
                 self.encode_config.rcParams.averageBitRate = bps;
@@ -1462,7 +1565,7 @@ impl NvencEncoder {
                     settings.video_vbv_multiplier,
                 );
             } else {
-                let qp = settings.video_crf as u32;
+                let qp = self.codec.quantizer(settings.video_crf);
                 self.encode_config.rcParams.constQP.qpInterP = qp;
                 self.encode_config.rcParams.constQP.qpInterB = qp;
                 self.encode_config.rcParams.constQP.qpIntra = qp;
@@ -1652,20 +1755,22 @@ impl NvencEncoder {
         Ok(())
     }
 
-    /// Reconfigure the live session's ConstQP when `target_qp` differs from the current QP,
-    /// returning whether a reconfigure actually happened.
+    /// Reconfigure the live session's ConstQP when the quantizer the session quality index
+    /// `crf` selects differs from the current one, returning whether a reconfigure actually
+    /// happened.
     ///
     /// A no-op in CBR mode (bitrate-controlled, so QP-based paint-over does not apply) and when the
     /// QP is unchanged. When it does apply, the three `constQP` fields are updated and the session is
     /// reconfigured **without** a forced IDR: a lower-QP P-frame refines the static image against the
     /// existing reference chain (paint-over) with no intra-frame bitrate spike, so the GOP continues
     /// seamlessly across the reconfigure.
-    unsafe fn reconfigure_if_needed(&mut self, target_qp: u32) -> bool {
+    unsafe fn reconfigure_if_needed(&mut self, crf: u32) -> bool {
         if self.encode_config.rcParams.rateControlMode
             == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
         {
             return false;
         }
+        let target_qp = self.codec.quantizer(crf as i32);
         if self.current_qp != target_qp {
             self.encode_config.rcParams.constQP.qpInterP = target_qp;
             self.encode_config.rcParams.constQP.qpInterB = target_qp;
@@ -1724,11 +1829,7 @@ impl NvencEncoder {
             if self.init_params.frameRateNum != fps {
                 self.init_params.frameRateNum = fps;
                 self.init_params.frameRateDen = 1;
-                self.encode_config.encodeCodecConfig.h264Config.level = nvenc_h264_level(
-                    self.init_params.encodeWidth,
-                    self.init_params.encodeHeight,
-                    fps,
-                );
+                self.set_level(self.init_params.encodeWidth, self.init_params.encodeHeight, fps);
                 changed = true;
             }
             if !changed {
@@ -1757,10 +1858,9 @@ impl NvencEncoder {
     ///    length) and submit the picture with `nvEncEncodePicture`; `force_idr` sets the force-IDR
     ///    pic flag.
     /// 2. **Lock the bitstream** (`nvEncLockBitstream`, blocking) to read the encoded bytes.
-    /// 3. **Frame the output**: unless `omit_stripe_headers` is set, prepend the 10-byte wire header
-    ///    — a `0x04` tag, a picture-type byte derived from the *actual* encoded `pictureType`
-    ///    (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than the `force_idr` request, the low 16 bits
-    ///    of the frame number, a zero field, and the width and height (all big-endian).
+    /// 3. **Frame the output**: unless `omit_stripe_headers` is set, prepend the wire header with
+    ///    the frame kind derived from the *actual* encoded `pictureType` (IDR = key, I = intra,
+    ///    else delta) rather than the `force_idr` request.
     /// 4. **Emit**: append the encoded bytes, unlock the bitstream, and return the framed buffer.
     unsafe fn submit_frame(
         &mut self,
@@ -1808,21 +1908,24 @@ impl NvencEncoder {
 
         let data_ptr = lock_params.bitstreamBufferPtr as *const u8;
         let data_size = lock_params.bitstreamSizeInBytes as usize;
-        let header_sz = if self.omit_stripe_headers { 0 } else { 10 };
+        let header_sz = if self.omit_stripe_headers { 0 } else { VIDEO_HEADER_LEN };
         let mut output = Vec::with_capacity(header_sz + data_size);
 
         if !self.omit_stripe_headers {
-            let type_hdr = match lock_params.pictureType {
-                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR => 0x01u8,
-                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => 0x02u8,
-                _ => 0x00u8,
+            let frame_type = match lock_params.pictureType {
+                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR => FRAME_KEY,
+                NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => FRAME_INTRA,
+                _ => FRAME_DELTA,
             };
-            output.push(0x04);
-            output.push(type_hdr);
-            output.extend_from_slice(&(frame_number as u16).to_be_bytes());
-            output.extend_from_slice(&0u16.to_be_bytes());
-            output.extend_from_slice(&(self.width as u16).to_be_bytes());
-            output.extend_from_slice(&(self.height as u16).to_be_bytes());
+            push_video_header(
+                &mut output,
+                self.codec,
+                frame_type,
+                frame_number as u16,
+                0,
+                self.width as u16,
+                self.height as u16,
+            );
         }
 
         if data_size > 0 && !data_ptr.is_null() {
@@ -1863,11 +1966,11 @@ impl NvencEncoder {
         &mut self,
         dmabuf: &Dmabuf,
         frame_number: u64,
-        target_qp: u32,
+        crf: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         unsafe {
-            self.reconfigure_if_needed(target_qp);
+            self.reconfigure_if_needed(crf);
             let fd = dmabuf.handles().next().ok_or("No handles")?.as_raw_fd();
             let fmt = dmabuf.format();
             let modifier: u64 = fmt.modifier.into();
@@ -2107,10 +2210,10 @@ impl NvencEncoder {
         argb: &[u8],
         src_stride: usize,
         frame_number: u64,
-        target_qp: u32,
+        crf: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
-        self.encode_cpu_packed(argb, src_stride, false, frame_number, target_qp, force_idr)
+        self.encode_cpu_packed(argb, src_stride, false, frame_number, crf, force_idr)
     }
 
     /// Encode a host packed-pixel frame by uploading it straight into the packed input surface,
@@ -2143,11 +2246,11 @@ impl NvencEncoder {
         src_stride: usize,
         rgba_input: bool,
         frame_number: u64,
-        target_qp: u32,
+        crf: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         unsafe {
-            self.reconfigure_if_needed(target_qp);
+            self.reconfigure_if_needed(crf);
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
 
             let width_bytes = (self.width * 4) as usize;
@@ -2204,227 +2307,6 @@ impl NvencEncoder {
             result
         }
     }
-
-    /// Encode a raw planar frame — NV12 (4:2:0) or YUV444 — uploaded host→device.
-    ///
-    /// The planar-input counterpart to `encode_cpu_argb`, used when the caller has already produced
-    /// YUV. The chroma format follows the session's `chromaFormatIDC` (3 ⇒ YUV444, else NV12). Flow
-    /// under the pushed CUDA context after any pending QP change:
-    ///
-    /// 1. **Pin the source once** (unless disabled at init): the caller reuses one planar buffer
-    ///    across frames, so page-locking its base via `pin_host_source` turns each upload into a
-    ///    direct pinned DMA instead of a pageable copy through a bounce buffer.
-    /// 2. **Lazily allocate** the planar device buffer on first use: a pitched allocation tall enough
-    ///    for three full planes (YUV444) or Y plus half-height interleaved UV (NV12), registered and
-    ///    mapped with the matching buffer format.
-    /// 3. **Upload each plane** with its own `cuMemcpy2D`. Every copy is bounds-checked against the
-    ///    host slice: the Y plane is required in full (a short buffer errors), and each chroma plane
-    ///    is copied only if its **entire** span — not merely its start offset — is present, so a
-    ///    truncated buffer never reads past its end.
-    /// 4. **Submit** the mapped planar input via `submit_frame`.
-    pub fn encode_raw(
-        &mut self,
-        raw_data: &[u8],
-        frame_number: u64,
-        target_qp: u32,
-        force_idr: bool,
-    ) -> Result<Vec<u8>, String> {
-        unsafe {
-            self.reconfigure_if_needed(target_qp);
-            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
-
-            if self.pin_uploads {
-                self.pin_host_source(raw_data.as_ptr() as usize, raw_data.len());
-            }
-
-            let is_444 = self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3;
-
-            if self.nv12_device_ptr.is_none() {
-                let mut d_ptr: CUdeviceptr = 0;
-                let mut pitch: usize = 0;
-
-                let alloc_height = if is_444 {
-                    self.height * 3
-                } else {
-                    self.height + (self.height / 2)
-                };
-
-                let res = (self.cuda.cuMemAllocPitch_v2)(
-                    &mut d_ptr,
-                    &mut pitch,
-                    self.width as usize,
-                    alloc_height as usize,
-                    16,
-                );
-                if res != CUresult::CUDA_SUCCESS {
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("Failed to allocate GPU buffer for raw input".into());
-                }
-
-                let buffer_fmt = if is_444 {
-                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
-                } else {
-                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
-                };
-
-                let mut reg_res = NV_ENC_REGISTER_RESOURCE {
-                    version: sv(NvStruct::RegisterResource),
-                    resourceType:
-                        NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-                    width: self.width,
-                    height: self.height,
-                    resourceToRegister: d_ptr as *mut c_void,
-                    pitch: pitch as u32,
-                    bufferFormat: buffer_fmt,
-                    bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
-                    ..Default::default()
-                };
-
-                let register_fn = self.nvenc_funcs.nvEncRegisterResource.unwrap();
-                if register_fn(self.encoder_session, &mut reg_res) != NVENCSTATUS::NV_ENC_SUCCESS {
-                    (self.cuda.cuMemFree_v2)(d_ptr);
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("Failed to register raw input buffer".into());
-                }
-
-                let mut map_params = NV_ENC_MAP_INPUT_RESOURCE {
-                    version: sv(NvStruct::MapInputResource),
-                    registeredResource: reg_res.registeredResource,
-                    ..Default::default()
-                };
-                let map_fn = self.nvenc_funcs.nvEncMapInputResource.unwrap();
-                if map_fn(self.encoder_session, &mut map_params) != NVENCSTATUS::NV_ENC_SUCCESS {
-                    (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
-                        self.encoder_session,
-                        reg_res.registeredResource,
-                    );
-                    (self.cuda.cuMemFree_v2)(d_ptr);
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("Failed to map raw input buffer".into());
-                }
-
-                self.nv12_device_ptr = Some(d_ptr);
-                self.nv12_pitch = pitch;
-                self.nv12_registered_resource = Some(reg_res.registeredResource);
-                self.nv12_mapped_buffer = Some(map_params.mappedResource);
-            }
-
-            let dev_ptr = self.nv12_device_ptr.unwrap();
-            let dev_pitch = self.nv12_pitch;
-            let width_bytes = self.width as usize;
-            let height = self.height as usize;
-
-            if is_444 {
-                let plane_size = width_bytes * height;
-                if raw_data.len() < plane_size {
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("raw frame smaller than the Y plane (444)".into());
-                }
-
-                let copy_y = CUDA_MEMCPY2D {
-                    srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                    srcHost: raw_data.as_ptr() as *const c_void,
-                    srcPitch: width_bytes,
-                    dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                    dstDevice: dev_ptr,
-                    dstPitch: dev_pitch,
-                    WidthInBytes: width_bytes,
-                    Height: height,
-                    ..Default::default()
-                };
-                if (self.cuda.cuMemcpy2D_v2)(&copy_y) != CUresult::CUDA_SUCCESS {
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("Failed to copy Y plane (444)".into());
-                }
-
-                if raw_data.len() >= 2 * plane_size {
-                    let copy_u = CUDA_MEMCPY2D {
-                        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                        srcHost: raw_data[plane_size..].as_ptr() as *const c_void,
-                        srcPitch: width_bytes,
-                        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                        dstDevice: dev_ptr + (dev_pitch * height) as u64,
-                        dstPitch: dev_pitch,
-                        WidthInBytes: width_bytes,
-                        Height: height,
-                        ..Default::default()
-                    };
-                    if (self.cuda.cuMemcpy2D_v2)(&copy_u) != CUresult::CUDA_SUCCESS {
-                        (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                        return Err("Failed to copy U plane (444)".into());
-                    }
-                }
-
-                if raw_data.len() >= 3 * plane_size {
-                    let copy_v = CUDA_MEMCPY2D {
-                        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                        srcHost: raw_data[2 * plane_size..].as_ptr() as *const c_void,
-                        srcPitch: width_bytes,
-                        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                        dstDevice: dev_ptr + (dev_pitch * height * 2) as u64,
-                        dstPitch: dev_pitch,
-                        WidthInBytes: width_bytes,
-                        Height: height,
-                        ..Default::default()
-                    };
-                    if (self.cuda.cuMemcpy2D_v2)(&copy_v) != CUresult::CUDA_SUCCESS {
-                        (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                        return Err("Failed to copy V plane (444)".into());
-                    }
-                }
-            } else {
-                let y_size = width_bytes * height;
-                if raw_data.len() < y_size {
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("raw frame smaller than the Y plane".into());
-                }
-                let copy_y = CUDA_MEMCPY2D {
-                    srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                    srcHost: raw_data.as_ptr() as *const c_void,
-                    srcPitch: width_bytes,
-                    dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                    dstDevice: dev_ptr,
-                    dstPitch: dev_pitch,
-                    WidthInBytes: width_bytes,
-                    Height: height,
-                    ..Default::default()
-                };
-                if (self.cuda.cuMemcpy2D_v2)(&copy_y) != CUresult::CUDA_SUCCESS {
-                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                    return Err("Failed to copy Y plane".into());
-                }
-
-                let uv_offset = y_size;
-                if raw_data.len() >= uv_offset + width_bytes * (height / 2) {
-                    let copy_uv = CUDA_MEMCPY2D {
-                        srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
-                        srcHost: raw_data[uv_offset..].as_ptr() as *const c_void,
-                        srcPitch: width_bytes,
-                        dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
-                        dstDevice: dev_ptr + (dev_pitch * height) as u64,
-                        dstPitch: dev_pitch,
-                        WidthInBytes: width_bytes,
-                        Height: height / 2,
-                        ..Default::default()
-                    };
-                    if (self.cuda.cuMemcpy2D_v2)(&copy_uv) != CUresult::CUDA_SUCCESS {
-                        (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-                        return Err("Failed to copy UV plane".into());
-                    }
-                }
-            }
-
-            let raw_format = if self.encode_config.encodeCodecConfig.h264Config.chromaFormatIDC == 3 {
-                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444
-            } else {
-                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12
-            };
-            let result =
-                self.submit_frame(self.nv12_mapped_buffer.unwrap(), raw_format, frame_number, force_idr);
-            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
-            result
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2436,7 +2318,7 @@ mod gpu_tests {
         RustCaptureSettings {
             width: w,
             height: h,
-            output_mode: 1,
+            codec: Codec::H264,
             target_fps: fps,
             video_crf: 25,
             ..Default::default()
@@ -2499,14 +2381,14 @@ mod gpu_tests {
             .encode_cpu_argb(&f1080, 1920 * 4, 5, 25, false)
             .expect("encode 1080p");
         assert_eq!(pkt[0], 0x04);
-        assert_eq!(pkt[1], 0x01, "first frame after a resize must be an IDR");
+        assert_eq!(pkt[1] & 0x0f, FRAME_KEY, "first frame after a resize must be an IDR");
         assert_eq!(wire_dims(&pkt), (1920, 1080));
         stream.extend_from_slice(&pkt[10..]);
         for i in 6..10u64 {
             let pkt = enc
                 .encode_cpu_argb(&f1080, 1920 * 4, i, 25, false)
                 .expect("encode 1080p");
-            assert_eq!(pkt[1], 0x00, "steady frames after the IDR are P frames");
+            assert_eq!(pkt[1] & 0x0f, FRAME_DELTA, "steady frames after the IDR are P frames");
             stream.extend_from_slice(&pkt[10..]);
         }
 
@@ -2519,7 +2401,7 @@ mod gpu_tests {
         let pkt = enc
             .encode_cpu_argb(&f480, 640 * 4, 10, 25, false)
             .expect("encode 480p");
-        assert_eq!(pkt[1], 0x01);
+        assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (640, 480));
         stream.extend_from_slice(&pkt[10..]);
 
@@ -2548,6 +2430,64 @@ mod gpu_tests {
         }
     }
 
+    /// On a real GPU: every codec the device lists an engine for comes up, frames it
+    /// emits carry the codec's wire id and a kind the bitstream agrees with, decode back
+    /// to the painted picture, and a key frame forced mid-stream starts a fresh decoder on
+    /// its own; a codec the device lacks (AV1 before Ada) is refused with a message naming
+    /// it. HEVC 4:4:4 is taken where the device carries it, AV1 never quietly. Ignored by
+    /// default.
+    #[test]
+    #[ignore]
+    fn gpu_codec_sessions_encode_and_decode() {
+        use crate::encoders::codec::{av1_is_key, h264_frame_type, h265_frame_type, parse_video_type, FRAME_DELTA, FRAME_KEY};
+        use crate::webcam::decode::{AvDecoder, Decoder};
+        let (w, h) = (1280usize, 720usize);
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            let mut enc = match NvencEncoder::new(&s, ptr::null()) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    assert!(e.contains("engine"), "a missing codec must be refused as such: {e}");
+                    continue;
+                }
+            };
+            assert_eq!(enc.codec(), codec);
+            let mut dec = AvDecoder::new(codec).expect("decoder");
+            for i in 0..6u64 {
+                let src = frame(w, h, 10 + i as u8);
+                let pkt = enc.encode_cpu_argb(&src, w * 4, i, 25, i == 0).expect("encode");
+                let (wire_codec, kind) = parse_video_type(pkt[1]).expect("video type byte");
+                assert_eq!(wire_codec, codec);
+                assert_eq!(kind, if i == 0 { FRAME_KEY } else { FRAME_DELTA }, "{codec:?} frame {i}");
+                let payload = &pkt[10..];
+                let read = match codec {
+                    Codec::H264 => h264_frame_type(payload),
+                    Codec::H265 => h265_frame_type(payload),
+                    _ => if av1_is_key(payload) { FRAME_KEY } else { FRAME_DELTA },
+                };
+                assert_eq!(read, kind, "{codec:?} frame {i}: the bitstream disagrees with pictureType");
+                assert!(dec.decode(payload).expect("decode"), "{codec:?} frame {i} decoded nothing");
+                let f = dec.frame().unwrap();
+                assert_eq!((f.width, f.height), (w, h));
+            }
+            let key = enc.encode_cpu_argb(&frame(w, h, 99), w * 4, 6, 25, true).expect("forced key");
+            assert_eq!(parse_video_type(key[1]), Some((codec, FRAME_KEY)));
+            let mut fresh = AvDecoder::new(codec).expect("decoder");
+            assert!(fresh.decode(&key[10..]).expect("decode"), "{codec:?}: a forced key frame must decode alone");
+
+            let mut full = s.clone();
+            full.video_fullcolor = true;
+            let enc = NvencEncoder::new(&full, ptr::null()).expect("4:4:4 request");
+            if codec.fullcolor() {
+                println!("{codec:?} 4:4:4: {}", enc.is_fullcolor());
+            } else {
+                assert!(!enc.is_fullcolor(), "{codec:?} never carries 4:4:4");
+            }
+        }
+    }
+
     /// On a real GPU, a CBR session resized 720p→1080p folds the new bitrate into the resize
     /// reconfigure (asserts `averageBitRate` updated to 8 Mbit/s) and the first post-resize frame is
     /// an IDR at the new dimensions. Ignored by default.
@@ -2572,7 +2512,7 @@ mod gpu_tests {
         let pkt = enc
             .encode_cpu_argb(&f1080, 1920 * 4, 3, 25, false)
             .expect("encode 1080p");
-        assert_eq!(pkt[1], 0x01);
+        assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (1920, 1080));
     }
 
@@ -2936,36 +2876,17 @@ mod gpu_tests {
     }
 
     /// On a real GPU: per-frame wall and CPU cost of the readback→NVENC hand-over, 1080p host
-    /// frames: the CPU NV12 conversion plus planar upload the readback path used to run, against
-    /// the packed upload with the hardware CSC (BGRA and RGBA), and that same packed upload as a
-    /// synchronous copy. Prints all; ignored by default.
+    /// frames: the packed upload with the hardware CSC (BGRA and RGBA), and that same packed
+    /// upload as a synchronous copy. Prints all; ignored by default.
     #[test]
     #[ignore]
     fn gpu_bench_readback_upload() {
-        use yuv::{BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix};
         let (w, h) = (1920u32, 1080u32);
         let n: usize = std::env::var("NVENC_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
         let s = settings(w as i32, h as i32, 60.0);
         let frames: Vec<Vec<u8>> = (0..4u8).map(|k| frame(w as usize, h as usize, 10 + 40 * k)).collect();
         let stride = (w * 4) as usize;
         let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
-
-        let mut nv12 = vec![0u8; (w * h * 3 / 2) as usize];
-        enc.encode_raw(&nv12, 0, 25, true).expect("warm-up");
-        per_frame("CPU NV12 conversion + encode_raw (former readback path)", n, |i| {
-            let (y, uv) = nv12.split_at_mut((w * h) as usize);
-            let mut planar = YuvBiPlanarImageMut {
-                y_plane: BufferStoreMut::Borrowed(y),
-                y_stride: w,
-                uv_plane: BufferStoreMut::Borrowed(uv),
-                uv_stride: w,
-                width: w,
-                height: h,
-            };
-            yuv::bgra_to_yuv_nv12(&mut planar, &frames[i % 4], w * 4, YuvRange::Limited, YuvStandardMatrix::Bt601, YuvConversionMode::Fast)
-                .expect("csc");
-            enc.encode_raw(&nv12, 1 + i as u64, 25, false).expect("encode_raw");
-        });
 
         enc.reconfigure_resolution(&s).expect("reconfigure");
         enc.encode_cpu_packed(&frames[0], stride, false, 0, 25, true).expect("warm-up");
