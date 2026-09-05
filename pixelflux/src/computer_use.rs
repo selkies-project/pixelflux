@@ -6,7 +6,8 @@
 
 //! HTTP server implementing the [Anthropic Computer Use](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo) specification.
 //!
-//! Enabled by setting the `PIXELFLUX_CU` environment variable to the listen port. The server
+//! Enabled by setting the `PIXELFLUX_CU` environment variable to a port, served on the loopback
+//! addresses only, or to `host:port`, the address to serve on. The server
 //! handles `POST /computer-use` requests for screenshots, mouse/keyboard injection, scrolling,
 //! and cursor position queries. Actions run against a [`CuBackend`], resolved per request: the
 //! Wayland compositor owned by this process when one is registered, otherwise the X server named
@@ -16,6 +17,7 @@
 //! and `/record_status`, so a headless script can drive a session and record it over plain HTTP.
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -849,32 +851,66 @@ pub fn spawn_cu_from_env() {
     }
 }
 
-/// Start the CU server on `bind`: a bare port listens on all interfaces (the
-/// container-deployment default), `host:port` scopes it. Guarded so that exactly
-/// one server binds per process no matter how many call sites (module import,
-/// Wayland compositor init, the selkies setting) race to spawn it; backend
-/// selection stays per-request, so a server bound at import serves a compositor
-/// that only starts later.
+/// Start the CU server on `bind`: a bare port listens on the loopback addresses
+/// only, `host:port` names the address to listen on (`0.0.0.0:port` accepts every
+/// interface). Guarded so that exactly one server binds per process no matter how
+/// many call sites (module import, Wayland compositor init, the selkies setting)
+/// race to spawn it; backend selection stays per-request, so a server bound at
+/// import serves a compositor that only starts later.
 pub fn start_cu_server(bind: &str) {
-    let addr = if bind.contains(':') {
-        bind.to_string()
-    } else {
-        match bind.parse::<u16>() {
-            Ok(port) => format!("0.0.0.0:{port}"),
-            Err(_) => {
-                println!("[ComputerUse] Invalid bind '{bind}' - expected a port or host:port");
-                return;
-            }
+    static SPAWNED: OnceLock<()> = OnceLock::new();
+    if SPAWNED.get().is_some() {
+        return;
+    }
+    let listeners = match cu_listeners(bind) {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            println!("[ComputerUse] Not started: {e}");
+            return;
         }
     };
-    static SPAWNED: OnceLock<()> = OnceLock::new();
-    let mut first = false;
-    SPAWNED.get_or_init(|| {
-        first = true;
-    });
-    if first {
-        thread::spawn(move || run_cu_server(addr));
+    if SPAWNED.set(()).is_err() {
+        return;
     }
+    for listener in listeners {
+        thread::spawn(move || run_cu_server(listener));
+    }
+}
+
+/// Bound listeners for a CU bind: both loopback addresses for a bare port, every
+/// address the host resolves to for `host:port`. An address the host lacks (the
+/// IPv6 loopback with IPv6 disabled) is skipped while another binds; any other
+/// failure, or nothing binding at all, is an error.
+fn cu_listeners(bind: &str) -> Result<Vec<TcpListener>, String> {
+    let addrs: Vec<SocketAddr> = match bind.parse::<u16>() {
+        Ok(port) => vec![
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+        ],
+        Err(_) if bind.contains(':') => bind
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve '{bind}': {e}"))?
+            .collect(),
+        Err(_) => return Err(format!("invalid bind '{bind}': expected a port or host:port")),
+    };
+    let mut listeners = Vec::new();
+    let mut skipped = Vec::new();
+    for addr in addrs {
+        match TcpListener::bind(addr) {
+            Ok(listener) => listeners.push(listener),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)) => {
+                skipped.push(format!("{addr} ({e})"));
+            }
+            Err(e) => return Err(format!("cannot bind {addr}: {e}")),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(format!("no address of '{bind}' is available: {}", skipped.join(", ")));
+    }
+    for note in skipped {
+        println!("[ComputerUse] Not listening on {note}");
+    }
+    Ok(listeners)
 }
 
 /// Pick the backend for one request: the registered Wayland compositor when present,
@@ -891,22 +927,22 @@ fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
 /// Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
 /// the session much as a human viewer would.
 ///
-/// It runs on its own thread listening on `addr` for POST `/computer-use` JSON actions
+/// It runs on its own thread serving `listener` POST `/computer-use` JSON actions
 /// (screenshot, mouse_move, click, key, scroll, …). The backend and the framebuffer dimensions
 /// are re-resolved on every request rather than cached, because the compositor can start, the
 /// stream can resize, or the X server can restart underneath the agent — a stale size would
 /// misplace every coordinate. On Wayland a screenshot forces a one-frame GPU readback when the
 /// pipeline is in zero-copy mode; on X11 it is a one-shot `GetImage` of the root window.
-pub fn run_cu_server(addr: String) {
-    println!("[ComputerUse] Server listening on {}", addr);
-
-    let server = match tiny_http::Server::http(addr.as_str()) {
+pub fn run_cu_server(listener: TcpListener) {
+    let addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let server = match tiny_http::Server::from_listener(listener, None) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("[ComputerUse] Failed to start server: {}", e);
+            eprintln!("[ComputerUse] Failed to start server on {addr}: {e}");
             return;
         }
     };
+    println!("[ComputerUse] Server listening on {addr}");
 
     let mut last_backend = "";
     for mut request in server.incoming_requests() {
@@ -983,5 +1019,50 @@ pub fn run_cu_server(addr: String) {
                     "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
                 )
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cu_listeners;
+    use std::net::{IpAddr, Ipv4Addr, TcpListener};
+
+    #[test]
+    fn bare_port_binds_loopback_only() {
+        let listeners = cu_listeners("0").expect("loopback binds");
+        assert!(!listeners.is_empty());
+        for listener in &listeners {
+            let addr = listener.local_addr().unwrap();
+            assert!(addr.ip().is_loopback(), "{addr}");
+            assert_ne!(addr.port(), 0);
+        }
+        assert!(listeners
+            .iter()
+            .any(|l| l.local_addr().unwrap().ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn host_port_names_the_address() {
+        let scoped = cu_listeners("127.0.0.1:0").unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].local_addr().unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let open = cu_listeners("0.0.0.0:0").unwrap();
+        assert_eq!(open.len(), 1);
+        assert!(open[0].local_addr().unwrap().ip().is_unspecified());
+    }
+
+    #[test]
+    fn a_taken_port_is_an_error() {
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        assert!(cu_listeners(&port.to_string()).is_err());
+        assert!(cu_listeners(&format!("127.0.0.1:{port}")).is_err());
+    }
+
+    #[test]
+    fn malformed_binds_are_errors() {
+        assert!(cu_listeners("abc").is_err());
+        assert!(cu_listeners("70000").is_err());
+        assert!(cu_listeners("").is_err());
     }
 }
