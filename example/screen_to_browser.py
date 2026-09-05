@@ -40,7 +40,7 @@ WS_PORT = 9000
 # WebSockets are not subject to CORS, so any page a browser visits could otherwise
 # open this socket and receive the screen. Only the page this server itself hands
 # out may; None keeps non-browser clients, which send no Origin, working.
-ALLOWED_ORIGINS = [f"http://localhost:{HTTP_PORT}", f"http://127.0.0.1:{HTTP_PORT}", None]
+ALLOWED_ORIGINS = [f"http://localhost:{HTTP_PORT}", f"http://127.0.0.1:{HTTP_PORT}", f"http://[::1]:{HTTP_PORT}", None]
 
 # Send-side bounds, mirroring selkies' per-client video relay: the queue holds
 # at most ~2 seconds of stream at 60 fps; keyframe requests triggered by
