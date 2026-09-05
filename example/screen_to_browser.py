@@ -377,10 +377,8 @@ async def websocket_handler(websocket):
         ACTIVE_CLIENTS.pop(websocket, None)
         print(f"Cleanup complete for client {client_id}. Active clients: {len(ACTIVE_CLIENTS)}")
 
-def _read_file(path):
-    """Read a static file; run off the loop, so a slow read cannot stall the stream."""
-    with open(path, 'rb') as handle:
-        return handle.read()
+# The static root, resolved once: the directory this script lives in.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _resolve_static_path(script_dir, request_path):
@@ -396,6 +394,23 @@ def _resolve_static_path(script_dir, request_path):
     if requested != root and not requested.startswith(root + os.sep):
         return None
     return requested
+
+
+def _serve_static(script_dir, request_path):
+    """Resolve request_path under script_dir and read what it names, as
+    (status, body, path): 403 when it escapes, 404 when no file is there, 200 with
+    the bytes otherwise. Every filesystem call a request needs is here, so the
+    handler makes one hop off the loop for all of them and no slow resolve or read
+    can stall the stream.
+    """
+    full_path = _resolve_static_path(script_dir, request_path)
+    if full_path is None:
+        return 403, None, None
+    if not os.path.isfile(full_path):
+        return 404, None, None
+    with open(full_path, 'rb') as handle:
+        return 200, handle.read(), full_path
+
 
 async def handle_http_request(reader, writer):
     """Handle HTTP requests by serving static files from the script directory."""
@@ -417,22 +432,17 @@ async def handle_http_request(reader, writer):
         if path == '/':
             path = '/index.html'
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        full_path = _resolve_static_path(script_dir, path)
-
-        # Security check: reject directory traversal / escapes outside script_dir.
-        if full_path is None:
+        status, content, full_path = await asyncio.to_thread(_serve_static, SCRIPT_DIR, path)
+        if status == 403:
+            # Directory traversal, or an escape outside SCRIPT_DIR.
             writer.write(b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
-            return
-
-        if os.path.isfile(full_path):
-            content = await asyncio.to_thread(_read_file, full_path)
+        elif status == 404:
+            writer.write(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+        else:
             content_type = mimetypes.guess_type(full_path)[0] or 'application/octet-stream'
             headers = f'HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {len(content)}\r\nConnection: close\r\n\r\n'
             writer.write(headers.encode())
             writer.write(content)
-        else:
-            writer.write(b'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
 
     except Exception as e:
         print(f"[HTTP Error] {e}")
