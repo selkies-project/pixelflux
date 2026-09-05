@@ -154,8 +154,7 @@ use smithay::{
 };
 
 use crate::encoders::overlay::OverlayState;
-use crate::encoders::vaapi::VaapiEncoder;
-use crate::nvenc::NvencEncoder;
+use crate::encoders::FrameEncoder;
 use crate::{RustCaptureSettings, StripeState};
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -207,16 +206,6 @@ pub fn wayland_utime() -> u64 {
     (ts.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add((ts.tv_nsec as u64) / 1_000)
 }
 
-/// The one hardware H.264 encoder session backing a capture. Only a single GPU backend is
-/// ever live for a given capture, and VA-API and NVENC expose entirely different session types, so
-/// this enum is what lets the render and delivery code pass around "the hardware encoder" without
-/// caring which vendor path actually produced the frames.
-#[allow(clippy::large_enum_variant)]
-pub enum GpuEncoder {
-    Vaapi(VaapiEncoder),
-    Nvenc(NvencEncoder),
-}
-
 /// One capture pipeline bound to one output (display id): its settings, encoder set,
 /// frame pools, delivery thread, and per-stream bookkeeping. Exactly one capture may run per
 /// output; all fields mirror the pipeline strategy documented on [`AppState`], instantiated
@@ -229,7 +218,7 @@ pub struct WlCapture {
     pub callback: Option<Arc<Py<PyAny>>>,
     /// Zero-copy GPU session (GLES render + same-GPU dmabuf encode), calloop-affine;
     /// `None` whenever a readback path is active for this display.
-    pub video_encoder: Option<GpuEncoder>,
+    pub video_encoder: Option<FrameEncoder>,
     pub vaapi_state: StripeState,
     pub recording_sink: Option<Arc<crate::recording_sink::RecordingSink>>,
     pub deliver_tx: Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
@@ -240,7 +229,7 @@ pub struct WlCapture {
     pub pending_hw_delivery: Option<Vec<crate::encoders::software::EncodedStripe>>,
     pub pending_hw_damage: bool,
     pub encode_pool: Option<Arc<crate::WlFramePool>>,
-    pub encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    pub encode_join: Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
     pub encode_controls: Arc<crate::WlEncodeControls>,
     pub encode_stats: Arc<crate::WlEncodeStats>,
     pub pool_last_render: Vec<u64>,
@@ -606,7 +595,7 @@ pub struct AppState {
     /// Encode threads whose teardown-time harvest expired (wedged behind a
     /// consumer inside Python); reaped like the deliver threads, with the
     /// unclaimed encoder dropped here on the event loop — its usual home.
-    pub encode_reaper: Vec<std::thread::JoinHandle<Option<crate::GpuEncoder>>>,
+    pub encode_reaper: Vec<std::thread::JoinHandle<Option<crate::FrameEncoder>>>,
 }
 
 /// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or

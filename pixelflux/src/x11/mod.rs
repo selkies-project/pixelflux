@@ -238,8 +238,8 @@ fn clamp_offset(x: i32, root: u16) -> i16 {
 /// width/height `<= 0`) the capture tracks the full root minus the offset, otherwise the
 /// requested size is clamped to what is available from it. Saturating subtraction plus a final
 /// `u16` clamp (minimum 2) keep pathological settings from overflowing or collapsing to an
-/// unusable surface. H.264 (`output_mode == 1`) requires even dimensions, so both are then
-/// rounded down to a multiple of two.
+/// unusable surface. Video codecs require even dimensions, so both are then rounded down to
+/// a multiple of two.
 fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16) {
     let cap_x = clamp_offset(s.capture_x, root_w) as i32;
     let cap_y = clamp_offset(s.capture_y, root_h) as i32;
@@ -257,7 +257,7 @@ fn resolve_dims(root_w: u16, root_h: u16, s: &RustCaptureSettings) -> (u16, u16)
     };
     w = w.clamp(2, u16::MAX as i32);
     h = h.clamp(2, u16::MAX as i32);
-    if s.output_mode == 1 {
+    if s.codec.is_video() {
         w &= !1;
         h &= !1;
     }
@@ -635,10 +635,10 @@ where
     F: FnMut(Vec<EncodedStripe>),
 {
     let mut psettings = settings.clone();
-    let recording_sink = RecordingSink::try_bind(&settings.recording_socket);
+    let recording_sink = RecordingSink::try_bind(&settings.recording_socket, settings.target_fps);
     if recording_sink.is_some() {
-        if settings.output_mode == 0 {
-            eprintln!("[recording_sink] recording_socket set but output_mode is JPEG; no recordable H.264 stream.");
+        if !settings.codec.is_video() {
+            eprintln!("[recording_sink] recording_socket set but the codec is JPEG; no recordable video stream.");
         } else if settings.use_cpu && !settings.video_fullframe {
             eprintln!("[recording_sink] recording_socket set but the CPU encoder is striped; set video_fullframe=true for a recordable stream.");
         }
@@ -672,16 +672,14 @@ where
                         "[x11] Stream settings active -> Res: {}x{} | FPS: {:.1} | Encoder: {}",
                         psettings.width, psettings.height, psettings.target_fps, pl.encoder_name()
                     );
-                    if psettings.output_mode == 1 && pl.encoder_name() == "CPU" {
-                        log_msg.push_str(&format!(" ({})", crate::encoders::SOFTWARE_H264_ENCODER));
-                    }
-                    if psettings.output_mode == 0 {
+                    if !pl.codec().is_video() {
                         log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", psettings.jpeg_quality));
                     } else {
+                        let mode = pl.codec().display();
                         if psettings.video_cbr_mode {
-                            log_msg.push_str(&format!(" | Mode: H264 CBR {}", psettings.video_bitrate_kbps));
+                            log_msg.push_str(&format!(" | Mode: {mode} CBR {}", psettings.video_bitrate_kbps));
                         } else {
-                            log_msg.push_str(&format!(" | Mode: H264 | CRF: {}", psettings.video_crf));
+                            log_msg.push_str(&format!(" | Mode: {mode} | CRF: {}", psettings.video_crf));
                             if psettings.video_bitrate_kbps > 0 {
                                 log_msg.push_str(&format!(" | VBV: {} kbps", psettings.video_bitrate_kbps));
                             }
@@ -730,7 +728,7 @@ where
             stripe_count += stripes.len() as u64;
             // IDR arming is consumed inside X11Pipeline::process; this tap only fans out.
             if let Some(ref socket) = recording_sink {
-                socket.write_frame(&stripes, psettings.height);
+                socket.write_frame(&stripes, psettings.width, psettings.height);
             }
             on_frame(stripes);
         }
@@ -1308,7 +1306,7 @@ mod cursor_tests {
             capture_y: 100000,
             width: 1920,
             height: 1080,
-            output_mode: 1,
+            codec: crate::encoders::Codec::H264,
             ..Default::default()
         };
         let (w, h) = resolve_dims(1920, 1080, &s);

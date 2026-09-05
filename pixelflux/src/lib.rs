@@ -60,9 +60,6 @@ use std::time::{Duration, Instant};
 use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as GbmFormat};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
-use yuv::{
-    BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
-};
 
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::viewporter::ViewporterState;
@@ -136,211 +133,8 @@ use smithay::{
     wayland::selection::primary_selection::PrimarySelectionState,
 };
 
-pub mod encoders {
-    /// NVIDIA NVENC hardware H.264 encoder loaded via runtime `libcuda` / `libnvidia-encode`.
-    pub mod nvenc;
-    /// Cisco OpenH264 software H.264 encoder (BSD-licensed): the software encoder of a build
-    /// without `gpl`, and always built for the test suite.
-    #[cfg(any(feature = "openh264", test))]
-    pub mod oh264;
-    /// PNG watermark overlay composited onto frames before encoding.
-    pub mod overlay;
-    /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
-    /// change detection.
-    pub mod software;
-    /// VA-API hardware H.264 encoder for Intel / AMD GPUs via FFmpeg.
-    pub mod vaapi;
-
-    #[cfg(not(any(feature = "gpl", feature = "openh264")))]
-    compile_error!(
-        "pixelflux needs a software H.264 encoder: enable the `gpl` feature (libx264, the default) or `openh264`."
-    );
-
-    /// The software H.264 encoder this build resolved to, fixed by the crate features: `"x264"`
-    /// whenever `gpl` is on (libx264 wins even if `openh264` is also enabled), `"openh264"` for
-    /// a GPL-free build. It is what the striped software path and the full-frame software fallback
-    /// under NVENC/VA-API both encode with; exposed to Python as `pixelflux.SOFTWARE_H264_ENCODER`.
-    #[cfg(feature = "gpl")]
-    pub const SOFTWARE_H264_ENCODER: &str = "x264";
-    #[cfg(not(feature = "gpl"))]
-    pub const SOFTWARE_H264_ENCODER: &str = "openh264";
-
-    /// Whether the build's software H.264 encoder carries a 4:4:4 (`video_fullcolor`) request:
-    /// libx264 does (High 4:4:4, full range); OpenH264 is 4:2:0-only and encodes such a request
-    /// 4:2:0. Every "is this software stream 4:4:4" decision reads it from here.
-    pub const SOFTWARE_H264_FULLCOLOR: bool = cfg!(feature = "gpl");
-
-    /// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
-    /// quality drop under sustained motion) must be requested before a fixed-QP encoder commits
-    /// it. Moving the quantizer costs a codec re-open (VA-API CQP) or a full encoder rebuild
-    /// (OpenH264), and either forces an IDR, so acting on every transient increase — and then
-    /// reversing it as motion settles — would make the picture pulse. Quality *increases* (a
-    /// lower QP, e.g. a paint-over refresh) apply at once and never wait. Shared so the two
-    /// fixed-QP encoders cannot disagree about how long a drop must persist.
-    pub(crate) const QP_HYSTERESIS_LIMIT: u32 = 60;
-
-    /// Lowest H.264 level whose Annex-A Table A-1 limits admit a `width` x `height` stream at
-    /// `fps`, as level_idc (41 = 4.1, 52 = 5.2, 62 = 6.2).
-    ///
-    /// A frame is charged two ways: **MaxFS**, its size in macroblocks, and **MaxMBPS**, that
-    /// size times the frame rate. Advertising the lowest fitting level asks the least of a
-    /// decoder, so clients that gate hardware decode on the level accept the widest range of
-    /// streams. One shared ladder keeps two encoders from disagreeing on the same geometry;
-    /// it starts at 4.1 and a caller needing more raises the floor itself. Above 6.2's limits
-    /// there is no higher level, so it returns 62 as a best effort.
-    pub(crate) fn min_h264_level(width: u32, height: u32, fps: u32) -> u32 {
-        let mbs = (width as u64).div_ceil(16) * (height as u64).div_ceil(16);
-        let mbps = mbs * fps.max(1) as u64;
-        const LEVELS: [(u32, u64, u64); 8] = [
-            (41, 8192, 245760),
-            (42, 8704, 522240),
-            (50, 22080, 589824),
-            (51, 36864, 983040),
-            (52, 36864, 2073600),
-            (60, 139264, 4177920),
-            (61, 139264, 8355840),
-            (62, 139264, 16711680),
-        ];
-        for &(level, max_fs, max_mbps) in &LEVELS {
-            if mbs <= max_fs && mbps <= max_mbps {
-                return level;
-            }
-        }
-        62
-    }
-
-    /// Size the CBR VBV/HRD buffer so rate control has enough slack to hold quality steady
-    /// without letting end-to-end latency drift upward.
-    ///
-    /// The size is expressed as a multiple of one frame's bit budget (`bitrate_bps / fps`) rather
-    /// than a fixed byte count so a live bitrate or framerate change rescales the buffer with it,
-    /// preserving the same latency behavior at every operating point.
-    ///
-    /// # Arguments
-    ///
-    /// * `bitrate_bps` - Target bitrate in bits per second.
-    /// * `fps` - Target frames per second.
-    /// * `keyframe_interval_s` - Seconds between scheduled keyframes; `<= 0` for infinite GOP.
-    /// * `multiplier` - Explicit buffer multiplier; `<= 0` selects the policy default (1.5 on
-    ///   infinite GOP, 3 when keyframe interval is active).
-    ///
-    /// # Returns
-    ///
-    /// VBV buffer size in bits, clamped to `[1, u32::MAX]`.
-    pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier: f64) -> u32 {
-        let frame_bits = bitrate_bps as f64 / fps.max(1.0);
-        let mult = if multiplier > 0.0 {
-            multiplier
-        } else if keyframe_interval_s > 0.0 {
-            3.0
-        } else {
-            1.5
-        };
-        (frame_bits * mult).round().max(1.0).min(u32::MAX as f64) as u32
-    }
-
-    /// Wire type byte for one encoded H.264 access unit, read from the bitstream
-    /// itself: IDR = `0x01`, intra-only non-IDR = `0x02`, predicted = `0x00`. The
-    /// stripe header labels real decode entry points, so the NAL and slice types the
-    /// encoder actually produced decide, never what was requested of it. An access
-    /// unit whose slices cannot be parsed is labeled predicted: a false delta costs
-    /// one skipped entry point, a false key breaks the decoder.
-    pub fn annexb_frame_type(au: &[u8]) -> u8 {
-        let mut intra = false;
-        let mut i = 0usize;
-        while i + 3 < au.len() {
-            if !(au[i] == 0 && au[i + 1] == 0) {
-                i += 1;
-                continue;
-            }
-            let start = if au[i + 2] == 1 {
-                i + 3
-            } else if au[i + 2] == 0 && i + 4 < au.len() && au[i + 3] == 1 {
-                i + 4
-            } else {
-                i += 1;
-                continue;
-            };
-            if start >= au.len() {
-                break;
-            }
-            match au[start] & 0x1f {
-                5 => return 0x01,
-                1 => match slice_is_intra(&au[start + 1..]) {
-                    Some(true) => intra = true,
-                    Some(false) => return 0x00,
-                    None => return 0x00,
-                },
-                _ => {}
-            }
-            i = start;
-        }
-        if intra { 0x02 } else { 0x00 }
-    }
-
-    /// Whether a non-IDR slice header opens an I/SI slice. Reads
-    /// `first_mb_in_slice` and `slice_type` (both ue(v)) from the start of the
-    /// slice RBSP, undoing emulation-prevention bytes; None when the header is
-    /// truncated or malformed.
-    fn slice_is_intra(payload: &[u8]) -> Option<bool> {
-        let mut rbsp = [0u8; 12];
-        let mut n = 0usize;
-        let mut zeros = 0usize;
-        for &b in payload {
-            if n == rbsp.len() {
-                break;
-            }
-            if zeros >= 2 && b == 3 {
-                zeros = 0;
-                continue;
-            }
-            zeros = if b == 0 { zeros + 1 } else { 0 };
-            rbsp[n] = b;
-            n += 1;
-        }
-        let mut pos = 0usize;
-        let bit = |p: &mut usize| -> Option<u8> {
-            if *p / 8 >= n {
-                return None;
-            }
-            let b = (rbsp[*p / 8] >> (7 - *p % 8)) & 1;
-            *p += 1;
-            Some(b)
-        };
-        let ue = |p: &mut usize| -> Option<u32> {
-            let mut leading = 0u32;
-            while bit(p)? == 0 {
-                leading += 1;
-                if leading > 24 {
-                    return None;
-                }
-            }
-            let mut val = 0u32;
-            for _ in 0..leading {
-                val = (val << 1) | bit(p)? as u32;
-            }
-            Some((1u32 << leading) - 1 + val)
-        };
-        ue(&mut pos)?;
-        let slice_type = ue(&mut pos)?;
-        if slice_type > 9 {
-            return None;
-        }
-        Some(matches!(slice_type % 5, 2 | 4))
-    }
-
-    /// The `Colorspace:` field of a stream log line, from what the session negotiated rather than
-    /// what was asked for: a hardware encoder can refuse 4:4:4, and only the software encoder
-    /// carries it at full range. Shared so the X11 and Wayland logs describe an identical session
-    /// identically.
-    pub fn colorspace_desc(fullcolor: bool, software: bool) -> &'static str {
-        match (fullcolor, software) {
-            (true, true) => "I444 (Full Range)",
-            (true, false) => "I444 (Limited Range)",
-            _ => "I420 (Limited Range)",
-        }
-    }
-}
+/// Encoder backends and the codec identities, wire framing and rate-control policy they share.
+pub mod encoders;
 
 /// Headless Wayland compositor and cursor rendering.
 pub mod wayland;
@@ -359,9 +153,9 @@ pub mod nvgpufilter;
 
 pub mod webcam;
 
+pub use encoders::avcodec;
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
-pub use encoders::vaapi;
 
 fn get_process_rss_bytes() -> usize {
     if let Ok(contents) = std::fs::read_to_string("/proc/self/statm")
@@ -391,15 +185,14 @@ fn get_shm_usage_bytes() -> u64 {
     shm_usage_in("/dev/shm")
 }
 
-use encoders::nvenc::NvencEncoder;
 use encoders::overlay::OverlayState;
 use encoders::software::MAX_STRIPE_CAPACITY;
-use encoders::vaapi::VaapiEncoder;
+use encoders::{Codec, FrameEncoder, FrameSource};
 
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 
 use wayland::cursor::{Cursor, CursorJob};
-use wayland::frontend::{AppState, ClientState, FocusTarget, GpuEncoder, next_serial, wayland_time, wayland_utime};
+use wayland::frontend::{AppState, ClientState, FocusTarget, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;
@@ -469,7 +262,8 @@ pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
 /// The full set of capture + encode parameters the Python layer hands to the Rust backend.
 ///
 /// A single value configures a capture session end to end: capture geometry and frame rate, the
-/// output mode (striped JPEG/x264 vs full-frame H.264), the H.264 quality and rate-control knobs,
+/// codec (striped JPEG, striped or full-frame H.264, or a full-frame video codec), the video
+/// quality and rate-control knobs,
 /// cursor and watermark options, the encode-device selection, and the optional recording socket.
 /// It derives `PartialEq` so the backend can detect when a live setting actually changed, and
 /// `Clone` so each capture pipeline can own its own copy.
@@ -487,7 +281,7 @@ pub struct RustCaptureSettings {
     pub paint_over_trigger_frames: u32,
     pub damage_block_threshold: u32,
     pub damage_block_duration: u32,
-    pub output_mode: i32,
+    pub codec: Codec,
     pub video_crf: i32,
     pub video_paintover_crf: i32,
     pub video_paintover_burst_frames: i32,
@@ -597,7 +391,7 @@ impl Default for RustCaptureSettings {
             paint_over_trigger_frames: 15,
             damage_block_threshold: 10,
             damage_block_duration: 30,
-            output_mode: 0,
+            codec: Codec::Jpeg,
             video_crf: 25,
             video_paintover_crf: 18,
             video_paintover_burst_frames: 5,
@@ -685,7 +479,14 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
         paint_over_trigger_frames: settings.getattr("paint_over_trigger_frames")?.extract()?,
         damage_block_threshold: settings.getattr("damage_block_threshold")?.extract()?,
         damage_block_duration: settings.getattr("damage_block_duration")?.extract()?,
-        output_mode: settings.getattr("output_mode")?.extract()?,
+        codec: {
+            let name: String = settings.getattr("codec")?.extract()?;
+            Codec::parse(&name).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "unknown codec '{name}': expected jpeg, h264, h265, vp8, vp9 or av1"
+                ))
+            })?
+        },
         video_crf: settings.getattr("video_crf")?.extract()?,
         video_paintover_crf: settings.getattr("video_paintover_crf")?.extract()?,
         video_paintover_burst_frames: settings.getattr("video_paintover_burst_frames")?.extract()?,
@@ -1318,12 +1119,12 @@ struct WlEncodeConfig {
     try_gpu: bool,
     /// HW session handed back by the previous encode thread; reconfigured in place and
     /// reused when still compatible, sparing the stream a session rebuild.
-    prior: Option<GpuEncoder>,
+    prior: Option<FrameEncoder>,
     /// The outgoing encode thread of a capture being restarted, joined here — off the
     /// calloop — before this thread builds anything. Everything the predecessor did
     /// therefore precedes everything this thread does, and its readback hardware session is
     /// inherited rather than rebuilt.
-    predecessor: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    predecessor: Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
     /// Weak, so the calloop's teardown owns the sink's lifetime: a strong handle held here
     /// could outlive the capture and unlink a successor's freshly bound socket path.
     recording_sink: Option<std::sync::Weak<crate::recording_sink::RecordingSink>>,
@@ -1332,83 +1133,25 @@ struct WlEncodeConfig {
     stats: Arc<WlEncodeStats>,
 }
 
-/// Build the readback-mode hardware encoder on the thread that will own and drive it.
-///
-/// The result is a hardware `GpuEncoder` (NVENC or VAAPI) consuming host NV12/YUV444 via
-/// `encode_raw`, or `None` for the software path — striped or full-frame JPEG/H.264 through the
-/// build's software encoder (`SOFTWARE_H264_ENCODER`), where `encode_cpu` builds its own per-stripe
-/// state. Selection follows the settings and the effective encode device — an auto index below
-/// zero resolves to device 0: NVENC on an NVIDIA driver, VAAPI on any other GPU, except a 4:4:4
-/// full-color request which VAAPI cannot do reliably and so falls through to the CPU. When a
-/// compatible NVENC session is handed over from the previous encode thread it is reconfigured in
-/// place (milliseconds) rather than rebuilt, which would stall the stream. The EGL display is
-/// always null here: readback mode never imports dmabufs.
+/// Build the readback-mode frame encoder on the thread that will own and drive it: the shared
+/// ladder with host frames (`rgba` for a GLES readback, BGRA otherwise), with the GPU rungs
+/// skipped when `try_gpu` is off (the recovery ladder's demotion). `None` is the striped
+/// software path, where `encode_cpu` builds its own per-stripe state. A compatible NVENC
+/// session handed over from the previous encode thread is reconfigured in place rather than
+/// rebuilt, which would stall the stream.
 fn build_readback_encoders(
-    settings: &RustCaptureSettings,
+    settings: &mut RustCaptureSettings,
     try_gpu: bool,
-    prior: Option<GpuEncoder>,
-) -> Option<GpuEncoder> {
+    rgba: bool,
+    prior: Option<FrameEncoder>,
+) -> Option<FrameEncoder> {
+    let mut attempt = settings.clone();
     if !try_gpu {
-        return None;
+        attempt.use_cpu = true;
     }
-    let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
-    println!(
-        "[Wayland] Encode Node Index: {} | Driver: {}",
-        settings.encode_node_index.max(0), encode_driver
-    );
-    if driver_selects_nvenc(&encode_driver) {
-        if let Some(GpuEncoder::Nvenc(mut enc)) = prior {
-            match enc.reconfigure_resolution(settings) {
-                Ok(()) => {
-                    println!("[Wayland] NVENC session reconfigured in place.");
-                    return Some(GpuEncoder::Nvenc(enc));
-                }
-                Err(e) => eprintln!(
-                    "[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding."
-                ),
-            }
-        }
-        println!("[Wayland] Nvidia Encoder detected. Initializing NVENC...");
-        match NvencEncoder::new(settings, std::ptr::null()) {
-            Ok(e) => {
-                println!("[Wayland] NVENC Encoder initialized successfully.");
-                return Some(GpuEncoder::Nvenc(e));
-            }
-            Err(e) => eprintln!(
-                "[Wayland] Failed to init NVENC: {}. Falling back to CPU ({}).",
-                e,
-                encoders::SOFTWARE_H264_ENCODER
-            ),
-        }
-    } else {
-        println!("[Wayland] Initializing Unified VAAPI Encoder...");
-        match VaapiEncoder::new(settings) {
-            Ok(e) => {
-                println!(
-                    "[Wayland] VAAPI Encoder initialized successfully ({}).",
-                    if e.is_fullcolor() { "4:4:4" } else { "4:2:0" }
-                );
-                return Some(GpuEncoder::Vaapi(e));
-            }
-            Err(e) => eprintln!(
-                "[Wayland] Failed to init VAAPI: {}. Falling back to CPU ({}).",
-                e,
-                encoders::SOFTWARE_H264_ENCODER
-            ),
-        }
-    }
-    None
-}
-
-/// Planar CSC target for a readback VA-API session: YUV444 needs three full planes, NV12 one
-/// plus a half-height interleaved chroma plane. Empty when no such session consumes it — NVENC
-/// takes the packed readback rows and converts in hardware.
-fn hw_plane_buffer(width: i32, height: i32, fullcolor: bool, planar: bool) -> Vec<u8> {
-    if !planar {
-        return Vec::new();
-    }
-    let n = (width * height) as usize;
-    vec![0u8; if fullcolor { n * 3 } else { n * 3 / 2 }]
+    let encoder = encoders::select_frame_encoder(&mut attempt, FrameSource::Host { rgba }, prior, "Wayland");
+    settings.codec = attempt.codec;
+    encoder
 }
 
 /// Encode-thread body for the Wayland readback paths: drain published frames and run the
@@ -1440,12 +1183,12 @@ fn hw_plane_buffer(width: i32, height: i32, fullcolor: bool, planar: bool) -> Ve
 ///
 /// On exit the hardware session is handed back to the calloop so a restart can reuse it in place
 /// when the new settings stay compatible (a plain `StopCapture` just drops it).
-fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEncoder> {
+fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameEncoder> {
     crate::boost_thread_priority(-10);
     let mut settings = cfg.settings;
     let inherited = cfg.predecessor.and_then(|h| h.join().ok().flatten());
     let mut video_encoder =
-        build_readback_encoders(&settings, cfg.try_gpu, cfg.prior.or(inherited));
+        build_readback_encoders(&mut settings, cfg.try_gpu, cfg.use_gpu, cfg.prior.or(inherited));
     if cfg.try_gpu && video_encoder.is_none() {
         println!(
             "[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding ({}).",
@@ -1463,16 +1206,6 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     // Smoothed number of stripes carrying the encode budget (see stripe_rate_control).
     let mut stripes_carrying: f32 = 1.0;
     let mut hw_state = StripeState::default();
-    // The CSC target follows the session's own chroma, not the request: a VA-API device that
-    // refused 4:4:4 encodes 4:2:0, and sizing this from the request would hand it a buffer laid
-    // out for planes it does not read.
-    let mut hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
-    let mut nv12_buffer: Vec<u8> = hw_plane_buffer(
-        width,
-        height,
-        hw_fullcolor,
-        matches!(video_encoder, Some(GpuEncoder::Vaapi(_))),
-    );
     // Mid-stream recovery state for the readback hardware session, mirroring the zero-copy tick.
     let mut hw_error_streak: u32 = 0;
     let mut hw_rebuilt = false;
@@ -1490,18 +1223,14 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             if fps > 0.0 {
                 settings.target_fps = fps;
             }
-            match video_encoder.as_mut() {
-                Some(GpuEncoder::Nvenc(enc)) => enc.reconfigure_rate(&settings),
-                Some(GpuEncoder::Vaapi(enc)) => {
-                    if let Err(e) = enc.reconfigure_rate(&settings) {
-                        // The failed re-open left no codec context: the next encode fails,
-                        // and a full streak makes that failure run the recovery ladder at
-                        // once instead of after a window of dead frames.
-                        eprintln!("[wl-encode] VAAPI rate reconfigure failed: {e}");
-                        hw_error_streak = HW_ERROR_RECOVERY_THRESHOLD - 1;
-                    }
-                }
-                None => {}
+            if let Some(enc) = video_encoder.as_mut()
+                && let Err(e) = enc.reconfigure_rate(&settings)
+            {
+                // The failed re-open left no codec context: the next encode fails, and a
+                // full streak makes that failure run the recovery ladder at once instead
+                // of after a window of dead frames.
+                eprintln!("[wl-encode] rate reconfigure failed: {e}");
+                hw_error_streak = HW_ERROR_RECOVERY_THRESHOLD - 1;
             }
         }
 
@@ -1524,81 +1253,19 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             );
             if decision.send {
                 let w = width as u32;
-                let h = height as u32;
                 let force_idr = decision.force_idr;
-                let outcome = match encoder {
-                    // NVENC takes the readback rows as they are — BGRA from the pixman
-                    // framebuffer, RGBA from a GLES readback — through a pinned upload and
-                    // its hardware CSC, the same hand-over the X11 capture uses, so no
-                    // colour conversion runs on this thread.
-                    GpuEncoder::Nvenc(enc) => enc.encode_cpu_packed(
-                        &f.buf,
-                        (w * 4) as usize,
-                        cfg.use_gpu,
-                        f.frame_id as u64,
-                        decision.target_qp,
-                        force_idr,
-                    ),
-                    GpuEncoder::Vaapi(enc) => {
-                        // VA-API's raw entry point takes planar YUV, converted here with the
-                        // matrix and range its session declares: BT.709, limited (the range
-                        // its own convert targets as well). A failed conversion leaves the
-                        // planes holding the previous frame, so the encode is skipped rather
-                        // than submitting stale content, and the failure feeds the same
-                        // recovery ladder as an encode failure: both leave the session
-                        // delivering nothing, and only the rebuild or the demote below can get
-                        // the stream moving again.
-                        let matrix = YuvStandardMatrix::Bt709;
-                        let range = YuvRange::Limited;
-                        let y_size = (w * h) as usize;
-                        let csc = if hw_fullcolor {
-                            let (y_plane, rest) = nv12_buffer.split_at_mut(y_size);
-                            let (u_plane, v_plane) = rest.split_at_mut(y_size);
-                            let mut planar_image = yuv::YuvPlanarImageMut {
-                                y_plane: BufferStoreMut::Borrowed(y_plane),
-                                y_stride: w,
-                                u_plane: BufferStoreMut::Borrowed(u_plane),
-                                u_stride: w,
-                                v_plane: BufferStoreMut::Borrowed(v_plane),
-                                v_stride: w,
-                                width: w,
-                                height: h,
-                            };
-                            if cfg.use_gpu {
-                                yuv::rgba_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                            } else {
-                                yuv::bgra_to_yuv444(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                            }
-                        } else {
-                            let (y_plane, uv_plane) = nv12_buffer.split_at_mut(y_size);
-                            let mut planar_image = YuvBiPlanarImageMut {
-                                y_plane: BufferStoreMut::Borrowed(y_plane),
-                                y_stride: w,
-                                uv_plane: BufferStoreMut::Borrowed(uv_plane),
-                                uv_stride: w,
-                                width: w,
-                                height: h,
-                            };
-                            if cfg.use_gpu {
-                                yuv::rgba_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                            } else {
-                                yuv::bgra_to_yuv_nv12(&mut planar_image, &f.buf, w * 4, range, matrix, YuvConversionMode::Fast)
-                            }
-                        };
-                        match csc {
-                            Err(e) => Err(format!(
-                                "{} CSC failed: {e:?}",
-                                if hw_fullcolor { "YUV444" } else { "NV12" }
-                            )),
-                            Ok(()) => enc.encode_raw(
-                                &nv12_buffer,
-                                f.frame_id as u64,
-                                decision.target_qp,
-                                force_idr,
-                            ),
-                        }
-                    }
-                };
+                // The readback rows go to the encoder as they are — BGRA from the pixman
+                // framebuffer or a host frame, RGBA from a GLES readback: a hardware session
+                // converts on the GPU and a software one on its own threads, so no colour
+                // conversion runs here.
+                let outcome = encoder.encode_host(
+                    &f.buf,
+                    (w * 4) as usize,
+                    cfg.use_gpu,
+                    f.frame_id as u64,
+                    decision.target_qp,
+                    force_idr,
+                );
                 match outcome {
                     Ok(data) => {
                         hw_error_streak = 0;
@@ -1606,7 +1273,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                         if !data.is_empty() {
                             out.push(EncodedStripe {
                                 data: Arc::new(data),
-                                data_type: 2,
+                                codec: settings.codec,
                                 stripe_y_start: 0,
                                 stripe_height: height,
                                 frame_id: f.frame_id as i32,
@@ -1640,15 +1307,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                             // the failure it recovers from is usually device memory pressure,
                             // and holding both at once is what would make the rebuild fail too.
                             drop(video_encoder.take());
-                            video_encoder = build_readback_encoders(&settings, try_gpu, None);
+                            video_encoder =
+                                build_readback_encoders(&mut settings, try_gpu, cfg.use_gpu, None);
                             hw_rebuilt = try_gpu && video_encoder.is_some();
-                            hw_fullcolor = encoder_fullcolor(video_encoder.as_ref(), &settings);
-                            nv12_buffer = hw_plane_buffer(
-                                width,
-                                height,
-                                hw_fullcolor,
-                                matches!(video_encoder, Some(GpuEncoder::Vaapi(_))),
-                            );
                             cfg.controls.force_idr.store(true, Ordering::Relaxed);
                             let n = wayland_stripe_count(&settings, video_encoder.is_some());
                             cfg.stats.n_stripes.store(n as u32, Ordering::Relaxed);
@@ -1665,7 +1326,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                 damage.push(Rectangle::new((0, 0).into(), (width, height).into()));
             }
             let force_idr_all = requested_idr
-                || (settings.output_mode == 1
+                || (settings.codec.is_video()
                     && crate::pipeline::periodic_idr_due(&settings, f.frame_id));
             out = encoders::software::encode_cpu(
                 &mut stripes,
@@ -1693,7 +1354,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
             cfg.stats.frames.fetch_add(1, Ordering::Relaxed);
             cfg.stats.stripes.fetch_add(out.len() as u32, Ordering::Relaxed);
             if let Some(ref socket) = recording_sink {
-                socket.write_frame(&out, settings.height);
+                socket.write_frame(&out, settings.width, settings.height);
             }
             crate::recorder::wayland_tap(cfg.display_id, &out);
             let _ = cfg.deliver_tx.send(out);
@@ -1709,46 +1370,42 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
     video_encoder
 }
 
-/// The chroma format a session actually carries, which is not always the one requested: NVENC
-/// takes 4:4:4 whenever asked, VA-API only when the driver and FFmpeg build both carry it, and the
-/// software path (`None`) only when the build's software encoder does (`SOFTWARE_H264_FULLCOLOR`:
-/// libx264 yes, OpenH264 no). Every consumer of "is this stream 4:4:4" — the readback buffer
-/// sizing, the CSC branch, and both log lines — reads it from here so they cannot disagree.
-fn encoder_fullcolor(video_encoder: Option<&GpuEncoder>, settings: &RustCaptureSettings) -> bool {
-    match video_encoder {
-        Some(GpuEncoder::Vaapi(enc)) => enc.is_fullcolor(),
-        Some(GpuEncoder::Nvenc(_)) => settings.video_fullcolor,
-        None => settings.video_fullcolor && encoders::SOFTWARE_H264_FULLCOLOR,
-    }
-}
-
 /// Compose the encoder half of the 1 s debug log line (backend, colorspace, frame mode) for
 /// whichever thread owns the encoders.
 fn encoder_desc(
     settings: &RustCaptureSettings,
-    video_encoder: Option<&GpuEncoder>,
+    video_encoder: Option<&FrameEncoder>,
     zero_copy: bool,
 ) -> String {
-    if settings.output_mode == 0 {
+    if !settings.codec.is_video() {
         return format!("JPEG Q:{}", settings.jpeg_quality);
     }
     let copy_mode = if zero_copy { "ZeroCopy" } else { "Readback" };
     let backend = match video_encoder {
-        Some(GpuEncoder::Nvenc(_)) => format!("NVENC ({})", copy_mode),
-        Some(GpuEncoder::Vaapi(_)) => format!("VAAPI ({})", copy_mode),
+        Some(enc) if enc.is_hardware() => format!("{} ({})", enc.backend_name(), copy_mode),
+        Some(enc) => format!("CPU {}", enc.backend_name()),
         None => format!("CPU {}", encoders::SOFTWARE_H264_ENCODER),
     };
-    let is_444 = encoder_fullcolor(video_encoder, settings);
+    let is_444 = encoders::session_fullcolor(video_encoder, settings);
     let cs_str = if is_444 { "CS_IN:I444" } else { "CS_IN:I420" };
-    // Only the software encoder carries 4:4:4 at full range; NVENC's hardware CSC is
+    // Only a software encoder carries 4:4:4 at full range; the hardware CSCs are
     // limited-range whatever the chroma format.
-    let range_str = if is_444 && video_encoder.is_none() { "FR" } else { "LR" };
+    let software = video_encoder.is_none_or(|enc| !enc.is_hardware());
+    let range_str = if is_444 && software { "FR" } else { "LR" };
     let frame_str = if video_encoder.is_some() || settings.video_fullframe {
         "FF"
     } else {
         "Striped"
     };
-    format!("H264 ({}) {} {} {} CRF:{}", backend, cs_str, range_str, frame_str, settings.video_crf)
+    format!(
+        "{} ({}) {} {} {} CRF:{}",
+        settings.codec.display(),
+        backend,
+        cs_str,
+        range_str,
+        frame_str,
+        settings.video_crf
+    )
 }
 
 /// How many horizontal stripes a frame is split into, for the settings line and the stats.
@@ -1759,7 +1416,7 @@ fn encoder_desc(
 fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool) -> usize {
     crate::encoders::software::stripe_count(
         settings.height,
-        settings.output_mode,
+        settings.codec,
         fullframe_encoder || settings.video_fullframe,
     )
 }
@@ -1769,14 +1426,14 @@ fn wayland_stripe_count(settings: &RustCaptureSettings, fullframe_encoder: bool)
 fn log_stream_settings(
     settings: &RustCaptureSettings,
     n_stripes: usize,
-    video_encoder: Option<&GpuEncoder>,
+    video_encoder: Option<&FrameEncoder>,
 ) {
     let mut log_msg = format!(
         "Stream settings active -> Res: {}x{} | FPS: {:.1} | Stripes: {}",
         settings.width, settings.height, settings.target_fps, n_stripes
     );
 
-    if settings.output_mode == 0 {
+    if !settings.codec.is_video() {
         log_msg.push_str(&format!(" | Mode: JPEG | Quality: {}", settings.jpeg_quality));
         if settings.use_paint_over_quality {
             log_msg.push_str(&format!(
@@ -1786,11 +1443,10 @@ fn log_stream_settings(
         }
     } else {
         let encoder_type = match video_encoder {
-            Some(GpuEncoder::Nvenc(_)) => "NVENC",
-            Some(GpuEncoder::Vaapi(_)) => "VAAPI",
+            Some(enc) => enc.backend_name(),
             None => encoders::SOFTWARE_H264_ENCODER,
         };
-        log_msg.push_str(&format!(" | Mode: H264 ({})", encoder_type));
+        log_msg.push_str(&format!(" | Mode: {} ({})", settings.codec.display(), encoder_type));
 
         if video_encoder.is_some() || settings.video_fullframe {
             log_msg.push_str(" FullFrame");
@@ -1818,10 +1474,10 @@ fn log_stream_settings(
             ));
         }
 
-        let is_actually_444 = encoder_fullcolor(video_encoder, settings);
+        let is_actually_444 = encoders::session_fullcolor(video_encoder, settings);
         log_msg.push_str(&format!(
             " | Colorspace: {}",
-            encoders::colorspace_desc(is_actually_444, video_encoder.is_none())
+            encoders::colorspace_desc(is_actually_444, video_encoder.is_none_or(|e| !e.is_hardware()))
         ));
     }
 
@@ -1845,7 +1501,7 @@ fn teardown_capture(
     cap: &mut wayland::frontend::WlCapture,
 ) -> (
     Option<std::thread::JoinHandle<()>>,
-    Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
 ) {
     if let Some(p) = cap.encode_pool.take() {
         p.shutdown();
@@ -2010,9 +1666,9 @@ fn reconcile_host_layouts(state: &mut AppState) {
             if let Some((cb, mut settings)) = restart {
                 settings.width = rw;
                 settings.height = rh;
-                // H.264 even-masks its dimensions, so an odd host mode is followed as closely
-                // as the encoder can; asking again would only loop.
-                let followed = if settings.output_mode == 1 { (rw & !1, rh & !1) } else { (rw, rh) };
+                // Video codecs even-mask their dimensions, so an odd host mode is followed as
+                // closely as the encoder can; asking again would only loop.
+                let followed = if settings.codec.is_video() { (rw & !1, rh & !1) } else { (rw, rh) };
                 if followed != (w, h) {
                     eprintln!(
                         "[HostCapture] host kept {rw}x{rh} for display {id} ({w}x{h} declined); capturing at that size."
@@ -2050,8 +1706,8 @@ fn bootstrap_readback_pool(
     display_id: u32,
     use_gpu: bool,
     try_gpu: bool,
-    prior: Option<GpuEncoder>,
-    predecessor: Option<std::thread::JoinHandle<Option<GpuEncoder>>>,
+    prior: Option<FrameEncoder>,
+    predecessor: Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
 ) {
     let Some(deliver_tx) = cap.deliver_tx.clone() else {
         return;
@@ -2103,21 +1759,14 @@ fn bootstrap_readback_pool(
 fn rebuild_zerocopy_encoder(
     cap: &wayland::frontend::WlCapture,
     state: &mut AppState,
-) -> Option<GpuEncoder> {
-    let settings = &cap.settings;
-    let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
-    if driver_selects_nvenc(&encode_driver) {
-        let egl_display = state
-            .gles_renderer
-            .as_ref()
-            .map(|r| r.egl_context().display().get_display_handle().handle)
-            .unwrap_or(std::ptr::null());
-        NvencEncoder::new(settings, egl_display)
-            .ok()
-            .map(GpuEncoder::Nvenc)
-    } else {
-        VaapiEncoder::new(settings).ok().map(GpuEncoder::Vaapi)
-    }
+) -> Option<FrameEncoder> {
+    let egl_display = state
+        .gles_renderer
+        .as_ref()
+        .map(|r| r.egl_context().display().get_display_handle().handle)
+        .unwrap_or(std::ptr::null());
+    let mut settings = cap.settings.clone();
+    encoders::select_frame_encoder(&mut settings, FrameSource::Dmabuf { egl_display }, None, "Wayland")
 }
 
 /// Consecutive encode failures before a hardware path recovers (~0.5s at 60fps): a hiccup
@@ -2161,15 +1810,15 @@ fn start_capture_on_display(
                 settings.encode_node_index = idx - 128;
             }
 
-    if settings.output_mode == 1 {
+    if settings.codec.is_video() {
         settings.width &= !1;
         settings.height &= !1;
     }
 
     // Tear down this display's previous capture first; its hardware sessions are the
     // reuse candidates below (zero-copy inline, readback via the encode config).
-    let mut prior_zero_copy: Option<GpuEncoder> = None;
-    let mut prior_encode_join: Option<std::thread::JoinHandle<Option<GpuEncoder>>> = None;
+    let mut prior_zero_copy: Option<FrameEncoder> = None;
+    let mut prior_encode_join: Option<std::thread::JoinHandle<Option<FrameEncoder>>> = None;
     let mut prior_deliver_join: Option<std::thread::JoinHandle<()>> = None;
     if let Some(mut old) = node.capture.take() {
         prior_zero_copy = old.video_encoder.take();
@@ -2179,7 +1828,8 @@ fn start_capture_on_display(
     // Bind only after the old capture is gone: its sink unlinks the socket path in
     // Drop, which would strip a fresh bind's filesystem name and leave every later
     // recorder connect with ENOENT.
-    let recording_sink = crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket);
+    let recording_sink =
+        crate::recording_sink::RecordingSink::try_bind(&settings.recording_socket, settings.target_fps);
 
     // Host-capture mode: connect on first use. The display's mode is requested from
     // the host further down, without waiting for an answer; a host that keeps its own
@@ -2404,10 +2054,7 @@ fn start_capture_on_display(
     }
 
     let use_cpu_explicit = settings.use_cpu || settings.encode_node_index == -1;
-    let gpu_intent = settings.output_mode == 1 && !use_cpu_explicit;
-    if use_cpu_explicit {
-        println!("[Wayland] CPU encoding selected (use_cpu=true or encode_node_index=-1).");
-    }
+    let gpu_intent = settings.codec.is_video() && !use_cpu_explicit;
 
     let mut different_gpu = false;
     if gpu_intent {
@@ -2419,78 +2066,27 @@ fn start_capture_on_display(
         }
     }
 
-    let mut video_encoder: Option<GpuEncoder> = None;
+    let mut video_encoder: Option<FrameEncoder> = None;
     if gpu_intent && state.use_gpu && !different_gpu {
-        let encode_driver = get_gpu_driver(settings.encode_node_index.max(0));
-        println!(
-            "[Wayland] Encode Node Index: {} | Driver: {}",
-            settings.encode_node_index.max(0), encode_driver
+        let egl_display = state
+            .gles_renderer
+            .as_ref()
+            .map(|r| r.egl_context().display().get_display_handle().handle)
+            .unwrap_or(std::ptr::null());
+        video_encoder = encoders::select_frame_encoder(
+            &mut settings,
+            FrameSource::Dmabuf { egl_display },
+            prior_zero_copy.take(),
+            "Wayland",
         );
-
-        if driver_selects_nvenc(&encode_driver) {
-            let reused = match prior_zero_copy.as_mut() {
-                Some(GpuEncoder::Nvenc(enc)) => match enc.reconfigure_resolution(&settings) {
-                    Ok(()) => {
-                        println!("[Wayland] NVENC session reconfigured in place.");
-                        true
-                    }
-                    Err(e) => {
-                        eprintln!("[Wayland] NVENC in-place reconfigure unavailable ({e}); rebuilding.");
-                        false
-                    }
-                },
-                _ => false,
-            };
-            if reused {
-                video_encoder = prior_zero_copy.take();
-            } else {
-                prior_zero_copy = None;
-                println!("[Wayland] Nvidia Encoder detected. Initializing NVENC...");
-                let egl_display = if let Some(renderer) = state.gles_renderer.as_ref() {
-                    renderer.egl_context().display().get_display_handle().handle
-                } else {
-                    std::ptr::null()
-                };
-
-                match NvencEncoder::new(&settings, egl_display) {
-                    Ok(encoder) => {
-                        video_encoder = Some(GpuEncoder::Nvenc(encoder));
-                        println!("[Wayland] NVENC Encoder initialized successfully.");
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[Wayland] Failed to init NVENC: {}. Falling back to CPU.",
-                            e
-                        );
-                        set_wayland_capture_err(
-                            display_id,
-                            Some(format!("NVENC init failed ({e}); using CPU encode")),
-                        );
-                    }
-                }
-            }
-        } else {
-            prior_zero_copy = None;
-            println!("[Wayland] Initializing Unified VAAPI Encoder...");
-            match VaapiEncoder::new(&settings) {
-                Ok(encoder) => {
-                    println!(
-                        "[Wayland] VAAPI Encoder initialized successfully ({}).",
-                        if encoder.is_fullcolor() { "4:4:4" } else { "4:2:0" }
-                    );
-                    video_encoder = Some(GpuEncoder::Vaapi(encoder));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[Wayland] Failed to init VAAPI: {}. Falling back to CPU.",
-                        e
-                    );
-                    set_wayland_capture_err(
-                        display_id,
-                        Some(format!("VAAPI init failed ({e}); using CPU encode")),
-                    );
-                }
-            }
+        if video_encoder.is_none() {
+            set_wayland_capture_err(
+                display_id,
+                Some(format!(
+                    "no zero-copy {} encoder on the render node; using readback encode",
+                    settings.codec.display()
+                )),
+            );
         }
     }
     drop(prior_zero_copy);
@@ -2530,11 +2126,11 @@ fn start_capture_on_display(
         );
     }
 
-    if recording_sink.is_some() && settings.output_mode == 0 {
+    if recording_sink.is_some() && !settings.codec.is_video() {
         eprintln!(
-            "[recording_sink] WARNING: recording_socket is set but output_mode is JPEG (0). \
-             The recording socket requires a single H.264 stream. Please set output_mode=1 \
-             on the Python CaptureSettings to produce a recordable output."
+            "[recording_sink] WARNING: recording_socket is set but the codec is JPEG. The \
+             recording socket requires a video stream; set a video codec on the Python \
+             CaptureSettings to produce a recordable output."
         );
     }
 
@@ -2604,7 +2200,7 @@ fn start_capture_on_display(
                         Python::attach(|py| {
                             for s in stripes {
                                 match Py::new(py, StripeFrame::new_owned_meta(
-                                    s.data, s.data_type, s.stripe_y_start,
+                                    s.data, s.codec.data_type(), s.stripe_y_start,
                                     s.stripe_height, s.frame_id,
                                 )) {
                                     Ok(f) => { if let Err(e) = cb.call1(py, (f,)) { e.print(py); } }
@@ -3248,7 +2844,7 @@ fn render_node_tick(
                     );
                     cap.video_encoder = None;
                     let s = &cap.settings;
-                    let try_gpu = s.output_mode == 1
+                    let try_gpu = s.codec.is_video()
                         && !(s.use_cpu || s.encode_node_index == -1);
                     bootstrap_readback_pool(cap, node.id, false, try_gpu, None, None);
                     cap.request_idr();
@@ -3595,7 +3191,7 @@ fn render_node_tick(
                     pool.shutdown();
                 }
                 let s = &cap.settings;
-                let try_gpu = s.output_mode == 1
+                let try_gpu = s.codec.is_video()
                     && !(s.use_cpu || s.encode_node_index == -1);
                 eprintln!("[Wayland] encode thread died; rebuilding the readback path.");
                 // Host frames reach the pool as BGRA; only our own GLES readback produces RGBA.
@@ -3671,21 +3267,11 @@ fn render_node_tick(
                     let enc_dmabuf: Option<Dmabuf> = host_enc_dmabuf
                         .clone()
                         .or_else(|| node.offscreen_buffer.as_ref().map(|(_, d)| d.clone()));
-                    let result = match encoder {
-                        GpuEncoder::Nvenc(enc) => {
-                            if let Some(ref dmabuf) = enc_dmabuf {
-                                enc.encode(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
-                            } else {
-                                Err("NVENC ZeroCopy requires offscreen buffer (GPU context)".to_string())
-                            }
-                        },
-                        GpuEncoder::Vaapi(enc) => {
-                            if let Some(ref dmabuf) = enc_dmabuf {
-                                enc.encode_dmabuf(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
-                            } else {
-                                Err("Vaapi ZeroCopy requires offscreen buffer (GPU context)".to_string())
-                            }
+                    let result = match enc_dmabuf {
+                        Some(ref dmabuf) => {
+                            encoder.encode_dmabuf(dmabuf, cap.frame_counter as u64, target_qp, force_idr)
                         }
+                        None => Err("zero-copy encode requires an offscreen buffer (GPU context)".to_string()),
                     };
 
                     if let Ok(data) = result {
@@ -3697,11 +3283,11 @@ fn render_node_tick(
                             cap.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                             if let Some(ref tx) = cap.deliver_tx {
                                 let stripes = vec![EncodedStripe {
-                                    data: Arc::new(data), data_type: 2, stripe_y_start: 0,
+                                    data: Arc::new(data), codec: cap.settings.codec, stripe_y_start: 0,
                                     stripe_height: height, frame_id: cap.frame_counter as i32,
                                 }];
                                 if let Some(ref socket) = cap.recording_sink {
-                                    socket.write_frame(&stripes, height);
+                                    socket.write_frame(&stripes, width, height);
                                 }
                                 crate::recorder::wayland_tap(node.id, &stripes);
                                 // Non-blocking: a full slot parks the frame (delivered
@@ -3750,7 +3336,7 @@ fn render_node_tick(
                                     // Mirror the startup intent: readback still
                                     // tries the GPU unless the operator opted out.
                                     let s = &cap.settings;
-                                    let try_gpu = s.output_mode == 1
+                                    let try_gpu = s.codec.is_video()
                                         && !(s.use_cpu || s.encode_node_index == -1);
                                     // Host frames reach the pool as BGRA; only our own
                                     // GLES readback produces RGBA.
@@ -5368,15 +4954,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             if let Some(b) = bitrate_kbps { cap.settings.video_bitrate_kbps = b; }
                             if let Some(v) = vbv_multiplier { cap.settings.video_vbv_multiplier = v; }
                             if let Some(f) = fps && f > 0.0 { cap.settings.target_fps = f; }
-                            if let Some(GpuEncoder::Nvenc(enc)) = cap.video_encoder.as_mut() {
-                                enc.reconfigure_rate(&cap.settings);
-                            }
-                            if let Some(GpuEncoder::Vaapi(enc)) = cap.video_encoder.as_mut()
+                            if let Some(enc) = cap.video_encoder.as_mut()
                                 && let Err(e) = enc.reconfigure_rate(&cap.settings) {
                                     // The failed re-open left no codec context: the next
                                     // tick's encode fails, and a full streak makes that
                                     // failure run the recovery ladder at once.
-                                    eprintln!("[Wayland] VAAPI rate reconfigure failed: {e}");
+                                    eprintln!("[Wayland] rate reconfigure failed: {e}");
                                     cap.hw_error_streak = HW_ERROR_RECOVERY_THRESHOLD - 1;
                                 }
                             let c = &cap.encode_controls;
@@ -6222,7 +5805,9 @@ struct CaptureSettings {
     #[pyo3(get, set)] paint_over_trigger_frames: i32,
     #[pyo3(get, set)] damage_block_threshold: i32,
     #[pyo3(get, set)] damage_block_duration: i32,
-    #[pyo3(get, set)] output_mode: i32,
+    /// The codec: "jpeg" (striped stills), "h264" (striped, or full-frame with
+    /// `video_fullframe`), or a full-frame video codec "h265", "vp8", "vp9", "av1".
+    #[pyo3(get, set)] codec: String,
     #[pyo3(get, set)] video_crf: i32,
     #[pyo3(get, set)] video_paintover_crf: i32,
     #[pyo3(get, set)] video_paintover_burst_frames: i32,
@@ -6272,7 +5857,7 @@ impl CaptureSettings {
             capture_width: 1920, capture_height: 1080, scale: 1.0, capture_x: 0, capture_y: 0,
             target_fps: 60.0, jpeg_quality: 85, paint_over_jpeg_quality: 95,
             use_paint_over_quality: false, paint_over_trigger_frames: 10,
-            damage_block_threshold: 15, damage_block_duration: 30, output_mode: 0,
+            damage_block_threshold: 15, damage_block_duration: 30, codec: "jpeg".to_string(),
             video_crf: 25, video_paintover_crf: 18, video_paintover_burst_frames: 5,
             video_fullcolor: false, video_fullframe: false, video_streaming_mode: false,
             capture_cursor: false, watermark_path: py.None(), watermark_location_enum: 0,
@@ -6789,7 +6374,7 @@ impl ScreenCapture {
                             py,
                             StripeFrame::new_owned_meta(
                                 s.data,
-                                s.data_type,
+                                s.codec.data_type(),
                                 s.stripe_y_start,
                                 s.stripe_height,
                                 s.frame_id,
@@ -7606,9 +7191,9 @@ fn start_recording(
     let mut opts = crate::recorder::RecordOptions::from_env(path);
     if let Some(s) = settings {
         let rs = extract_settings(s)?;
-        if rs.output_mode != 1 {
+        if rs.codec != Codec::H264 {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "recording requires H.264 capture settings (output_mode=1); JPEG cannot be recorded",
+                "recording requires H.264 capture settings (codec='h264')",
             ));
         }
         opts.display_id = read_display_id(s);
@@ -7850,7 +7435,13 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<webcam::VirtualCameraSettings>()?;
     // The software H.264 encoder this build resolved to ("x264" | "openh264"): what a CPU
     // H.264 session encodes with, so a consumer can pick rate-control defaults and name it.
-    m.add("SOFTWARE_H264_ENCODER", encoders::SOFTWARE_H264_ENCODER)?;
+    let software = pyo3::types::PyDict::new(m.py());
+    for codec in Codec::VIDEO {
+        if let Some(enc) = encoders::software_encoder(codec) {
+            software.set_item(codec.name(), enc.library)?;
+        }
+    }
+    m.add("SOFTWARE_ENCODERS", software)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;
@@ -7884,7 +7475,7 @@ mod annexb_frame_type_tests {
     //! access units (truncated past the classifier's decision point) whose
     //! ground truth came from libavcodec's own slice-header trace, an open-GOP
     //! stream being the one place non-IDR I frames occur.
-    use crate::encoders::annexb_frame_type;
+    use crate::encoders::h264_frame_type as annexb_frame_type;
 
     const IDR_AU: &[u8] = &[0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xc0, 0xf1, 0x42, 0x99, 0x60, 0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0, 0x00, 0x00, 0x01, 0x06, 0x05, 0xff, 0xff, 0xa8, 0xdc, 0x45, 0xe9, 0xbd, 0xe6, 0xd9, 0x48, 0xb7, 0x96, 0x2c, 0xd8, 0x20, 0xd9, 0x23, 0xee, 0xef, 0x78, 0x32, 0x36, 0x34, 0x20, 0x2d, 0x20, 0x63, 0x6f, 0x72, 0x65, 0x20, 0x31, 0x36, 0x34, 0x20, 0x72, 0x33, 0x30, 0x39, 0x35, 0x20, 0x62, 0x61, 0x65, 0x65, 0x34, 0x30, 0x30, 0x20, 0x2d, 0x20, 0x48, 0x2e, 0x32, 0x36, 0x34, 0x2f, 0x4d, 0x50, 0x45, 0x47, 0x2d, 0x34, 0x20, 0x41, 0x56, 0x43, 0x20, 0x63, 0x6f, 0x64, 0x65, 0x63, 0x20, 0x2d, 0x20, 0x43, 0x6f, 0x70, 0x79, 0x6c, 0x65, 0x66, 0x74, 0x20, 0x32, 0x30, 0x30, 0x33, 0x2d, 0x32, 0x30, 0x32, 0x32, 0x20, 0x2d, 0x20, 0x68, 0x74, 0x74, 0x70, 0x3a, 0x2f, 0x2f, 0x77, 0x77, 0x77, 0x2e, 0x76, 0x69, 0x64, 0x65, 0x6f, 0x6c, 0x61, 0x6e, 0x2e, 0x6f, 0x72, 0x67, 0x2f, 0x78, 0x32, 0x36, 0x34, 0x2e, 0x68, 0x74, 0x6d, 0x6c, 0x20, 0x2d, 0x20, 0x6f, 0x70, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x3a, 0x20, 0x63, 0x61, 0x62, 0x61, 0x63, 0x3d, 0x31, 0x20, 0x72, 0x65, 0x66, 0x3d, 0x33, 0x20, 0x64, 0x65, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x3d, 0x31, 0x3a, 0x30, 0x3a, 0x30, 0x20, 0x61, 0x6e, 0x61, 0x6c, 0x79, 0x73, 0x65, 0x3d, 0x30, 0x78, 0x33, 0x3a, 0x30, 0x78, 0x31, 0x31, 0x33, 0x20, 0x6d, 0x65, 0x3d, 0x68, 0x65, 0x78, 0x20, 0x73, 0x75, 0x62, 0x6d, 0x65, 0x3d, 0x37, 0x20, 0x70, 0x73, 0x79, 0x3d, 0x31, 0x20, 0x70, 0x73, 0x79, 0x5f, 0x72, 0x64, 0x3d, 0x31, 0x2e, 0x30, 0x30, 0x3a, 0x30, 0x2e, 0x30, 0x30, 0x20, 0x6d, 0x69, 0x78, 0x65, 0x64, 0x5f, 0x72, 0x65, 0x66, 0x3d, 0x31, 0x20, 0x6d, 0x65, 0x5f, 0x72, 0x61, 0x6e, 0x67, 0x65, 0x3d, 0x31, 0x36, 0x20, 0x63, 0x68, 0x72, 0x6f, 0x6d, 0x61, 0x5f, 0x6d, 0x65, 0x3d, 0x31, 0x20, 0x74, 0x72, 0x65, 0x6c, 0x6c, 0x69, 0x73, 0x3d, 0x31, 0x20, 0x38, 0x78, 0x38, 0x64, 0x63, 0x74, 0x3d, 0x31, 0x20, 0x63, 0x71, 0x6d, 0x3d, 0x30, 0x20, 0x64, 0x65, 0x61, 0x64, 0x7a, 0x6f, 0x6e, 0x65, 0x3d, 0x32, 0x31, 0x2c, 0x31, 0x31, 0x20, 0x66, 0x61, 0x73, 0x74, 0x5f, 0x70, 0x73, 0x6b, 0x69, 0x70, 0x3d, 0x31, 0x20, 0x63, 0x68, 0x72, 0x6f, 0x6d, 0x61, 0x5f, 0x71, 0x70, 0x5f, 0x6f, 0x66, 0x66, 0x73, 0x65, 0x74, 0x3d, 0x2d, 0x32, 0x20, 0x74, 0x68, 0x72, 0x65, 0x61, 0x64, 0x73, 0x3d, 0x37, 0x20, 0x6c, 0x6f, 0x6f, 0x6b, 0x61, 0x68, 0x65, 0x61, 0x64, 0x5f, 0x74, 0x68, 0x72, 0x65, 0x61, 0x64, 0x73, 0x3d, 0x31, 0x20, 0x73, 0x6c, 0x69, 0x63, 0x65, 0x64, 0x5f, 0x74, 0x68, 0x72, 0x65, 0x61, 0x64, 0x73, 0x3d, 0x30, 0x20, 0x6e, 0x72, 0x3d, 0x30, 0x20, 0x64, 0x65, 0x63, 0x69, 0x6d, 0x61, 0x74, 0x65, 0x3d, 0x31, 0x20, 0x69, 0x6e, 0x74, 0x65, 0x72, 0x6c, 0x61, 0x63, 0x65, 0x64, 0x3d, 0x30, 0x20, 0x62, 0x6c, 0x75, 0x72, 0x61, 0x79, 0x5f, 0x63, 0x6f, 0x6d, 0x70, 0x61, 0x74, 0x3d, 0x30, 0x20, 0x63, 0x6f, 0x6e, 0x73, 0x74, 0x72, 0x61, 0x69, 0x6e, 0x65, 0x64, 0x5f, 0x69, 0x6e, 0x74, 0x72, 0x61, 0x3d, 0x30, 0x20, 0x62, 0x66, 0x72, 0x61, 0x6d, 0x65, 0x73, 0x3d, 0x32, 0x20, 0x62, 0x5f, 0x70, 0x79, 0x72, 0x61, 0x6d, 0x69, 0x64, 0x3d, 0x32, 0x20, 0x62, 0x5f, 0x61, 0x64, 0x61, 0x70, 0x74, 0x3d, 0x31, 0x20, 0x62, 0x5f, 0x62, 0x69, 0x61, 0x73, 0x3d, 0x30, 0x20, 0x64, 0x69, 0x72, 0x65, 0x63, 0x74, 0x3d, 0x31, 0x20, 0x77, 0x65, 0x69, 0x67, 0x68, 0x74, 0x62, 0x3d, 0x31, 0x20, 0x6f, 0x70, 0x65, 0x6e, 0x5f, 0x67, 0x6f, 0x70, 0x3d, 0x31, 0x20, 0x77, 0x65, 0x69, 0x67, 0x68, 0x74, 0x70, 0x3d, 0x32, 0x20, 0x6b, 0x65, 0x79, 0x69, 0x6e, 0x74, 0x3d, 0x31, 0x32, 0x20, 0x6b, 0x65, 0x79, 0x69, 0x6e, 0x74, 0x5f, 0x6d, 0x69, 0x6e, 0x3d, 0x37, 0x20, 0x73, 0x63, 0x65, 0x6e, 0x65, 0x63, 0x75, 0x74, 0x3d, 0x34, 0x30, 0x20, 0x69, 0x6e, 0x74, 0x72, 0x61, 0x5f, 0x72, 0x65, 0x66, 0x72, 0x65, 0x73, 0x68, 0x3d, 0x30, 0x20, 0x72, 0x63, 0x5f, 0x6c, 0x6f, 0x6f, 0x6b, 0x61, 0x68, 0x65, 0x61, 0x64, 0x3d, 0x31, 0x32, 0x20, 0x72, 0x63, 0x3d, 0x63, 0x72, 0x66, 0x20, 0x6d, 0x62, 0x74, 0x72, 0x65, 0x65, 0x3d, 0x31, 0x20, 0x63, 0x72, 0x66, 0x3d, 0x32, 0x33, 0x2e, 0x30, 0x20, 0x71, 0x63, 0x6f, 0x6d, 0x70, 0x3d, 0x30, 0x2e, 0x36, 0x30, 0x20, 0x71, 0x70, 0x6d, 0x69, 0x6e, 0x3d, 0x30, 0x20, 0x71, 0x70, 0x6d, 0x61, 0x78, 0x3d, 0x36, 0x39, 0x20, 0x71, 0x70, 0x73, 0x74, 0x65, 0x70, 0x3d, 0x34, 0x20, 0x69, 0x70, 0x5f, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x3d, 0x31, 0x2e, 0x34, 0x30, 0x20, 0x61, 0x71, 0x3d, 0x31, 0x3a, 0x31, 0x2e, 0x30, 0x30, 0x00, 0x80, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00, 0x47, 0xda, 0xe3, 0x98, 0x5b, 0xd7, 0x57, 0xda, 0x42, 0x3e, 0x83, 0x89, 0x96, 0xcb, 0xc5, 0x1b];
     const INTRA_AU: &[u8] = &[0x00, 0x00, 0x01, 0x09, 0x10, 0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0d, 0xac, 0xd9, 0x41, 0x41, 0xfb, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0xc0, 0xf1, 0x42, 0x99, 0x60, 0x00, 0x00, 0x00, 0x01, 0x68, 0xeb, 0xe3, 0xcb, 0x22, 0xc0, 0x00, 0x00, 0x01, 0x06, 0x06, 0x01, 0xc4, 0x80, 0x00, 0x00, 0x01, 0x41, 0x88, 0xc3, 0x05, 0xff, 0xd4, 0x57, 0x6d, 0x62, 0x78, 0xad, 0x3e, 0x89, 0xb4, 0xb5, 0x2a, 0xde, 0xcb, 0x0c, 0x64];

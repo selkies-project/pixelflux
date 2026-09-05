@@ -9,7 +9,7 @@
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 
-It supports CPU-based encoding (JPEG, and H.264 through x264 or — in a GPL-free build — the BSD-licensed OpenH264) as well as hardware-accelerated H.264 encoding via NVIDIA's NVENC and VA-API for Intel/AMD GPUs. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM). The X11 path copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
+It encodes JPEG, H.264, H.265, VP8, VP9 and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM). The X11 path copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
 
 ## Installation
 
@@ -43,13 +43,13 @@ sudo apt-get install -y \
   libva-dev
 ```
 
-> **Notes:** the FFmpeg bindings (`ffmpeg-sys-next` 8.1) work with any system **FFmpeg 6.0–8.1 built LGPL-only** (only `avcodec`/`avfilter` are used, for `h264_vaapi`; `--enable-gpl` is deliberately never passed to upstream FFmpeg builds); on distros shipping an older FFmpeg, install a newer build and point `PKG_CONFIG_PATH` at it. `libjpeg-turbo` is vendored and built statically by its crate — **no `libturbojpeg` system package is needed** (only `cmake` + `nasm`). X11 capture uses pure-Rust XCB; colorspace conversion is pure-Rust and the NVENC/CUDA libraries are loaded at runtime (no compile-time NVIDIA packages).
+> **Notes:** the FFmpeg bindings (`ffmpeg-sys-next` 9.0) work with any system **FFmpeg 6.0–9.0** (only `avcodec`/`avfilter` are used: the VA-API encoders, and the software HEVC/VP8/VP9/AV1 encoders that FFmpeg build carries — `libx265` or `libkvazaar`, `libvpx`, `libsvtav1`; a codec whose encoder the build lacks has no software path, which `pixelflux.SOFTWARE_ENCODERS` reports); on distros shipping an older FFmpeg, install a newer build and point `PKG_CONFIG_PATH` at it. `libjpeg-turbo` is vendored and built statically by its crate — **no `libturbojpeg` system package is needed** (only `cmake` + `nasm`). X11 capture uses pure-Rust XCB; colorspace conversion is pure-Rust and the NVENC/CUDA libraries are loaded at runtime (no compile-time NVIDIA packages).
 >
-> **GPL component (`libx264`):** software H.264 uses the system `libx264` (GPL-2.0+), which is the only GPL-licensed dependency **of pixelflux itself**. It is enabled **by default**; to build without it, set `PIXELFLUX_ENABLE_GPL=0` (or `=false`) before `pip install`. The build then substitutes the BSD-licensed Cisco OpenH264 (vendored, built from source) as the software H.264 encoder behind the very same API and wire format — striped and full-frame sessions, CRF and CBR, live bitrate/quality changes all keep working, and `libx264-dev` is not required. What you lose is 4:4:4 software H.264: OpenH264 is 4:2:0-only, so `video_fullcolor` is encoded 4:2:0 on the CPU (NVENC still carries it). JPEG, NVENC and VA-API are unaffected. `pixelflux.SOFTWARE_H264_ENCODER` reports `"x264"` or `"openh264"` for the build in use, and a notice is printed at install time whether GPL components are enabled or not.
+> **GPL component (`libx264`):** software H.264 uses the system `libx264` (GPL-2.0+), which is the only GPL-licensed dependency **of pixelflux itself**. It is enabled **by default**; to build without it, set `PIXELFLUX_ENABLE_GPL=0` (or `=false`) before `pip install`. The build then substitutes the BSD-licensed Cisco OpenH264 (vendored, built from source) as the software H.264 encoder behind the very same API and wire format — striped and full-frame sessions, CRF and CBR, live bitrate/quality changes all keep working, and `libx264-dev` is not required. What you lose is 4:4:4 software H.264: OpenH264 is 4:2:0-only, so `video_fullcolor` is encoded 4:2:0 on the CPU (NVENC still carries it). Software H.265 follows the same switch through the linked FFmpeg: x265 (GPL) in the default build, kvazaar (BSD) otherwise. JPEG, NVENC and VA-API are unaffected. `pixelflux.SOFTWARE_ENCODERS` maps each codec to the software encoder the build in use carries (`{"h264": "x264", "h265": "x265", "vp8": "libvpx", "vp9": "libvpx", "av1": "svt-av1"}` for the wheels), and a notice is printed at install time whether GPL components are enabled or not.
 >
-> **Caveat (transitively-linked x264):** the extension links the *system* FFmpeg (`libavcodec`/`libavfilter`) for VA-API, and many distro FFmpeg builds (e.g. Ubuntu/Debian's) are themselves compiled with `--enable-libx264`, so their `libavcodec` drags `libx264` in as a transitive shared-library dependency even when pixelflux was built GPL-free. pixelflux contains no x264 code in that case (verified: no `x264` symbols or `NEEDED` entries), for a deployment that must be x264-free end to end, use an FFmpeg built without `--enable-libx264` (the project's wheel CI builds FFmpeg n8.1 LGPL-only, and the project's AppImage bundles such a variant).
+> **Caveat (transitively-linked x264):** the extension links the *system* FFmpeg (`libavcodec`/`libavfilter`) for VA-API, and many distro FFmpeg builds (e.g. Ubuntu/Debian's) are themselves compiled with `--enable-libx264`, so their `libavcodec` drags `libx264` in as a transitive shared-library dependency even when pixelflux was built GPL-free. pixelflux contains no x264 code in that case (verified: no `x264` symbols or `NEEDED` entries), for a deployment that must be x264-free end to end, use an FFmpeg built without `--enable-libx264` (the project's non-GPL wheel builds FFmpeg n8.1 LGPL-only with kvazaar, libvpx, SVT-AV1 and dav1d; the GPL wheel's FFmpeg adds x264 and x265 under `--enable-gpl`).
 >
-> **Official wheels are always GPL-enabled** (x264 as the software H.264 encoder, LGPL-only FFmpeg); the `PIXELFLUX_ENABLE_GPL=0` path is for verified license-minimal source builds. The AppImage distribution bundles the LGPL-only FFmpeg variant so the optional GPL-free posture holds end-to-end.
+> **Official wheels are always GPL-enabled** (x264 and x265 as the software H.264 and H.265 encoders, a GPL-built FFmpeg); the `PIXELFLUX_ENABLE_GPL=0` path is for verified license-minimal source builds. The AppImage distribution bundles the LGPL-only FFmpeg variant so the optional GPL-free posture holds end-to-end.
 
 ### 2. Hardware Acceleration (Optional but Recommended)
 *   **NVIDIA (NVENC):** The library detects the NVIDIA driver at runtime. No extra compile-time packages are needed.
@@ -144,11 +144,13 @@ settings.target_fps = 60.0
 settings.scale = 1.0  # Fractional scaling (Wayland only)
 settings.wayland_host_display = ""                  # Capture from an EXTERNAL compositor instead of the built-in one (host-capture mode)
 
-# --- Encoding Mode ---
-# 0 for JPEG, 1 for H.264
-settings.output_mode = 1
-# Force CPU encoding and ignore hardware encoders. Software H.264 is x264 in the default
-# build and OpenH264 in a PIXELFLUX_ENABLE_GPL=0 build (pixelflux.SOFTWARE_H264_ENCODER).
+# --- Codec ---
+# "jpeg" (striped stills), "h264" (striped, or full-frame with video_fullframe), or a
+# full-frame video codec: "h265", "vp8", "vp9", "av1"
+settings.codec = "h264"
+# Force CPU encoding and ignore hardware encoders. The software encoder behind each codec
+# is the build's (pixelflux.SOFTWARE_ENCODERS): x264 or OpenH264 for H.264, x265 or kvazaar
+# for H.265, libvpx for VP8/VP9, SVT-AV1 for AV1.
 settings.use_cpu = False
 
 # --- Debugging ---
@@ -158,12 +160,12 @@ settings.debug_logging = False # Enable/disable the continuous FPS and settings 
 settings.jpeg_quality = 75              # Quality for changed stripes (0-100)
 settings.paint_over_jpeg_quality = 90   # Quality for static "paint-over" stripes (0-100)
 
-# --- H.264 Settings ---
-settings.video_crf = 25                            # CRF value (0-51, lower is better quality/higher bitrate)
-settings.video_paintover_crf = 18                  # CRF for H.264 paintover on static content. Must be lower than video_crf to activate.
+# --- Video Settings ---
+settings.video_crf = 25                            # Quality index on the H.264 QP scale (0-51, lower is better quality); mapped onto each codec's own quantizer range
+settings.video_paintover_crf = 18                  # Quality index for the paintover on static content. Must be lower than video_crf to activate.
 settings.video_paintover_burst_frames = 5          # Number of high-quality frames to send in a burst when a paintover is triggered.
-settings.video_fullcolor = False                   # Use I444/full color (High 4:4:4) instead of I420. Carried by software encoding and NVENC; VA-API negotiates it per device.
-settings.video_fullframe = True                    # Encode full frames (required for HW accel) instead of just changed stripes
+settings.video_fullcolor = False                   # Use 4:4:4 chroma instead of 4:2:0 where the codec carries it (H.264 and H.265): software x264/x265 and NVENC take it, VA-API negotiates it per device.
+settings.video_fullframe = True                    # H.264 only: encode full frames instead of changed stripes (every other video codec is full-frame)
 settings.video_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 settings.keyframe_interval_s = 0.0                   # Periodic keyframe interval in seconds (0 = keyframes only on demand/paint-over)
 settings.video_cbr_mode = False                    # Switches to CBR mode and ignores CRF value. Used in conjunction with video_bitrate_kbps.
@@ -236,7 +238,7 @@ Wayland backends). It supports the buffer protocol — `bytes(frame)` / `memoryv
 
 ```python
 def my_callback(frame):
-    # frame.data_type      (0=Unknown, 1=JPEG, 2=H.264)
+    # frame.data_type      (the codec id: 0=JPEG, 1=H.264, 2=VP8, 3=VP9, 4=AV1, 5=H.265)
     # frame.frame_id
     # frame.stripe_y_start
     # frame.stripe_height
@@ -280,9 +282,9 @@ For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat`
 
 ## Recording Sink
 
-The capture session can output the raw H.264 video stream directly to a Unix domain socket for external recording.
+The capture session can output the raw video stream directly to a Unix domain socket for external recording: Annex-B for H.264 and H.265, an OBU stream for AV1, and IVF for VP8 and VP9.
 
-*Note: This feature requires full-frame H.264 encoding (CPU, VA-API, or NVENC) and does not work with JPEG or striped H.264 modes.*
+*Note: This feature requires full-frame video encoding and does not work with JPEG or striped H.264 modes.*
 
 ```python
 # Enable the unix socket (forces IDR frames every 30 frames and on connect)
@@ -541,8 +543,8 @@ session settled on rather than what was asked for.
     *   **X11:** XShm capture via pure-Rust XCB, with XFixes cursor and watermark compositing.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
-    *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — all with multi-threaded striping; `pixelflux.SOFTWARE_H264_ENCODER` names the build's encoder.
-    *   **Hardware:** NVIDIA NVENC (incl. High 4:4:4, ARGB-direct with matched VUI colour signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD, VA-VPP convert, per-device 4:4:4 negotiation) with Zero-Copy support.
+    *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, all through the linked FFmpeg; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec.
+    *   **Hardware:** NVIDIA NVENC (H.264, H.265 and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI colour signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9 and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**
@@ -553,7 +555,7 @@ session settled on rather than what was asked for.
 *   **Input Handling:** Built-in input injection for mouse and keyboard (Wayland; XTEST on X11 via Computer Use).
 *   **Cursor Compositing:** Hardware cursor planes or software rendering options.
 *   **Dynamic Watermarking:** Overlay PNGs with static positioning or DVD-screensaver style animation.
-*   **Recording Sink:** Direct Unix socket output of full-frame H.264 streams for local capture.
+*   **Recording Sink:** Direct Unix socket output of full-frame video streams (Annex-B, OBU or IVF by codec) for local capture.
 *   **Virtual Camera:** A client's webcam uplink (H.264/VP8/VP9/AV1/HEVC/MJPEG) decoded off the GIL into a V4L2 capture device (or passed through as an MJPEG device when the browser sends JPEG), served to the Selkies V4L2 interposer (no privileges) and mirrored into v4l2loopback and a PipeWire node where available.
 *   **Built-in MP4 Recorder:** Crash-safe fragmented-MP4 recording without any FFmpeg `avformat` dependency.
 *   **AI Agent Control:** Computer Use API to dump screenshots and drive all facets of a desktop environment.
@@ -563,6 +565,6 @@ session settled on rather than what was asked for.
 This project is licensed under the **Mozilla Public License Version 2.0**.
 A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
 
-Note that the default build links the GPL-2.0+ `libx264` as its software H.264 encoder; build with `PIXELFLUX_ENABLE_GPL=0` to exclude every GPL-licensed component (the BSD-licensed `openh264` then takes its place, and the FFmpeg bindings are used LGPL-only).
+Note that the default build links the GPL-2.0+ `libx264` as its software H.264 encoder and reaches GPL-2.0+ x265 through FFmpeg for H.265; build with `PIXELFLUX_ENABLE_GPL=0` to exclude every GPL-licensed component (the BSD-licensed `openh264` and kvazaar then take their places, and the FFmpeg bindings are used LGPL-only).
 
 [LICENSES.md](LICENSES.md) inventories every third-party component of both builds (crates, linked and vendored native libraries, what is loaded at run time) with its license, and describes the check (`scripts/check-licenses.py`, `pixelflux/deny.toml`, the `Licenses` workflow) that keeps the non-GPL build free of copyleft code.

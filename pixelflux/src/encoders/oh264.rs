@@ -18,6 +18,7 @@
 //! strict-GOP streaming behavior. Host ARGB is converted to I420 with the same
 //! BT.709 path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
 
+use crate::encoders::codec::{push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN};
 use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
@@ -483,14 +484,10 @@ impl Openh264Encoder {
     ///    selects the source byte order — `false` is B,G,R,A (X11 XShm), `true` is R,G,B,A (Wayland
     ///    GL readback).
     /// 3. **Encode**: the planes are wrapped as borrowed `YUVSlices` and encoded.
-    /// 4. **Framing**: unless `omit_stripe_headers` is set, a 10-byte wire header is prepended —
-    ///    byte-for-byte the layout the NVENC/VAAPI/x264 paths emit, which is what lets a single
-    ///    client demuxer serve every encoder. Its type byte is read from the *actually encoded*
-    ///    picture type (IDR = `0x01`, I = `0x02`, P = `0x00`) rather than from `force_idr`, because
-    ///    the encoder may re-type a frame, and the header must label a real decode entry point, not
-    ///    the request. It also carries the frame number, `y_start` (the stripe's top row within the
-    ///    frame), and the width/height (all big-endian). With `omit_stripe_headers` the output is
-    ///    bare Annex-B.
+    /// 4. **Framing**: unless `omit_stripe_headers` is set, the wire header is prepended, its
+    ///    frame kind read from the *actually encoded* picture type rather than from `force_idr`,
+    ///    because the encoder may re-type a frame and the header must label a real decode entry
+    ///    point, not the request. With `omit_stripe_headers` the output is bare Annex-B.
     /// 5. **Empty payload**: if the encoder produced no bitstream (e.g. a skipped frame), an empty
     ///    vec is returned rather than a lone header — a header with no Annex-B behind it would be a
     ///    malformed frame to the client, and the pipeline reads empty as "nothing to send".
@@ -517,6 +514,7 @@ impl Openh264Encoder {
             &mut self.y_buf,
             &mut self.u_buf,
             &mut self.v_buf,
+            (self.width, cw),
             self.csc_bands,
         )
         .map_err(|e| format!("rgb-to-yuv420 failed: {e:?}"))?;
@@ -528,20 +526,23 @@ impl Openh264Encoder {
         );
         match self.encoder.encode(&slices) {
             Ok(bitstream) => {
-                let header_sz = if self.omit_stripe_headers { 0 } else { 10 };
+                let header_sz = if self.omit_stripe_headers { 0 } else { VIDEO_HEADER_LEN };
                 let mut out = Vec::with_capacity(header_sz);
                 if header_sz != 0 {
-                    let type_hdr = match bitstream.frame_type() {
-                        FrameType::IDR => 0x01u8,
-                        FrameType::I => 0x02u8,
-                        _ => 0x00u8,
+                    let frame_type = match bitstream.frame_type() {
+                        FrameType::IDR => FRAME_KEY,
+                        FrameType::I => FRAME_INTRA,
+                        _ => FRAME_DELTA,
                     };
-                    out.push(0x04);
-                    out.push(type_hdr);
-                    out.extend_from_slice(&(frame_number as u16).to_be_bytes());
-                    out.extend_from_slice(&y_start.to_be_bytes());
-                    out.extend_from_slice(&(self.width as u16).to_be_bytes());
-                    out.extend_from_slice(&(self.height as u16).to_be_bytes());
+                    push_video_header(
+                        &mut out,
+                        Codec::H264,
+                        frame_type,
+                        frame_number as u16,
+                        y_start,
+                        self.width as u16,
+                        self.height as u16,
+                    );
                 }
                 bitstream.write_vec(&mut out);
                 if out.len() == header_sz {
@@ -611,7 +612,7 @@ mod tests {
         let idr = enc.encode_host_argb(&busy_frame(128, 96, 0), stride, 0, true, false).expect("encode idr");
         assert!(idr.len() > 10, "IDR frame should produce output");
         assert_eq!(idr[0], 0x04);
-        assert_eq!(idr[1], 0x01, "forced first frame must be typed IDR");
+        assert_eq!(idr[1], 0x11, "forced first frame must be typed an H.264 key frame");
         assert_eq!(&idr[2..6], &[0, 0, 0, 0], "frame_id 0 and y_start 0");
         assert_eq!(&idr[6..10], &[0, 128, 0, 96], "width/height big-endian");
         assert!(
@@ -620,7 +621,7 @@ mod tests {
         );
         let p = enc.encode_host_argb(&busy_frame(128, 96, 0), stride, 7, false, false).expect("encode p");
         assert!(p.len() > 10, "second frame should produce output");
-        assert_eq!(p[1], 0x00, "unforced static second frame must be typed delta");
+        assert_eq!(p[1], 0x10, "unforced static second frame must be typed an H.264 delta");
         assert_eq!(&p[2..4], &[0, 7], "frame_id must come from frame_number");
     }
 
@@ -841,7 +842,7 @@ mod slice_tests {
         let s = RustCaptureSettings {
             width: 640,
             height: 480,
-            output_mode: 1,
+            codec: Codec::H264,
             video_bitrate_kbps: 2000,
             video_cbr_mode: true,
             ..Default::default()
@@ -862,7 +863,7 @@ mod slice_tests {
         let s = RustCaptureSettings {
             width: 640,
             height: 480,
-            output_mode: 1,
+            codec: Codec::H264,
             video_bitrate_kbps: 2000,
             video_cbr_mode: true,
             ..Default::default()
@@ -875,7 +876,7 @@ mod slice_tests {
         let mut stripe = Openh264Encoder::new_stripe(&s, 640, 64, 25, 2000, false).expect("stripe");
         let out = stripe.encode_stripe_argb(&frame, 640 * 4, 3, 320, true, false).expect("encode");
         assert_eq!(out[0], 0x04);
-        assert_eq!(out[1], 0x01, "forced first stripe frame is an IDR");
+        assert_eq!(out[1], 0x11, "forced first stripe frame is an H.264 key frame");
         assert_eq!(&out[2..4], &[0, 3], "frame number");
         assert_eq!(&out[4..6], &320u16.to_be_bytes(), "y-start");
         assert_eq!(&out[6..10], &[2, 128, 0, 64], "stripe geometry");
@@ -886,7 +887,7 @@ mod slice_tests {
             "a stripe must be single-slice ({stripe_nals} NALs) against the four-slice full frame ({full_nals})"
         );
         let p = stripe.encode_stripe_argb(&frame, 640 * 4, 4, 320, false, false).expect("encode");
-        assert_eq!(p[1], 0x00, "an unforced static frame is a delta");
+        assert_eq!(p[1], 0x10, "an unforced static frame is an H.264 delta");
         assert_eq!(&p[4..6], &320u16.to_be_bytes(), "y-start rides every frame");
     }
 
@@ -1024,7 +1025,7 @@ mod rebuild_cost {
         let s = RustCaptureSettings {
             width: 1920,
             height: 1080,
-            output_mode: 1,
+            codec: Codec::H264,
             video_bitrate_kbps: 8000,
             ..Default::default()
         };

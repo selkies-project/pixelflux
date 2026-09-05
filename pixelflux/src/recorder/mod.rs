@@ -268,7 +268,7 @@ fn offer_frame(shared: &RecShared, tx: &Sender<TapFrame>, stripes: &[EncodedStri
     if stripes.is_empty() {
         return;
     }
-    if stripes.len() != 1 || stripes[0].data_type != 2 || stripes[0].stripe_y_start != 0 {
+    if stripes.len() != 1 || stripes[0].codec != crate::encoders::Codec::H264 || stripes[0].stripe_y_start != 0 {
         shared.skipped_non_h264.fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -378,18 +378,15 @@ fn writer_thread(
 fn own_capture_settings(opts: &RecordOptions) -> Result<RustCaptureSettings, String> {
     let mut s = match &opts.capture {
         Some(explicit) => {
-            if explicit.output_mode != 1 {
-                return Err(
-                    "recording requires H.264 capture settings (output_mode=1); JPEG cannot be recorded"
-                        .to_string(),
-                );
+            if explicit.codec != crate::encoders::Codec::H264 {
+                return Err("recording requires H.264 capture settings (codec='h264')".to_string());
             }
             explicit.clone()
         }
         None => RustCaptureSettings {
             width: 0,
             height: 0,
-            output_mode: 1,
+            codec: crate::encoders::Codec::H264,
             capture_cursor: true,
             target_fps: opts.effective_fps(),
             ..Default::default()
@@ -419,11 +416,8 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         return Err("recording path is empty".to_string());
     }
     if let Some(cap) = &opts.capture
-        && cap.output_mode != 1 {
-            return Err(
-                "recording requires H.264 capture settings (output_mode=1); JPEG cannot be recorded"
-                    .to_string(),
-            );
+        && cap.codec != crate::encoders::Codec::H264 {
+            return Err("recording requires H.264 capture settings (codec='h264')".to_string());
         }
 
     let wl_tx = crate::computer_use::wayland_command_sender();

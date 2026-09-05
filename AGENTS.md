@@ -35,14 +35,26 @@ and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
-Software H.264 is resolved at build time, never by a setting: the default `gpl` feature makes libx264 the
-encoder behind every CPU H.264 session (striped and full-frame), and a build without it
-(`PIXELFLUX_ENABLE_GPL=0` → `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same
-striped path (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; `SOFTWARE_H264_ENCODER`
-/ `SOFTWARE_H264_FULLCOLOR` in `lib.rs` (exported to Python as `pixelflux.SOFTWARE_H264_ENCODER`) are the only
-places the choice is read, and selkies derives its rate-control default from the exported name. Test both
-configurations (`cargo test --lib` and `cargo test --lib --no-default-features --features openh264`); the
-OpenH264 crates are also dev-dependencies so its tests run under the default build.
+The codec of a capture is `CaptureSettings.codec` (`jpeg`, `h264`, `h265`, `vp8`, `vp9`, `av1`), the
+`encoders::Codec` enum in Rust: it carries the wire id (the high nibble of a `0x04` frame's type byte, the
+low nibble being the frame kind), the per-codec quantizer domain the shared `video_crf` index maps onto, the
+level ladders and the bitstream reads that label frames. JPEG and H.264 may stripe (`encoders/software.rs`);
+every other codec streams whole frames. Every full-frame session is chosen by one ladder,
+`encoders::select_frame_encoder` (NVENC on the NVIDIA driver, VA-API otherwise, then the codec's software
+encoder, then a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback. `encoders/nvenc.rs`
+is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
+the libavcodec session: VA-API for all five codecs, and the software HEVC (x265 with the `gpl` feature, else
+kvazaar), VP8/VP9 (libvpx) and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
+(`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`), never assumed. Software H.264 is
+resolved at build time, never by a setting: the default `gpl` feature makes libx264 the encoder behind every
+CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
+`--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
+(`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies derives its rate-control
+default from the exported names. Test both configurations (`cargo test --lib` and
+`cargo test --lib --no-default-features --features openh264`, the latter against an FFmpeg carrying
+`libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
+wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
+from source ahead of FFmpeg.
 
 The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
 `AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the
