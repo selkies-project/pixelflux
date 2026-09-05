@@ -7871,9 +7871,10 @@ pyo3::create_exception!(
     "The target compositor does not advertise zwp_virtual_keyboard_manager_v1."
 );
 
-/// Start the Computer-Use HTTP server: a bare port listens on the loopback
-/// addresses only, `host:port` names the address to listen on. Idempotent; the
-/// PIXELFLUX_CU env var remains the standalone fallback.
+/// Start the Computer-Use HTTP server on comma-separated entries: a bare port
+/// listens on the loopback addresses only, `host:port` names the address to
+/// listen on. Idempotent; the PIXELFLUX_CU env var remains the standalone
+/// fallback.
 #[pyfunction]
 fn start_computer_use(bind: String) {
     crate::computer_use::start_cu_server(&bind);

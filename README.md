@@ -346,7 +346,7 @@ Both backends implement the [Anthropic Computer Use specification](https://githu
 export PIXELFLUX_CU=5000
 ```
 
-A bare port is served on the loopback addresses only (`127.0.0.1` and `::1`); the API carries no authentication, so open it to other hosts deliberately by naming the address to listen on, `PIXELFLUX_CU=0.0.0.0:5000` for every interface. The same value is what `start_computer_use()` takes when a script starts the server itself.
+A bare port is served on the loopback addresses only (`127.0.0.1,::1`); the API carries no authentication, so open it to other hosts deliberately by naming the addresses to listen on as comma-separated `host:port` entries, `PIXELFLUX_CU=0.0.0.0:5000,[::]:5000` for every interface. The same value is what `start_computer_use()` takes when a script starts the server itself.
 
 When using Computer Use, call `ensure_wayland_display()` before starting a capture to bring the compositor socket up early — this lets apps launched alongside your script connect to `WAYLAND_DISPLAY` immediately. GPU auto-selection (`auto_gpu` on `CaptureSettings`) works normally; the screenshot path forces a single-frame CPU readback when the GPU is in zero-copy mode.
 

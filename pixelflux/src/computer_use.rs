@@ -6,8 +6,9 @@
 
 //! HTTP server implementing the [Anthropic Computer Use](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo) specification.
 //!
-//! Enabled by setting the `PIXELFLUX_CU` environment variable to a port, served on the loopback
-//! addresses only, or to `host:port`, the address to serve on. The server
+//! Enabled by setting the `PIXELFLUX_CU` environment variable to a bind: comma-separated entries,
+//! each a port, served on the loopback addresses only, or `host:port`, the address to serve on
+//! (`0.0.0.0:5000,[::]:5000` serves every interface). The server
 //! handles `POST /computer-use` requests for screenshots, mouse/keyboard injection, scrolling,
 //! and cursor position queries. Actions run against a [`CuBackend`], resolved per request: the
 //! Wayland compositor owned by this process when one is registered, otherwise the X server named
@@ -851,12 +852,13 @@ pub fn spawn_cu_from_env() {
     }
 }
 
-/// Start the CU server on `bind`: a bare port listens on the loopback addresses
-/// only, `host:port` names the address to listen on (`0.0.0.0:port` accepts every
-/// interface). Guarded so that exactly one server binds per process no matter how
-/// many call sites (module import, Wayland compositor init, the selkies setting)
-/// race to spawn it; backend selection stays per-request, so a server bound at
-/// import serves a compositor that only starts later.
+/// Start the CU server on `bind`, comma-separated entries: a bare port listens on
+/// the loopback addresses only, `host:port` names the address to listen on
+/// (`0.0.0.0:port,[::]:port` accepts every interface). Guarded so that exactly one
+/// server binds per process no matter how many call sites (module import, Wayland
+/// compositor init, the selkies setting) race to spawn it; backend selection stays
+/// per-request, so a server bound at import serves a compositor that only starts
+/// later.
 pub fn start_cu_server(bind: &str) {
     static SPAWNED: OnceLock<()> = OnceLock::new();
     if SPAWNED.get().is_some() {
@@ -877,26 +879,38 @@ pub fn start_cu_server(bind: &str) {
     }
 }
 
-/// Bound listeners for a CU bind: both loopback addresses for a bare port, every
-/// address the host resolves to for `host:port`. An address the host lacks (the
-/// IPv6 loopback with IPv6 disabled) is skipped while another binds; any other
-/// failure, or nothing binding at all, is an error.
+/// Bound listeners for a CU bind: for each comma-separated entry, both loopback
+/// addresses for a bare port and every address the host resolves to for
+/// `host:port`. An address the host lacks (the IPv6 loopback with IPv6 disabled)
+/// is skipped while another binds; any other failure, or nothing binding at all,
+/// is an error.
 fn cu_listeners(bind: &str) -> Result<Vec<TcpListener>, String> {
-    let addrs: Vec<SocketAddr> = match bind.parse::<u16>() {
-        Ok(port) => vec![
-            SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-            SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
-        ],
-        Err(_) if bind.contains(':') => bind
-            .to_socket_addrs()
-            .map_err(|e| format!("cannot resolve '{bind}': {e}"))?
-            .collect(),
-        Err(_) => return Err(format!("invalid bind '{bind}': expected a port or host:port")),
-    };
+    let mut addrs: Vec<SocketAddr> = Vec::new();
+    for entry in bind.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let resolved: Vec<SocketAddr> = match entry.parse::<u16>() {
+            Ok(port) => vec![
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+            ],
+            Err(_) if entry.contains(':') => entry
+                .to_socket_addrs()
+                .map_err(|e| format!("cannot resolve '{entry}': {e}"))?
+                .collect(),
+            Err(_) => return Err(format!("invalid bind '{entry}': expected a port or host:port")),
+        };
+        for addr in resolved {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+    }
+    if addrs.is_empty() {
+        return Err(format!("invalid bind '{bind}': expected a port or host:port"));
+    }
     let mut listeners = Vec::new();
     let mut skipped = Vec::new();
     for addr in addrs {
-        match TcpListener::bind(addr) {
+        match bind_listener(addr) {
             Ok(listener) => listeners.push(listener),
             Err(e) if matches!(e.raw_os_error(), Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)) => {
                 skipped.push(format!("{addr} ({e})"));
@@ -911,6 +925,74 @@ fn cu_listeners(bind: &str) -> Result<Vec<TcpListener>, String> {
         println!("[ComputerUse] Not listening on {note}");
     }
     Ok(listeners)
+}
+
+/// A listening socket on `addr`, IPv6-only for an IPv6 address so `[::]` and
+/// `0.0.0.0` can share a port: the standard library binds `[::]` dual-stack and
+/// offers no way to change that before the bind.
+fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+    let family = if addr.is_ipv4() { libc::AF_INET } else { libc::AF_INET6 };
+    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let one: libc::c_int = 1;
+    let enable = |level: libc::c_int, name: libc::c_int| -> std::io::Result<()> {
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                &one as *const libc::c_int as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    };
+    enable(libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
+    if addr.is_ipv6() {
+        enable(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?;
+    }
+    let rc = match addr {
+        SocketAddr::V4(v4) => {
+            let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) };
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin as *const libc::sockaddr_in as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+        }
+        SocketAddr::V6(v6) => {
+            let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_flowinfo = v6.flowinfo();
+            sin6.sin6_addr = libc::in6_addr { s6_addr: v6.ip().octets() };
+            sin6.sin6_scope_id = v6.scope_id();
+            unsafe {
+                libc::bind(
+                    fd,
+                    &sin6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::listen(fd, 128) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { TcpListener::from_raw_fd(sock.into_raw_fd()) })
 }
 
 /// Pick the backend for one request: the registered Wayland compositor when present,
@@ -1064,5 +1146,48 @@ mod tests {
         assert!(cu_listeners("abc").is_err());
         assert!(cu_listeners("70000").is_err());
         assert!(cu_listeners("").is_err());
+        assert!(cu_listeners(",").is_err());
+        assert!(cu_listeners("127.0.0.1:0,abc").is_err());
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn v6only(listener: &TcpListener) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                listener.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        value
+    }
+
+    #[test]
+    fn both_wildcards_share_a_port() {
+        let port = free_port();
+        let listeners = cu_listeners(&format!("0.0.0.0:{port}, [::]:{port}")).unwrap();
+        assert!(listeners.iter().all(|l| l.local_addr().unwrap().port() == port));
+        assert!(listeners.iter().all(|l| l.local_addr().unwrap().ip().is_unspecified()));
+        if let Some(v6) = listeners.iter().find(|l| l.local_addr().unwrap().is_ipv6()) {
+            assert_eq!(listeners.len(), 2);
+            assert_eq!(v6only(v6), 1);
+        }
+    }
+
+    #[test]
+    fn repeated_entries_bind_once() {
+        let port = free_port();
+        let listeners = cu_listeners(&format!("{port},127.0.0.1:{port},{port}")).unwrap();
+        assert!(listeners.len() <= 2);
+        assert!(listeners.iter().all(|l| l.local_addr().unwrap().ip().is_loopback()));
     }
 }
