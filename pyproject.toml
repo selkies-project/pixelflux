@@ -42,20 +42,20 @@ before-all = """
         return 1
     }
 
-    # The same two native builds on both platforms, so a wheel carries the same
-    # native code whichever libc it targets:
+    # The same native builds on both platforms, so a wheel carries the same
+    # native code whichever libc it targets. No distro package is used for any
+    # of them: manylinux has none, Alpine's are GPL builds auditwheel would
+    # bundle into the non-GPL wheel, and the wheel flavour must decide whether
+    # a GPL library exists at all.
     #
-    # * libx264, only for the GPL wheel (the default; PIXELFLUX_ENABLE_GPL=0
-    #   builds without it and OpenH264, vendored by its crate, is the software
-    #   H.264 encoder instead). No distro package is used on either platform:
-    #   manylinux has none, and the wheel flavour must decide whether the
-    #   library exists at all.
-    # * FFmpeg n8.1, plain LGPL (no --enable-gpl/--enable-version3/
-    #   --enable-libx264: only avcodec/avfilter/avutil are consumed, for
-    #   h264_vaapi). Alpine's ffmpeg-dev is a GPL build (--enable-gpl
-    #   --enable-libx264 ...), which auditwheel would bundle into every
-    #   musllinux wheel, the non-GPL one included; building from source is what
-    #   keeps the non-GPL wheel free of GPL native code.
+    # * libx264 and x265, only for the GPL wheel (the default; PIXELFLUX_ENABLE_GPL=0
+    #   builds without them: OpenH264, vendored by its crate, is the software
+    #   H.264 encoder and kvazaar the software H.265 encoder instead).
+    # * kvazaar, libvpx, SVT-AV1 and dav1d (BSD), the software H.265, VP8/VP9
+    #   and AV1 encoders and the AV1 decoder of the virtual camera, all reached
+    #   through FFmpeg.
+    # * FFmpeg n8.1 wrapping those: LGPL for the non-GPL wheel, --enable-gpl
+    #   (for x265) on the GPL one. Only avcodec/avfilter/avutil are consumed.
     # libjpeg-turbo is NOT built: turbojpeg-sys vendors + statically links its
     # own copy by default (cmake + nasm are what it needs).
     case "$(printf %s "${PIXELFLUX_ENABLE_GPL:-1}" | tr 'A-Z' 'a-z')" in
@@ -72,6 +72,57 @@ before-all = """
             make install)
     }
 
+    build_x265() {
+        (cd /tmp && \
+            clone_source 4.1 x265 https://bitbucket.org/multicoreware/x265_git.git && \
+            cd x265 && \
+            cmake -S source -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF && \
+            cmake --build build -j$(nproc) && \
+            cmake --install build)
+    }
+
+    build_kvazaar() {
+        (cd /tmp && \
+            clone_source v2.3.2 kvazaar https://github.com/ultravideo/kvazaar.git && \
+            cd kvazaar && \
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON && \
+            cmake --build build -j$(nproc) && \
+            cmake --install build)
+    }
+
+    build_libvpx() {
+        (cd /tmp && \
+            clone_source v1.15.2 libvpx https://chromium.googlesource.com/webm/libvpx https://github.com/webmproject/libvpx.git && \
+            cd libvpx && \
+            ./configure --prefix=/usr/local --enable-shared --disable-static --disable-examples \
+                --disable-tools --disable-docs --disable-unit-tests \
+                $([ "$(uname -m)" = x86_64 ] && echo --as=nasm) && \
+            make -j$(nproc) && \
+            make install)
+    }
+
+    build_svtav1() {
+        (cd /tmp && \
+            clone_source v4.2.0 svtav1 https://gitlab.com/AOMediaCodec/SVT-AV1.git https://github.com/AOMediaCodec/SVT-AV1.git && \
+            cd svtav1 && \
+            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+                -DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=ON -DBUILD_APPS=OFF -DBUILD_DEC=OFF && \
+            cmake --build build -j$(nproc) && \
+            cmake --install build)
+    }
+
+    build_dav1d() {
+        (cd /tmp && \
+            clone_source 1.5.1 dav1d https://code.videolan.org/videolan/dav1d.git https://github.com/videolan/dav1d.git && \
+            cd dav1d && \
+            meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
+                -Denable_tools=false -Denable_tests=false && \
+            ninja -C build && \
+            ninja -C build install)
+    }
+
     build_ffmpeg() {
         (cd /tmp && \
             clone_source n8.1 ffmpeg https://git.ffmpeg.org/ffmpeg.git https://github.com/FFmpeg/FFmpeg.git && \
@@ -81,9 +132,19 @@ before-all = """
                 --enable-shared \
                 --disable-static \
                 --disable-programs \
-                --disable-doc && \
+                --disable-doc \
+                --enable-libkvazaar \
+                --enable-libvpx \
+                --enable-libsvtav1 \
+                --enable-libdav1d \
+                $([ "${gpl}" = 1 ] && echo --enable-gpl --enable-libx265) && \
             make -j$(nproc) && \
             make install)
+    }
+
+    build_codec_libraries() {
+        build_kvazaar && build_libvpx && build_svtav1 && build_dav1d && \
+        if [ "${gpl}" = 1 ]; then build_x264 && build_x265; fi
     }
 
     # --- MANYLINUX (RPM-based) ---
@@ -113,20 +174,27 @@ before-all = """
         \
         curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal && \
         \
-        if [ "${gpl}" = 1 ]; then build_x264; fi && \
+        # dav1d builds with meson, which the image's own Python is too old for;
+        # the interpreters cibuildwheel ships carry a current pip.
+        /opt/python/cp311-cp311/bin/pip install meson ninja && \
+        export PATH="/opt/python/cp311-cp311/bin:$PATH" && \
+        build_codec_libraries && \
         build_ffmpeg && \
         \
         ldconfig
 
     # --- ALPINE (APK-based) ---
     # libjpeg-turbo is NOT a system dep: turbojpeg-sys builds its vendored copy
-    # (needs cmake + nasm). x264 and FFmpeg come from the source builds above;
-    # musl's loader searches /usr/local/lib on its own, so there is no ldconfig.
+    # (needs cmake + nasm). The codec libraries and FFmpeg come from the source
+    # builds above; musl's loader searches /usr/local/lib on its own, so there
+    # is no ldconfig.
     elif command -v apk; then
         apk add --no-cache \
             build-base \
             clang \
             cmake \
+            meson \
+            ninja \
             nasm \
             git \
             pixman-dev \
@@ -149,7 +217,7 @@ before-all = """
         \
         curl --proto '=https' --tlsv1.2 -sSf --retry 5 --retry-delay 3 --retry-connrefused https://sh.rustup.rs | sh -s -- -y --profile minimal && \
         \
-        if [ "${gpl}" = 1 ]; then build_x264; fi && \
+        build_codec_libraries && \
         build_ffmpeg
     else
         echo "Unsupported package manager"

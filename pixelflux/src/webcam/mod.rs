@@ -325,7 +325,7 @@ fn worker(cfg: WorkerConfig) {
     };
 
     while let Some(job) = queue.pop() {
-        if mjpeg_device && job.codec == Codec::Mjpeg && job.orientation.is_upright() {
+        if mjpeg_device && job.codec == Codec::Jpeg && job.orientation.is_upright() {
             // The device speaks the uplink's own format: an upright frame of the device's
             // size is published as received, undecoded; any other goes through decode and fit.
             if let Ok(hdr) = turbojpeg::read_header(&job.data) {
@@ -416,17 +416,17 @@ fn worker(cfg: WorkerConfig) {
 #[pymethods]
 impl VirtualCamera {
     #[classattr]
-    const CODEC_MJPEG: u32 = Codec::Mjpeg as u32;
+    const CODEC_MJPEG: u32 = Codec::Jpeg.id();
     #[classattr]
-    const CODEC_H264: u32 = Codec::H264 as u32;
+    const CODEC_H264: u32 = Codec::H264.id();
     #[classattr]
-    const CODEC_VP8: u32 = Codec::Vp8 as u32;
+    const CODEC_VP8: u32 = Codec::Vp8.id();
     #[classattr]
-    const CODEC_VP9: u32 = Codec::Vp9 as u32;
+    const CODEC_VP9: u32 = Codec::Vp9.id();
     #[classattr]
-    const CODEC_AV1: u32 = Codec::Av1 as u32;
+    const CODEC_AV1: u32 = Codec::Av1.id();
     #[classattr]
-    const CODEC_HEVC: u32 = Codec::Hevc as u32;
+    const CODEC_HEVC: u32 = Codec::H265.id();
     /// `push()` result bit: the decoder needs a keyframe from the client to resume.
     #[classattr]
     const KEYFRAME_WANTED: u32 = 1;
