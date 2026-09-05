@@ -507,7 +507,6 @@ pub struct AppState {
     pub output_capture_source_state: OutputCaptureSourceState,
     pub image_copy_capture_state: ImageCopyCaptureState,
     pub copy_sessions: Vec<OutputCopySession>,
-    #[allow(dead_code)]
     pub output_state: OutputManagerState,
     pub seat_state: SeatState<AppState>,
     pub shell_state: XdgShellState,
@@ -516,7 +515,6 @@ pub struct AppState {
     pub data_device_state: DataDeviceState,
     pub data_control_state: DataControlState,
     pub dh: DisplayHandle,
-    #[allow(dead_code)]
     pub seat: Seat<AppState>,
     /// Every live output with its per-display render/capture state; index 0 is the
     /// primary (display id 0), which is never destroyed.
