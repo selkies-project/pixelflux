@@ -94,7 +94,7 @@ def build_capture_settings():
 
     # --- Encoding Mode ---
     # Sets the output codec. 0 for JPEG, 1 for H.264.
-    cs.output_mode = 1
+    cs.codec = "h264"
     # Force CPU encoding and ignore hardware encoders
     cs.use_cpu = False
 
@@ -293,12 +293,13 @@ async def websocket_handler(websocket):
 
             def enqueue():
                 data = item_to_queue['data']
-                # Wire prefixes: 0x04 = H.264 (byte 1 = encoded picture type,
-                # 0x01 = IDR; bytes 4:6 = stripe y_start big-endian), 0x03 =
-                # JPEG. JPEG is never gated: every frame is independently
-                # decodable, a dropped one is simply repainted by the next.
+                # Wire prefixes: 0x04 = video (byte 1 = frame kind in the low
+                # nibble, 0x1 = key frame, and the codec id in the high nibble;
+                # bytes 4:6 = stripe y_start big-endian), 0x03 = JPEG. JPEG is
+                # never gated: every frame is independently decodable, a
+                # dropped one is simply repainted by the next.
                 is_h264 = len(data) >= 10 and data[0] == 0x04
-                is_idr = is_h264 and data[1] == 0x01
+                is_idr = is_h264 and (data[1] & 0x0f) == 0x01
                 row = ((data[4] << 8) | data[5]) if is_h264 else 0
                 if is_h264 and not is_idr and row not in relay_state['live_rows']:
                     # Undecodable until this row re-anchors; ask for a

@@ -13,6 +13,7 @@
 //! inter-prediction, and both libraries emit the same per-stripe wire framing; the JPEG path is
 //! stateless.
 
+use super::codec::{push_jpeg_header, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY};
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
@@ -43,11 +44,12 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// row-major, so a horizontal boundary yields contiguous, non-overlapping plane sub-slices with no
 /// per-row seam bookkeeping.
 ///
-/// 1. **Plane strides**: the Y plane is `width` wide; the chroma planes are `width` for 4:4:4
-///    (`i444 == true`) or `width / 2` for 4:2:0. `rgba_input` selects the source byte order and
-///    `i444` the subsampling, together choosing one of four `yuv` crate routines — 4:4:4 uses
-///    **Full** range, 4:2:0 uses **Limited** range, and both use the **BT.709** matrix and the
-///    **Fast** conversion mode.
+/// 1. **Plane strides**: `strides` gives the Y and chroma row pitches of the output planes
+///    (tightly packed for the stripe buffers, padded for an AVFrame); the chroma planes are
+///    `width` wide for 4:4:4 (`i444 == true`) or `width / 2` for 4:2:0. `rgba_input` selects
+///    the source byte order and `i444` the subsampling, together choosing one of four `yuv`
+///    crate routines — 4:4:4 uses **Full** range, 4:2:0 uses **Limited** range, and both use
+///    the **BT.709** matrix and the **Fast** conversion mode.
 /// 2. **Band split**: `band_h` is `height / bands` floored to an even number and at least 2 rows
 ///    (a band under 2 rows is not worth a thread). Keeping band boundaries even ensures a 4:2:0
 ///    chroma pair never straddles a seam. When `bands <= 1` or the whole image fits one band, the
@@ -69,10 +71,10 @@ pub(crate) fn convert_to_yuv_mt(
     y_buf: &mut [u8],
     u_buf: &mut [u8],
     v_buf: &mut [u8],
+    strides: (usize, usize),
     bands: usize,
 ) -> Result<(), yuv::YuvError> {
-    let y_stride = width;
-    let uv_stride = if i444 { width } else { width / 2 };
+    let (y_stride, uv_stride) = strides;
 
     let convert_band = |src_band: &[u8], y: &mut [u8], u: &mut [u8], v: &mut [u8], h: usize| {
         let mut img = YuvPlanarImageMut {
@@ -407,12 +409,11 @@ impl H264EncoderWrapper {
     ///    and requests an IDR when `force_idr` is set (otherwise `X264_TYPE_AUTO`).
     /// 2. **Encode**: calls `x264_encoder_encode`; a non-positive returned size means no frame was
     ///    emitted this call, so the function returns `false` without writing output.
-    /// 3. **Framing**: `output_buf` is cleared and refilled. Unless `omit_headers` is set, a header
-    ///    is prepended — a `0x04` codec tag, then a type byte read from the *actual* output picture
-    ///    type rather than from `force_idr`, because the encoder may not honor a keyframe request and
-    ///    the client keys its decode-recovery on the frame type it truly received (IDR = `0x01`,
-    ///    I = `0x02`, else `0x00`), then the caller's `fixed_header` (frame number, y-start, width,
-    ///    height). With `omit_headers` the output is bare Annex-B.
+    /// 3. **Framing**: `output_buf` is cleared and refilled. Unless `omit_headers` is set, the wire
+    ///    header is prepended with a frame kind read from the *actual* output picture type rather
+    ///    than from `force_idr`, because the encoder may not honor a keyframe request and the
+    ///    client keys its decode-recovery on the kind it truly received. With `omit_headers` the
+    ///    output is bare Annex-B.
     /// 4. **Payload**: every NAL payload is appended to `output_buf` after the optional header,
     ///    so the bytes past the wire header are always a contiguous Annex-B access unit.
     #[allow(clippy::too_many_arguments)]
@@ -424,9 +425,9 @@ impl H264EncoderWrapper {
         y_stride: i32,
         u_stride: i32,
         v_stride: i32,
-        frame_id: i64,
+        frame_id: u16,
+        y_start: u16,
         force_idr: bool,
-        fixed_header: &[u8],
         omit_headers: bool,
         output_buf: &mut Vec<u8>,
     ) -> bool {
@@ -446,7 +447,7 @@ impl H264EncoderWrapper {
             pic_in.img.i_stride[0] = y_stride;
             pic_in.img.i_stride[1] = u_stride;
             pic_in.img.i_stride[2] = v_stride;
-            pic_in.i_pts = frame_id;
+            pic_in.i_pts = frame_id as i64;
             pic_in.i_type = if force_idr {
                 x264_sys::X264_TYPE_IDR
             } else {
@@ -466,23 +467,25 @@ impl H264EncoderWrapper {
             );
 
             if frame_size > 0 {
-                let header_len = if omit_headers { 0 } else { 2 + fixed_header.len() };
-                let total_len = header_len + frame_size as usize;
-
                 output_buf.clear();
-                output_buf.reserve(total_len);
-
+                output_buf.reserve(super::codec::VIDEO_HEADER_LEN + frame_size as usize);
                 if !omit_headers {
-                    output_buf.push(0x04);
-                    let type_byte = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
-                        0x01
+                    let frame_type = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
+                        FRAME_KEY
                     } else if pic_out.i_type == x264_sys::X264_TYPE_I as i32 {
-                        0x02
+                        FRAME_INTRA
                     } else {
-                        0x00
+                        FRAME_DELTA
                     };
-                    output_buf.push(type_byte);
-                    output_buf.extend_from_slice(fixed_header);
+                    push_video_header(
+                        output_buf,
+                        Codec::H264,
+                        frame_type,
+                        frame_id,
+                        y_start,
+                        self.width as u16,
+                        self.height as u16,
+                    );
                 }
 
                 let nal_slice = std::slice::from_raw_parts(nals, i_nals as usize);
@@ -612,15 +615,15 @@ impl StripeState {
 ///
 /// # Fields
 ///
-/// * `data` - Compressed payload (JPEG or H.264 NAL units). `Arc`-shared so every
+/// * `data` - Compressed payload (JPEG, or the video codec's bitstream). `Arc`-shared so every
 ///   delivery-layer consumer can retain the frame without copying the bytes.
-/// * `data_type` - Codec tag: **1 = JPEG**, **2 = H.264**.
+/// * `codec` - The codec of the payload.
 /// * `stripe_y_start` - Y pixel coordinate of the stripe's top edge within the frame.
 /// * `stripe_height` - Height of the stripe in pixels.
 /// * `frame_id` - Frame sequence number this stripe belongs to.
 pub struct EncodedStripe {
     pub data: Arc<Vec<u8>>,
-    pub data_type: i32,
+    pub codec: Codec,
     pub stripe_y_start: i32,
     pub stripe_height: i32,
     pub frame_id: i32,
@@ -690,12 +693,12 @@ pub struct EncodedStripe {
 ///    previously-painted-over stripe at the paint-over quality already on screen so a joining viewer
 ///    does not see a downgrade.
 /// 6. **Encoding**:
-///    - **JPEG** (`output_mode 0`): source byte order is RGBA on the GPU readback path and BGRA on
+///    - **JPEG**: source byte order is RGBA on the GPU readback path and BGRA on
 ///      X11; each worker thread reuses its thread-local TurboJPEG compressor. Header-less output
 ///      hands the compressed buffer straight through; otherwise a 6-byte stripe header (`0x03` tag,
 ///      a reserved byte, frame number, y-start) is prepended to match the H.264 path's native
 ///      framing so the transport can forward the buffer without re-framing.
-///    - **H.264** (`output_mode 1`): the stripe's encoder is reused unless the width, height, or
+///    - **H.264**: the stripe's encoder is reused unless the width, height, or
 ///      (x264) chroma format changed, in which case it is rebuilt and an IDR forced; otherwise CRF
 ///      and rate are reconfigured live. With libx264, ARGB is converted to YUV here (a conversion
 ///      failure skips the stripe rather than encoding garbage) and an 8-byte fixed header (frame
@@ -732,15 +735,14 @@ pub fn encode_cpu(
     hash_damage: bool,
     force_idr_all: bool,
 ) -> Vec<EncodedStripe> {
-    let n_processing_stripes =
-        stripe_count(height, settings.output_mode, settings.video_fullframe);
+    let codec = settings.codec;
+    let n_processing_stripes = stripe_count(height, codec, settings.video_fullframe);
 
     if stripes.len() != n_processing_stripes {
         stripes.resize_with(n_processing_stripes, StripeState::default);
     }
 
-    let stripe_geometries =
-        compute_stripe_geometries(height as usize, n_processing_stripes, settings.output_mode);
+    let stripe_geometries = compute_stripe_geometries(height as usize, n_processing_stripes, codec);
 
     // Idle fast path: a static frame must still advance every stripe's paint-over countdown,
     // but nothing else — so when no stripe can emit anything this frame, do that bookkeeping
@@ -754,16 +756,16 @@ pub fn encode_cpu(
     // machinery observes no difference.
     let idle_candidate = damage_rects.is_empty()
         && !force_idr_all
-        && !(settings.output_mode == 1 && settings.video_streaming_mode);
+        && !(codec.is_video() && settings.video_streaming_mode);
     if idle_candidate {
         let paint_over_armed = settings.use_paint_over_quality
-            && if settings.output_mode == 0 {
+            && if !codec.is_video() {
                 settings.paint_over_jpeg_quality > settings.jpeg_quality
             } else {
                 settings.video_paintover_crf < settings.video_crf
             };
         let no_pending_send = |st: &StripeState| {
-            (settings.output_mode == 0 || st.h264_burst_frames_remaining <= 0)
+            (!codec.is_video() || st.h264_burst_frames_remaining <= 0)
                 && (!paint_over_armed
                     || st.paint_over_sent
                     || st.no_motion_frame_count.saturating_add(1)
@@ -815,7 +817,7 @@ pub fn encode_cpu(
     }
 
     let width_usize = width as usize;
-    let output_mode = settings.output_mode;
+    let video = codec.is_video();
     let video_crf = settings.video_crf;
     let video_po_crf = settings.video_paintover_crf;
     let video_burst = settings.video_paintover_burst_frames;
@@ -853,7 +855,7 @@ pub fn encode_cpu(
     };
     #[cfg(feature = "gpl")]
     let csc_bands = 1;
-    if output_mode == 1 && video_fullcolor && !crate::encoders::SOFTWARE_H264_FULLCOLOR {
+    if video && video_fullcolor && !crate::encoders::SOFTWARE_H264_FULLCOLOR {
         static FULLCOLOR_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !FULLCOLOR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -871,17 +873,17 @@ pub fn encode_cpu(
             let stripe_bytes = &raw_pixels[start_idx..end_idx];
 
             let mut send_this_stripe = false;
-            let mut quality_or_crf = if output_mode == 0 { jpeg_q } else { video_crf };
+            let mut quality_or_crf = if !video { jpeg_q } else { video_crf };
             let mut force_idr = false;
             let is_dirty = if !hash_damage {
                 stripe_is_dirty[i]
-            } else if output_mode == 1 && video_streaming {
+            } else if video && video_streaming {
                 false
             } else {
                 stripe_state.content_dirty(stripe_bytes, damage_block_threshold, damage_block_duration)
             };
 
-            if output_mode == 1 && stripe_state.h264_burst_frames_remaining > 0 {
+            if video && stripe_state.h264_burst_frames_remaining > 0 {
                 send_this_stripe = true;
                 quality_or_crf = burst_crf;
                 stripe_state.h264_burst_frames_remaining -= 1;
@@ -893,7 +895,7 @@ pub fn encode_cpu(
                 }
             }
 
-            if !send_this_stripe && output_mode == 1 && video_streaming {
+            if !send_this_stripe && video && video_streaming {
                 send_this_stripe = true;
             }
 
@@ -902,7 +904,7 @@ pub fn encode_cpu(
                 stripe_state.no_motion_frame_count = 0;
                 stripe_state.paint_over_sent = false;
                 stripe_state.h264_burst_frames_remaining = 0;
-                quality_or_crf = if output_mode == 0 { jpeg_q } else { video_crf };
+                quality_or_crf = if !video { jpeg_q } else { video_crf };
             } else if !send_this_stripe {
                 stripe_state.no_motion_frame_count += 1;
 
@@ -910,11 +912,11 @@ pub fn encode_cpu(
                     && stripe_state.no_motion_frame_count >= trigger_frames
                     && !stripe_state.paint_over_sent
                 {
-                    if output_mode == 0 && paint_q > jpeg_q {
+                    if !video && paint_q > jpeg_q {
                         send_this_stripe = true;
                         quality_or_crf = paint_q;
                         stripe_state.paint_over_sent = true;
-                    } else if output_mode == 1 && video_po_crf < video_crf {
+                    } else if video && video_po_crf < video_crf {
                         send_this_stripe = true;
                         stripe_state.paint_over_sent = true;
                         quality_or_crf = video_po_crf;
@@ -926,7 +928,7 @@ pub fn encode_cpu(
 
             if force_idr_all {
                 send_this_stripe = true;
-                if output_mode == 1 {
+                if video {
                     force_idr = true;
                     if stripe_state.h264_burst_frames_remaining <= 0 && video_burst > 0 {
                         stripe_state.paint_over_sent = true;
@@ -938,7 +940,7 @@ pub fn encode_cpu(
             }
 
             if send_this_stripe {
-                if output_mode == 0 {
+                if !video {
                     let pixel_format = if use_gpu {
                         turbojpeg::PixelFormat::RGBA
                     } else {
@@ -963,20 +965,13 @@ pub fn encode_cpu(
                             jpeg
                         } else {
                             stripe_state.packet_buf.clear();
-                            stripe_state.packet_buf.push(0x03);
-                            stripe_state.packet_buf.push(0x00);
-                            stripe_state
-                                .packet_buf
-                                .extend_from_slice(&frame_counter.to_be_bytes());
-                            stripe_state
-                                .packet_buf
-                                .extend_from_slice(&(y_start as u16).to_be_bytes());
+                            push_jpeg_header(&mut stripe_state.packet_buf, frame_counter, y_start as u16);
                             stripe_state.packet_buf.extend_from_slice(&jpeg);
                             std::mem::take(&mut stripe_state.packet_buf)
                         };
                         Some(EncodedStripe {
                             data: Arc::new(data),
-                            data_type: 1,
+                            codec: Codec::Jpeg,
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
@@ -1039,6 +1034,7 @@ pub fn encode_cpu(
                             &mut stripe_state.y_buf,
                             &mut stripe_state.u_buf,
                             &mut stripe_state.v_buf,
+                            (y_stride as usize, uv_stride as usize),
                             csc_bands,
                         );
 
@@ -1050,12 +1046,6 @@ pub fn encode_cpu(
                             return None;
                         }
 
-                        let mut fixed_header = [0u8; 8];
-                        fixed_header[0..2].copy_from_slice(&frame_counter.to_be_bytes());
-                        fixed_header[2..4].copy_from_slice(&(y_start as u16).to_be_bytes());
-                        fixed_header[4..6].copy_from_slice(&(width_usize as u16).to_be_bytes());
-                        fixed_header[6..8].copy_from_slice(&(actual_height as u16).to_be_bytes());
-
                         if enc.encode_with_headers(
                             &stripe_state.y_buf,
                             &stripe_state.u_buf,
@@ -1063,15 +1053,15 @@ pub fn encode_cpu(
                             y_stride,
                             uv_stride,
                             uv_stride,
-                            frame_counter as i64,
+                            frame_counter,
+                            y_start as u16,
                             force_idr,
-                            &fixed_header,
                             omit_headers,
                             &mut stripe_state.packet_buf,
                         ) {
                             Some(EncodedStripe {
                                 data: Arc::new(std::mem::take(&mut stripe_state.packet_buf)),
-                                data_type: 2,
+                                codec: Codec::H264,
                                 stripe_y_start: y_start as i32,
                                 stripe_height: actual_height as i32,
                                 frame_id: frame_counter as i32,
@@ -1125,7 +1115,7 @@ pub fn encode_cpu(
                     ) {
                         Ok(data) if !data.is_empty() => Some(EncodedStripe {
                             data: Arc::new(data),
-                            data_type: 2,
+                            codec: Codec::H264,
                             stripe_y_start: y_start as i32,
                             stripe_height: actual_height as i32,
                             frame_id: frame_counter as i32,
@@ -1162,9 +1152,9 @@ pub fn encode_cpu(
 /// A full-frame session is one contiguous stream and so a single stripe; otherwise the frame
 /// fans out across cores, bounded so no stripe is shorter than a macroblock row. Both the
 /// encoder and the settings line report from here, so what is logged is what is encoded.
-pub fn stripe_count(height: i32, output_mode: i32, fullframe: bool) -> usize {
+pub fn stripe_count(height: i32, codec: Codec, fullframe: bool) -> usize {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    if (output_mode == 1 && fullframe) || height < MIN_STRIPE_HEIGHT {
+    if !codec.stripes() || (codec.is_video() && fullframe) || height < MIN_STRIPE_HEIGHT {
         return 1;
     }
     cores.min((height / MIN_STRIPE_HEIGHT) as usize).max(1)
@@ -1198,17 +1188,17 @@ fn stripe_rate_control(
 /// Divide `height` into `n` contiguous stripes as `(y_start, stripe_height)`, with the split
 /// rule differing by codec because only H.264 constrains stripe height.
 ///
-/// - **JPEG** (`output_mode 0`): JPEG has no vertical subsampling, so stripes may be any height; the
-///   heights differ by at most one row — the first `remainder` stripes take one extra each — and
-///   every row of the frame is covered.
-/// - **H.264** (`output_mode 1`): 4:2:0 pairs chroma rows vertically, so every stripe height is
-///   forced even and the remainder is handed out two rows at a time. The deliberate cost is that a
-///   single trailing odd row may be left uncovered — preferable to an odd-height stripe the encoder
-///   cannot represent.
-fn compute_stripe_geometries(height: usize, n: usize, output_mode: i32) -> Vec<(usize, usize)> {
+/// - **JPEG**: JPEG has no vertical subsampling, so stripes may be any height; the heights differ
+///   by at most one row — the first `remainder` stripes take one extra each — and every row of
+///   the frame is covered.
+/// - **Video**: 4:2:0 pairs chroma rows vertically, so every stripe height is forced even and the
+///   remainder is handed out two rows at a time. The deliberate cost is that a single trailing
+///   odd row may be left uncovered — preferable to an odd-height stripe the encoder cannot
+///   represent.
+fn compute_stripe_geometries(height: usize, n: usize, codec: Codec) -> Vec<(usize, usize)> {
     let mut geoms = Vec::with_capacity(n);
     let mut current_y = 0;
-    if output_mode == 0 {
+    if !codec.is_video() {
         let base_h = height / n;
         let remainder = height - base_h * n;
         for i in 0..n {
@@ -1280,13 +1270,13 @@ mod tests {
         let settings = RustCaptureSettings {
             width: w,
             height: h,
-            output_mode: 0,
+            codec: Codec::Jpeg,
             jpeg_quality: 40,
             use_paint_over_quality: false,
             ..Default::default()
         };
         let full = [smithay::utils::Rectangle::new((0, 0).into(), (w, h).into())];
-        let stripes_n = super::stripe_count(h, settings.output_mode, settings.video_fullframe);
+        let stripes_n = super::stripe_count(h, settings.codec, settings.video_fullframe);
         if stripes_n < 2 {
             return;
         }
@@ -1326,7 +1316,7 @@ mod tests {
             "motion in one stripe must bring the divisor back down: {carrying} vs {moved}"
         );
     }
-    use super::{compute_stripe_geometries, StripeState};
+    use super::{compute_stripe_geometries, Codec, StripeState};
 
     /// Without `gpl` the striped H.264 path runs one OpenH264 instance per stripe and speaks
     /// the x264 stripes' protocol: the first frame emits every stripe as an IDR whose wire header
@@ -1344,13 +1334,13 @@ mod tests {
         let settings = RustCaptureSettings {
             width: w,
             height: h,
-            output_mode: 1,
+            codec: Codec::H264,
             video_crf: 25,
             use_paint_over_quality: false,
             video_streaming_mode: false,
             ..Default::default()
         };
-        let n = super::stripe_count(h, settings.output_mode, settings.video_fullframe);
+        let n = super::stripe_count(h, settings.codec, settings.video_fullframe);
         if n < 2 {
             return;
         }
@@ -1361,10 +1351,10 @@ mod tests {
             &mut stripes, &mut carrying, &px, w, h, &[], &settings, 0, false, true, false,
         );
         assert_eq!(first.len(), n, "every stripe is sent on the first frame");
-        for (stripe, (y, sh)) in first.iter().zip(compute_stripe_geometries(h as usize, n, 1)) {
+        for (stripe, (y, sh)) in first.iter().zip(compute_stripe_geometries(h as usize, n, Codec::H264)) {
             let d = &stripe.data;
             assert_eq!(d[0], 0x04, "H.264 stripe tag");
-            assert_eq!(d[1], 0x01, "first frame of a stripe is an IDR");
+            assert_eq!(d[1], 0x11, "first frame of a stripe is an H.264 key frame");
             assert_eq!(u16::from_be_bytes([d[2], d[3]]), 0, "frame number");
             assert_eq!(u16::from_be_bytes([d[4], d[5]]) as usize, y, "y-start");
             assert_eq!(u16::from_be_bytes([d[6], d[7]]) as i32, w, "width");
@@ -1387,7 +1377,7 @@ mod tests {
         );
         assert_eq!(top.len(), 1, "motion in the top rows re-sends the top stripe alone");
         assert_eq!(top[0].stripe_y_start, 0);
-        assert_eq!(top[0].data[1], 0x00, "an unforced follow-up is a delta frame");
+        assert_eq!(top[0].data[1], 0x10, "an unforced follow-up is an H.264 delta frame");
         assert_eq!(u16::from_be_bytes([top[0].data[2], top[0].data[3]]), 2, "frame number");
     }
 
@@ -1423,7 +1413,7 @@ mod tests {
         let settings = RustCaptureSettings {
             width: w,
             height: h,
-            output_mode: 0,
+            codec: Codec::Jpeg,
             jpeg_quality: 60,
             paint_over_jpeg_quality: 90,
             use_paint_over_quality: true,
@@ -1471,7 +1461,7 @@ mod tests {
         let settings = RustCaptureSettings {
             width: w,
             height: h,
-            output_mode: 0,
+            codec: Codec::Jpeg,
             jpeg_quality: 60,
             paint_over_jpeg_quality: 90,
             use_paint_over_quality: true,
@@ -1526,7 +1516,7 @@ mod tests {
     fn jpeg_covers_every_row_including_odd() {
         for &h in &[1usize, 63, 720, 721, 1079, 1080, 1081] {
             for &n in &[1usize, 2, 3, 8, 16] {
-                let g = compute_stripe_geometries(h, n, 0);
+                let g = compute_stripe_geometries(h, n, Codec::Jpeg);
                 assert_eq!(g.len(), n);
                 assert_eq!(covered(&g), h, "JPEG must cover full height h={} n={}", h, n);
                 assert_contiguous(&g);
@@ -1540,7 +1530,7 @@ mod tests {
     fn h264_stripes_even_and_within_bounds() {
         for &h in &[64usize, 720, 721, 1080, 1081] {
             for &n in &[1usize, 2, 8] {
-                let g = compute_stripe_geometries(h, n, 1);
+                let g = compute_stripe_geometries(h, n, Codec::H264);
                 assert_eq!(g.len(), n);
                 for &(_, sh) in &g {
                     assert_eq!(sh % 2, 0, "H.264 stripe heights must be even h={} n={}", h, n);
@@ -1563,6 +1553,7 @@ mod qp_bound_sweep {
     #[cfg(feature = "gpl")]
     use super::H264EncoderWrapper;
     use crate::encoders::oh264::Openh264Encoder;
+    use crate::encoders::Codec;
     use crate::RustCaptureSettings;
     use openh264::decoder::Decoder;
     use openh264::formats::YUVSource;
@@ -1621,7 +1612,7 @@ mod qp_bound_sweep {
                 let mut out = Vec::new();
                 enc.encode_with_headers(
                     &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32,
-                    i as i64, i == 0, &[], true, &mut out,
+                    i as u16, 0, i == 0, true, &mut out,
                 );
                 out
             })
@@ -1636,7 +1627,7 @@ mod qp_bound_sweep {
             width: W as i32,
             height: H as i32,
             target_fps: 60.0,
-            output_mode: 1,
+            codec: Codec::H264,
             video_cbr_mode: cbr,
             video_bitrate_kbps: kbps,
             video_crf: crf,
@@ -1822,8 +1813,8 @@ mod qp_bound_sweep {
                 let y = noise_luma(i);
                 let mut out = Vec::new();
                 enc.encode_with_headers(
-                    &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32, i as i64, i == start,
-                    &[], true, &mut out,
+                    &y, &u, &v, W as i32, (W / 2) as i32, (W / 2) as i32, i as u16, 0, i == start,
+                    true, &mut out,
                 );
                 if i >= start + WARMUP && !out.is_empty() {
                     bytes += out.len();
