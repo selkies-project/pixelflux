@@ -13,6 +13,7 @@
 //! recycled, so its release event always means the symbol its press meant.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 
 use smithay::input::keyboard::xkb;
 
@@ -314,10 +315,10 @@ impl KeymapPolicy {
         };
         text.push_str(&rest[..kc_end]);
         for &(i, _) in &occupied {
-            text.push_str(&format!("\t<P{:03}> = {};\n", i, self.overlay_first + i as u32));
+            let _ = writeln!(text, "\t<P{:03}> = {};", i, self.overlay_first + i as u32);
         }
         for &kc in self.manual_overlay.keys() {
-            text.push_str(&format!("\t<X{kc:03}> = {kc};\n"));
+            let _ = writeln!(text, "\t<X{kc:03}> = {kc};");
         }
         let rest = &rest[kc_end..];
         let Some(close_at) = rest
@@ -328,10 +329,10 @@ impl KeymapPolicy {
         };
         text.push_str(&rest[..close_at]);
         for &(i, sym) in &occupied {
-            text.push_str(&format!("\tkey <P{:03}> {{ [ {:#x} ] }};\n", i, sym));
+            let _ = writeln!(text, "\tkey <P{:03}> {{ [ {:#x} ] }};", i, sym);
         }
         for (&kc, &sym) in &self.manual_overlay {
-            text.push_str(&format!("\tkey <X{kc:03}> {{ [ {sym:#x} ] }};\n"));
+            let _ = writeln!(text, "\tkey <X{kc:03}> {{ [ {sym:#x} ] }};");
         }
         text.push_str(&rest[close_at..]);
         text
