@@ -283,6 +283,27 @@ type NvFBCCreateInstanceFn = unsafe extern "C" fn(*mut NVFBC_API_FUNCTION_LIST) 
 /// driver capability, alongside `libnvidia-encode.so.1`.
 const NVFBC_LIBRARY: &str = "libnvidia-fbc.so.1";
 
+/// A driver call that failed: the status the driver returned, and its own account of it.
+///
+/// The status is kept because what to do next follows from it and nothing else: a session
+/// invalidated by a modeset is rebuilt, a lost X server needs a whole new handle, and anything
+/// else ends the capture.
+#[derive(Debug)]
+struct NvfbcError {
+    status: NVFBCSTATUS,
+    message: String,
+}
+
+impl std::fmt::Display for NvfbcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "({})", self.status)
+        } else {
+            write!(f, "{} ({})", self.message, self.status)
+        }
+    }
+}
+
 /// One frame the driver composited into video memory.
 struct GrabbedFrame {
     device_ptr: CUdeviceptr,
@@ -364,13 +385,14 @@ impl NvfbcSession {
     }
 
     /// Turn a driver status into an error carrying both the code and the driver's own message.
-    fn fail(&self, what: &str, st: NVFBCSTATUS) -> String {
+    fn fail(&self, what: &str, status: NVFBCSTATUS) -> NvfbcError {
         let detail = self.last_error();
-        if detail.is_empty() {
-            format!("{what} failed ({st})")
+        let message = if detail.is_empty() {
+            format!("{what} failed")
         } else {
-            format!("{what} failed ({st}): {detail}")
-        }
+            format!("{what} failed: {detail}")
+        };
+        NvfbcError { status, message }
     }
 
     /// Open a client handle on the X server named by the environment, letting NvFBC create and
@@ -401,7 +423,7 @@ impl NvfbcSession {
     }
 
     /// Ask the driver whether capture is possible here and how large the framebuffer is.
-    fn status(&self) -> Result<NVFBC_GET_STATUS_PARAMS, String> {
+    fn status(&self) -> Result<NVFBC_GET_STATUS_PARAMS, NvfbcError> {
         let mut params = NVFBC_GET_STATUS_PARAMS {
             dwVersion: struct_ver(std::mem::size_of::<NVFBC_GET_STATUS_PARAMS>(), 2),
             ..Default::default()
@@ -422,7 +444,12 @@ impl NvfbcSession {
     /// cursor is not composited); and the native BGRA format, which needs no conversion pass and
     /// so no extra copy. Modeset recovery is left to the driver, which rebuilds the session and
     /// resumes on its own.
-    fn start(&mut self, region: NVFBC_BOX, size: NVFBC_SIZE, with_cursor: bool) -> Result<(), String> {
+    fn start(
+        &mut self,
+        region: NVFBC_BOX,
+        size: NVFBC_SIZE,
+        with_cursor: bool,
+    ) -> Result<(), NvfbcError> {
         self.stop();
         let mut params = NVFBC_CREATE_CAPTURE_SESSION_PARAMS {
             dwVersion: struct_ver(std::mem::size_of::<NVFBC_CREATE_CAPTURE_SESSION_PARAMS>(), 6),
@@ -479,12 +506,12 @@ impl NvfbcSession {
     /// blocks until one is rendered or the timeout expires, and then returns the frame already in
     /// the buffer with `is_new` false. Nothing is copied either way: the device pointer addresses
     /// the driver's own capture buffer, which stays valid until the next grab.
-    fn grab(&mut self, timeout: Duration) -> Result<GrabbedFrame, String> {
+    fn grab(&mut self, timeout: Duration) -> Result<GrabbedFrame, NvfbcError> {
         self.grab_with(NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY, timeout)
     }
 
     /// The grab above, with the driver's wait behaviour named explicitly.
-    fn grab_with(&mut self, flags: u32, timeout: Duration) -> Result<GrabbedFrame, String> {
+    fn grab_with(&mut self, flags: u32, timeout: Duration) -> Result<GrabbedFrame, NvfbcError> {
         let mut device_ptr: CUdeviceptr = 0;
         let mut info = NVFBC_FRAME_GRAB_INFO::default();
         let mut params = NVFBC_TOCUDA_GRAB_FRAME_PARAMS {
@@ -522,9 +549,25 @@ impl Drop for NvfbcSession {
     }
 }
 
-/// Whether an NvFBC status means the session must be rebuilt rather than the capture abandoned.
-fn recoverable(err: &str) -> bool {
-    err.contains(&format!("({NVFBC_ERR_MUST_RECREATE})")) || err.contains(&format!("({NVFBC_ERR_X})"))
+/// What a failed driver call leaves the capture able to do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// The capture session is gone but the client handle is live: create the session again.
+    Session,
+    /// The X server the handle talks to is gone. The API has no way back from this other than a
+    /// new handle, so the old one is destroyed (which may leak the X, GLX and GL resources it can
+    /// no longer reach) and the capture rebuilt around a fresh one.
+    Handle,
+    /// Nothing this path can do; the caller stops.
+    None,
+}
+
+fn recovery_for(err: &NvfbcError) -> Recovery {
+    match err.status {
+        NVFBC_ERR_MUST_RECREATE => Recovery::Session,
+        NVFBC_ERR_X => Recovery::Handle,
+        _ => Recovery::None,
+    }
 }
 
 /// The capture region and delivered frame size for a set of settings against a framebuffer of
@@ -539,7 +582,11 @@ fn resolve_region(screen: NVFBC_SIZE, s: &RustCaptureSettings) -> (NVFBC_BOX, NV
     let x = super::clamp_offset(s.capture_x, screen.w.min(u16::MAX as u32) as u16).max(0) as u32;
     let y = super::clamp_offset(s.capture_y, screen.h.min(u16::MAX as u32) as u16).max(0) as u32;
     let size = NVFBC_SIZE { w: w as u32, h: h as u32 };
-    let full = x == 0 && y == 0 && size.w == (screen.w & !1) && size.h == (screen.h & !1);
+    // An empty box is the whole tracked region, which is what keeps a whole-screen capture
+    // following a resize. It may only stand in for a frame that *is* the screen: a frame size
+    // differing from the captured region makes the driver scale into it, which is both a
+    // conversion pass and the end of direct capture.
+    let full = x == 0 && y == 0 && size.w == screen.w && size.h == screen.h;
     let region = if full {
         NVFBC_BOX::default()
     } else {
@@ -599,7 +646,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     // NVENC session the XShm path would immediately build again.
     let probed = (|| -> Result<(NvfbcSession, NVFBC_SIZE), String> {
         let nvfbc = NvfbcSession::open()?;
-        let status = nvfbc.status()?;
+        let status = nvfbc.status().map_err(|e| e.to_string())?;
         if status.bIsCapturePossible != NVFBC_TRUE {
             return Err("the driver reports capture is not possible on this X server".into());
         }
@@ -625,7 +672,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     let (region, size) = resolve_region(screen, settings);
     if let Err(e) = nvfbc.start(region, size, settings.capture_cursor) {
         encoder.pop_context();
-        return declined(&e);
+        return declined(&e.to_string());
     }
 
     let request = settings.clone();
@@ -635,6 +682,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     if (settings.width != encoder.width() as i32 || settings.height != encoder.height() as i32)
         && let Err(e) = encoder.reconfigure_resolution(&settings)
     {
+        nvfbc.stop();
         encoder.pop_context();
         return declined(&format!("NVENC could not follow the captured size: {e}"));
     }
@@ -782,13 +830,20 @@ where
             }
             Err(e) => {
                 error_streak += 1;
-                if !recoverable(&e) || error_streak > 5 {
+                let recovery = recovery_for(&e);
+                if recovery == Recovery::None || error_streak > 5 {
                     return Some(Err(format!("NvFBC capture ended: {e}")));
                 }
-                eprintln!("[x11] NvFBC grab failed ({e}); rebuilding the capture session.");
                 let (region, size) = resolve_region(gpu.screen, &gpu.request);
-                if let Err(e) = restart_session(&mut gpu, region, size, want_cursor) {
-                    return Some(Err(format!("NvFBC session could not be rebuilt: {e}")));
+                let rebuilt = if recovery == Recovery::Handle {
+                    eprintln!("[x11] NvFBC lost the X server ({e}); rebuilding the client handle.");
+                    rebuild_handle(&mut gpu, region, size, want_cursor)
+                } else {
+                    eprintln!("[x11] NvFBC grab failed ({e}); rebuilding the capture session.");
+                    restart_session(&mut gpu, region, size, want_cursor).map_err(|e| e.to_string())
+                };
+                if let Err(e) = rebuilt {
+                    return Some(Err(format!("NvFBC capture could not be rebuilt: {e}")));
                 }
                 state = StripeState::default();
                 pending_force_idr = true;
@@ -815,7 +870,7 @@ where
             &mut state,
             &gpu.settings,
             frame_counter,
-            frame.is_new,
+            !gpu.settings.video_streaming_mode && frame.is_new,
             false,
             pending_force_idr,
         );
@@ -892,7 +947,7 @@ fn restart_session(
     region: NVFBC_BOX,
     size: NVFBC_SIZE,
     with_cursor: bool,
-) -> Result<(), String> {
+) -> Result<(), NvfbcError> {
     // The registration addresses the buffer the outgoing session owns, so it goes before the
     // session does.
     gpu.encoder.release_external_input();
@@ -901,9 +956,35 @@ fn restart_session(
     gpu.settings.height = size.h as i32;
     if gpu.settings.width != gpu.encoder.width() as i32 || gpu.settings.height != gpu.encoder.height() as i32
     {
-        gpu.encoder.reconfigure_resolution(&gpu.settings)?;
+        gpu.encoder
+            .reconfigure_resolution(&gpu.settings)
+            .map_err(|e| NvfbcError { status: NVFBC_SUCCESS, message: e })?;
     }
     Ok(())
+}
+
+/// Replace the client handle and the capture session on it, for the one failure the API offers no
+/// other way back from: the X server the handle was opened on is gone.
+///
+/// The encoder, its CUDA context and the frames already delivered all survive; only the driver
+/// objects are rebuilt, in the order that keeps the encoder from holding a registration of memory
+/// the outgoing session owns.
+fn rebuild_handle(
+    gpu: &mut GpuCapture,
+    region: NVFBC_BOX,
+    size: NVFBC_SIZE,
+    with_cursor: bool,
+) -> Result<(), String> {
+    gpu.encoder.release_external_input();
+    gpu.nvfbc.stop();
+    gpu.nvfbc = NvfbcSession::open()?;
+    gpu.screen = gpu.nvfbc.status().map_err(|e| e.to_string())?.screenSize;
+    let (region, size) = if region == NVFBC_BOX::default() {
+        resolve_region(gpu.screen, &gpu.request)
+    } else {
+        (region, size)
+    };
+    restart_session(gpu, region, size, with_cursor).map_err(|e| e.to_string())
 }
 
 /// The row stride of a captured frame: the driver's own, derived from the buffer size it
@@ -991,11 +1072,16 @@ mod region_tests {
 
     /// Both dimensions are even, because every video codec requires it, and a region is clamped
     /// into the framebuffer rather than running past its edge.
+    ///
+    /// An odd screen therefore captures an even box of it, never the whole screen delivered at
+    /// the even size: the driver would scale into the difference, which is a conversion pass and
+    /// the end of direct capture.
     #[test]
     fn region_is_even_and_inside_the_screen() {
         let screen = NVFBC_SIZE { w: 1919, h: 1081 };
-        let (_, size) = resolve_region(screen, &settings(0, 0));
+        let (region, size) = resolve_region(screen, &settings(0, 0));
         assert_eq!(size, NVFBC_SIZE { w: 1918, h: 1080 });
+        assert_eq!(region, NVFBC_BOX { x: 0, y: 0, w: 1918, h: 1080 });
 
         let mut s = settings(1920, 1080);
         s.capture_x = 1000;
@@ -1006,6 +1092,20 @@ mod region_tests {
         assert_eq!(size, NVFBC_SIZE { w: 920, h: 280 });
         assert_eq!(region.w, size.w);
         assert_eq!(region.h, size.h);
+    }
+
+    /// What the capture does after a failed driver call follows from the status alone: a session
+    /// the driver invalidated is created again, a lost X server needs a whole new handle, and
+    /// nothing else is recoverable. The status is read from the error rather than matched in its
+    /// text, where the driver's own message could carry the same digits.
+    #[test]
+    fn recovery_follows_the_status() {
+        let session = |status| NvfbcError { status, message: String::new() };
+        assert!(matches!(recovery_for(&session(NVFBC_ERR_MUST_RECREATE)), Recovery::Session));
+        assert!(matches!(recovery_for(&session(NVFBC_ERR_X)), Recovery::Handle));
+        assert!(matches!(recovery_for(&session(1)), Recovery::None));
+        let misleading = NvfbcError { status: 1, message: "the display (16) went away (10)".into() };
+        assert!(matches!(recovery_for(&misleading), Recovery::None));
     }
 
     /// The stride comes from the driver's own byte count when that is a whole number of rows,
@@ -1255,7 +1355,7 @@ mod gpu_tests {
                 continue;
             };
             let (w, h) = (gpu.encoder.width(), gpu.encoder.height());
-            let mut run = |label: &str, repaint: bool, gpu: &mut GpuCapture| {
+            let run = |label: &str, repaint: bool, gpu: &mut GpuCapture| {
                 let f = gpu.nvfbc.grab(Duration::from_millis(200)).expect("grab");
                 let pitch = frame_pitch(f.byte_size, f.width, f.height);
                 gpu.encoder
