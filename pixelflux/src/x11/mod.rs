@@ -11,6 +11,12 @@
 //! protocol socket every tick, so XShm has the server write the pixels straight into memory this
 //! process already has mapped.
 //!
+//! This is the general path, and it works against any X server. On an NVIDIA X server whose
+//! session encodes on NVENC there is a better one: [`nvfbc`] has the driver composite the screen
+//! straight into video memory and registers that buffer with the encoder in place, so no frame is
+//! copied at all. `run_capture` takes it whenever it can serve the session and falls back here
+//! otherwise.
+//!
 //! `run_capture` splits the work across two threads because grabbing the next frame and encoding
 //! the previous one have no reason to wait on each other: the caller's thread grabs frames and owns
 //! the x11rb connection and the pool of shm surfaces, while a spawned encode thread owns the
@@ -41,6 +47,7 @@ use crate::RustCaptureSettings;
 
 pub mod computer_use;
 pub mod cursor;
+pub mod nvfbc;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
 /// payloads) the owning `ScreenCapture` pyclass flips from the Python thread and the capture thread
@@ -756,6 +763,36 @@ where
     }
 }
 
+/// Capture an X11 display until `stop` is set, on the best path this session can run.
+///
+/// [`nvfbc::run_capture`] is tried first: where the NVIDIA driver offers framebuffer capture and
+/// the session encodes on NVENC, the screen is composited into video memory and encoded in place,
+/// so a frame reaches the bitstream without being copied once. It reports that it cannot serve
+/// the session — a codec NVENC has no engine for, software encoding, another vendor's GPU, a
+/// watermark that has to be blended into host pixels, or a driver without NvFBC — and the capture
+/// then runs on the general XShm path below, which every X server supports.
+///
+/// Blocking; intended to run on a dedicated thread.
+pub fn run_capture<F>(
+    settings: RustCaptureSettings,
+    controls: Arc<Controls>,
+    encode_tid_tx: Sender<thread::ThreadId>,
+    mut on_frame: F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<EncodedStripe>) + Send + 'static,
+{
+    if let Some(result) = nvfbc::run_capture(
+        settings.clone(),
+        controls.clone(),
+        encode_tid_tx.clone(),
+        &mut on_frame,
+    ) {
+        return result;
+    }
+    run_shm_capture(settings, controls, encode_tid_tx, on_frame)
+}
+
 /// Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
 /// threads that overlap for throughput.
 ///
@@ -796,7 +833,7 @@ where
 ///
 /// Blocking; intended to run on a dedicated thread. The X connection and shm surfaces live on this
 /// thread and the encoder lives on the encode thread — nothing X-related crosses the boundary.
-pub fn run_capture<F>(
+fn run_shm_capture<F>(
     settings: RustCaptureSettings,
     controls: Arc<Controls>,
     encode_tid_tx: Sender<thread::ThreadId>,
