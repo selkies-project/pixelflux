@@ -400,6 +400,24 @@ struct CachedDmaBuf {
     input: DmaBufInput,
 }
 
+/// An input surface the session does not own: a device pointer produced by another component on
+/// the same CUDA context — the NvFBC capture buffer — registered and mapped with NVENC in place
+/// so the encoder reads the captured frame where it was composited.
+///
+/// The registration is kept for as long as the pointer and geometry hold, because a capture
+/// source hands back the same buffer every frame; it is released and rebuilt when any of them
+/// changes, and always before the component that owns the memory tears it down.
+#[derive(Clone, Copy)]
+struct ExternalInput {
+    device_ptr: CUdeviceptr,
+    pitch: usize,
+    width: u32,
+    height: u32,
+    format: NV_ENC_BUFFER_FORMAT,
+    registered: NV_ENC_REGISTERED_PTR,
+    mapped: NV_ENC_INPUT_PTR,
+}
+
 /// How a cached dmabuf import feeds the encoder.
 ///
 /// `Direct` is the zero-copy case: the mapped frame's first plane is itself registered and mapped
@@ -663,6 +681,7 @@ pub struct NvencEncoder {
     bitstream_buffers: Vec<NV_ENC_OUTPUT_PTR>,
     current_buffer_idx: usize,
     dmabuf_cache: HashMap<i32, CachedDmaBuf>,
+    external_input: Option<ExternalInput>,
     pinned_hosts: HashMap<usize, usize>,
     cuda: Arc<CudaFunctions>,
     egl: Arc<EglFunctions>,
@@ -701,6 +720,7 @@ impl Drop for NvencEncoder {
         unsafe {
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
 
+            self.unmap_external_input();
             if !self.mapped_input_buffer.is_null() {
                 (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
                     self.encoder_session,
@@ -1351,6 +1371,7 @@ impl NvencEncoder {
                 bitstream_buffers,
                 current_buffer_idx: 0,
                 dmabuf_cache: HashMap::new(),
+                external_input: None,
                 pinned_hosts: HashMap::new(),
                 cuda,
                 egl,
@@ -1536,6 +1557,7 @@ impl NvencEncoder {
 
         unsafe {
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            self.unmap_external_input();
             if !self.mapped_input_buffer.is_null() {
                 (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
                     self.encoder_session,
@@ -2314,6 +2336,168 @@ impl NvencEncoder {
                 frame_number,
                 force_idr,
             );
+            if result.is_err() {
+                (self.cuda.cuStreamSynchronize)(ptr::null_mut());
+            }
+            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+            result
+        }
+    }
+
+    /// The geometry the session is currently initialized for.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// The geometry the session is currently initialized for.
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Make this session's CUDA context current on the calling thread, so a capture source can
+    /// allocate its frames in the very context the encoder reads them from — the whole basis of
+    /// a zero-copy hand-over. Paired with [`NvencEncoder::pop_context`].
+    pub(crate) fn push_context(&self) -> bool {
+        unsafe { (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context) == CUresult::CUDA_SUCCESS }
+    }
+
+    /// Give back the context [`NvencEncoder::push_context`] made current.
+    pub(crate) fn pop_context(&self) {
+        unsafe {
+            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+    }
+
+    /// Drop the registration of an externally-owned input surface, under the pushed CUDA context.
+    ///
+    /// The caller owns the memory behind it, so this must run before that owner releases it: a
+    /// registration outliving its buffer leaves the driver holding a mapping of freed video
+    /// memory.
+    pub fn release_external_input(&mut self) {
+        if self.external_input.is_none() {
+            return;
+        }
+        unsafe {
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            self.unmap_external_input();
+            let _ = (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+    }
+
+    /// Unmap and unregister the external input, with the CUDA context already current.
+    unsafe fn unmap_external_input(&mut self) {
+        if let Some(ext) = self.external_input.take() {
+            (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(self.encoder_session, ext.mapped);
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(self.encoder_session, ext.registered);
+        }
+    }
+
+    /// The mapped NVENC input for an externally-owned device pointer, registering it in place the
+    /// first time and reusing that registration for every later frame from the same buffer.
+    ///
+    /// A capture source hands back one buffer for as long as its geometry holds, so the register
+    /// and map cost is paid once per session rather than per frame; a pointer, pitch or geometry
+    /// that changes releases the old registration and builds a new one.
+    unsafe fn register_external_input(
+        &mut self,
+        device_ptr: CUdeviceptr,
+        pitch: usize,
+        format: NV_ENC_BUFFER_FORMAT,
+    ) -> Result<NV_ENC_INPUT_PTR, String> {
+        if let Some(ext) = self.external_input
+            && ext.device_ptr == device_ptr
+            && ext.pitch == pitch
+            && ext.format == format
+            && ext.width == self.width
+            && ext.height == self.height
+        {
+            return Ok(ext.mapped);
+        }
+        self.unmap_external_input();
+        if pitch < self.width as usize * 4 || pitch % 4 != 0 {
+            return Err(format!(
+                "external input pitch {pitch} does not cover {}x{} at 4-byte alignment",
+                self.width, self.height
+            ));
+        }
+        let mut reg_res = NV_ENC_REGISTER_RESOURCE {
+            version: sv(NvStruct::RegisterResource),
+            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            width: self.width,
+            height: self.height,
+            resourceToRegister: device_ptr as *mut c_void,
+            pitch: pitch as u32,
+            bufferFormat: format,
+            bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+            ..Default::default()
+        };
+        let st = (self.nvenc_funcs.nvEncRegisterResource.unwrap())(self.encoder_session, &mut reg_res);
+        if st != NVENCSTATUS::NV_ENC_SUCCESS {
+            return Err(format!("failed to register the captured frame as an NVENC input ({st:?})"));
+        }
+        let mut map_params = NV_ENC_MAP_INPUT_RESOURCE {
+            version: sv(NvStruct::MapInputResource),
+            registeredResource: reg_res.registeredResource,
+            ..Default::default()
+        };
+        let st = (self.nvenc_funcs.nvEncMapInputResource.unwrap())(self.encoder_session, &mut map_params);
+        if st != NVENCSTATUS::NV_ENC_SUCCESS {
+            (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(
+                self.encoder_session,
+                reg_res.registeredResource,
+            );
+            return Err(format!("failed to map the captured frame as an NVENC input ({st:?})"));
+        }
+        self.external_input = Some(ExternalInput {
+            device_ptr,
+            pitch,
+            width: self.width,
+            height: self.height,
+            format,
+            registered: reg_res.registeredResource,
+            mapped: map_params.mappedResource,
+        });
+        Ok(map_params.mappedResource)
+    }
+
+    /// Encode a frame that already lives in video memory, reading it exactly where it was
+    /// produced.
+    ///
+    /// This is the zero-copy hand-over: `device_ptr` addresses packed pixels in this session's own
+    /// CUDA context — the X11 NvFBC capture buffer the NVIDIA driver composited the screen into —
+    /// so no upload, conversion or `cuMemcpy` stands between the screen and the bitstream. The
+    /// hardware CSC does the colour conversion the session's VUI declares, as it does for every
+    /// other packed input. `rgba` names the byte order (`false` for the B,G,R,A the driver's
+    /// native format delivers), and `pitch` is the buffer's row stride in bytes.
+    ///
+    /// The caller must keep the buffer alive and unmodified until this returns; the blocking
+    /// bitstream lock inside means the encoder has finished reading by then, so the next capture
+    /// may overwrite it.
+    pub fn encode_cuda_pitch(
+        &mut self,
+        device_ptr: CUdeviceptr,
+        pitch: usize,
+        rgba: bool,
+        frame_number: u64,
+        crf: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, String> {
+        unsafe {
+            self.reconfigure_if_needed(crf);
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            let format = if rgba {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
+            } else {
+                NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+            };
+            let mapped = match self.register_external_input(device_ptr, pitch, format) {
+                Ok(m) => m,
+                Err(e) => {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err(e);
+                }
+            };
+            let result = self.submit_frame(mapped, format, frame_number, force_idr);
             if result.is_err() {
                 (self.cuda.cuStreamSynchronize)(ptr::null_mut());
             }
