@@ -115,7 +115,7 @@ impl Openh264Encoder {
     ///
     /// 1. **Geometry**: width and height are floored to even values (`& !1`, min 2) because 4:2:0
     ///    chroma subsampling requires it. A 4:4:4 request is encoded 4:2:0 regardless: OpenH264 is
-    ///    4:2:0-only (the caller reports that once, via `SOFTWARE_H264_FULLCOLOR`).
+    ///    4:2:0-only (the caller reports that once, via `software_fullcolor`).
     ///
     /// 2. **CRF floor**: `crf` is clamped to `[1, 51]`. The floor is 1, not 0, because a zero
     ///    anywhere in the QP pair makes OpenH264's `ParamValidation` discard the *entire* range and
