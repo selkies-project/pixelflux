@@ -204,7 +204,7 @@ impl X11Pipeline {
         if self.hw_rebuilt {
             eprintln!(
                 "[x11] HW encoder unrecoverable; demoting to software encoding ({}).",
-                crate::encoders::SOFTWARE_H264_ENCODER
+                crate::encoders::software_library(Codec::H264)
             );
             // The broken session is released before its replacement is built: these failures
             // are usually device memory pressure, and holding both at once is what would make
@@ -234,7 +234,7 @@ impl X11Pipeline {
         match &self.hw {
             Some(enc) if enc.is_hardware() => enc.backend_name().to_string(),
             Some(enc) => format!("CPU ({})", enc.backend_name()),
-            None => format!("CPU ({})", crate::encoders::SOFTWARE_H264_ENCODER),
+            None => format!("CPU ({})", crate::encoders::software_library(Codec::H264)),
         }
     }
 
@@ -605,8 +605,8 @@ mod tests {
     /// backends.
     #[test]
     fn x11_colorspace_desc_reports_what_the_software_encoder_carries() {
-        let carries_444 = crate::encoders::SOFTWARE_H264_FULLCOLOR;
-        assert_eq!(carries_444, crate::encoders::SOFTWARE_H264_ENCODER == "x264");
+        let carries_444 = crate::encoders::software_fullcolor(Codec::H264);
+        assert_eq!(carries_444, crate::encoders::software_library(Codec::H264) == "x264");
         let i444 = if carries_444 { "I444 (Full Range)" } else { "I420 (Limited Range)" };
         for (fullcolor, expected) in [(true, i444), (false, "I420 (Limited Range)")] {
             let p = X11Pipeline::new(RustCaptureSettings {
@@ -617,7 +617,7 @@ mod tests {
                 video_fullcolor: fullcolor,
                 ..Default::default()
             });
-            assert_eq!(p.encoder_name(), format!("CPU ({})", crate::encoders::SOFTWARE_H264_ENCODER));
+            assert_eq!(p.encoder_name(), format!("CPU ({})", crate::encoders::software_library(Codec::H264)));
             assert_eq!(p.colorspace_desc(), expected);
             assert_eq!(
                 p.colorspace_desc(),
