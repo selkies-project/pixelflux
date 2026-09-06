@@ -21,7 +21,7 @@
 //! is handled inside them (e.g. the libx264 open/close lock); each capture owns its own private xcb
 //! connection, so there is no shared X state to serialize here.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -77,6 +77,9 @@ pub struct Controls {
     pub tunables_dirty: AtomicBool,
     pub tunables: Mutex<Option<crate::LiveTunables>>,
     pub capture_cursor: AtomicBool,
+    /// The codec the pipeline streams, as `Codec::id`, once one has been built; the
+    /// selection ladder may have demoted the requested one. `u32::MAX` until then.
+    pub codec: AtomicU32,
     pub region_dirty: AtomicBool,
     pub region: Mutex<(i32, i32, i32, i32)>,
 }
@@ -96,6 +99,7 @@ impl Controls {
             tunables_dirty: AtomicBool::new(false),
             tunables: Mutex::new(None),
             capture_cursor: AtomicBool::new(s.capture_cursor),
+            codec: AtomicU32::new(u32::MAX),
             region_dirty: AtomicBool::new(false),
             region: Mutex::new((s.capture_x, s.capture_y, s.width, s.height)),
         }
@@ -722,6 +726,7 @@ where
 
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let stripes = pl.process(buf, frame.stride);
+        controls.codec.store(pl.codec().id(), Ordering::Relaxed);
         pool.recycle(frame.idx);
         if !stripes.is_empty() {
             frame_count += 1;
