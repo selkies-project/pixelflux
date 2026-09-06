@@ -175,6 +175,22 @@ impl Codec {
     pub fn quantizer_bound(self, qp: i32) -> u32 {
         if qp <= 0 { 0 } else { self.quantizer(qp) }
     }
+
+    /// `quantizer` for an NVENC session, whose AV1 engine has its own measured curve:
+    /// matched on SSIM against H.264 at the same index on Ada and L40S (the two agree
+    /// to the byte) with Blackwell within ten steps, and interpolated between the
+    /// measured points. NVENC refuses an AV1 index of zero, so the floor stays one.
+    pub fn nvenc_quantizer(self, crf: i32) -> u32 {
+        match self {
+            Codec::Av1 => interpolate(&AV1_NVENC_QINDEX, crf.clamp(0, 51) as u32).max(1),
+            _ => self.quantizer(crf),
+        }
+    }
+
+    /// `quantizer_bound` for an NVENC session.
+    pub fn nvenc_quantizer_bound(self, qp: i32) -> u32 {
+        if qp <= 0 { 0 } else { self.nvenc_quantizer(qp) }
+    }
 }
 
 /// Session quality index → VP8 quantizer index (0..=127) breakpoints.
@@ -186,6 +202,11 @@ const VP9_QINDEX: [(u32, u32); 9] =
 /// Session quality index → AV1 `base_q_idx` (0..=255) breakpoints.
 const AV1_QINDEX: [(u32, u32); 9] =
     [(0, 0), (10, 9), (15, 45), (20, 119), (25, 166), (30, 195), (35, 223), (40, 240), (51, 255)];
+/// Session quality index → NVENC AV1 `base_q_idx` breakpoints.
+const AV1_NVENC_QINDEX: [(u32, u32); 13] = [
+    (0, 1), (10, 1), (15, 4), (20, 31), (22, 44), (25, 65), (28, 109), (30, 126), (35, 156),
+    (40, 182), (45, 210), (50, 251), (51, 255),
+];
 
 /// Piecewise-linear lookup of `x` in ascending `(x, y)` breakpoints, clamped at both ends.
 fn interpolate(points: &[(u32, u32)], x: u32) -> u32 {
@@ -590,6 +611,7 @@ mod tests {
             for crf in 0..=51 {
                 let q = codec.quantizer(crf);
                 assert!(q >= last, "{codec:?} crf {crf}: {q} < {last}");
+                assert!(codec.nvenc_quantizer(crf) >= codec.nvenc_quantizer(crf.max(1) - 1));
                 assert!(q <= codec.quantizer_max());
                 last = q;
             }
