@@ -75,6 +75,18 @@ default from the exported names. Test both configurations (`cargo test --lib` an
 wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
 from source ahead of FFmpeg.
 
+X11 capture has two backends and picks between them itself (`x11::run_capture`): NvFBC
+(`x11/nvfbc.rs`) where the NVIDIA driver composites the screen into video memory and the buffer is
+registered with NVENC in place, which is zero-copy and the lower-latency path, and the general
+XShm path otherwise. NvFBC is declined -- with one line saying why -- for a codec NVENC has no
+engine for, software encoding, a non-NVIDIA encode node, a watermark, or a driver without it.
+There is no setting either way: the driver's own answer decides, and a host without NvFBC pays
+about 7 ms once per capture start to find that out. The NvFBC structures are hand-written FFI checked
+against the SDK by the layout and version assertions in that module, and `libnvidia-fbc.so.1` is
+loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
+(`cargo test gpu_nvfbc -- --ignored --nocapture --test-threads=1` with `DISPLAY` on an NVIDIA X
+server).
+
 The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
 `AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the
 fixed device format, and publishing happen on the camera's own thread. `push` takes the frame's upright transform as

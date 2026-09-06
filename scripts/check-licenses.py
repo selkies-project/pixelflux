@@ -227,7 +227,8 @@ NATIVE: Dict[str, Dict[str, object]] = {
                          "not linked",
                      note="Python binding"),
     "nvcodec-sys": dict(
-        library="NVIDIA NVENC (libnvidia-encode.so.1) and CUDA driver (libcuda.so.1)",
+        library="NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture "
+                "(libnvidia-fbc.so.1) and CUDA driver (libcuda.so.1)",
         license="proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings "
                 "are declarations generated from the CUDA toolkit headers",
         rank=PERMISSIVE,
@@ -242,7 +243,8 @@ NATIVE: Dict[str, Dict[str, object]] = {
                  note="libm, libpthread, libdl are part of it"),
     "libloading": dict(
         library="libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), "
-                "libwayland-server.so.0 (MIT), libcuda.so.1/libnvidia-encode.so.1 "
+                "libwayland-server.so.0 (MIT), libcuda.so.1/libnvidia-encode.so.1/"
+                "libnvidia-fbc.so.1 "
                 "(proprietary)",
         license="MIT and proprietary driver libraries", rank=PERMISSIVE,
         how="dlopen at run time, never linked", note="see nvcodec-sys"),
