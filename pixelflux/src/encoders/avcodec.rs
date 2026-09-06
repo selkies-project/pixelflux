@@ -813,7 +813,9 @@ impl AvcodecEncoder {
                     dict_set(opts, "row-mt", "1");
                     dict_set(opts, "tune-content", "screen");
                     dict_set(opts, "frame-parallel", "0");
-                    let tile_columns = (self.width / 512).max(1).ilog2().min(6);
+                    // Column threading is per tile and VP9's narrowest tile is 256 pixels,
+                    // so the width sets how many columns the encode can spread across.
+                    let tile_columns = (self.width / 256).max(1).ilog2().min(6);
                     dict_set(opts, "tile-columns", &tile_columns.to_string());
                 }
                 if !self.cbr_mode {
