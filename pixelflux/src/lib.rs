@@ -1212,6 +1212,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
     let n_stripes = wayland_stripe_count(&settings, video_encoder.is_some());
     cfg.stats.n_stripes.store(n_stripes as u32, Ordering::Relaxed);
     *cfg.stats.desc.lock().unwrap() = encoder_desc(&settings, video_encoder.as_ref(), false);
+    set_wayland_active_codec(cfg.display_id, Some(settings.codec));
     log_stream_settings(&settings, n_stripes, video_encoder.as_ref());
 
     let width = settings.width;
@@ -1329,6 +1330,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             cfg.stats.n_stripes.store(n as u32, Ordering::Relaxed);
                             *cfg.stats.desc.lock().unwrap() =
                                 encoder_desc(&settings, video_encoder.as_ref(), false);
+                            set_wayland_active_codec(cfg.display_id, Some(settings.codec));
                             log_stream_settings(&settings, n, video_encoder.as_ref());
                         }
                     }
@@ -1585,6 +1587,7 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     }
     wayland_alive().lock().unwrap().remove(&display_id);
     set_wayland_capture_err(display_id, None);
+    set_wayland_active_codec(display_id, None);
     if let Some(p) = state.host_layout_pending.remove(&display_id) {
         answer_geometry_waiters(state, display_id, p.geometry_waiters);
     }
@@ -2276,6 +2279,7 @@ fn start_capture_on_display(
         cap.encode_stats.n_stripes.store(1, Ordering::Relaxed);
         *cap.encode_stats.desc.lock().unwrap() =
             encoder_desc(&settings, cap.video_encoder.as_ref(), true);
+        set_wayland_active_codec(display_id, Some(settings.codec));
         log_stream_settings(&settings, 1, cap.video_encoder.as_ref());
     }
     // A zero-copy start has no successor encode thread to inherit the outgoing readback
@@ -6103,6 +6107,26 @@ fn wayland_capture_err() -> &'static Mutex<std::collections::HashMap<u32, String
 }
 
 /// Record (or clear, with `None`) the last-start outcome for `display_id`.
+static WAYLAND_ACTIVE_CODEC: OnceLock<Mutex<std::collections::HashMap<u32, u32>>> = OnceLock::new();
+
+/// The codec each Wayland display's capture streams, as `Codec::id`, read by
+/// `ScreenCapture::active_codec` without a round trip to the compositor thread.
+fn wayland_active_codec() -> &'static Mutex<std::collections::HashMap<u32, u32>> {
+    WAYLAND_ACTIVE_CODEC.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn set_wayland_active_codec(display_id: u32, codec: Option<Codec>) {
+    let mut map = wayland_active_codec().lock().unwrap();
+    match codec {
+        Some(c) => {
+            map.insert(display_id, c.id());
+        }
+        None => {
+            map.remove(&display_id);
+        }
+    }
+}
+
 fn set_wayland_capture_err(display_id: u32, err: Option<String>) {
     let mut map = wayland_capture_err().lock().unwrap();
     match err {
@@ -6620,6 +6644,23 @@ impl ScreenCapture {
         st.err = Some(err_slot);
         drop(st);
         Ok(())
+    }
+
+    /// The codec this capture streams, by name, once its pipeline has been built: the
+    /// requested one, or the one the selection ladder demoted it to when no encoder could
+    /// serve the request. None before the first frame or after a stop.
+    fn active_codec(&self, py: Python<'_>) -> PyResult<Option<String>> {
+        let (backend, controls, wl_display) = {
+            let st = self.inner.lock().unwrap();
+            (st.backend, st.controls.clone(), st.wl_display)
+        };
+        let id = match backend {
+            1 => controls.map_or(u32::MAX, |c| c.codec.load(Ordering::Relaxed)),
+            2 => py.detach(|| wayland_active_codec().lock().unwrap().get(&wl_display).copied())
+                .unwrap_or(u32::MAX),
+            _ => u32::MAX,
+        };
+        Ok(Codec::from_id(id).map(|c| c.name().to_string()))
     }
 
     fn stop_capture(&self, py: Python<'_>) -> PyResult<()> {

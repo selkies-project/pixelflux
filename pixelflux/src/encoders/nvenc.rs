@@ -1197,14 +1197,14 @@ impl NvencEncoder {
                     settings.keyframe_interval_s,
                     settings.video_vbv_multiplier,
                 );
-                let lo = codec.quantizer_bound(settings.video_min_qp);
+                let lo = codec.nvenc_quantizer_bound(settings.video_min_qp);
                 if lo > 0 {
                     config.rcParams.set_enableMinQP(1);
                     config.rcParams.minQP.qpInterP = lo;
                     config.rcParams.minQP.qpInterB = lo;
                     config.rcParams.minQP.qpIntra = lo;
                 }
-                let hi = codec.quantizer_bound(settings.video_max_qp);
+                let hi = codec.nvenc_quantizer_bound(settings.video_max_qp);
                 if hi > 0 {
                     config.rcParams.set_enableMaxQP(1);
                     config.rcParams.maxQP.qpInterP = hi;
@@ -1212,7 +1212,7 @@ impl NvencEncoder {
                     config.rcParams.maxQP.qpIntra = hi;
                 }
             } else {
-                let q = codec.quantizer(settings.video_crf);
+                let q = codec.nvenc_quantizer(settings.video_crf);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
                 config.rcParams.constQP.qpInterP = q;
                 config.rcParams.constQP.qpInterB = q;
@@ -1340,7 +1340,7 @@ impl NvencEncoder {
                 fullcolor: is_444,
                 width,
                 height,
-                current_qp: codec.quantizer(settings.video_crf),
+                current_qp: codec.nvenc_quantizer(settings.video_crf),
                 encode_config: config,
                 init_params,
                 input_device_ptr,
@@ -1576,7 +1576,7 @@ impl NvencEncoder {
                     settings.video_vbv_multiplier,
                 );
             } else {
-                let qp = self.codec.quantizer(settings.video_crf);
+                let qp = self.codec.nvenc_quantizer(settings.video_crf);
                 self.encode_config.rcParams.constQP.qpInterP = qp;
                 self.encode_config.rcParams.constQP.qpInterB = qp;
                 self.encode_config.rcParams.constQP.qpIntra = qp;
@@ -1781,7 +1781,7 @@ impl NvencEncoder {
         {
             return false;
         }
-        let target_qp = self.codec.quantizer(crf as i32);
+        let target_qp = self.codec.nvenc_quantizer(crf as i32);
         if self.current_qp != target_qp {
             self.encode_config.rcParams.constQP.qpInterP = target_qp;
             self.encode_config.rcParams.constQP.qpInterB = target_qp;
