@@ -151,14 +151,15 @@ impl Codec {
     /// The quantizer, in this codec's own domain, that a session quality index (`video_crf`,
     /// on the H.26x QP scale) selects.
     ///
-    /// H.26x takes the index as its QP. The VP8, VP9 and AV1 quantizer indices are looked
-    /// up in tables measured against x264 at the same settings pixelflux runs it with,
-    /// matching on SSIM of a scrolling text desktop, and interpolated between the
-    /// measured points. Past an index of 40 those encoders cannot degrade as far as x264
-    /// does, so the tables ramp from the last matched point to the codec's maximum at 51
-    /// rather than sitting on it, keeping every step of the index a step of the quantizer.
-    /// An AV1 index of zero is refused by NVENC and is lossless on the others, so its
-    /// floor is one.
+    /// H.26x takes the index as its QP. The VP8, VP9 and AV1 quantizer indices come from
+    /// tables measured on the software encoders: each point is the quantizer whose SSIM
+    /// matches libx264's at the same index on a scrolling text desktop, every encoder at
+    /// the settings pixelflux gives it, interpolated in between. Each table ends at the
+    /// codec's maximum quantizer at index 51, since past its last matched point the
+    /// encoder cannot degrade as far as x264 does and there is nothing left to match. A
+    /// VA-API session reads the same tables, which no VA-API encoder has been measured
+    /// against. An AV1 index of zero is refused by NVENC and is lossless on the others,
+    /// so its floor is one.
     pub fn quantizer(self, crf: i32) -> u32 {
         let crf = crf.clamp(0, 51) as u32;
         match self {
@@ -197,13 +198,15 @@ impl Codec {
 
 /// Session quality index → VP8 quantizer index (0..=127) breakpoints.
 const VP8_QINDEX: [(u32, u32); 9] =
-    [(0, 0), (10, 3), (15, 14), (20, 29), (25, 52), (30, 78), (35, 111), (40, 119), (51, 127)];
+    [(0, 0), (10, 4), (15, 14), (20, 33), (25, 60), (30, 87), (35, 117), (36, 121), (51, 127)];
 /// Session quality index → VP9 `base_q_idx` (0..=255) breakpoints.
-const VP9_QINDEX: [(u32, u32); 9] =
-    [(0, 0), (10, 25), (15, 70), (20, 122), (25, 158), (30, 190), (35, 216), (40, 238), (51, 255)];
+const VP9_QINDEX: [(u32, u32); 10] = [
+    (0, 0), (10, 21), (15, 59), (20, 110), (25, 148), (30, 177), (35, 208), (40, 242), (42, 251),
+    (51, 255),
+];
 /// Session quality index → AV1 `base_q_idx` (0..=255) breakpoints.
 const AV1_QINDEX: [(u32, u32); 9] =
-    [(0, 0), (10, 9), (15, 45), (20, 119), (25, 166), (30, 195), (35, 223), (40, 240), (51, 255)];
+    [(0, 0), (10, 9), (15, 45), (20, 119), (25, 165), (30, 194), (35, 221), (40, 254), (51, 255)];
 /// Session quality index → NVENC AV1 `base_q_idx` breakpoints.
 const AV1_NVENC_QINDEX: [(u32, u32); 13] = [
     (0, 1), (10, 1), (15, 4), (20, 31), (22, 44), (25, 65), (28, 109), (30, 126), (35, 156),
