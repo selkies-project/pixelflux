@@ -154,8 +154,11 @@ impl Codec {
     /// H.26x takes the index as its QP. The VP8, VP9 and AV1 quantizer indices are looked
     /// up in tables measured against x264 at the same settings pixelflux runs it with,
     /// matching on SSIM of a scrolling text desktop, and interpolated between the
-    /// measured points. An AV1 index of zero is refused by NVENC and is lossless on the
-    /// others, so its floor is one.
+    /// measured points. Past an index of 40 those encoders cannot degrade as far as x264
+    /// does, so the tables ramp from the last matched point to the codec's maximum at 51
+    /// rather than sitting on it, keeping every step of the index a step of the quantizer.
+    /// An AV1 index of zero is refused by NVENC and is lossless on the others, so its
+    /// floor is one.
     pub fn quantizer(self, crf: i32) -> u32 {
         let crf = crf.clamp(0, 51) as u32;
         match self {
@@ -175,14 +178,14 @@ impl Codec {
 }
 
 /// Session quality index → VP8 quantizer index (0..=127) breakpoints.
-const VP8_QINDEX: [(u32, u32); 8] =
-    [(0, 0), (10, 3), (15, 14), (20, 29), (25, 52), (30, 78), (35, 111), (40, 127)];
+const VP8_QINDEX: [(u32, u32); 9] =
+    [(0, 0), (10, 3), (15, 14), (20, 29), (25, 52), (30, 78), (35, 111), (40, 119), (51, 127)];
 /// Session quality index → VP9 `base_q_idx` (0..=255) breakpoints.
 const VP9_QINDEX: [(u32, u32); 9] =
-    [(0, 0), (10, 25), (15, 70), (20, 122), (25, 158), (30, 190), (35, 216), (40, 249), (45, 255)];
+    [(0, 0), (10, 25), (15, 70), (20, 122), (25, 158), (30, 190), (35, 216), (40, 238), (51, 255)];
 /// Session quality index → AV1 `base_q_idx` (0..=255) breakpoints.
 const AV1_QINDEX: [(u32, u32); 9] =
-    [(0, 0), (10, 9), (15, 45), (20, 119), (25, 166), (30, 195), (35, 223), (40, 254), (45, 255)];
+    [(0, 0), (10, 9), (15, 45), (20, 119), (25, 166), (30, 195), (35, 223), (40, 240), (51, 255)];
 
 /// Piecewise-linear lookup of `x` in ascending `(x, y)` breakpoints, clamped at both ends.
 fn interpolate(points: &[(u32, u32)], x: u32) -> u32 {
