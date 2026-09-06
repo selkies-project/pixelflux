@@ -5,7 +5,7 @@
  */
 
 //! CPU-based striped encoder: H.264 through the build's software encoder — libx264 with the
-//! `gpl` feature, Cisco OpenH264 without it (`SOFTWARE_H264_ENCODER`) — and turbojpeg for JPEG.
+//! `gpl` feature, Cisco OpenH264 without it (`software_encoder`) — and turbojpeg for JPEG.
 //!
 //! Frames are split into horizontal stripes processed in parallel via rayon. Each stripe is
 //! independently hashed against the previous frame for change detection, and only dirty stripes
@@ -857,7 +857,7 @@ pub fn encode_cpu(
     };
     #[cfg(feature = "gpl")]
     let csc_bands = 1;
-    if video && video_fullcolor && !crate::encoders::SOFTWARE_H264_FULLCOLOR {
+    if video && video_fullcolor && !crate::encoders::software_fullcolor(Codec::H264) {
         static FULLCOLOR_LOGGED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !FULLCOLOR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {

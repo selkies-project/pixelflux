@@ -1206,7 +1206,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
     if cfg.try_gpu && video_encoder.is_none() {
         println!(
             "[Wayland] Decision: No GPU Encoder available -> Using CPU Software Encoding ({}).",
-            encoders::SOFTWARE_H264_ENCODER
+            encoders::software_library(settings.codec)
         );
     }
     let n_stripes = wayland_stripe_count(&settings, video_encoder.is_some());
@@ -1314,7 +1314,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             } else {
                                 eprintln!(
                                     "[wl-encode] readback HW encoder unrecoverable; demoting to software encoding ({}).",
-                                    encoders::SOFTWARE_H264_ENCODER
+                                    encoders::software_library(Codec::H264)
                                 );
                             }
                             // The broken session is released before its replacement is opened:
@@ -1398,7 +1398,7 @@ fn encoder_desc(
     let backend = match video_encoder {
         Some(enc) if enc.is_hardware() => format!("{} ({})", enc.backend_name(), copy_mode),
         Some(enc) => format!("CPU {}", enc.backend_name()),
-        None => format!("CPU {}", encoders::SOFTWARE_H264_ENCODER),
+        None => format!("CPU {}", encoders::software_library(Codec::H264)),
     };
     let is_444 = encoders::session_fullcolor(video_encoder, settings);
     let cs_str = if is_444 { "CS_IN:I444" } else { "CS_IN:I420" };
@@ -1458,7 +1458,7 @@ fn log_stream_settings(
     } else {
         let encoder_type = match video_encoder {
             Some(enc) => enc.backend_name(),
-            None => encoders::SOFTWARE_H264_ENCODER,
+            None => encoders::software_library(Codec::H264),
         };
         log_msg.push_str(&format!(" | Mode: {} ({})", settings.codec.display(), encoder_type));
 

@@ -41,20 +41,6 @@ compile_error!(
     "pixelflux needs a software H.264 encoder: enable the `gpl` feature (libx264, the default) or `openh264`."
 );
 
-/// The software H.264 encoder this build resolved to, fixed by the crate features: `"x264"`
-/// whenever `gpl` is on (libx264 wins even if `openh264` is also enabled), `"openh264"` for
-/// a GPL-free build. It is what the striped software path and the full-frame software fallback
-/// under NVENC/VA-API both encode with.
-#[cfg(feature = "gpl")]
-pub const SOFTWARE_H264_ENCODER: &str = "x264";
-#[cfg(not(feature = "gpl"))]
-pub const SOFTWARE_H264_ENCODER: &str = "openh264";
-
-/// Whether the build's software H.264 encoder carries a 4:4:4 (`video_fullcolor`) request:
-/// libx264 does (High 4:4:4, full range); OpenH264 is 4:2:0-only and encodes such a request
-/// 4:2:0.
-pub const SOFTWARE_H264_FULLCOLOR: bool = cfg!(feature = "gpl");
-
 /// A software encoder the build can run for one codec: the library's name as reported to
 /// Python and the logs, and the libavcodec encoder that reaches it (empty for H.264, whose
 /// software encoders are linked directly).
@@ -64,8 +50,9 @@ pub struct SoftwareEncoder {
     pub avcodec: &'static str,
 }
 
-/// Whether the software encoder of a codec carries 4:4:4: x264 and x265 do, the rest are
-/// 4:2:0 encoders.
+/// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264
+/// (High 4:4:4, full range) and x265 do; OpenH264, kvazaar, libvpx and SVT-AV1 encode such a
+/// request 4:2:0.
 pub fn software_fullcolor(codec: Codec) -> bool {
     match software_encoder(codec) {
         Some(enc) => matches!(enc.library, "x264" | "x265"),
@@ -73,14 +60,22 @@ pub fn software_fullcolor(codec: Codec) -> bool {
     }
 }
 
+/// The name of the software encoder this build runs for `codec`, for logs; `"none"` where the
+/// linked FFmpeg carries none.
+pub fn software_library(codec: Codec) -> &'static str {
+    software_encoder(codec).map_or("none", |enc| enc.library)
+}
+
 /// The software encoder this build runs for `codec`, or `None` when the linked FFmpeg
 /// carries none of the encoders the codec is served by.
 ///
-/// H.264 is resolved at build time (`SOFTWARE_H264_ENCODER`). The other codecs are probed
-/// once against the linked libavcodec: HEVC through x265 (GPL, so only with the `gpl`
-/// feature) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1. A build without
-/// `gpl` never picks x265 even from a system FFmpeg that has it, keeping the GPL-free
-/// posture the feature promises.
+/// H.264 is fixed by the crate features: libx264 whenever `gpl` is on (it wins even if
+/// `openh264` is also enabled), Cisco OpenH264 for a GPL-free build; it is what the striped
+/// software path and the full-frame software fallback under NVENC/VA-API both encode with.
+/// The other codecs are probed once against the linked libavcodec: HEVC through x265 (GPL,
+/// so only with the `gpl` feature) or kvazaar, VP8 and VP9 through libvpx, AV1 through
+/// SVT-AV1. A build without `gpl` never picks x265 even from a system FFmpeg that has it,
+/// keeping the GPL-free posture the feature promises.
 pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
     static PROBED: OnceLock<[Option<SoftwareEncoder>; 5]> = OnceLock::new();
     if codec == Codec::Jpeg {
@@ -99,7 +94,10 @@ pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
             candidates.iter().copied().find(|c| avcodec_has_encoder(c.avcodec))
         };
         [
-            Some(SoftwareEncoder { library: SOFTWARE_H264_ENCODER, avcodec: "" }),
+            Some(SoftwareEncoder {
+                library: if cfg!(feature = "gpl") { "x264" } else { "openh264" },
+                avcodec: "",
+            }),
             first_linked(&[SoftwareEncoder { library: "libvpx", avcodec: "libvpx" }]),
             first_linked(&[SoftwareEncoder { library: "libvpx", avcodec: "libvpx-vp9" }]),
             first_linked(&[SoftwareEncoder { library: "svt-av1", avcodec: "libsvtav1" }]),
@@ -176,7 +174,9 @@ mod tests {
     #[test]
     fn software_encoders_follow_the_build() {
         let h264 = software_encoder(Codec::H264).expect("H.264 is always served");
-        assert_eq!(h264.library, SOFTWARE_H264_ENCODER);
+        assert_eq!(h264.library, if cfg!(feature = "gpl") { "x264" } else { "openh264" });
+        assert_eq!(software_library(Codec::H264), h264.library);
+        assert_eq!(software_library(Codec::Jpeg), "none");
         assert!(h264.avcodec.is_empty());
         assert_eq!(software_encoder(Codec::Jpeg), None);
         for codec in [Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1] {
@@ -188,7 +188,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(software_fullcolor(Codec::H264), SOFTWARE_H264_FULLCOLOR);
+        assert_eq!(software_fullcolor(Codec::H264), cfg!(feature = "gpl"));
         assert!(!software_fullcolor(Codec::Vp8));
     }
 }
@@ -363,7 +363,7 @@ pub fn select_frame_encoder(
         return None;
     };
     if codec == Codec::H264 {
-        println!("[{tag}] Software H.264 ({}).", SOFTWARE_H264_ENCODER);
+        println!("[{tag}] Software H.264 ({}).", software_library(Codec::H264));
         return None;
     }
     match AvcodecEncoder::new(settings, codec, Backend::Software, Input::Host { rgba }) {
@@ -375,7 +375,7 @@ pub fn select_frame_encoder(
             eprintln!(
                 "[{tag}] No {} encoder available: {e}. Encoding H.264 ({}) instead.",
                 codec.display(),
-                SOFTWARE_H264_ENCODER
+                software_library(Codec::H264)
             );
             settings.codec = Codec::H264;
             None
