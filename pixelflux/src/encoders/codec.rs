@@ -176,10 +176,12 @@ impl Codec {
         if qp <= 0 { 0 } else { self.quantizer(qp) }
     }
 
-    /// `quantizer` for an NVENC session, whose AV1 engine has its own measured curve:
-    /// matched on SSIM against H.264 at the same index on Ada and L40S (the two agree
-    /// to the byte) with Blackwell within ten steps, and interpolated between the
-    /// measured points. NVENC refuses an AV1 index of zero, so the floor stays one.
+    /// `quantizer` for an NVENC session, whose AV1 engine has its own curve: the quantizer
+    /// whose SSIM matches H.264's at the same index, measured on Ada and interpolated
+    /// between those points. One table serves every generation because SSIM is where they
+    /// agree, within ten steps at the five indices sampled on Blackwell, where a VMAF match
+    /// parts them by up to thirty-four. NVENC refuses an AV1 index of zero, so the floor
+    /// stays one.
     pub fn nvenc_quantizer(self, crf: i32) -> u32 {
         match self {
             Codec::Av1 => interpolate(&AV1_NVENC_QINDEX, crf.clamp(0, 51) as u32).max(1),
