@@ -13,7 +13,9 @@
 //! inter-prediction, and both libraries emit the same per-stripe wire framing; the JPEG path is
 //! stateless.
 
-use super::codec::{push_jpeg_header, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY};
+#[cfg(feature = "gpl")]
+use super::codec::{push_video_header, FRAME_DELTA, FRAME_INTRA, FRAME_KEY};
+use super::codec::{push_jpeg_header, Codec};
 use crate::RustCaptureSettings;
 use rayon::prelude::*;
 use smithay::utils::{Physical, Rectangle};
