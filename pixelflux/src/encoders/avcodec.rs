@@ -17,7 +17,11 @@
 //!
 //! Chroma follows `video_fullcolor` where the codec carries 4:4:4 (H.264 and H.265): a
 //! hardware session negotiates the 4:4:4 surface format the driver reports, a software one
-//! takes planar 4:4:4 at full range like x264. Anything else encodes 4:2:0.
+//! takes planar 4:4:4 at full range like x264. Anything else encodes 4:2:0. The colour matrix
+//! follows NVENC: hardware sessions and 4:2:0 software sessions convert with BT.601 at limited
+//! range, the matrix browser presentation paths invert exactly, and declare it with BT.709
+//! primaries and transfer for the sRGB source; software 4:4:4 converts BT.709 at full range and
+//! declares that, like x264.
 
 // Every operation in these functions is an FFmpeg or VA-API call, or a dereference of a
 // pointer one handed back; the safety contract is carried by the function signatures.
@@ -508,7 +512,7 @@ impl AvcodecEncoder {
     }
 
     /// Build the `buffersrc` → `hwmap`/`hwupload` + `scale_vaapi` → `buffersink` chain that
-    /// lands every input on a GPU surface in `sw_format`, BT.709 limited range.
+    /// lands every input on a GPU surface in `sw_format`, BT.601 limited range.
     ///
     /// The chain is staged with the segment API (parse, create filters, attach the VA device
     /// to every filter, apply) rather than the one-shot parser, because `hwupload`
@@ -565,7 +569,7 @@ impl AvcodecEncoder {
 
         let stage = if self.input == Input::Dmabuf { "hwmap" } else { "hwupload" };
         let filters_desc = CString::new(format!(
-            "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt709:out_range=tv",
+            "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt601:out_range=tv",
             stage,
             self.width,
             self.height,
@@ -654,7 +658,15 @@ impl AvcodecEncoder {
         } else {
             ff::AVColorRange::AVCOL_RANGE_MPEG
         };
-        (*ctx).colorspace = ff::AVColorSpace::AVCOL_SPC_BT709;
+        // VP9 names BT.601 by its own header code, the one Chromium's decoder maps; the
+        // SMPTE 170M code lands there as unspecified.
+        (*ctx).colorspace = if fullcolor && software {
+            ff::AVColorSpace::AVCOL_SPC_BT709
+        } else if self.codec == Codec::Vp9 {
+            ff::AVColorSpace::AVCOL_SPC_BT470BG
+        } else {
+            ff::AVColorSpace::AVCOL_SPC_SMPTE170M
+        };
         (*ctx).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
         (*ctx).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         if let Some(session) = self.hw.as_ref() {
@@ -1285,7 +1297,7 @@ mod software_tests {
     }
 
     /// Luma PSNR of a decoded frame against the BGRA source it came from, with the source's
-    /// luma derived by the BT.709 limited-range formula the encoder's conversion uses.
+    /// luma derived by the BT.601 limited-range formula the encoder's conversion uses.
     fn luma_psnr(decoded: &I420View<'_>, bgra: &[u8]) -> f64 {
         assert_eq!((decoded.width, decoded.height), (W, H));
         let mut mse = 0f64;
@@ -1293,7 +1305,7 @@ mod software_tests {
             for x in 0..W {
                 let i = (y * W + x) * 4;
                 let (b, g, r) = (bgra[i] as f64, bgra[i + 1] as f64, bgra[i + 2] as f64);
-                let luma = 16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * b) * 219.0 / 255.0;
+                let luma = 16.0 + (0.299 * r + 0.587 * g + 0.114 * b) * 219.0 / 255.0;
                 let d = decoded.y[y * decoded.y_stride + x] as f64 - luma;
                 mse += d * d;
             }
@@ -1428,6 +1440,33 @@ mod software_tests {
             assert_eq!(parse_video_type(after[1]), Some((codec, FRAME_KEY)));
             assert!(decode_one(&mut dec, &after));
             assert!(luma_psnr(&dec.frame().unwrap(), &frame(3)) > 28.0);
+        }
+    }
+
+    /// Every 4:2:0 session declares the BT.601 matrix it converts with, at limited range:
+    /// VP9 by its own header code, which reads back as BT.470BG, VP8 by declaring none, which
+    /// its decoder takes as that matrix. The x265 4:4:4 session declares BT.709 at full range
+    /// like x264.
+    #[test]
+    fn sessions_declare_the_matrix_they_convert_with() {
+        use ff::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
+        use ff::AVColorSpace::{AVCOL_SPC_BT470BG, AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
+        for codec in software_codecs() {
+            let mut s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).expect("encode");
+            let mut dec = AvDecoder::new(codec).expect("decoder");
+            assert!(decode_one(&mut dec, &out));
+            let want = if matches!(codec, Codec::Vp8 | Codec::Vp9) { AVCOL_SPC_BT470BG } else { AVCOL_SPC_SMPTE170M };
+            assert_eq!(dec.colour_tags(), Some((want, AVCOL_RANGE_MPEG)), "{codec:?}");
+            if super::super::software_fullcolor(codec) {
+                s.video_fullcolor = true;
+                let mut enc = session(codec, &s, false);
+                let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).expect("encode");
+                let mut dec = AvDecoder::new(codec).expect("decoder");
+                assert!(decode_one(&mut dec, &out));
+                assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_JPEG)), "{codec:?} 4:4:4");
+            }
         }
     }
 

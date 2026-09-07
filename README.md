@@ -539,15 +539,20 @@ curl -s -X POST http://localhost:5000/computer-use \
     a client reconnects or its decoder is reset. It routes to whichever encoder is active
     (NVENC, VA-API, or software) and is a no-op while no capture is running.
 
-### NVENC color conversion
+### Colour conversion
 
 NVENC encodes the captured ARGB directly, so there is **no CUDA Toolkit / NVRTC requirement** —
 only the NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime.
 The driver's ARGB→YUV hardware conversion is fixed at BT.601 limited range (no encode-session
 flag retargets it), so pixelflux declares exactly that in the VUI — BT.709 primaries and
-transfer for the sRGB desktop source, SMPTE 170M matrix, limited range — and uses the same
-matrix when it converts on the host-planar path, so clients decode correct colour either way.
-Nothing extra to install at build or runtime beyond the driver.
+transfer for the sRGB desktop source, SMPTE 170M matrix, limited range. Every other 4:2:0
+session follows the same posture: the VA-API convert (`scale_vaapi`) and the software encoders'
+host conversion use the BT.601 matrix at limited range and declare it, because that is the
+matrix the browser engines' presentation paths invert exactly (Chromium and Firefox paint a
+BT.709-tagged frame with a BT.601-like inversion and WebKit honours either tag, measured
+against a painted colour chart), so clients decode the same colour from every backend. The
+software 4:4:4 sessions (x264, x265) convert BT.709 at full range and declare that. Nothing
+extra to install at build or runtime beyond the driver.
 
 ## VA-API 4:4:4
 
