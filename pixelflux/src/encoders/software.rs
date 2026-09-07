@@ -50,8 +50,12 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 ///    (tightly packed for the stripe buffers, padded for an AVFrame); the chroma planes are
 ///    `width` wide for 4:4:4 (`i444 == true`) or `width / 2` for 4:2:0. `rgba_input` selects
 ///    the source byte order and `i444` the subsampling, together choosing one of four `yuv`
-///    crate routines — 4:4:4 uses **Full** range, 4:2:0 uses **Limited** range, and both use
-///    the **BT.709** matrix and the **Fast** conversion mode.
+///    crate routines in the **Fast** conversion mode — 4:4:4 uses **Full** range with the
+///    **BT.709** matrix, 4:2:0 uses **Limited** range with the **BT.601** matrix: the matrix
+///    NVENC's hardware conversion is fixed at, and the one browser presentation paths invert
+///    exactly (Chromium and Firefox paint a BT.709-tagged frame with a BT.601-like inversion,
+///    WebKit honours either), so every backend's 4:2:0 stream decodes to the same colour. Each
+///    encoder declares the matrix it was fed.
 /// 2. **Band split**: `band_h` is `height / bands` floored to an even number and at least 2 rows
 ///    (a band under 2 rows is not worth a thread). Keeping band boundaries even ensures a 4:2:0
 ///    chroma pair never straddles a seam. When `bands <= 1` or the whole image fits one band, the
@@ -100,11 +104,11 @@ pub(crate) fn convert_to_yuv_mt(
             ),
             (false, true) => yuv::rgba_to_yuv420(
                 &mut img, src_band, src_stride, YuvRange::Limited,
-                YuvStandardMatrix::Bt709, YuvConversionMode::Fast,
+                YuvStandardMatrix::Bt601, YuvConversionMode::Fast,
             ),
             (false, false) => yuv::bgra_to_yuv420(
                 &mut img, src_band, src_stride, YuvRange::Limited,
-                YuvStandardMatrix::Bt709, YuvConversionMode::Fast,
+                YuvStandardMatrix::Bt601, YuvConversionMode::Fast,
             ),
         }
     };
@@ -231,8 +235,9 @@ impl H264EncoderWrapper {
     ///      the legibility floor (caps how ugly a rate-starved frame gets) and `min_qp` the waste
     ///      ceiling (stops over-spending on easy content); both are clamped to 51.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
-    /// 4. **Colour**: I444 (full range) or I420 (limited range) CSP, BT.709 VUI primaries/transfer/
-    ///    matrix, and the matching `high444` / `baseline` profile.
+    /// 4. **Colour**: I444 (full range, BT.709 matrix) or I420 (limited range, BT.601 matrix)
+    ///    CSP, a VUI declaring that matrix with BT.709 primaries and transfer for the sRGB
+    ///    source, and the matching `high444` / `baseline` profile.
     /// 5. **Coding tools**: CABAC and the 8x8 transform are disabled, matching the low-latency
     ///    baseline profile — CAVLC entropy coding with no 8x8 DCT — for minimal encode cost.
     /// 6. **Output**: repeated headers (SPS/PPS before each keyframe) and Annex-B framing, with
@@ -284,7 +289,7 @@ impl H264EncoderWrapper {
             param.vui.b_fullrange = if is_i444 { 1 } else { 0 };
             param.vui.i_colorprim = 1;
             param.vui.i_transfer = 1;
-            param.vui.i_colmatrix = 1;
+            param.vui.i_colmatrix = if is_i444 { 1 } else { 6 };
 
             let profile = CString::new(if is_i444 { "high444" } else { "baseline" }).unwrap();
             x264_sys::x264_param_apply_profile(&mut param, profile.as_ptr());
@@ -1619,6 +1624,30 @@ mod qp_bound_sweep {
                 out
             })
             .collect()
+    }
+
+    /// The x264 stream declares the matrix its input was converted with: BT.601 at limited
+    /// range for I420, BT.709 at full range for I444.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_declares_the_conversion_matrix() {
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use ffmpeg_sys_next::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
+        use ffmpeg_sys_next::AVColorSpace::{AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
+        for (i444, want) in [(false, (AVCOL_SPC_SMPTE170M, AVCOL_RANGE_MPEG)), (true, (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG))] {
+            let (w, h) = (128usize, 96usize);
+            let mut enc = H264EncoderWrapper::new(w as i32, h as i32, 25, i444, 30.0, 1, false, 0, 0, 0, 0)
+                .expect("x264 init");
+            let (cw, ch) = if i444 { (w, h) } else { (w / 2, h / 2) };
+            let y = vec![90u8; w * h];
+            let u = vec![128u8; cw * ch];
+            let v = vec![160u8; cw * ch];
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(&y, &u, &v, w as i32, cw as i32, cw as i32, 0, 0, true, true, &mut out));
+            let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+            assert!(dec.decode(&out).expect("decode"), "i444={i444}");
+            assert_eq!(dec.colour_tags(), Some(want), "i444={i444}");
+        }
     }
 
     /// Encode the same scrolling-text sequence through the OpenH264 full-frame encoder (luma

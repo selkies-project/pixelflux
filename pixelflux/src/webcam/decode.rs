@@ -98,6 +98,18 @@ pub struct AvDecoder {
 unsafe impl Send for AvDecoder {}
 
 impl AvDecoder {
+    /// The colour matrix and range the last decoded frame carries, as the bitstream
+    /// declared them; unspecified where the codec cannot declare a matrix (VP8).
+    pub fn colour_tags(&self) -> Option<(ff::AVColorSpace, ff::AVColorRange)> {
+        if !self.have_frame {
+            return None;
+        }
+        unsafe {
+            let f = &*self.frame;
+            Some((f.colorspace, f.color_range))
+        }
+    }
+
     pub fn new(codec: Codec) -> Result<Self, String> {
         unsafe {
             static QUIET: std::sync::Once = std::sync::Once::new();
