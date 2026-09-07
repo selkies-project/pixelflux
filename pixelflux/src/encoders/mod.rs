@@ -51,11 +51,11 @@ pub struct SoftwareEncoder {
 }
 
 /// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264
-/// (High 4:4:4, full range) and x265 do; OpenH264, kvazaar, libvpx and SVT-AV1 encode such a
-/// request 4:2:0.
+/// (High 4:4:4, full range), x265 and libvpx's VP9 (profile 1) do; OpenH264, kvazaar, VP8 and
+/// SVT-AV1 encode such a request 4:2:0.
 pub fn software_fullcolor(codec: Codec) -> bool {
     match software_encoder(codec) {
-        Some(enc) => matches!(enc.library, "x264" | "x265"),
+        Some(enc) => matches!(enc.library, "x264" | "x265") || (codec == Codec::Vp9 && enc.library == "libvpx"),
         None => false,
     }
 }
@@ -153,11 +153,11 @@ pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier
 }
 
 /// The `Colorspace:` field of a stream log line, from what the session negotiated rather than
-/// what was asked for: a hardware encoder can refuse 4:4:4, and only the software encoder
-/// carries it at full range. Shared so the X11 and Wayland logs describe an identical session
+/// what was asked for: a hardware encoder can refuse 4:4:4, and only some software encoders
+/// carry it at full range. Shared so the X11 and Wayland logs describe an identical session
 /// identically.
-pub fn colorspace_desc(fullcolor: bool, software: bool) -> &'static str {
-    match (fullcolor, software) {
+pub fn colorspace_desc(fullcolor: bool, full_range: bool) -> &'static str {
+    match (fullcolor, full_range) {
         (true, true) => "I444 (Full Range)",
         (true, false) => "I444 (Limited Range)",
         _ => "I420 (Limited Range)",
@@ -190,6 +190,7 @@ mod tests {
         }
         assert_eq!(software_fullcolor(Codec::H264), cfg!(feature = "gpl"));
         assert!(!software_fullcolor(Codec::Vp8));
+        assert_eq!(software_fullcolor(Codec::Vp9), software_encoder(Codec::Vp9).is_some());
     }
 }
 
@@ -233,6 +234,14 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.is_fullcolor(),
             FrameEncoder::Avcodec(enc) => enc.is_fullcolor(),
+        }
+    }
+
+    /// Whether the session signals full range, which only a software 4:4:4 of x264's kind does.
+    pub fn is_full_range(&self) -> bool {
+        match self {
+            FrameEncoder::Nvenc(_) => false,
+            FrameEncoder::Avcodec(enc) => enc.is_full_range(),
         }
     }
 
@@ -390,5 +399,14 @@ pub fn session_fullcolor(encoder: Option<&FrameEncoder>, settings: &RustCaptureS
     match encoder {
         Some(enc) => enc.is_fullcolor(),
         None => settings.video_fullcolor && software_fullcolor(settings.codec),
+    }
+}
+
+/// Whether a session signals full range: a software 4:4:4 session of x264's kind, which the
+/// striped path (`None`) is whenever it carries 4:4:4.
+pub fn session_full_range(encoder: Option<&FrameEncoder>, settings: &RustCaptureSettings) -> bool {
+    match encoder {
+        Some(enc) => enc.is_full_range(),
+        None => session_fullcolor(None, settings),
     }
 }

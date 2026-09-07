@@ -1413,10 +1413,7 @@ fn encoder_desc(
     };
     let is_444 = encoders::session_fullcolor(video_encoder, settings);
     let cs_str = if is_444 { "CS_IN:I444" } else { "CS_IN:I420" };
-    // Only a software encoder carries 4:4:4 at full range; the hardware CSCs are
-    // limited-range whatever the chroma format.
-    let software = video_encoder.is_none_or(|enc| !enc.is_hardware());
-    let range_str = if is_444 && software { "FR" } else { "LR" };
+    let range_str = if encoders::session_full_range(video_encoder, settings) { "FR" } else { "LR" };
     let frame_str = if video_encoder.is_some() || settings.video_fullframe {
         "FF"
     } else {

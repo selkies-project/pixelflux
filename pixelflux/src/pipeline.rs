@@ -253,7 +253,7 @@ impl X11Pipeline {
     /// only when the build's encoder for the codec does.
     pub fn colorspace_desc(&self) -> &'static str {
         let fullcolor = encoders::session_fullcolor(self.hw.as_ref(), &self.settings);
-        crate::encoders::colorspace_desc(fullcolor, !self.is_hardware())
+        crate::encoders::colorspace_desc(fullcolor, encoders::session_full_range(self.hw.as_ref(), &self.settings))
     }
 
     /// Adapt the live pipeline to recreated capture surfaces without rebuilding it.
