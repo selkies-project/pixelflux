@@ -69,7 +69,11 @@ resolved at build time, never by a setting: the default `gpl` feature makes libx
 CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
 `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
 (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies derives its rate-control
-default from the exported names. Test both configurations (`cargo test --lib` and
+default from the exported names. Every 4:2:0 session, on every backend, converts with the BT.601 matrix
+at limited range and declares it (NVENC's hardware conversion is fixed there, and it is the matrix
+browser presentation paths invert exactly); the software 4:4:4 sessions convert BT.709 at full range
+and declare that. `AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
+encoder to it. Test both configurations (`cargo test --lib` and
 `cargo test --lib --no-default-features --features openh264`, the latter against an FFmpeg carrying
 `libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
 wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
