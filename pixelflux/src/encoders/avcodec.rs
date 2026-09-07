@@ -729,10 +729,11 @@ impl AvcodecEncoder {
 
     /// The value a quantizer of the codec's domain is programmed as on this session's
     /// encoder: the libvpx and SVT-AV1 encoders take the 0..=63 level, everything else the
-    /// domain value itself.
+    /// domain value itself. SVT-AV1's real-time mode faults below level 3, so that is its floor.
     fn encoder_quantizer(&self, q: u32) -> u32 {
         if self.backend == Backend::Software && matches!(self.codec, Codec::Vp8 | Codec::Vp9 | Codec::Av1) {
-            vpx_level(self.codec, q)
+            let level = vpx_level(self.codec, q);
+            if self.codec == Codec::Av1 { level.max(3) } else { level }
         } else {
             q
         }
@@ -819,7 +820,10 @@ impl AvcodecEncoder {
             }
             "libvpx" => {
                 dict_set(opts, "deadline", "realtime");
-                dict_set(opts, "cpu-used", if self.codec == Codec::Vp9 { "7" } else { "8" });
+                // The fastest speed each encoder offers through libavcodec: VP8 at 16 is a
+                // fifth faster than 8 to 14, which run the same path, at the same quality; VP9's
+                // 8 is a third faster than 7 for a tenth more bytes at a fixed quantizer.
+                dict_set(opts, "cpu-used", if self.codec == Codec::Vp9 { "8" } else { "16" });
                 dict_set(opts, "lag-in-frames", "0");
                 dict_set(opts, "auto-alt-ref", "0");
                 dict_set(opts, "error-resilient", "0");
@@ -845,10 +849,13 @@ impl AvcodecEncoder {
                 }
             }
             "svt-av1" => {
-                dict_set(opts, "preset", "10");
-                // `lp` is a level of parallelism, 0..=6, not a thread count.
+                // Preset 11 in the real-time mode: a quarter less encode time than preset 10
+                // for more bytes at a fixed quantizer, which the quantizer table absorbs; the
+                // presets above it are no faster. `lp` is a level of parallelism, 0..=6, not a
+                // thread count.
+                dict_set(opts, "preset", "11");
                 let mut params = format!(
-                    "pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
+                    "rtc=1:pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
                     self.threads.min(6)
                 );
                 if self.cbr_mode {
