@@ -33,13 +33,16 @@ sudo apt-get install -y \
   nasm \
   libclang-dev \
   libavcodec-dev \
+  libavfilter-dev \
   libavutil-dev \
   libx264-dev \
   libgbm-dev \
   libdrm-dev \
   libwayland-dev \
   libinput-dev \
+  libudev-dev \
   libxkbcommon-dev \
+  libpixman-1-dev \
   libva-dev
 ```
 
