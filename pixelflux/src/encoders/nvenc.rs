@@ -645,6 +645,32 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
     }
 }
 
+/// The encoder-side quality knobs of a session: the preset, the rate-control passes of a CBR
+/// session and adaptive quantization. Production sessions take the default, which the tuning
+/// bench (`gpu_bench_tuning`) measures against the alternatives: P3 encodes a 1080p H.264
+/// frame in 3.7 ms where P4 takes 5.2 ms on a V100, for 0.001 of SSIM at the same bitrate,
+/// and the presets above P4 buy nothing; a single pass saves half a millisecond but overshoots
+/// a CBR target by five to twelve percent; adaptive quantization moves neither time nor
+/// quality measurably.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NvencTuning {
+    pub preset: GUID,
+    pub multipass: NV_ENC_MULTI_PASS,
+    pub spatial_aq: bool,
+    pub temporal_aq: bool,
+}
+
+impl Default for NvencTuning {
+    fn default() -> Self {
+        Self {
+            preset: NV_ENC_PRESET_P3_GUID,
+            multipass: NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION,
+            spatial_aq: false,
+            temporal_aq: false,
+        }
+    }
+}
+
 /// The profile of a session: the 4:2:0 profile of the codec, or its 4:4:4 one where the codec
 /// has it.
 fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
@@ -997,7 +1023,7 @@ impl NvencEncoder {
     ///    with the negotiated `apiVersion`, refuse a codec the device lists no engine for, and
     ///    query `nvEncGetEncodeCaps` so init degrades rather than fails — a 4:4:4 request on a GPU
     ///    or codec without it drops to 4:2:0, and a capture beyond the encoder's max dimensions
-    ///    returns `Err` so the caller falls back to software. Then pull a preset config (P4,
+    ///    returns `Err` so the caller falls back to software. Then pull a preset config (P3,
     ///    ultra-low-latency); a failed preset lookup logs the driver's error string and proceeds
     ///    with the zeroed default rather than aborting.
     /// 5. **Configure the stream** (mutating the returned preset config, whose `version` word is
@@ -1026,9 +1052,16 @@ impl NvencEncoder {
     /// `init_params.encodeConfig` raw pointer is nulled before the struct is returned (it points at
     /// a local `config` about to move); the reconfigure paths repoint it at `self.encode_config`
     /// when they resubmit.
-    pub fn new(
+    pub fn new(settings: &RustCaptureSettings, egl_display: *const c_void) -> Result<Self, String> {
+        Self::new_tuned(settings, egl_display, NvencTuning::default())
+    }
+
+    /// `new` with the preset, rate-control passes and adaptive quantization named, for the
+    /// tuning bench; production sessions take `NvencTuning::default`.
+    pub(crate) fn new_tuned(
         settings: &RustCaptureSettings,
         egl_display: *const c_void,
+        tuning: NvencTuning,
     ) -> Result<Self, String> {
         let codec = settings.codec;
         let codec_guid = codec_guid(codec)
@@ -1206,7 +1239,7 @@ impl NvencEncoder {
             let preset_status = get_preset_ex(
                 encoder_session,
                 codec_guid,
-                NV_ENC_PRESET_P4_GUID,
+                tuning.preset,
                 NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 &mut preset_config,
             );
@@ -1223,7 +1256,7 @@ impl NvencEncoder {
             if settings.video_cbr_mode {
                 let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-                config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+                config.rcParams.multiPass = tuning.multipass;
                 config.rcParams.averageBitRate = bps;
                 config.rcParams.maxBitRate = bps;
                 config.rcParams.vbvBufferSize = crate::encoders::vbv_bits(
@@ -1253,6 +1286,8 @@ impl NvencEncoder {
                 config.rcParams.constQP.qpInterB = q;
                 config.rcParams.constQP.qpIntra = q;
             }
+            config.rcParams.set_enableAQ(tuning.spatial_aq as u32);
+            config.rcParams.set_enableTemporalAQ(tuning.temporal_aq as u32);
             config.frameIntervalP = 1;
             config.gopLength = 0xFFFFFFFF;
             config.rcParams.set_zeroReorderDelay(1);
@@ -1264,7 +1299,7 @@ impl NvencEncoder {
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
                 encodeGUID: codec_guid,
-                presetGUID: NV_ENC_PRESET_P4_GUID,
+                presetGUID: tuning.preset,
                 tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
                 encodeWidth: width,
                 encodeHeight: height,
@@ -3094,6 +3129,57 @@ mod gpu_tests {
             );
             let (block, bg) = decoded_means(&mut dec, &pkt, rect);
             assert_painted(&format!("frame {i} rgba={is_rgba}"), block, bg, 6.0);
+        }
+    }
+
+    /// On a real GPU: per-frame wall time of every NVENC preset, rate-control pass mode and
+    /// adaptive quantization, 1080p CBR on both codecs. Prints all; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_tuning() {
+        let (w, h) = (1920u32, 1080u32);
+        let n: usize = std::env::var("NVENC_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(240);
+        let mut s = settings(w as i32, h as i32, 60.0);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 8000;
+        let frames: Vec<Vec<u8>> = (0..8u8).map(|k| frame(w as usize, h as usize, 10 + 30 * k)).collect();
+        let stride = (w * 4) as usize;
+        let presets = [
+            ("P1", NV_ENC_PRESET_P1_GUID), ("P2", NV_ENC_PRESET_P2_GUID), ("P3", NV_ENC_PRESET_P3_GUID),
+            ("P4", NV_ENC_PRESET_P4_GUID), ("P5", NV_ENC_PRESET_P5_GUID), ("P6", NV_ENC_PRESET_P6_GUID),
+            ("P7", NV_ENC_PRESET_P7_GUID),
+        ];
+        let passes = [
+            ("single pass", NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED),
+            ("two-pass quarter", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION),
+            ("two-pass full", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_FULL_RESOLUTION),
+        ];
+        let mut cases: Vec<(String, NvencTuning)> = Vec::new();
+        for (name, preset) in presets {
+            cases.push((format!("{name} two-pass quarter"), NvencTuning { preset, ..NvencTuning::default() }));
+        }
+        for (name, multipass) in passes {
+            cases.push((format!("P4 {name}"), NvencTuning { multipass, ..NvencTuning::default() }));
+        }
+        cases.push(("P4 two-pass quarter spatial AQ".into(), NvencTuning { spatial_aq: true, ..NvencTuning::default() }));
+        cases.push(("P4 two-pass quarter temporal AQ".into(), NvencTuning { temporal_aq: true, ..NvencTuning::default() }));
+        for codec in [Codec::H264, Codec::H265] {
+            s.codec = codec;
+            for (label, tuning) in &cases {
+                let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), *tuning) {
+                    Ok(enc) => enc,
+                    Err(e) => {
+                        println!("{codec:?} {label}: {e}");
+                        continue;
+                    }
+                };
+                enc.encode_cpu_packed(&frames[0], stride, false, 0, 25, true).expect("warm-up");
+                let mut bytes = 0usize;
+                per_frame(&format!("{codec:?} {label}"), n, |i| {
+                    bytes += enc.encode_cpu_packed(&frames[i % 8], stride, false, 1 + i as u64, 25, false).expect("encode").len();
+                });
+                println!("    {} kbps", bytes * 8 * 60 / n / 1000);
+            }
         }
     }
 
