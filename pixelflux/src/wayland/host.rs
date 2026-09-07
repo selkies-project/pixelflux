@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use gbm::{BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer as _;
+use smithay::input::keyboard::xkb;
 use smithay::utils::{Physical, Rectangle};
 use wayland_client::protocol::{wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
@@ -768,10 +769,68 @@ impl OutputHandle {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SerializedMods {
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
+}
+
+#[derive(Default)]
+struct HostKeyboardState {
+    state: Option<xkb::State>,
+    pressed: std::collections::HashSet<u32>,
+}
+
+impl HostKeyboardState {
+    fn set_keymap(&mut self, text: &str) -> Option<SerializedMods> {
+        let keymap = crate::wayland::keymap::compile_keymap(text)?;
+        let mut state = xkb::State::new(&keymap);
+        for &keycode in &self.pressed {
+            state.update_key(xkb::Keycode::new(keycode), xkb::KeyDirection::Down);
+        }
+        let mods = Self::serialize(&state);
+        self.state = Some(state);
+        Some(mods)
+    }
+
+    fn update_key(&mut self, xkb_keycode: u32, pressed: bool) -> Option<SerializedMods> {
+        let changed = if pressed {
+            self.pressed.insert(xkb_keycode)
+        } else {
+            self.pressed.remove(&xkb_keycode)
+        };
+        if !changed {
+            return None;
+        }
+        let state = self.state.as_mut()?;
+        state.update_key(
+            xkb::Keycode::new(xkb_keycode),
+            if pressed {
+                xkb::KeyDirection::Down
+            } else {
+                xkb::KeyDirection::Up
+            },
+        );
+        Some(Self::serialize(state))
+    }
+
+    fn serialize(state: &xkb::State) -> SerializedMods {
+        SerializedMods {
+            depressed: state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched: state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked: state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            group: state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        }
+    }
+}
+
 /// The calloop-side session: input proxies plus one capture handle per output.
 pub struct HostSession {
     conn: Connection,
     vk: Option<ZwpVirtualKeyboardV1>,
+    keyboard: Mutex<HostKeyboardState>,
     vptr: Option<ZwlrVirtualPointerV1>,
     ctrl_tx: Sender<CtrlMsg>,
     ctrl_wake: OwnedFd,
@@ -906,9 +965,14 @@ impl HostSession {
         }
 
         let layout = Mutex::new(std::collections::BTreeMap::new());
+        let mut keyboard = HostKeyboardState::default();
+        if let Some(text) = crate::wayland::vkclient::us_base_text() {
+            keyboard.set_keymap(text);
+        }
         Ok(Self {
             conn,
             vk,
+            keyboard: Mutex::new(keyboard),
             vptr,
             ctrl_tx,
             ctrl_wake,
@@ -1196,13 +1260,21 @@ impl HostSession {
         let Some(vk) = &self.vk else { return };
         let mut data = text.as_bytes().to_vec();
         data.push(0);
-        match memfd_with(&data) {
-            Ok(fd) => {
-                vk.keymap(KEYMAP_FORMAT_XKB_V1, fd.as_fd(), data.len() as u32);
-                let _ = self.conn.flush();
+        let fd = match memfd_with(&data) {
+            Ok(fd) => fd,
+            Err(e) => {
+                eprintln!("[HostCapture] keymap upload failed: {e}");
+                return;
             }
-            Err(e) => eprintln!("[HostCapture] keymap upload failed: {e}"),
-        }
+        };
+        let mut keyboard = self.keyboard.lock().unwrap();
+        let Some(mods) = keyboard.set_keymap(text) else {
+            eprintln!("[HostCapture] keymap state update failed");
+            return;
+        };
+        vk.keymap(KEYMAP_FORMAT_XKB_V1, fd.as_fd(), data.len() as u32);
+        vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
+        let _ = self.conn.flush();
     }
 
     /// Key event in xkb numbering (evdev + 8), matching the seat injectors.
@@ -1211,7 +1283,12 @@ impl HostSession {
         if xkb_keycode < 8 {
             return;
         }
+        let mut keyboard = self.keyboard.lock().unwrap();
+        let Some(mods) = keyboard.update_key(xkb_keycode, pressed) else {
+            return;
+        };
         vk.key(0, xkb_keycode - 8, if pressed { 1 } else { 0 });
+        vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
         let _ = self.conn.flush();
     }
 
@@ -2375,6 +2452,63 @@ fn drain_ctl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn us_host_keyboard() -> HostKeyboardState {
+        let text = crate::wayland::keymap::compile_rmlvo("", "", "us", "", "").unwrap();
+        let mut keyboard = HostKeyboardState::default();
+        assert!(keyboard.set_keymap(&text).is_some());
+        keyboard
+    }
+
+    #[test]
+    fn host_keyboard_serializes_control_modifier() {
+        let mut keyboard = us_host_keyboard();
+        let control_down = keyboard.update_key(37, true).unwrap();
+        assert_ne!(control_down.depressed, 0);
+        let control_up = keyboard.update_key(37, false).unwrap();
+        assert_eq!(control_up.depressed, 0);
+    }
+
+    #[test]
+    fn host_keyboard_ignores_repeated_key_down() {
+        let mut keyboard = us_host_keyboard();
+        keyboard.update_key(37, true).unwrap();
+        assert!(keyboard.update_key(37, true).is_none());
+        let control_up = keyboard.update_key(37, false).unwrap();
+        assert_eq!(control_up.depressed, 0);
+    }
+
+    #[test]
+    fn host_keyboard_preserves_pressed_modifiers_across_keymap_changes() {
+        let text = crate::wayland::keymap::compile_rmlvo("", "", "us", "", "").unwrap();
+        let mut keyboard = us_host_keyboard();
+        keyboard.update_key(37, true).unwrap();
+        let after_keymap = keyboard.set_keymap(&text).unwrap();
+        assert_ne!(after_keymap.depressed, 0);
+        let control_up = keyboard.update_key(37, false).unwrap();
+        assert_eq!(control_up.depressed, 0);
+    }
+
+    #[test]
+    fn host_keyboard_keeps_control_active_until_both_keys_are_released() {
+        let mut keyboard = us_host_keyboard();
+        keyboard.update_key(37, true).unwrap();
+        keyboard.update_key(105, true).unwrap();
+        let after_left_release = keyboard.update_key(37, false).unwrap();
+        assert_ne!(after_left_release.depressed, 0);
+        let after_right_release = keyboard.update_key(105, false).unwrap();
+        assert_eq!(after_right_release.depressed, 0);
+    }
+
+    #[test]
+    fn host_keyboard_ignores_repeated_lock_key_down() {
+        let mut keyboard = us_host_keyboard();
+        keyboard.update_key(66, true).unwrap();
+        assert!(keyboard.update_key(66, true).is_none());
+        let caps_lock = keyboard.update_key(66, false).unwrap();
+        assert_eq!(caps_lock.depressed, 0);
+        assert_ne!(caps_lock.locked, 0);
+    }
 
     /// The shm-format table maps each announced format to the right BGRA conversion. The
     /// wl_shm definitions are little-endian, so `Bgr888` (`[23:0] B:G:R`) is red-first in memory and
