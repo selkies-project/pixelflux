@@ -39,8 +39,8 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 ///
 /// **Why the band split exists.** Colour conversion is a non-trivial slice of per-frame CPU. The
 /// striped path already parallelizes it for free — each stripe converts on its own rayon worker —
-/// but a single full-frame consumer (the whole-frame x264 stripe, or a full-frame OpenH264
-/// instance, which passes `bands = 4`) would otherwise convert its entire image on one thread and
+/// but a single full-frame consumer (the whole-frame x264 stripe, a full-frame OpenH264
+/// instance, a libavcodec session) would otherwise convert its entire image on one thread and
 /// stall the frame there. Splitting into horizontal bands hands that lone conversion the same
 /// multi-threading the striped path enjoys. The cut is horizontal because YUV planes are
 /// row-major, so a horizontal boundary yields contiguous, non-overlapping plane sub-slices with no
@@ -49,23 +49,22 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// 1. **Plane strides**: `strides` gives the Y and chroma row pitches of the output planes
 ///    (tightly packed for the stripe buffers, padded for an AVFrame); the chroma planes are
 ///    `width` wide for 4:4:4 (`i444 == true`) or `width / 2` for 4:2:0. `rgba_input` selects
-///    the source byte order and `i444` the subsampling, together choosing one of four `yuv`
-///    crate routines in the **Fast** conversion mode — 4:4:4 uses **Full** range with the
-///    **BT.709** matrix, 4:2:0 uses **Limited** range with the **BT.601** matrix: the matrix
-///    NVENC's hardware conversion is fixed at, and the one browser presentation paths invert
-///    exactly (Chromium and Firefox paint a BT.709-tagged frame with a BT.601-like inversion,
-///    WebKit honours either), so every backend's 4:2:0 stream decodes to the same colour. Each
-///    encoder declares the matrix it was fed.
+///    the source byte order, `i444` the subsampling and `full_range` the signal: **Full** range
+///    with the **BT.709** matrix is the 4:4:4 signal x264 and x265 declare; everything else is
+///    **Limited** range with the **BT.601** matrix, the matrix NVENC's hardware conversion is
+///    fixed at and the one browser presentation paths invert exactly (Chromium and Firefox paint
+///    a BT.709-tagged frame with a BT.601-like inversion, WebKit honours either), so every
+///    backend's stream decodes to the same colour. Each encoder declares the matrix it was fed.
+///    All four `yuv` crate routines run in the **Fast** conversion mode.
 /// 2. **Band split**: `band_h` is `height / bands` floored to an even number and at least 2 rows
-///    (a band under 2 rows is not worth a thread). Keeping band boundaries even ensures a 4:2:0
+///    (a band under 2 rows is not worth a task). Keeping band boundaries even ensures a 4:2:0
 ///    chroma pair never straddles a seam. When `bands <= 1` or the whole image fits one band, the
-///    conversion runs single-threaded in place.
-/// 3. **Parallel bands**: otherwise a `std::thread::scope` carves `src` and the three output planes
-///    into contiguous per-band sub-slices (chroma rows scaled by `uv_rows` — full height for 4:4:4,
-///    half for 4:2:0) and spawns one thread per band. The final band absorbs any leftover rows,
-///    taking all remaining rows whenever fewer than `band_h + 2` are left. Each thread's result is
-///    joined and collected; a panicked join degrades to a `PointerOverflow` error, and the first
-///    error wins.
+///    conversion runs on the calling thread in place.
+/// 3. **Parallel bands**: otherwise `src` and the three output planes are carved into contiguous
+///    per-band sub-slices (chroma rows scaled by `uv_rows` — full height for 4:4:4, half for
+///    4:2:0) and converted on the rayon pool, whose workers already exist, so a frame spawns no
+///    thread. The final band absorbs any leftover rows, taking all remaining rows whenever fewer
+///    than `band_h + 2` are left. The first error wins.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_to_yuv_mt(
     src: &[u8],
@@ -113,29 +112,26 @@ pub(crate) fn convert_to_yuv_mt(
     }
 
     let uv_rows = |rows: usize| if i444 { rows } else { rows / 2 };
-    let mut results: Vec<Result<(), yuv::YuvError>> = Vec::new();
-    std::thread::scope(|s| {
-        let mut handles = Vec::new();
-        let (mut src_rest, mut y_rest, mut u_rest, mut v_rest) = (src, y_buf, u_buf, v_buf);
-        let mut row = 0;
-        while row < height {
-            let h = if height - row < band_h + 2 { height - row } else { band_h };
-            let (src_band, s_next) = src_rest.split_at(h * src_stride as usize);
-            let (y_band, y_next) = y_rest.split_at_mut(h * y_stride);
-            let (u_band, u_next) = u_rest.split_at_mut(uv_rows(h) * uv_stride);
-            let (v_band, v_next) = v_rest.split_at_mut(uv_rows(h) * uv_stride);
-            src_rest = s_next;
-            y_rest = y_next;
-            u_rest = u_next;
-            v_rest = v_next;
-            row += h;
-            handles.push(s.spawn(move || convert_band(src_band, y_band, u_band, v_band, h)));
-        }
-        for hnd in handles {
-            results.push(hnd.join().unwrap_or(Err(yuv::YuvError::PointerOverflow)));
-        }
-    });
-    results.into_iter().collect()
+    let mut jobs = Vec::new();
+    let (mut src_rest, mut y_rest, mut u_rest, mut v_rest) = (src, y_buf, u_buf, v_buf);
+    let mut row = 0;
+    while row < height {
+        let h = if height - row < band_h + 2 { height - row } else { band_h };
+        let (src_band, s_next) = src_rest.split_at(h * src_stride as usize);
+        let (y_band, y_next) = y_rest.split_at_mut(h * y_stride);
+        let (u_band, u_next) = u_rest.split_at_mut(uv_rows(h) * uv_stride);
+        let (v_band, v_next) = v_rest.split_at_mut(uv_rows(h) * uv_stride);
+        src_rest = s_next;
+        y_rest = y_next;
+        u_rest = u_next;
+        v_rest = v_next;
+        row += h;
+        jobs.push((src_band, y_band, u_band, v_band, h));
+    }
+    jobs.into_par_iter()
+        .map(|(src_band, y_band, u_band, v_band, h)| convert_band(src_band, y_band, u_band, v_band, h))
+        .collect::<Result<Vec<()>, _>>()
+        .map(|_| ())
 }
 
 thread_local! {
