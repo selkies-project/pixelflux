@@ -404,6 +404,13 @@ impl AvcodecEncoder {
         )
     }
 
+    /// Whether the session signals full range: the software 4:4:4 of x264's kind (x265), never
+    /// a hardware session, and not VP9, whose 4:4:4 keeps the limited-range BT.601 signal of
+    /// its 4:2:0 so the decoder hint the client sends for VP9 stays true.
+    pub fn is_full_range(&self) -> bool {
+        self.is_fullcolor() && self.backend == Backend::Software && self.codec != Codec::Vp9
+    }
+
     /// Open the VA-API device, surface pool and filter graph, then the codec.
     unsafe fn open_vaapi(&mut self, settings: &RustCaptureSettings, fullcolor: bool) -> Result<(), String> {
         let render_node = if settings.encode_node_index >= 0 {
@@ -652,19 +659,18 @@ impl AvcodecEncoder {
         (*ctx).max_b_frames = 0;
         (*ctx).gop_size = c_int::MAX;
         (*ctx).thread_count = self.threads;
-        let fullcolor = self.is_fullcolor();
-        let software = self.backend == Backend::Software;
-        (*ctx).color_range = if fullcolor && software {
+        let full_range = self.is_full_range();
+        (*ctx).color_range = if full_range {
             ff::AVColorRange::AVCOL_RANGE_JPEG
         } else {
             ff::AVColorRange::AVCOL_RANGE_MPEG
         };
         // VP9 names BT.601 by its own header code, the one Chromium's decoder maps; the
         // SMPTE 170M code lands there as unspecified.
-        (*ctx).colorspace = if fullcolor && software {
-            ff::AVColorSpace::AVCOL_SPC_BT709
-        } else if self.codec == Codec::Vp9 {
+        (*ctx).colorspace = if self.codec == Codec::Vp9 {
             ff::AVColorSpace::AVCOL_SPC_BT470BG
+        } else if full_range {
+            ff::AVColorSpace::AVCOL_SPC_BT709
         } else {
             ff::AVColorSpace::AVCOL_SPC_SMPTE170M
         };
@@ -1136,6 +1142,7 @@ impl AvcodecEncoder {
                 return Err(format!("Failed to make the input frame writable: {}", ff_err_str(ret)));
             }
             let i444 = self.is_fullcolor();
+            let full_range = self.is_full_range();
             let w = self.width as usize;
             let uv_rows = if i444 { h } else { h.div_ceil(2) };
             let (ys, us, vs) = (
@@ -1146,7 +1153,7 @@ impl AvcodecEncoder {
             let y = std::slice::from_raw_parts_mut((*self.frame).data[0], ys * h);
             let u = std::slice::from_raw_parts_mut((*self.frame).data[1], us * uv_rows);
             let v = std::slice::from_raw_parts_mut((*self.frame).data[2], vs * uv_rows);
-            convert_to_yuv_mt(pixels, stride as u32, w, h, rgba, i444, y, u, v, (ys, us), self.threads as usize)
+            convert_to_yuv_mt(pixels, stride as u32, w, h, rgba, i444, full_range, y, u, v, (ys, us), self.threads as usize)
                 .map_err(|e| format!("rgb-to-yuv conversion failed: {e:?}"))?;
             self.encode_frame(self.frame, frame_number, force_idr)
         }
@@ -1474,10 +1481,12 @@ mod software_tests {
             if super::super::software_fullcolor(codec) {
                 s.video_fullcolor = true;
                 let mut enc = session(codec, &s, false);
+                assert!(enc.is_fullcolor(), "{codec:?} carries the 4:4:4 request");
                 let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).expect("encode");
                 let mut dec = AvDecoder::new(codec).expect("decoder");
                 assert!(decode_one(&mut dec, &out));
-                assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_JPEG)), "{codec:?} 4:4:4");
+                let want = if codec == Codec::Vp9 { (AVCOL_SPC_BT470BG, AVCOL_RANGE_MPEG) } else { (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG) };
+                assert_eq!(dec.colour_tags(), Some(want), "{codec:?} 4:4:4");
             }
         }
     }

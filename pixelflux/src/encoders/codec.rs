@@ -124,10 +124,10 @@ impl Codec {
         self.is_video()
     }
 
-    /// Whether the codec can carry 4:4:4 chroma at all; whether a given backend does is
-    /// negotiated by that backend.
+    /// Whether the codec can carry 4:4:4 chroma at all (H.264 High 4:4:4, H.265 RExt, VP9
+    /// profile 1); whether a given backend does is negotiated by that backend.
     pub fn fullcolor(self) -> bool {
-        matches!(self, Codec::H264 | Codec::H265)
+        matches!(self, Codec::H264 | Codec::H265 | Codec::Vp9)
     }
 
     /// Whether a forced key frame of this codec repeats the stream's parameter sets, so
@@ -609,8 +609,8 @@ mod tests {
             assert!(!codec.stripes(), "{codec:?}");
             assert!(codec.is_video());
         }
-        assert!(Codec::H264.fullcolor() && Codec::H265.fullcolor());
-        assert!(!Codec::Vp9.fullcolor() && !Codec::Av1.fullcolor());
+        assert!(Codec::H264.fullcolor() && Codec::H265.fullcolor() && Codec::Vp9.fullcolor());
+        assert!(!Codec::Vp8.fullcolor() && !Codec::Av1.fullcolor());
     }
 
     /// The quantizer maps are monotonic, span their domain, clamp the index, and keep AV1
