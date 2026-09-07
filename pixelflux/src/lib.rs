@@ -713,14 +713,22 @@ pub enum ThreadCommand {
 /// lowercased for case-insensitive substring matching, and is empty when the node has no driver
 /// link (treated as "no detectable GPU" by the selection logic).
 ///
+/// sysfs lists every card the kernel sees, not the ones this process was given: a container
+/// handed a single GPU still finds the host's others under `/sys/class/drm`. A driver read
+/// from a node with no device file would route the encoder at hardware it cannot open, so an
+/// absent node answers the same as an unknown one.
+///
 /// # Arguments
 ///
 /// * `card_index` - DRM card index (maps to `/sys/class/drm/renderD{128 + card_index}`).
 ///
 /// # Returns
 ///
-/// Lowercased driver name, or an empty string if the node has no driver link.
+/// Lowercased driver name, or an empty string if the node is unusable or has no driver link.
 pub(crate) fn get_gpu_driver(card_index: i32) -> String {
+    if !std::path::Path::new(&format!("/dev/dri/renderD{}", 128 + card_index)).exists() {
+        return String::new();
+    }
     let path = format!("/sys/class/drm/renderD{}/device/driver", 128 + card_index);
     match std::fs::read_link(&path) {
         Ok(link_path) => link_path.to_string_lossy().to_lowercase(),
