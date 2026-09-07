@@ -831,7 +831,7 @@ impl AvcodecEncoder {
             "svt-av1" => {
                 dict_set(opts, "preset", "10");
                 let mut params = format!(
-                    "pred-struct=1:lookahead=0:force-key-frames=1:keyint=-2:scm=1:fast-decode=1:tile-columns=0:tile-rows=0:lp={}",
+                    "pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
                     self.threads
                 );
                 if self.cbr_mode {
