@@ -16,8 +16,9 @@
 //! A high-performance screen capture and encoding pipeline exposed as a Python extension via
 //! PyO3. It supports two independent backends — **X11** (XShm + XFixes) and **Wayland**
 //! (a headless [Smithay](https://github.com/Smithay/smithay) compositor) — and a shared
-//! encoding layer that dispatches to software (striped JPEG, and H.264 through the build's
-//! software encoder: libx264 with the `gpl` feature, OpenH264 without) or hardware (NVENC,
+//! encoding layer that dispatches to software (striped JPEG, H.264 through the build's
+//! software encoder — libx264 with the `gpl` feature, OpenH264 without — and the other
+//! codecs through the software encoders the linked FFmpeg carries) or hardware (NVENC,
 //! VA-API) encoders based on the available GPU and operator settings.
 //!
 //! ## Crate structure
@@ -1190,14 +1191,14 @@ fn build_readback_encoders(
 ///    store, so a payload is never seen half-applied). The IDR request is swapped as late as
 ///    possible, so a request that arrived while this frame was in flight is honored one pipeline
 ///    stage earlier than the next publish.
-/// 2. **Dispatch by encoder**: a hardware session runs `decide_hw_fullframe`, then hands only the
-///    frames actually being encoded to the session — NVENC takes the packed rows as they are (RGBA
-///    vs BGRA source chosen by the renderer) through `encode_cpu_packed` and converts in hardware,
-///    VA-API gets them colorspace-converted into the reused NV12/YUV444 buffer and `encode_raw`;
-///    otherwise `encode_cpu` runs the
-///    software path with compositor damage — JPEG, or H.264 through the build's software encoder,
-///    striped or full-frame. The software H.264 path keeps an infinite GOP, forcing an IDR only on
-///    an explicit request or the configured interval, and an explicit request also forces a full
+/// 2. **Dispatch by encoder**: a full-frame session runs `decide_hw_fullframe`, then hands only
+///    the frames actually being encoded to it through `FrameEncoder::encode_host` with the packed
+///    rows as they are (RGBA vs BGRA source chosen by the renderer) — NVENC uploads and converts
+///    in hardware, a VA-API session uploads and converts on the GPU, a software session converts
+///    on its encode threads; otherwise `encode_cpu` runs the striped software path with
+///    compositor damage — JPEG, or H.264 through the build's software encoder, striped or
+///    full-frame. The software H.264 path keeps an infinite GOP, forcing an IDR only on an
+///    explicit request or the configured interval, and an explicit request also forces a full
 ///    JPEG resend for joiners.
 /// 3. **Recycle then deliver**: the capture buffer is recycled BEFORE delivery so a slow consumer
 ///    never pins one, then the stripes go to the delivery thread through a single-slot `send` whose
