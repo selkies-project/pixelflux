@@ -625,11 +625,12 @@ impl AvcodecEncoder {
         if self.encoder_ctx.is_null() {
             return;
         }
-        if self.backend == Backend::Software && !self.fresh {
-            if ff::avcodec_send_frame(self.encoder_ctx, ptr::null()) >= 0 {
-                while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) >= 0 {
-                    ff::av_packet_unref(self.packet);
-                }
+        if self.backend == Backend::Software
+            && !self.fresh
+            && ff::avcodec_send_frame(self.encoder_ctx, ptr::null()) >= 0
+        {
+            while ff::avcodec_receive_packet(self.encoder_ctx, self.packet) >= 0 {
+                ff::av_packet_unref(self.packet);
             }
         }
         ff::avcodec_free_context(&mut self.encoder_ctx);
@@ -1289,7 +1290,7 @@ mod software_tests {
     fn noise(t: usize) -> Vec<u8> {
         let mut f = vec![255u8; W * H * 4];
         let mut s = (t as u32).wrapping_mul(2654435761).wrapping_add(7);
-        for px in f.chunks_exact_mut(4) {
+        for px in f.as_chunks_mut::<4>().0 {
             s ^= s << 13;
             s ^= s >> 17;
             s ^= s << 5;

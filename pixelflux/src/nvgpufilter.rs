@@ -704,6 +704,7 @@ mod tests {
     /// arch carries its own `JUMP_SLOT` / `GLOB_DAT` pair. The two arches the filter supports use
     /// distinct codes, and both must be flagged supported.
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn reloc_types_track_the_target_arch() {
         assert_ne!(RELOC_JUMP_SLOT, RELOC_GLOB_DAT);
         #[cfg(target_arch = "x86_64")]
