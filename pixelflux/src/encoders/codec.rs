@@ -359,22 +359,24 @@ pub fn h265_level(width: u32, height: u32, fps: u32) -> u32 {
 /// seq_level_idx (8 = 4.0, 13 = 5.1, 19 = 6.3).
 ///
 /// A frame is charged by **MaxPicSize** and the per-axis **MaxHSize** / **MaxVSize**, and
-/// its rate by **MaxDisplayRate**. The ladder starts at 4.0 and answers 6.3 for anything
-/// beyond its limits.
+/// its rate by **MaxDisplayRate**. MaxPicSize is its own limit, far below the product of the
+/// axis maxima -- no level admits a picture that is both its widest and its tallest -- so it
+/// is carried per level rather than derived. The ladder starts at 4.0 and answers 6.3 for
+/// anything beyond its limits.
 pub fn av1_level(width: u32, height: u32, fps: u32) -> u32 {
     let ps = width as u64 * height as u64;
     let rate = ps * fps.max(1) as u64;
     const LEVELS: [(u32, u64, u32, u32, u64); 10] = [
-        (8, 8_912_896, 4096, 2176, 267_386_880),
-        (9, 8_912_896, 4096, 2176, 534_773_760),
-        (12, 35_651_584, 8192, 4352, 1_069_547_520),
-        (13, 35_651_584, 8192, 4352, 2_139_095_040),
-        (14, 35_651_584, 8192, 4352, 4_278_190_080),
-        (15, 35_651_584, 8192, 4352, 4_278_190_080),
-        (16, 142_606_336, 16384, 8704, 4_278_190_080),
-        (17, 142_606_336, 16384, 8704, 8_556_380_160),
-        (18, 142_606_336, 16384, 8704, 17_112_760_320),
-        (19, 142_606_336, 16384, 8704, 17_112_760_320),
+        (8, 2_359_296, 6144, 3456, 70_778_880),
+        (9, 2_359_296, 6144, 3456, 141_557_760),
+        (12, 8_912_896, 8192, 4352, 267_386_880),
+        (13, 8_912_896, 8192, 4352, 534_773_760),
+        (14, 8_912_896, 8192, 4352, 1_069_547_520),
+        (15, 8_912_896, 8192, 4352, 1_069_547_520),
+        (16, 35_651_584, 16384, 8704, 1_069_547_520),
+        (17, 35_651_584, 16384, 8704, 2_139_095_040),
+        (18, 35_651_584, 16384, 8704, 4_278_190_080),
+        (19, 35_651_584, 16384, 8704, 4_278_190_080),
     ];
     for &(level, max_ps, max_w, max_h, max_rate) in &LEVELS {
         if ps <= max_ps && width <= max_w && height <= max_h && rate <= max_rate {
@@ -669,14 +671,16 @@ mod tests {
         assert_eq!(h265_level(7680, 4320, 120), 186);
         assert_eq!(h265_level(16384, 16384, 240), 186);
 
-        assert_eq!(av1_level(1920, 1080, 60), 8);
-        assert_eq!(av1_level(3840, 2160, 60), 9);
-        assert_eq!(av1_level(4096, 2304, 30), 12, "taller than 4.x's MaxVSize");
-        assert_eq!(av1_level(3840, 2160, 120), 12);
-        assert_eq!(av1_level(7680, 4320, 60), 13);
-        assert_eq!(av1_level(7680, 4320, 120), 14);
-        assert_eq!(av1_level(16384, 8704, 60), 17);
-        assert_eq!(av1_level(16384, 16384, 240), 19);
+        assert_eq!(av1_level(1280, 720, 30), 8);
+        assert_eq!(av1_level(1920, 1080, 60), 9);
+        assert_eq!(av1_level(3840, 2160, 60), 13);
+        assert_eq!(av1_level(3840, 2160, 120), 14);
+        assert_eq!(av1_level(4096, 2304, 30), 16, "larger than 5.x's MaxPicSize");
+        assert_eq!(av1_level(7680, 4320, 60), 17);
+        assert_eq!(av1_level(7680, 4320, 120), 18);
+        // Both axes fit 5.x, the picture does not: MaxPicSize is not the product of the axes.
+        assert_eq!(av1_level(8192, 4352, 60), 17);
+        assert_eq!(av1_level(8192, 4352, 240), 19);
     }
 
     /// H.264 labels follow the NAL and slice types: an IDR is a key, an I slice in a
