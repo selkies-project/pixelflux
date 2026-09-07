@@ -559,9 +559,16 @@ fn decide_caps(
     CapsDecision { fullcolor, downgraded_color, too_large }
 }
 
-/// The in-place resize headroom for one axis: the requested size lifted to `floor` (the 5.2
-/// ceiling the level is pinned at) but never past the driver's reported maximum, so initializing
-/// with headroom cannot itself exceed what the GPU supports.
+/// The geometry every session is initialized to hold, so `reconfigure_resolution` can grow into
+/// it in place. It is the largest picture the 5.x levels of all three codecs admit, which is what
+/// keeps the pinned level low enough for a hardware decoder to accept, and it spans both UHD and
+/// DCI 4K; a taller resize rebuilds the session instead.
+const HEADROOM_WIDTH: u32 = 4096;
+const HEADROOM_HEIGHT: u32 = 2160;
+
+/// The in-place resize headroom for one axis: the requested size lifted to `floor` but never past
+/// the driver's reported maximum, so initializing with headroom cannot itself exceed what the GPU
+/// supports.
 fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     let want = size.max(floor);
     match cap {
@@ -765,20 +772,22 @@ impl Drop for NvencEncoder {
     }
 }
 
-/// The level an NVENC session advertises for this geometry, floored at the level that spans
-/// the in-place resize headroom (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc
-/// for H.264, general_level_idc for HEVC, seq_level_idx for AV1).
+/// The level an NVENC session advertises, read from the shared ladder at the resize headroom
+/// rather than at the capture (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for
+/// H.264, general_level_idc for HEVC, seq_level_idx for AV1).
 ///
 /// `reconfigure_resolution` resizes a live session in place, so the level has to cover every
-/// geometry that session can still reach — a level bump mid-GOP forces some hardware decoders to
-/// re-initialize. The floors (H.264 5.2, HEVC 5.2, AV1 5.0) span everything up to 4096×2304 at
-/// 60 fps, so the whole range resolves to one level; only beyond it does the shared ladder step
-/// up.
+/// geometry that session can still reach: NVENC refuses an AV1 session whose level cannot hold
+/// `maxEncodeWidth` x `maxEncodeHeight`, and a level bump mid-GOP forces some hardware decoders
+/// to re-initialize. Reading the ladder at the headroom keeps one answer across the whole resize
+/// range and keeps it true of every frame the session may emit.
 fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32) -> u32 {
+    let w = width.max(HEADROOM_WIDTH);
+    let h = height.max(HEADROOM_HEIGHT);
     match codec {
-        Codec::H265 => h265_level(width, height, fps).max(156),
-        Codec::Av1 => av1_level(width, height, fps).max(12),
-        _ => h264_level(width, height, fps).max(52),
+        Codec::H265 => h265_level(w, h, fps),
+        Codec::Av1 => av1_level(w, h, fps),
+        _ => h264_level(w, h, fps),
     }
 }
 
@@ -989,10 +998,11 @@ impl NvencEncoder {
     ///    SMPTE170M matrix and limited range to match the hardware ARGB CSC; repeated parameter
     ///    sets on every key frame; H.264 CABAC; no AUD; one AV1 tile; strict GOP target; and
     ///    lookahead disabled for real-time latency.
-    /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to at
-    ///    least 4096×2304 (the 5.2 ceiling) so `reconfigure_resolution` can grow in place, but never
-    ///    past the driver's reported maximum; this costs ~290 MiB of device memory, so a failed init
-    ///    retries at the exact size (in-place resize then falls back to a rebuild).
+    /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to
+    ///    at least `HEADROOM_WIDTH` x `HEADROOM_HEIGHT` so `reconfigure_resolution` can grow in
+    ///    place, but never past the driver's reported maximum; this costs a few hundred MiB of
+    ///    device memory, so a failed init retries at the exact size (in-place resize then falls
+    ///    back to a rebuild).
     /// 7. **Register, map, and buffer**: register and map the packed input surface (as `ARGB`;
     ///    `set_input_format` re-registers it for an RGBA source), and create a
     ///    4-deep ring of bitstream output buffers.
@@ -1259,8 +1269,8 @@ impl NvencEncoder {
                 frameRateDen: 1,
                 enablePTD: 1,
                 encodeConfig: &mut config,
-                maxEncodeWidth: nvenc_headroom(width, 4096, caps_wmax),
-                maxEncodeHeight: nvenc_headroom(height, 2304, caps_hmax),
+                maxEncodeWidth: nvenc_headroom(width, HEADROOM_WIDTH, caps_wmax),
+                maxEncodeHeight: nvenc_headroom(height, HEADROOM_HEIGHT, caps_hmax),
                 ..Default::default()
             };
 
@@ -3391,6 +3401,70 @@ mod decision_tests {
         assert_eq!(nvenc_headroom(6000, 4096, Some(8192)), 6000);
         assert_eq!(nvenc_headroom(1920, 4096, None), 4096);
         assert_eq!(nvenc_headroom(1920, 4096, Some(2048)), 2048);
+    }
+
+    /// Every session is initialized to hold the resize headroom, so the level it advertises has
+    /// to admit that picture whatever the capture is -- NVENC refuses an AV1 session where it
+    /// does not -- and it must not move as the capture is resized underneath it.
+    #[test]
+    fn level_covers_the_resize_headroom() {
+        let pixels = (HEADROOM_WIDTH * HEADROOM_HEIGHT) as u64;
+        let macroblocks = (HEADROOM_WIDTH as u64 / 16) * (HEADROOM_HEIGHT as u64 / 16);
+        for fps in [30, 60, 120] {
+            for (w, h) in [(1280, 720), (1600, 900), (1920, 1080), (3840, 2160)] {
+                assert_eq!(
+                    nvenc_level(Codec::Av1, w, h, fps),
+                    nvenc_level(Codec::Av1, HEADROOM_WIDTH, HEADROOM_HEIGHT, fps),
+                    "AV1 level moved with the capture at {w}x{h}@{fps}"
+                );
+                assert!(
+                    av1_max_picture(nvenc_level(Codec::Av1, w, h, fps)) >= pixels,
+                    "AV1 level at {w}x{h}@{fps} cannot hold the headroom"
+                );
+                assert!(
+                    h265_max_picture(nvenc_level(Codec::H265, w, h, fps)) >= pixels,
+                    "HEVC level at {w}x{h}@{fps} cannot hold the headroom"
+                );
+                assert!(
+                    h264_max_macroblocks(nvenc_level(Codec::H264, w, h, fps)) >= macroblocks,
+                    "H.264 level at {w}x{h}@{fps} cannot hold the headroom"
+                );
+            }
+        }
+        // The headroom spans UHD and DCI 4K, which is what keeps these levels low enough for a
+        // hardware decoder to accept them.
+        assert_eq!(nvenc_level(Codec::H264, 1920, 1080, 60), 52);
+        assert_eq!(nvenc_level(Codec::H265, 1920, 1080, 60), 153);
+        assert_eq!(nvenc_level(Codec::Av1, 1920, 1080, 60), 13);
+    }
+
+    /// AV1 Annex A MaxPicSize for a seq_level_idx the ladder can return.
+    fn av1_max_picture(level: u32) -> u64 {
+        match level {
+            8 | 9 => 2_359_296,
+            12..=15 => 8_912_896,
+            _ => 35_651_584,
+        }
+    }
+
+    /// HEVC Annex A MaxLumaPs for a general_level_idc the ladder can return.
+    fn h265_max_picture(level: u32) -> u64 {
+        match level {
+            123 => 2_228_224,
+            150 | 153 | 156 => 8_912_896,
+            _ => 35_651_584,
+        }
+    }
+
+    /// H.264 Annex A MaxFS for a level_idc the ladder can return.
+    fn h264_max_macroblocks(level: u32) -> u64 {
+        match level {
+            41 => 8192,
+            42 => 8704,
+            50 => 22080,
+            51 | 52 => 36864,
+            _ => 139264,
+        }
     }
 
     /// Two buffers that reuse one fd number but differ in any identity field are distinct, so a
