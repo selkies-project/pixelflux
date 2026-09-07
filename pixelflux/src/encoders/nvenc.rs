@@ -2457,7 +2457,7 @@ impl NvencEncoder {
             return Ok(ext.mapped);
         }
         self.unmap_external_input();
-        if pitch < self.width as usize * 4 || pitch % 4 != 0 {
+        if pitch < self.width as usize * 4 || !pitch.is_multiple_of(4) {
             return Err(format!(
                 "external input pitch {pitch} does not cover {}x{} at 4-byte alignment",
                 self.width, self.height

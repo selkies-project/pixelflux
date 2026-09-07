@@ -43,6 +43,7 @@
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
+#![allow(clippy::upper_case_acronyms)]
 
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::Ordering;
@@ -995,7 +996,7 @@ fn frame_pitch(byte_size: u32, width: u32, height: u32) -> usize {
         return packed;
     }
     let rows = byte_size as usize / height as usize;
-    if rows >= packed && rows % 4 == 0 && rows * height as usize == byte_size as usize {
+    if rows >= packed && rows.is_multiple_of(4) && rows * height as usize == byte_size as usize {
         rows
     } else {
         packed
