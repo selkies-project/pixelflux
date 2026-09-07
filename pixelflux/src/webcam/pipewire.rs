@@ -236,7 +236,7 @@ fn push_u32(v: &mut Vec<u8>, x: u32) {
 }
 
 fn pad8(v: &mut Vec<u8>) {
-    while v.len() % 8 != 0 {
+    while !v.len().is_multiple_of(8) {
         v.push(0);
     }
 }
@@ -334,7 +334,7 @@ fn buffers_pod(fmt: &RingFormat) -> Vec<u8> {
         prop(p, SPA_PARAM_BUFFERS_STRIDE, |v| pod_int(v, fmt.bytesperline as i32));
         prop(p, SPA_PARAM_BUFFERS_ALIGN, |v| pod_int(v, 16));
         prop(p, SPA_PARAM_BUFFERS_DATATYPE, |v| {
-            pod_choice_int(v, SPA_CHOICE_FLAGS, &[((1 << SPA_DATA_MEMFD) | (1 << SPA_DATA_MEMPTR)) as i32])
+            pod_choice_int(v, SPA_CHOICE_FLAGS, &[(1 << SPA_DATA_MEMFD) | (1 << SPA_DATA_MEMPTR)])
         });
     })
 }
@@ -626,8 +626,11 @@ mod tests {
         u32::from_ne_bytes(v[off..off + 4].try_into().unwrap())
     }
 
-    /// Walk an object pod: (object type, param id, [(key, value type, value payload)]).
-    fn parse_object(pod: &[u8]) -> (u32, u32, Vec<(u32, u32, Vec<u8>)>) {
+    /// One property of an object pod: key, value type, value payload.
+    type ObjectProp = (u32, u32, Vec<u8>);
+
+    /// Walk an object pod: (object type, param id, properties).
+    fn parse_object(pod: &[u8]) -> (u32, u32, Vec<ObjectProp>) {
         assert_eq!(pod.len() % 8, 0);
         assert_eq!(u32_at(pod, 0) as usize, pod.len() - 8);
         assert_eq!(u32_at(pod, 4), SPA_TYPE_OBJECT);

@@ -475,7 +475,7 @@ fn direct_plane(frame: &CUeglFrame, width: u32, height: u32) -> Option<DirectPla
     match frame.frame_type {
         CU_EGL_FRAME_TYPE_PITCH => {
             let plane = unsafe { frame.frame.p_pitch[0] };
-            let pitch_ok = frame.pitch >= width.saturating_mul(4) && frame.pitch % 4 == 0;
+            let pitch_ok = frame.pitch >= width.saturating_mul(4) && frame.pitch.is_multiple_of(4);
             (!plane.is_null() && pitch_ok).then_some(DirectPlane::Pitch(frame.pitch))
         }
         CU_EGL_FRAME_TYPE_ARRAY => {
@@ -2457,7 +2457,7 @@ impl NvencEncoder {
             return Ok(ext.mapped);
         }
         self.unmap_external_input();
-        if pitch < self.width as usize * 4 || pitch % 4 != 0 {
+        if pitch < self.width as usize * 4 || !pitch.is_multiple_of(4) {
             return Err(format!(
                 "external input pitch {pitch} does not cover {}x{} at 4-byte alignment",
                 self.width, self.height
@@ -2570,7 +2570,7 @@ mod gpu_tests {
     /// the content has structure and encodes are non-trivial.
     fn frame(w: usize, h: usize, seed: u8) -> Vec<u8> {
         let mut f = vec![0u8; w * h * 4];
-        for (i, px) in f.chunks_exact_mut(4).enumerate() {
+        for (i, px) in f.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let v = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
             px[0] = v.wrapping_add(seed);
             px[1] = v ^ seed;

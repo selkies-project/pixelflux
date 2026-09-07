@@ -910,7 +910,7 @@ mod slice_tests {
     fn noise_frame(w: usize, h: usize, seed: u32) -> Vec<u8> {
         let mut x = seed.wrapping_mul(2654435761).max(1);
         let mut v = vec![0u8; w * h * 4];
-        for px in v.chunks_exact_mut(4) {
+        for px in v.as_chunks_mut::<4>().0 {
             x ^= x << 13;
             x ^= x >> 17;
             x ^= x << 5;

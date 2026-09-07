@@ -25,6 +25,8 @@
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
+use super::ScreenInfo;
+
 use wayland_client::protocol::wl_registry;
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_protocols_wlr::output_management::v1::client::{
@@ -44,12 +46,15 @@ pub enum ScaleOutcome {
     Unsupported,
 }
 
+/// An announced head: the object, its name, whether it is enabled, and its layout position.
+type Head = (ZwlrOutputHeadV1, Option<String>, bool, (i32, i32));
+
 #[derive(Default)]
 struct OutState {
     manager: Option<ZwlrOutputManagerV1>,
     /// Announced heads with their name, enabled state and layout position. The
     /// manager's order is its own; screens are addressed by name below.
-    heads: Vec<(ZwlrOutputHeadV1, Option<String>, bool, (i32, i32))>,
+    heads: Vec<Head>,
     /// Size per announced mode object, and the mode each head currently holds:
     /// a head carries no size of its own, so the two are joined to report one.
     modes: Vec<(ZwlrOutputModeV1, (i32, i32))>,
@@ -79,10 +84,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for OutState {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            if interface == "zwlr_output_manager_v1" && state.manager.is_none() {
-                state.manager = Some(registry.bind(name, version.min(4), qh, ()));
-            }
+        if let wl_registry::Event::Global { name, interface, version } = event
+            && interface == "zwlr_output_manager_v1"
+            && state.manager.is_none()
+        {
+            state.manager = Some(registry.bind(name, version.min(4), qh, ()));
         }
     }
 }
@@ -236,7 +242,7 @@ pub fn set_screen_geometry(
 /// not always what it was asked for. A head carries no size itself, so the size
 /// is its current mode's; `(0, 0)` where it announced none. Empty when the
 /// compositor manages no outputs for clients.
-pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32, i32, i32)>, String> {
+pub fn list_screens(socket_path: &str) -> Result<Vec<ScreenInfo>, String> {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
     let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;

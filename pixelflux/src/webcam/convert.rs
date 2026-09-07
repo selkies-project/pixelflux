@@ -186,6 +186,7 @@ fn halve_plane(src: &[u8], sw: usize, sh: usize, sstride: usize, dst: &mut Vec<u
 }
 
 /// Separable bilinear resample of one plane (fixed point 16.16).
+#[allow(clippy::too_many_arguments)]
 fn bilinear_plane(src: &[u8], sw: usize, sh: usize, sstride: usize, dst: &mut [u8], dw: usize, dh: usize, dstride: usize) {
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
         return;
@@ -223,6 +224,7 @@ fn bilinear_plane(src: &[u8], sw: usize, sh: usize, sstride: usize, dst: &mut [u
 
 /// Resample a plane into `dst` (tightly packed `dw` x `dh`), halving first while the source is more
 /// than twice the destination in either dimension.
+#[allow(clippy::too_many_arguments)]
 fn scale_plane(src: &[u8], sw: usize, sh: usize, sstride: usize, dst: &mut [u8], dw: usize, dh: usize, tmp: &mut [Vec<u8>; 2]) {
     let mut cur: Option<(usize, usize, usize)> = None;
     let mut which = 0;
@@ -335,7 +337,7 @@ impl Orientation {
     pub const UPRIGHT: Orientation = Orientation { quarter_turns: 0, hflip: false };
 
     pub fn is_upright(&self) -> bool {
-        self.quarter_turns % 4 == 0 && !self.hflip
+        self.quarter_turns.is_multiple_of(4) && !self.hflip
     }
 }
 
@@ -353,7 +355,7 @@ const ORIENT_TILE: usize = 32;
 fn orient_plane(src: &[u8], stride: usize, w: usize, h: usize, o: Orientation, dst: &mut [u8]) {
     let q = o.quarter_turns % 4;
     let (dw, dh) = if q % 2 == 1 { (h, w) } else { (w, h) };
-    if q % 2 == 0 {
+    if q.is_multiple_of(2) {
         let reversed = (q == 2) != o.hflip;
         for dy in 0..dh {
             let sy = if q == 2 { h - 1 - dy } else { dy };

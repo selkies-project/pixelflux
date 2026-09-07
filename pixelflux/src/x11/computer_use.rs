@@ -449,7 +449,7 @@ impl CuBackend for CuX11Backend {
                 }
         // The grab is BGRX; the padding byte is undefined for depth-24 roots, so alpha is
         // forced opaque or the PNG would come out transparent.
-        for px in data.chunks_exact_mut(4) {
+        for px in data.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 0xFF;
         }

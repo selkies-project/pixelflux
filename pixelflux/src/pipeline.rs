@@ -376,7 +376,7 @@ impl X11Pipeline {
                     Err(e) => {
                         // One line per recovery window: a session failing at frame rate would
                         // otherwise write a line per frame for the life of the capture.
-                        if self.hw_error_streak % crate::HW_ERROR_RECOVERY_THRESHOLD == 0 {
+                        if self.hw_error_streak.is_multiple_of(crate::HW_ERROR_RECOVERY_THRESHOLD) {
                             eprintln!("[x11] HW encode error: {e}");
                         }
                         self.hw_error_streak = self.hw_error_streak.saturating_add(1);
@@ -479,10 +479,12 @@ mod tests {
     #[test]
     fn hw_fullframe_motion_sends_at_normal_quality_and_cancels_the_burst() {
         let s = hw_settings();
-        let mut st = StripeState::default();
-        st.h264_burst_frames_remaining = 3;
-        st.paint_over_sent = true;
-        st.no_motion_frame_count = 9;
+        let mut st = StripeState {
+            h264_burst_frames_remaining: 3,
+            paint_over_sent: true,
+            no_motion_frame_count: 9,
+            ..Default::default()
+        };
 
         let d = decide_hw_fullframe(&mut st, &s, 1, true, false, false);
         assert!(d.send);

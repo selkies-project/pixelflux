@@ -194,7 +194,7 @@ impl AvDecoder {
                             let s0 = f.data[plane].add(r0 * f.linesize[plane] as usize);
                             let s1 = f.data[plane].add(r1 * f.linesize[plane] as usize);
                             for x in 0..cw {
-                                dst[row * cw + x] = ((*s0.add(x) as u32 + *s1.add(x) as u32 + 1) / 2) as u8;
+                                dst[row * cw + x] = (*s0.add(x) as u32 + *s1.add(x) as u32).div_ceil(2) as u8;
                             }
                         }
                     }

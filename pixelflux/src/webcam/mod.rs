@@ -530,9 +530,10 @@ impl VirtualCamera {
     /// relays to the client. Raises when the camera is not running, the codec id is unknown or the
     /// rotation is not a quarter turn.
     #[pyo3(signature = (data, codec, keyframe = false, offset = 0, rotation = 0, flip = false))]
+    #[allow(clippy::too_many_arguments)]
     fn push(&self, py: Python<'_>, data: PyBuffer<u8>, codec: u32, keyframe: bool, offset: usize, rotation: u32, flip: bool) -> PyResult<u32> {
         let codec = Codec::from_id(codec).ok_or_else(|| PyValueError::new_err(format!("unknown codec id {}", codec)))?;
-        if rotation % 90 != 0 || rotation >= 360 {
+        if !rotation.is_multiple_of(90) || rotation >= 360 {
             return Err(PyValueError::new_err("rotation must be 0, 90, 180 or 270"));
         }
         let orientation = Orientation { quarter_turns: (rotation / 90) as u8, hflip: flip };

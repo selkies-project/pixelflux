@@ -139,7 +139,7 @@ fn convert_shm_row(src: &[u8], dst: &mut [u8], src_bpp: usize, swap_rb: bool) {
             dst[..n].copy_from_slice(&src[..n]);
         }
         (4, true) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
@@ -149,13 +149,13 @@ fn convert_shm_row(src: &[u8], dst: &mut [u8], src_bpp: usize, swap_rb: bool) {
         // One 4-byte store per pixel rather than four byte stores: measured ~1.7x on a
         // 3-byte source. The 4-byte arms above vectorize better as they stand.
         (_, true) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
-                d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<3>().0) {
+                *d = [s[2], s[1], s[0], 0xff];
             }
         }
         (_, false) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
-                d.copy_from_slice(&[s[0], s[1], s[2], 0xff]);
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<3>().0) {
+                *d = [s[0], s[1], s[2], 0xff];
             }
         }
     }
@@ -403,17 +403,14 @@ impl Dispatch<wl_output::WlOutput, usize> for CtrlState {
                     o.1 = Some(name);
                 }
             }
-            wl_output::Event::Mode { flags, width, height, .. } => {
-                if flags
-                    .into_result()
-                    .is_ok_and(|f| f.contains(wl_output::Mode::Current))
-                {
-                    let mut sizes = state.sizes.lock().unwrap();
-                    if sizes.len() <= *idx {
-                        sizes.resize(*idx + 1, (0, 0));
-                    }
-                    sizes[*idx] = (width, height);
+            wl_output::Event::Mode { flags, width, height, .. }
+                if flags.into_result().is_ok_and(|f| f.contains(wl_output::Mode::Current)) =>
+            {
+                let mut sizes = state.sizes.lock().unwrap();
+                if sizes.len() <= *idx {
+                    sizes.resize(*idx + 1, (0, 0));
                 }
+                sizes[*idx] = (width, height);
             }
             _ => {}
         }
@@ -623,10 +620,7 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
                 // and the shm formats below still apply.
             }
             Event::DmabufFormat { format, modifiers } => {
-                let mods = modifiers
-                    .chunks_exact(8)
-                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
-                    .collect();
+                let mods = modifiers.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
                 state.ext_pending_dma.push((format, mods));
             }
             Event::Done => {

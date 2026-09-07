@@ -636,6 +636,12 @@ pub struct EncodedStripe {
     pub frame_id: i32,
 }
 
+/// No stripe is shorter than a macroblock row.
+const MIN_STRIPE_HEIGHT: i32 = 64;
+/// How fast the smoothed count of budget-carrying stripes follows the frame's.
+const CARRY_RISE: f32 = 0.3;
+const CARRY_FALL: f32 = 0.05;
+
 /// The software encoder's per-frame entry point: split the frame into horizontal stripes,
 /// decide per stripe whether it needs sending, and encode only those as JPEG or H.264 (libx264
 /// or OpenH264, by build) across the rayon pool.
@@ -723,12 +729,6 @@ pub struct EncodedStripe {
 ///    with a single encode thread and one conversion band each, since the parallelism there
 ///    already comes from encoding the stripes concurrently.
 #[allow(clippy::too_many_arguments)]
-/// No stripe is shorter than a macroblock row.
-const MIN_STRIPE_HEIGHT: i32 = 64;
-/// How fast the smoothed count of budget-carrying stripes follows the frame's.
-const CARRY_RISE: f32 = 0.3;
-const CARRY_FALL: f32 = 0.05;
-
 pub fn encode_cpu(
     stripes: &mut Vec<StripeState>,
     carrying: &mut f32,
@@ -1671,7 +1671,7 @@ mod qp_bound_sweep {
             .map(|i| {
                 let y = text_luma(i);
                 let mut bgra = vec![255u8; W * H * 4];
-                for (px, &l) in bgra.chunks_exact_mut(4).zip(y.iter()) {
+                for (px, &l) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(y.iter()) {
                     px[0] = l;
                     px[1] = l;
                     px[2] = l;

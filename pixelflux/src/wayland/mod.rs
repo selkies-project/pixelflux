@@ -29,3 +29,6 @@ pub mod kdeclient;
 pub mod kdeproto;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;
+
+/// One screen of a nested compositor as its clients report it: name, x, y, width, height.
+pub type ScreenInfo = (String, i32, i32, i32, i32);
