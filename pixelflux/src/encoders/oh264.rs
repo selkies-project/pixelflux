@@ -512,6 +512,7 @@ impl Openh264Encoder {
             self.height,
             rgba_input,
             false,
+            false,
             &mut self.y_buf,
             &mut self.u_buf,
             &mut self.v_buf,

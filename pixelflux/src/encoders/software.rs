@@ -74,6 +74,7 @@ pub(crate) fn convert_to_yuv_mt(
     height: usize,
     rgba_input: bool,
     i444: bool,
+    full_range: bool,
     y_buf: &mut [u8],
     u_buf: &mut [u8],
     v_buf: &mut [u8],
@@ -81,6 +82,11 @@ pub(crate) fn convert_to_yuv_mt(
     bands: usize,
 ) -> Result<(), yuv::YuvError> {
     let (y_stride, uv_stride) = strides;
+    let (range, matrix) = if full_range {
+        (YuvRange::Full, YuvStandardMatrix::Bt709)
+    } else {
+        (YuvRange::Limited, YuvStandardMatrix::Bt601)
+    };
 
     let convert_band = |src_band: &[u8], y: &mut [u8], u: &mut [u8], v: &mut [u8], h: usize| {
         let mut img = YuvPlanarImageMut {
@@ -94,22 +100,10 @@ pub(crate) fn convert_to_yuv_mt(
             height: h as u32,
         };
         match (i444, rgba_input) {
-            (true, true) => yuv::rgba_to_yuv444(
-                &mut img, src_band, src_stride, YuvRange::Full,
-                YuvStandardMatrix::Bt709, YuvConversionMode::Fast,
-            ),
-            (true, false) => yuv::bgra_to_yuv444(
-                &mut img, src_band, src_stride, YuvRange::Full,
-                YuvStandardMatrix::Bt709, YuvConversionMode::Fast,
-            ),
-            (false, true) => yuv::rgba_to_yuv420(
-                &mut img, src_band, src_stride, YuvRange::Limited,
-                YuvStandardMatrix::Bt601, YuvConversionMode::Fast,
-            ),
-            (false, false) => yuv::bgra_to_yuv420(
-                &mut img, src_band, src_stride, YuvRange::Limited,
-                YuvStandardMatrix::Bt601, YuvConversionMode::Fast,
-            ),
+            (true, true) => yuv::rgba_to_yuv444(&mut img, src_band, src_stride, range, matrix, YuvConversionMode::Fast),
+            (true, false) => yuv::bgra_to_yuv444(&mut img, src_band, src_stride, range, matrix, YuvConversionMode::Fast),
+            (false, true) => yuv::rgba_to_yuv420(&mut img, src_band, src_stride, range, matrix, YuvConversionMode::Fast),
+            (false, false) => yuv::bgra_to_yuv420(&mut img, src_band, src_stride, range, matrix, YuvConversionMode::Fast),
         }
     };
 
@@ -1037,6 +1031,7 @@ pub fn encode_cpu(
                             width_usize,
                             actual_height,
                             use_gpu,
+                            video_fullcolor,
                             video_fullcolor,
                             &mut stripe_state.y_buf,
                             &mut stripe_state.u_buf,
