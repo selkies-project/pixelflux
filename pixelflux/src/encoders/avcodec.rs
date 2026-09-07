@@ -690,6 +690,9 @@ impl AvcodecEncoder {
             self.current_vbv_mult,
         ) as i64;
         if self.cbr_mode {
+            // SVT-AV1 refuses a rate-control buffer shorter than 20 ms, which the 1.5-frame
+            // VBV falls under above 75 fps.
+            let vbv = if self.library == "svt-av1" { vbv.max(bps / 50) } else { vbv };
             (*ctx).bit_rate = bps;
             (*ctx).rc_max_rate = bps;
             (*ctx).rc_min_rate = bps;
@@ -842,9 +845,10 @@ impl AvcodecEncoder {
             }
             "svt-av1" => {
                 dict_set(opts, "preset", "10");
+                // `lp` is a level of parallelism, 0..=6, not a thread count.
                 let mut params = format!(
                     "pred-struct=1:lookahead=0:keyint=-1:tile-columns=0:tile-rows=0:lp={}",
-                    self.threads
+                    self.threads.min(6)
                 );
                 if self.cbr_mode {
                     params.push_str(":rc=2");
