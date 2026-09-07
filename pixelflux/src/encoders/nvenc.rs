@@ -577,6 +577,19 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     }
 }
 
+/// The driver's message for the last failure on `session`, or a stand-in when it has none: NVENC
+/// clears the string once a session is torn down, so it is only meaningful read straight after
+/// the call that failed.
+unsafe fn last_error(funcs: &NV_ENCODE_API_FUNCTION_LIST, session: *mut c_void) -> String {
+    funcs
+        .nvEncGetLastErrorString
+        .map(|f| f(session))
+        .filter(|p| !p.is_null())
+        .map(|p| CStr::from_ptr(p).to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "no error string".to_string())
+}
+
 /// Query one NVENC capability of `codec` on an open session, returning the driver's integer
 /// answer or `None` when the entry point is absent or the query fails — `decide_caps` reads
 /// `None` as "do not gate", so a query failure never becomes a false refusal.
@@ -1001,8 +1014,8 @@ impl NvencEncoder {
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to
     ///    at least `HEADROOM_WIDTH` x `HEADROOM_HEIGHT` so `reconfigure_resolution` can grow in
     ///    place, but never past the driver's reported maximum; this costs a few hundred MiB of
-    ///    device memory, so a failed init retries at the exact size (in-place resize then falls
-    ///    back to a rebuild).
+    ///    device memory, so a failed init reopens the session and retries at the exact size
+    ///    (in-place resize then falls back to a rebuild).
     /// 7. **Register, map, and buffer**: register and map the packed input surface (as `ARGB`;
     ///    `set_input_format` re-registers it for an RGBA source), and create a
     ///    4-deep ring of bitstream output buffers.
@@ -1198,17 +1211,9 @@ impl NvencEncoder {
                 &mut preset_config,
             );
             if preset_status != NVENCSTATUS::NV_ENC_SUCCESS {
-                let detail = function_list.nvEncGetLastErrorString.and_then(|f| {
-                    let p = f(encoder_session);
-                    if p.is_null() {
-                        None
-                    } else {
-                        Some(CStr::from_ptr(p).to_string_lossy().into_owned())
-                    }
-                });
                 eprintln!(
                     "[NVENC] nvEncGetEncodePresetConfigEx failed ({preset_status:?}): {}",
-                    detail.as_deref().unwrap_or("no error string")
+                    last_error(&function_list, encoder_session)
                 );
             }
 
@@ -1275,17 +1280,45 @@ impl NvencEncoder {
             };
 
             let init_fn = function_list.nvEncInitializeEncoder.unwrap();
-            if init_fn(encoder_session, &mut init_params) != NVENCSTATUS::NV_ENC_SUCCESS {
+            let headroom_status = init_fn(encoder_session, &mut init_params);
+            if headroom_status != NVENCSTATUS::NV_ENC_SUCCESS {
+                eprintln!(
+                    "[NVENC] Init with {}x{} resize headroom failed ({headroom_status:?}): {}",
+                    init_params.maxEncodeWidth,
+                    init_params.maxEncodeHeight,
+                    last_error(&function_list, encoder_session)
+                );
+                // An encoder the driver refused to initialize stays refused, so the retry at the
+                // exact capture size needs a session of its own rather than this one.
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                encoder_session = ptr::null_mut();
+                let reopened = open_fn(&mut session_params, &mut encoder_session)
+                    == NVENCSTATUS::NV_ENC_SUCCESS;
                 init_params.maxEncodeWidth = width;
                 init_params.maxEncodeHeight = height;
-                if init_fn(encoder_session, &mut init_params) != NVENCSTATUS::NV_ENC_SUCCESS {
-                    (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                init_params.encodeConfig = &mut config;
+                let exact_status = if reopened {
+                    init_fn(encoder_session, &mut init_params)
+                } else {
+                    NVENCSTATUS::NV_ENC_ERR_NO_ENCODE_DEVICE
+                };
+                if exact_status != NVENCSTATUS::NV_ENC_SUCCESS {
+                    let detail = if reopened {
+                        let d = last_error(&function_list, encoder_session);
+                        (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                        d
+                    } else {
+                        "could not reopen the session".to_string()
+                    };
                     (cuda.cuMemFree_v2)(input_device_ptr);
                     (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
-                    return Err("Failed to initialize encoder".into());
+                    return Err(format!(
+                        "Failed to initialize {} encoder at {width}x{height} ({exact_status:?}): {detail}",
+                        codec.display()
+                    ));
                 }
-                eprintln!("[NVENC] Init with resize headroom failed; running without it.");
+                eprintln!("[NVENC] Running without resize headroom.");
             }
 
             init_params.encodeConfig = ptr::null_mut();
