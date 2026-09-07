@@ -55,6 +55,12 @@ const FULLCOLOR_SW_FORMATS: [ff::AVPixelFormat; 2] = [
 /// A bitrate ceiling (100 Mbps) programmed wherever a constant-quantizer session needs a rate
 /// target the encoder API demands but must never bind.
 const BITRATE_CEILING_BPS: i64 = 100_000_000;
+/// `AV_BUFFER_FLAG_READONLY`: the buffer wraps memory FFmpeg may read but never write.
+const AV_BUFFER_FLAG_READONLY: c_int = 1;
+
+/// FFmpeg buffer-free callback for a host frame that borrows the caller's rows: nothing to
+/// free, the rows belong to the capture.
+unsafe extern "C" fn release_borrowed(_opaque: *mut c_void, _data: *mut u8) {}
 
 /// Mirrors FFmpeg's `libavutil/hwcontext_drm.h` ABI so a Wayland dmabuf can be handed to the
 /// `hwmap` filter without a copy. FFmpeg reinterprets these bytes directly, so every field,
@@ -1089,9 +1095,10 @@ impl AvcodecEncoder {
     }
 
     /// Encode one packed host frame (`stride` bytes per row, in the byte order the session
-    /// was built for) at the quality index `crf`. A hardware session uploads it and converts
-    /// on the GPU; a software session converts it into its planar input frame — 4:2:0 limited
-    /// range, or 4:4:4 full range — across the encode threads and hands the planes to the
+    /// was built for) at the quality index `crf`. A hardware session uploads it straight from
+    /// the caller's rows, which the graph reads only within this call, and converts on the GPU;
+    /// a software session converts it into its planar input frame — 4:2:0 limited range, or
+    /// 4:4:4 at the range the codec signals — across the rayon pool and hands the planes to the
     /// codec.
     pub fn encode_host(
         &mut self,
@@ -1122,18 +1129,19 @@ impl AvcodecEncoder {
                 } else {
                     ff::AVPixelFormat::AV_PIX_FMT_BGRA as i32
                 };
-                if ff::av_frame_get_buffer(self.frame, 0) < 0 {
-                    return Err("Failed to allocate the host frame".into());
+                let buf = ff::av_buffer_create(
+                    pixels.as_ptr() as *mut u8,
+                    needed,
+                    Some(release_borrowed),
+                    ptr::null_mut(),
+                    AV_BUFFER_FLAG_READONLY,
+                );
+                if buf.is_null() {
+                    return Err("Failed to wrap the host frame".into());
                 }
-                let dst = (*self.frame).data[0];
-                let dst_stride = (*self.frame).linesize[0] as usize;
-                for row in 0..h {
-                    ptr::copy_nonoverlapping(
-                        pixels.as_ptr().add(row * stride),
-                        dst.add(row * dst_stride),
-                        row_bytes,
-                    );
-                }
+                (*self.frame).buf[0] = buf;
+                (*self.frame).data[0] = pixels.as_ptr() as *mut u8;
+                (*self.frame).linesize[0] = stride as i32;
                 (*self.frame).pts = frame_number as i64;
                 return self.encode_through_graph(frame_number, force_idr);
             }
