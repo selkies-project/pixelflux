@@ -809,7 +809,12 @@ impl AvcodecEncoder {
                     self.threads
                 );
                 if self.cbr_mode {
+                    // x265's default quantizer ceiling admits the out-of-spec values above 51
+                    // that only force skips on a VBV underflow, freezing rows of the picture.
                     params.push_str(":strict-cbr=1");
+                    if self.codec.quantizer_bound(self.max_qp) == 0 {
+                        params.push_str(":qpmax=51");
+                    }
                 } else {
                     params.push_str(&format!(":crf={q}"));
                 }

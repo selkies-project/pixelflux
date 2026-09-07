@@ -221,9 +221,12 @@ impl H264EncoderWrapper {
     /// 3. **Rate control**:
     ///    - **CBR** (`cbr_mode`): ABR targeting `bitrate_kbps` with a VBV cap pinned to the same
     ///      value (buffer `vbv_kbit`, precomputed by the caller from the frame-time multiplier
-    ///      policy) and filler disabled. Optional QP clamps apply only when non-zero — `max_qp` is
-    ///      the legibility floor (caps how ugly a rate-starved frame gets) and `min_qp` the waste
-    ///      ceiling (stops over-spending on easy content); both are clamped to 51.
+    ///      policy) and filler disabled. `max_qp` is the legibility floor (caps how ugly a
+    ///      rate-starved frame gets) and `min_qp` the waste ceiling (stops over-spending on easy
+    ///      content); both are clamped to 51, and the ceiling is 51 when unset because x264's
+    ///      own default admits out-of-spec quantizers above it that exist only to force skips
+    ///      when the VBV underflows, which leaves rows of the picture frozen on old content. A
+    ///      budget the content cannot meet overshoots instead, as NVENC and libvpx do.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
     /// 4. **Colour**: I444 (full range, BT.709 matrix) or I420 (limited range, BT.601 matrix)
     ///    CSP, a VUI declaring that matrix with BT.709 primaries and transfer for the sRGB
@@ -264,9 +267,7 @@ impl H264EncoderWrapper {
                 if min_qp > 0 {
                     param.rc.i_qp_min = min_qp.min(51);
                 }
-                if max_qp > 0 {
-                    param.rc.i_qp_max = max_qp.min(51);
-                }
+                param.rc.i_qp_max = if max_qp > 0 { max_qp.min(51) } else { 51 };
             } else {
                 param.rc.i_rc_method = x264_sys::X264_RC_CRF as i32;
                 param.rc.f_rf_constant = crf as f32;
@@ -1790,8 +1791,9 @@ mod qp_bound_sweep {
     ///
     /// x264's per-frame CBR budget is `bitrate / fps`, so halving the frame rate at a fixed kbps
     /// budget must roughly double each encoded frame while the per-second bitrate holds. This encodes
-    /// incompressible full-frame noise at 4 Mbps CBR (content the rate controller cannot undershoot,
-    /// so per-frame size sits at the budget), measures the mean encoded frame size at 60 fps, drops
+    /// incompressible full-frame noise at 20 Mbps CBR (content the rate controller cannot undershoot,
+    /// so per-frame size sits at the budget; a budget the noise cannot meet within the quantizer
+    /// ceiling would read the encoder's shortfall instead), measures the mean encoded frame size at 60 fps, drops
     /// to 30 fps through `reconfigure_rate`, and requires the per-frame size to roughly double — so
     /// the per-second bitrate is preserved rather than collapsing to half, which is what the pre-fix
     /// path did by leaving the session budgeting for 60 fps (`x264_encoder_reconfig` never applies a
@@ -1800,7 +1802,7 @@ mod qp_bound_sweep {
     #[cfg(feature = "gpl")]
     #[test]
     fn cbr_bitrate_tracks_configured_rate_after_fps_change() {
-        const TARGET_KBPS: i32 = 4000;
+        const TARGET_KBPS: i32 = 20000;
         const WARMUP: usize = 24;
         const MEASURED: usize = 96;
         let u = vec![128u8; (W / 2) * (H / 2)];
