@@ -60,7 +60,16 @@ default from the exported names. Every 4:2:0 session, on every backend, converts
 at limited range and declares it (NVENC's hardware conversion is fixed there, and it is the matrix
 browser presentation paths invert exactly); the software 4:4:4 sessions convert BT.709 at full range
 and declare that. `AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
-encoder to it. Test both configurations (`cargo test --lib` and
+encoder to it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
+bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
+ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
+ultrafast with wavefront threads) and NVENC at preset P3 with two-pass quarter-resolution rate control
+(`gpu_bench_tuning` measures the alternatives); the VP8, VP9 and AV1 quantizer tables in `codec.rs` were
+measured at those settings and must be re-measured whenever they change (`encoders::codec` documents the
+method). VP9 carries 4:4:4 as profile 1 at the same limited-range BT.601 signal as its 4:2:0. The CBR
+sessions of x264 and x265 cap the quantizer at 51: both libraries default to an out-of-spec range above
+it that forces macroblock skips on a VBV underflow, which freezes rows of a screen for a few frames, so a
+budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test both configurations (`cargo test --lib` and
 `cargo test --lib --no-default-features --features openh264`, the latter against an FFmpeg carrying
 `libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
 wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
