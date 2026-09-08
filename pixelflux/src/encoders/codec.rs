@@ -359,6 +359,14 @@ pub fn h265_level(width: u32, height: u32, fps: u32) -> u32 {
     186
 }
 
+/// The tier an H.265 session declares at `level` (general_level_idc): High (1) from level 4.0
+/// up, where Annex A defines one and every decoder of those levels takes it, so a CBR target
+/// above the level's Main-tier MaxBR is not refused by an encoder that validates the two
+/// together; Main (0) below, where no High tier exists.
+pub fn h265_tier(level: u32) -> u32 {
+    if level >= 120 { 1 } else { 0 }
+}
+
 /// Lowest AV1 level whose Annex A limits admit a `width` x `height` stream at `fps`, as
 /// seq_level_idx (8 = 4.0, 13 = 5.1, 19 = 6.3).
 ///
@@ -560,6 +568,16 @@ fn h264_slice_is_intra(payload: &[u8]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// High tier exists from level 4.0 up and is declared there; the ladder never answers below
+    /// 4.1, so every level it names carries one.
+    #[test]
+    fn hevc_tier_follows_the_level() {
+        assert_eq!(h265_tier(93), 0);
+        assert_eq!(h265_tier(120), 1);
+        assert_eq!(h265_tier(h265_level(1280, 720, 30)), 1);
+        assert_eq!(h265_tier(h265_level(3840, 2160, 60)), 1);
+    }
 
     /// Names round-trip through the parser, and the aliases land on the same codec.
     #[test]
