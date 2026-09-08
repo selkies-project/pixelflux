@@ -724,7 +724,8 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
 ///   registered in place (`DmaBufInput::Direct`) unless `direct_dmabuf` was switched off, anything
 ///   else is copied into the packed input each frame.
 ///
-/// `bitstream_buffers` is a small ring (`current_buffer_idx` cycles it) of output buffers.
+/// `bitstream_buffers` is a ring (`current_buffer_idx` cycles it) of output buffers, sized by
+/// `BITSTREAM_BUFFERS` to the depth this encoder actually runs at.
 /// `pinned_hosts` maps each page-locked host upload source's base pointer to its registered length,
 /// with a `0` length recording a failed registration so that address is never re-pinned.
 /// `codec` and `fullcolor` name the session's codec and negotiated chroma; `current_qp` tracks the
@@ -1431,9 +1432,21 @@ impl NvencEncoder {
                 return Err("Failed to map input buffer".into());
             }
 
+            /// Output bitstream buffers to allocate.
+            ///
+            /// One, because `submit_frame` locks the bitstream, copies the bytes out and unlocks it
+            /// before it returns, so at most one buffer is ever outstanding. It was four, which cost
+            /// three driver-sized allocations per session and read as pipelining that does not exist.
+            /// The depth-1 design is deliberate rather than an oversight: the lock has to block (see
+            /// `submit_frame`, where a `doNotWait` lock answers an unfinished encode with an empty
+            /// bitstream on Linux), and blocking once beats handing out empty frames.
+            ///
+            /// The ring itself is kept rather than flattened, so raising this to re-introduce a
+            /// pipeline later is a one-line change.
+            const BITSTREAM_BUFFERS: usize = 1;
             let mut bitstream_buffers = Vec::new();
             let create_bs_fn = function_list.nvEncCreateBitstreamBuffer.unwrap();
-            for _ in 0..4 {
+            for _ in 0..BITSTREAM_BUFFERS {
                 let mut bitstream_params = NV_ENC_CREATE_BITSTREAM_BUFFER {
                     version: sv(NvStruct::CreateBitstreamBuffer),
                     ..Default::default()
