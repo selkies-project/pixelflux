@@ -786,9 +786,24 @@ struct HostKeyboardState {
 impl HostKeyboardState {
     fn set_keymap(&mut self, text: &str) -> Option<SerializedMods> {
         let keymap = crate::wayland::keymap::compile_keymap(text)?;
+        // Latched, locked and the locked layout live in the xkb state rather than the
+        // pressed set, so they are read off the outgoing state and seeded back once the
+        // held keys are replayed; without this a keymap swap drops CapsLock and a locked
+        // group, and the modifiers() that follows clears them on the host.
+        let carried = self.state.as_ref().map(|s| {
+            (
+                s.serialize_mods(xkb::STATE_MODS_LATCHED),
+                s.serialize_mods(xkb::STATE_MODS_LOCKED),
+                s.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
+            )
+        });
         let mut state = xkb::State::new(&keymap);
         for &keycode in &self.pressed {
             state.update_key(xkb::Keycode::new(keycode), xkb::KeyDirection::Down);
+        }
+        if let Some((latched, locked, layout)) = carried {
+            let depressed = state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+            state.update_mask(depressed, latched, locked, 0, 0, layout);
         }
         let mods = Self::serialize(&state);
         self.state = Some(state);
@@ -796,6 +811,11 @@ impl HostKeyboardState {
     }
 
     fn update_key(&mut self, xkb_keycode: u32, pressed: bool) -> Option<SerializedMods> {
+        // A key can only move a state that exists; with no keymap the caller sends no key
+        // event, so the pressed set must not record the transition either.
+        if self.state.is_none() {
+            return None;
+        }
         let changed = if pressed {
             self.pressed.insert(xkb_keycode)
         } else {
@@ -2476,6 +2496,19 @@ mod tests {
         assert!(keyboard.update_key(37, true).is_none());
         let control_up = keyboard.update_key(37, false).unwrap();
         assert_eq!(control_up.depressed, 0);
+    }
+
+    #[test]
+    fn host_keyboard_keeps_lock_across_keymap_changes() {
+        let text = crate::wayland::keymap::compile_rmlvo("", "", "us", "", "").unwrap();
+        let mut keyboard = us_host_keyboard();
+        keyboard.update_key(66, true).unwrap();
+        let locked = keyboard.update_key(66, false).unwrap();
+        assert_ne!(locked.locked, 0);
+        // A keymap swap must not drop the lock; the modifiers() that follows would
+        // otherwise clear CapsLock on the host.
+        let after_keymap = keyboard.set_keymap(&text).unwrap();
+        assert_ne!(after_keymap.locked, 0);
     }
 
     #[test]
