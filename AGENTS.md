@@ -35,7 +35,9 @@ hanging or lagging. Performance preservation or improvements such as zero-copy a
 always important. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher, and CUDA/NVENC 11
 to 13 or higher. Protocol clients form fallback ladders that bind the newest architecture first (ext- before
 zwlr-data-control in dcclient) and exist to keep selkies' Wayland path subprocess-free — they replace wtype/wl-copy
-style forks, so extend them in-process rather than shelling out. Update the translations as well (and write/update additional entries if necessary) as necessary.
+style forks, so extend them in-process rather than shelling out. A nested KWin session forwards no delta from its host
+seat, so relative pointer motion reaches it through `org_kde_kwin_fake_input` on the app compositor socket
+(`wayland/ficlient.rs`); wlroots sessions take the seat's `zwp_relative_pointer_v1` as before. Update the translations as well (and write/update additional entries if necessary) as necessary.
 A defect that predates the change you are making is still in scope: finding it does not make it someone else's,
 and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is broken, what you ruled out, and
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
