@@ -701,7 +701,9 @@ const BITSTREAM_BUFFERS: usize = 1;
 /// frame in 3.7 ms where P4 takes 5.2 ms on a V100, for 0.001 of SSIM at the same bitrate,
 /// and the presets above P4 buy nothing; a single pass saves half a millisecond but overshoots
 /// a CBR target by five to twelve percent; adaptive quantization moves neither time nor
-/// quality measurably.
+/// quality measurably. The quarter-resolution first pass needs the 1.5-frame VBV `vbv_bits`
+/// gives it: on a one-frame buffer its miss on a scene cut runs an 8 Mbit/s H.264 session at
+/// 13.7 Mbit/s (`gpu_bench_cbr_rate_control`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NvencTuning {
     pub preset: GUID,
@@ -715,6 +717,9 @@ pub(crate) struct NvencTuning {
     /// same session at Main tier, the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling`
     /// measures.
     pub hevc_high_tier: bool,
+    /// Slices per H.264 and HEVC frame: `SLICES_PER_FRAME` in production, one to measure their
+    /// cost (`gpu_bench_slices`).
+    pub slices: u32,
 }
 
 impl Default for NvencTuning {
@@ -725,6 +730,7 @@ impl Default for NvencTuning {
             spatial_aq: false,
             temporal_aq: false,
             hevc_high_tier: true,
+            slices: SLICES_PER_FRAME,
         }
     }
 }
@@ -1603,7 +1609,7 @@ impl NvencEncoder {
                     c.level = level;
                     c.tier = if tuning.hevc_high_tier { h265_tier(level) } else { 0 };
                     c.sliceMode = SLICE_MODE_COUNT;
-                    c.sliceModeData = SLICES_PER_FRAME;
+                    c.sliceModeData = tuning.slices;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
                     c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
@@ -1634,7 +1640,7 @@ impl NvencEncoder {
                     let c = &mut config.encodeCodecConfig.h264Config;
                     c.level = level;
                     c.sliceMode = SLICE_MODE_COUNT;
-                    c.sliceModeData = SLICES_PER_FRAME;
+                    c.sliceModeData = tuning.slices;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.chromaFormatIDC = if fullcolor { 3 } else { 1 };
                     c.set_repeatSPSPPS(1);
@@ -2735,6 +2741,77 @@ mod gpu_tests {
         f
     }
 
+    /// Test helper: a NAL unit with its emulation-prevention bytes removed.
+    fn rbsp(nal: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nal.len());
+        let mut zeros = 0usize;
+        for &b in nal {
+            if zeros >= 2 && b == 3 {
+                zeros = 0;
+                continue;
+            }
+            zeros = if b == 0 { zeros + 1 } else { 0 };
+            out.push(b);
+        }
+        out
+    }
+
+    /// Test helper: luma PSNR of one decoded access unit against the BGRA frame it encodes, the
+    /// source taken through the limited-range BT.601 luma the hardware CSC applies.
+    fn luma_psnr(
+        dec: &mut crate::webcam::decode::AvDecoder,
+        pkt: &[u8],
+        src: &[u8],
+        w: usize,
+        h: usize,
+    ) -> f64 {
+        use crate::webcam::decode::Decoder;
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
+        let v = dec.frame().expect("decoded frame");
+        let mut se = 0f64;
+        for y in 0..h {
+            for x in 0..w {
+                let p = &src[(y * w + x) * 4..(y * w + x) * 4 + 3];
+                let luma = 16.0
+                    + 219.0 * (0.299 * p[2] as f64 + 0.587 * p[1] as f64 + 0.114 * p[0] as f64) / 255.0;
+                let d = v.y[y * v.y_stride + x] as f64 - luma;
+                se += d * d;
+            }
+        }
+        let mse = se / (w * h) as f64;
+        if mse == 0.0 { 99.0 } else { 10.0 * (255.0f64 * 255.0 / mse).log10() }
+    }
+
+    /// Test helper: one CBR bench row. Encodes `seq` on `enc`, its first frame as the warm-up key
+    /// frame, and prints the achieved rate at `fps`, the smallest and largest frame and the luma
+    /// PSNR of every decoded frame against its source.
+    fn cbr_row(label: &str, enc: &mut NvencEncoder, codec: Codec, seq: &[&Vec<u8>], w: usize, h: usize, fps: usize) {
+        use crate::webcam::decode::AvDecoder;
+        let n = seq.len() - 1;
+        let first = enc.encode_cpu_packed(seq[0], w * 4, false, 0, 25, true).expect("warm-up");
+        let mut pkts: Vec<Vec<u8>> = Vec::with_capacity(n);
+        per_frame(label, n, |i| {
+            pkts.push(
+                enc.encode_cpu_packed(seq[1 + i], w * 4, false, 1 + i as u64, 25, false)
+                    .expect("encode"),
+            );
+        });
+        let sizes: Vec<usize> = pkts.iter().map(|p| p.len() - VIDEO_HEADER_LEN).collect();
+        let bytes: usize = sizes.iter().sum();
+        let mut dec = AvDecoder::new(codec).expect("decoder");
+        luma_psnr(&mut dec, &first, seq[0], w, h);
+        let psnr: Vec<f64> =
+            pkts.iter().enumerate().map(|(i, p)| luma_psnr(&mut dec, p, seq[1 + i], w, h)).collect();
+        println!(
+            "    {} kbps, frames {}..{} kbit, luma PSNR {:.1} dB mean, {:.1} dB worst",
+            bytes * 8 * fps / n / 1000,
+            sizes.iter().min().unwrap() * 8 / 1000,
+            sizes.iter().max().unwrap() * 8 / 1000,
+            psnr.iter().sum::<f64>() / n as f64,
+            psnr.iter().cloned().fold(f64::INFINITY, f64::min),
+        );
+    }
+
     /// Test helper: read the big-endian width/height (bytes 6-9) from a 10-byte wire header.
     fn wire_dims(pkt: &[u8]) -> (u16, u16) {
         (
@@ -2969,6 +3046,214 @@ mod gpu_tests {
         assert_eq!(reconfigure_raw(&mut enc).0, NVENCSTATUS::NV_ENC_SUCCESS);
         enc.encode_cpu_argb(&frames[7], w * 4, n + 1, 25, false)
             .expect("the session still encodes");
+    }
+
+    /// The slice count and the HEVC tier are properties of the bitstream a client decodes, so
+    /// they are read back out of it on a real GPU: four VCL NAL units per H.264 and HEVC frame
+    /// at two geometries, and an HEVC SPS carrying the High tier flag beside the pinned level.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_frames_carry_four_slices_and_hevc_declares_high_tier() {
+        use crate::encoders::codec::annexb_nals;
+        for (w, h) in [(1280usize, 720usize), (640, 480)] {
+            for codec in [Codec::H264, Codec::H265] {
+                let mut s = settings(w as i32, h as i32, 60.0);
+                s.codec = codec;
+                let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+                for i in 0..4u64 {
+                    let pkt = enc
+                        .encode_cpu_argb(&frame(w, h, 20 + i as u8), w * 4, i, 25, i == 0)
+                        .expect("encode");
+                    let au = &pkt[VIDEO_HEADER_LEN..];
+                    let vcl = annexb_nals(au)
+                        .filter(|nal| match codec {
+                            Codec::H265 => (nal[0] >> 1) & 0x3f < 32,
+                            _ => matches!(nal[0] & 0x1f, 1 | 5),
+                        })
+                        .count();
+                    assert_eq!(vcl, SLICES_PER_FRAME as usize, "{codec:?} {w}x{h} frame {i} slices");
+                    if codec == Codec::H265 && i == 0 {
+                        let sps = annexb_nals(au)
+                            .find(|nal| (nal[0] >> 1) & 0x3f == 33)
+                            .map(rbsp)
+                            .expect("an SPS on the key frame");
+                        // After the two-byte NAL header and the byte holding the VPS id, the
+                        // sub-layer count and the nesting flag, profile_tier_level opens with
+                        // general_profile_space (2), general_tier_flag (1) and
+                        // general_profile_idc (5); general_level_idc follows the 32
+                        // compatibility flags and the 48 constraint bits.
+                        assert_eq!((sps[3] >> 5) & 1, 1, "general_tier_flag at {w}x{h}");
+                        assert_eq!(
+                            sps[14] as u32,
+                            nvenc_level(Codec::H265, w as u32, h as u32, 60),
+                            "general_level_idc at {w}x{h}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a real GPU: what `SLICES_PER_FRAME` slices cost against one at a fixed quantizer,
+    /// H.264 and HEVC at 1080p on the gradient frames the other benches use. Prints the rates and
+    /// the difference; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_slices() {
+        let (w, h) = (1920usize, 1080usize);
+        let n: usize = std::env::var("NVENC_BENCH_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(240);
+        let frames: Vec<Vec<u8>> = (0..8u8).map(|k| frame(w, h, 10 + 30 * k)).collect();
+        for codec in [Codec::H264, Codec::H265] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            let mut sizes = Vec::new();
+            for slices in [1u32, SLICES_PER_FRAME] {
+                let tuning = NvencTuning { slices, ..NvencTuning::default() };
+                let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), tuning) {
+                    Ok(enc) => enc,
+                    Err(e) => {
+                        println!("{codec:?}: {e}");
+                        continue;
+                    }
+                };
+                enc.encode_cpu_packed(&frames[0], w * 4, false, 0, 25, true).expect("warm-up");
+                let mut bytes = 0usize;
+                per_frame(&format!("{codec:?} {slices} slice(s)"), n, |i| {
+                    bytes += enc
+                        .encode_cpu_packed(&frames[i % 8], w * 4, false, 1 + i as u64, 25, false)
+                        .expect("encode")
+                        .len();
+                });
+                println!("    {} kbps", bytes * 8 * 60 / n / 1000);
+                sizes.push(bytes);
+            }
+            if let [one, many] = sizes[..] {
+                println!(
+                    "{codec:?}: {SLICES_PER_FRAME} slices cost {:+.2}% bitrate at a fixed quantizer",
+                    (many as f64 / one as f64 - 1.0) * 100.0
+                );
+            }
+        }
+    }
+
+    /// On a real GPU: how closely a CBR session holds its target under each VBV policy choice,
+    /// for H.264 and HEVC at 1080p, on three kinds of content: the alternating gradient frames
+    /// the other benches use, where every frame is a scene cut; a steady desktop-like sequence
+    /// with one moving block; and that sequence entered through one cut. Each row varies the VBV
+    /// (one frame or one and a half), the initial delay (a full buffer or the driver's default)
+    /// and the slice count (`SLICES_PER_FRAME` or one), and prints the achieved rate, the
+    /// largest and smallest frame, the luma PSNR of the decoded picture against the source (mean
+    /// and worst frame) and the wall time per frame. `NVENC_BENCH_KBPS` and `NVENC_BENCH_FPS`
+    /// move the target from 8000 kbit/s at 60 fps. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_cbr_policy() {
+        let (w, h) = (1920usize, 1080usize);
+        let env = |name: &str, default: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let n = env("NVENC_BENCH_FRAMES", 120);
+        let kbps = env("NVENC_BENCH_KBPS", 8000);
+        let fps = env("NVENC_BENCH_FPS", 60);
+        let cuts: Vec<Vec<u8>> = (0..8u8).map(|k| frame(w, h, 10 + 30 * k)).collect();
+        let steady: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(w, h, i)).collect();
+        let other = frame(w, h, 200);
+        let contents: Vec<(&str, Vec<&Vec<u8>>)> = vec![
+            ("scene cuts", std::iter::once(&cuts[0]).chain((0..n).map(|i| &cuts[1 + i % 7])).collect()),
+            ("steady", std::iter::once(&steady[0]).chain((0..n).map(|i| &steady[1 + i % 15])).collect()),
+            ("one cut", std::iter::once(&other).chain((0..n).map(|i| &steady[i % 16])).collect()),
+        ];
+        println!("CBR {kbps} kbit/s at {fps} fps, {n} frames per row");
+        for codec in [Codec::H264, Codec::H265] {
+            for (content, seq) in &contents {
+                for vbv_frames in [1.0f64, 1.5] {
+                    for full_delay in [true, false] {
+                        for slices in [SLICES_PER_FRAME, 1] {
+                            let mut s = settings(w as i32, h as i32, fps as f64);
+                            s.codec = codec;
+                            s.video_cbr_mode = true;
+                            s.video_bitrate_kbps = kbps as i32;
+                            s.video_vbv_multiplier = vbv_frames;
+                            let tuning = NvencTuning { slices, ..NvencTuning::default() };
+                            let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), tuning) {
+                                Ok(enc) => enc,
+                                Err(e) => {
+                                    println!("{codec:?}: {e}");
+                                    continue;
+                                }
+                            };
+                            if !full_delay {
+                                enc.encode_config.rcParams.vbvInitialDelay = 0;
+                                assert_eq!(reconfigure_raw(&mut enc).0, NVENCSTATUS::NV_ENC_SUCCESS);
+                            }
+                            let label = format!(
+                                "{codec:?} {content}: VBV {vbv_frames} frame(s), initial delay {}, {slices} slice(s)",
+                                if full_delay { "full" } else { "default" }
+                            );
+                            cbr_row(&label, &mut enc, codec, seq, w, h, fps);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// On a real GPU: which H.264 rate-control setting lets a CBR session run past a small VBV.
+    /// Holds a 1080p H.264 session at the target `NVENC_BENCH_KBPS` and `NVENC_BENCH_FPS` name
+    /// on the scene-cut and one-cut sequences at one and one and a half frames of buffer, and
+    /// changes one setting per row against the production session: single-pass and
+    /// full-resolution two-pass rate control in place of the quarter-resolution first pass,
+    /// `strictGOPTarget` off, and a quantizer ceiling of 51. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_cbr_rate_control() {
+        let (w, h) = (1920usize, 1080usize);
+        let env = |name: &str, default: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let n = env("NVENC_BENCH_FRAMES", 120);
+        let kbps = env("NVENC_BENCH_KBPS", 8000);
+        let fps = env("NVENC_BENCH_FPS", 60);
+        let cuts: Vec<Vec<u8>> = (0..8u8).map(|k| frame(w, h, 10 + 30 * k)).collect();
+        let steady: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(w, h, i)).collect();
+        let other = frame(w, h, 200);
+        let contents: Vec<(&str, Vec<&Vec<u8>>)> = vec![
+            ("scene cuts", std::iter::once(&cuts[0]).chain((0..n).map(|i| &cuts[1 + i % 7])).collect()),
+            ("one cut", std::iter::once(&other).chain((0..n).map(|i| &steady[i % 16])).collect()),
+        ];
+        let variants = [
+            ("production", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION, true, 0),
+            ("single pass", NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED, true, 0),
+            ("two-pass full", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_FULL_RESOLUTION, true, 0),
+            ("strictGOPTarget off", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION, false, 0),
+            ("max QP 51", NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION, true, 51),
+        ];
+        println!("H264 CBR {kbps} kbit/s at {fps} fps, {n} frames per row");
+        for (content, seq) in &contents {
+            for vbv_frames in [1.0f64, 1.5] {
+                for (name, multipass, strict, max_qp) in variants {
+                    let mut s = settings(w as i32, h as i32, fps as f64);
+                    s.video_cbr_mode = true;
+                    s.video_bitrate_kbps = kbps as i32;
+                    s.video_vbv_multiplier = vbv_frames;
+                    s.video_max_qp = max_qp;
+                    let tuning = NvencTuning { multipass, ..NvencTuning::default() };
+                    let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), tuning) {
+                        Ok(enc) => enc,
+                        Err(e) => {
+                            println!("{name}: {e}");
+                            continue;
+                        }
+                    };
+                    if !strict {
+                        enc.encode_config.rcParams.set_strictGOPTarget(0);
+                        assert_eq!(reconfigure_raw(&mut enc).0, NVENCSTATUS::NV_ENC_SUCCESS);
+                    }
+                    cbr_row(&format!("{content}: VBV {vbv_frames} frame(s), {name}"), &mut enc, Codec::H264, seq, w, h, fps);
+                }
+            }
+        }
     }
 
     /// The reason HEVC pins High tier: with the level pinned rather than autoselected,

@@ -129,6 +129,15 @@ pub(crate) const QP_HYSTERESIS_LIMIT: u32 = 60;
 /// than a fixed byte count so a live bitrate or framerate change rescales the buffer with it,
 /// preserving the same latency behavior at every operating point.
 ///
+/// The 1.5-frame default holds for hardware rate control too: a one-frame buffer measured on
+/// NVENC (`gpu_bench_cbr_policy`, a V100) ran an 8 Mbit/s H.264 session at 13.3 to 13.7 Mbit/s
+/// on scene cuts at the same PSNR, made the frame after a single cut larger (408 against 288
+/// kbit) and bought nothing on steady content. The overshoot is the quarter-resolution first
+/// pass misjudging a scene cut with no buffer left to absorb the miss
+/// (`gpu_bench_cbr_rate_control`): full-resolution two-pass holds a one-frame buffer at
+/// 1.5 ms more per frame, single-pass halves the overshoot at a lower PSNR, and the GOP target
+/// and quantizer ceiling change nothing. HEVC holds either buffer.
+///
 /// # Arguments
 ///
 /// * `bitrate_bps` - Target bitrate in bits per second.
