@@ -645,6 +645,24 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
     }
 }
 
+/// `sliceMode = 3`: `sliceModeData` is the number of slices in the picture, which the driver
+/// divides evenly; the other modes count macroblocks, bytes or rows and drift with geometry.
+const SLICE_MODE_COUNT: u32 = 3;
+
+/// Slices per H.264 and HEVC frame, the count the VA-API (`slices = 4`) and OpenH264
+/// (`SM_FIXEDSLCNUM_SLICE`) sessions emit too: a client decoding in software threads a frame
+/// across its slices, and more than four upsets some Chromium decoders. What the slices cost at
+/// a fixed quantizer is measured by `gpu_bench_slices`. AV1 partitions by tiles instead, pinned
+/// at 1x1 in `configure_codec`.
+const SLICES_PER_FRAME: u32 = 4;
+
+/// Output bitstream buffers per session: one, because `submit_frame` locks, copies and unlocks
+/// each frame's bitstream before it returns, so no second buffer is ever outstanding (the lock
+/// blocks; a `doNotWait` lock on Linux answers an unfinished encode with an empty bitstream
+/// rather than `NV_ENC_ERR_LOCK_BUSY`). The ring stays, so a pipelined depth is one constant
+/// away.
+const BITSTREAM_BUFFERS: usize = 1;
+
 /// The encoder-side quality knobs of a session: the preset, the rate-control passes of a CBR
 /// session and adaptive quantization. Production sessions take the default, which the tuning
 /// bench (`gpu_bench_tuning`) measures against the alternatives: P3 encodes a 1080p H.264
@@ -652,36 +670,14 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// and the presets above P4 buy nothing; a single pass saves half a millisecond but overshoots
 /// a CBR target by five to twelve percent; adaptive quantization moves neither time nor
 /// quality measurably.
-/// `sliceMode = 3` means "sliceModeData holds the number of slices in the picture"
-/// (nvEncodeAPI.h). The other three modes count macroblocks, bytes or macroblock rows,
-/// none of which stays a fixed division as the geometry changes.
-const SLICE_MODE_COUNT: u32 = 3;
-
-/// Slices per frame for H.264 and HEVC, matching what the VA-API path already asks
-/// libavcodec for (`slices = 4`, avcodec.rs) and what the OpenH264 path pins
-/// (`SM_FIXEDSLCNUM_SLICE`, oh264.rs, whose comment records that more than four upsets
-/// some Chromium decoders).
-///
-/// It exists for the CLIENT, not for this encoder: a browser decoding in software can
-/// slice-thread a frame across four cores, and a single-slice frame decodes on one.
-/// Until now an NVENC session handed that client one slice while a VA-API session of the
-/// same geometry and settings handed it four, so decode latency depended on which GPU the
-/// host happened to have. The cost is the same one to three percent of bitrate the other
-/// two backends already pay, which this project's own priority order accepts.
-///
-/// AV1 is deliberately excluded: its tiles are pinned at 1x1 below, and NVENC expresses
-/// AV1 partitioning through the tile fields rather than through sliceMode.
-const SLICES_PER_FRAME: u32 = 4;
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NvencTuning {
     pub preset: GUID,
     pub multipass: NV_ENC_MULTI_PASS,
     pub spatial_aq: bool,
     pub temporal_aq: bool,
-    /// HEVC tier. 1 (High) is the shipping value; the field exists so
-    /// `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling` can open the same session
-    /// at the old tier 0 and report what the driver does with it.
+    /// The tier an HEVC session declares: High (1) in production, Main (0) to open the same
+    /// session at the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling` measures.
     pub hevc_tier: u32,
 }
 
@@ -724,8 +720,8 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
 ///   registered in place (`DmaBufInput::Direct`) unless `direct_dmabuf` was switched off, anything
 ///   else is copied into the packed input each frame.
 ///
-/// `bitstream_buffers` is a ring (`current_buffer_idx` cycles it) of output buffers, sized by
-/// `BITSTREAM_BUFFERS` to the depth this encoder actually runs at.
+/// `bitstream_buffers` is a ring of `BITSTREAM_BUFFERS` output buffers (`current_buffer_idx`
+/// cycles it).
 /// `pinned_hosts` maps each page-locked host upload source's base pointer to its registered length,
 /// with a `0` length recording a failed registration so that address is never re-pinned.
 /// `codec` and `fullcolor` name the session's codec and negotiated chroma; `current_qp` tracks the
@@ -1432,18 +1428,6 @@ impl NvencEncoder {
                 return Err("Failed to map input buffer".into());
             }
 
-            /// Output bitstream buffers to allocate.
-            ///
-            /// One, because `submit_frame` locks the bitstream, copies the bytes out and unlocks it
-            /// before it returns, so at most one buffer is ever outstanding. It was four, which cost
-            /// three driver-sized allocations per session and read as pipelining that does not exist.
-            /// The depth-1 design is deliberate rather than an oversight: the lock has to block (see
-            /// `submit_frame`, where a `doNotWait` lock answers an unfinished encode with an empty
-            /// bitstream on Linux), and blocking once beats handing out empty frames.
-            ///
-            /// The ring itself is kept rather than flattened, so raising this to re-introduce a
-            /// pipeline later is a one-line change.
-            const BITSTREAM_BUFFERS: usize = 1;
             let mut bitstream_buffers = Vec::new();
             let create_bs_fn = function_list.nvEncCreateBitstreamBuffer.unwrap();
             for _ in 0..BITSTREAM_BUFFERS {
@@ -1536,8 +1520,15 @@ impl NvencEncoder {
     /// ARGB hardware CSC is fixed at BT.601, so a client that inverts BT.709 shifts saturated
     /// colour badly; that same CSC emits limited range in every chroma format, and both capture
     /// paths go through it, so every session declares limited. H.264 additionally restricts
-    /// reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC; AV1 keeps
-    /// one tile, since tiles cost bitrate and buy no quality.
+    /// reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC. H.264 and
+    /// HEVC frames carry `SLICES_PER_FRAME` slices; AV1 keeps one tile, since tiles cost bitrate
+    /// and buy no quality, and tier 0, the only tier NVENC takes for it.
+    ///
+    /// HEVC declares High tier: NVENC validates a CBR target against the MaxBR of the pinned
+    /// level, and the Main-tier ceiling of the 5.x levels (40 Mbit/s at 5.1) is one a 4K desktop
+    /// session reaches, where a Main-tier open is refused and a live rate change past it is
+    /// declined. The tier is a signalled cap every decoder of those levels takes, not a coding
+    /// tool; it does change the codec string a client derives from the SPS (`H153` for `L153`).
     fn configure_codec(
         config: &mut NV_ENC_CONFIG,
         codec: Codec,
@@ -1565,22 +1556,6 @@ impl NvencEncoder {
                 Codec::H265 => {
                     let c = &mut config.encodeCodecConfig.hevcConfig;
                     c.level = level;
-                    // High tier, because the level is pinned rather than
-                    // autoselected (see nvenc_level). NVENC validates
-                    // averageBitRate against the pinned level's MaxBR at
-                    // nvEncInitializeEncoder and nvEncReconfigureEncoder, and
-                    // Main tier caps level 5.2 at 60 Mbps for Main/Main10.
-                    // Above that a CBR open returns INVALID_PARAM and the
-                    // session falls through to software HEVC, while a live
-                    // update_rate hits "Rate reconfigure failed" and silently
-                    // keeps the old bitrate. High tier lifts the ceiling to
-                    // 240 Mbps and is a signalled cap only: every HEVC decoder
-                    // decodes it. It does change the derived codec string
-                    // (hvc1.1.6.H156 rather than L156), so a client that gates
-                    // hardware decode on that string sees a different one.
-                    //
-                    // AV1 below deliberately stays tier 0: NVENC answers
-                    // tier = 1 for AV1 with INVALID_PARAM.
                     c.tier = hevc_tier;
                     c.sliceMode = SLICE_MODE_COUNT;
                     c.sliceModeData = SLICES_PER_FRAME;
@@ -2894,7 +2869,7 @@ mod gpu_tests {
         let mut s = settings(3840, 2160, 60.0);
         s.codec = Codec::H265;
         s.video_cbr_mode = true;
-        // Main tier at level 5.2 and at level 6.0 both cap at 60 Mbps for Main/Main10.
+        // Above the Main-tier MaxBR of every 5.x level (40 Mbit/s at 5.1, 60 at 5.2).
         s.video_bitrate_kbps = 100_000;
 
         let high = NvencEncoder::new(&s, ptr::null());
@@ -2911,8 +2886,7 @@ mod gpu_tests {
         }
         drop(high);
 
-        // The same session with the tier this code used to send. Built through the tuned
-        // constructor so only the tier differs.
+        // The same session at Main tier, through the tuned constructor so only the tier differs.
         let main = NvencEncoder::new_tuned(
             &s,
             ptr::null(),
@@ -2930,7 +2904,7 @@ mod gpu_tests {
                 )
             },
             Err(e) => println!(
-                "HEVC Main tier at {} kbps: refused, which is the ceiling this change lifts: {e}",
+                "HEVC Main tier at {} kbps: refused, the Main-tier ceiling: {e}",
                 s.video_bitrate_kbps,
             ),
         }
