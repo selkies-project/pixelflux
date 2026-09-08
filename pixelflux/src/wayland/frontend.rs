@@ -644,6 +644,9 @@ pub struct AppState {
     /// answer, then re-sizes the capture to the mode the host announces. Emptied with the
     /// host session.
     pub host_layout_pending: std::collections::HashMap<u32, PendingHostLayout>,
+    /// Per display, how many mode requests in a row the host has answered with a different
+    /// mode; cleared when it applies one. Past a few, the log names the remedy.
+    pub host_mode_refusals: std::collections::HashMap<u32, u32>,
 
     pub current_cursor_icon: Option<CursorImageStatus>,
     /// A surface-backed cursor set during the dispatch in progress and not delivered yet:

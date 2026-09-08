@@ -1909,6 +1909,7 @@ fn reap_dead_host(state: &mut AppState) {
         );
     }
     state.host = None;
+    state.host_mode_refusals.clear();
     // Nothing will answer the requests still in flight: their geometry readers get
     // what the outputs show now.
     let pending: Vec<_> = state.host_layout_pending.drain().collect();
@@ -1987,6 +1988,11 @@ fn host_layout_resolution(want: (i32, i32), current: Option<(i32, i32)>) -> Opti
     current.filter(|&c| c != want)
 }
 
+/// Refused mode requests in a row for one display before the log says plainly what to do: a
+/// host that keeps its own mode is asked again on every client resize, and each refusal
+/// restarts the capture at the mode the host runs.
+const HOST_MODE_REFUSALS_BEFORE_HINT: u32 = 3;
+
 /// Settle the host layout requests answered since the last tick, against the mode each host
 /// announced. A host already running the requested size needs nothing: the capture was
 /// configured for it and its frames flow. A host running anything else — a request it
@@ -2013,6 +2019,9 @@ fn reconcile_host_layouts(state: &mut AppState) {
             None => None,
         };
         let Some(pending) = state.host_layout_pending.remove(&id) else { continue };
+        if host_mode.is_none() {
+            state.host_mode_refusals.remove(&id);
+        }
         if let Some((rw, rh)) = host_mode {
             let (w, h) = pending.want;
             let restart = state
@@ -2029,8 +2038,22 @@ fn reconcile_host_layouts(state: &mut AppState) {
                     eprintln!(
                         "[HostCapture] host runs {rw}x{rh} for display {id} ({w}x{h} not applied); capturing at that size."
                     );
+                    let refusals = {
+                        let n = state.host_mode_refusals.entry(id).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    if refusals == HOST_MODE_REFUSALS_BEFORE_HINT {
+                        eprintln!(
+                            "[HostCapture] display {id}: the host keeps its own mode; a manual resolution of {rw}x{rh} stops the capture restarting on every resize."
+                        );
+                    }
                     start_capture_on_display(state, id, cb, settings);
-                    let mismatch = format!("host runs {rw}x{rh} ({w}x{h} not applied)");
+                    let mismatch = if refusals >= HOST_MODE_REFUSALS_BEFORE_HINT {
+                        format!("host runs {rw}x{rh} ({w}x{h} not applied; set a manual resolution of {rw}x{rh})")
+                    } else {
+                        format!("host runs {rw}x{rh} ({w}x{h} not applied)")
+                    };
                     let own = wayland_capture_err().lock().unwrap().get(&id).cloned();
                     set_wayland_capture_err(
                         id,
@@ -4808,6 +4831,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         keymap_policy: wayland::keymap::KeymapPolicy::empty(),
         host: None,
         host_layout_pending: std::collections::HashMap::new(),
+        host_mode_refusals: std::collections::HashMap::new(),
         current_cursor_icon: None,
         cursor_surface_pending: false,
         cursor_buffer: None,
