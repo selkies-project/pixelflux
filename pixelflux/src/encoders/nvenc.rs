@@ -37,7 +37,8 @@ use libloading::{Library, Symbol};
 use smithay::backend::allocator::{dmabuf::Dmabuf, Buffer, Fourcc};
 
 use super::codec::{
-    av1_level, h264_level, h265_level, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY,
+    av1_level, h264_level, h265_level, h265_tier, push_video_header, Codec, FRAME_DELTA, FRAME_INTRA,
+    FRAME_KEY,
     VIDEO_HEADER_LEN,
 };
 use crate::RustCaptureSettings;
@@ -706,9 +707,10 @@ pub(crate) struct NvencTuning {
     /// it: a Volta HEVC session given it faults inside its first encode instead of failing to
     /// open.
     pub temporal_aq: bool,
-    /// The tier an HEVC session declares: High (1) in production, Main (0) to open the same
-    /// session at the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling` measures.
-    pub hevc_tier: u32,
+    /// Whether an HEVC session declares the tier `h265_tier` names for its level; off opens the
+    /// same session at Main tier, the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling`
+    /// measures.
+    pub hevc_high_tier: bool,
 }
 
 impl Default for NvencTuning {
@@ -718,7 +720,7 @@ impl Default for NvencTuning {
             multipass: NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION,
             spatial_aq: false,
             temporal_aq: false,
-            hevc_tier: 1,
+            hevc_high_tier: true,
         }
     }
 }
@@ -1361,7 +1363,7 @@ impl NvencEncoder {
                 width,
                 height,
                 settings.target_fps as u32,
-                tuning.hevc_tier,
+                &tuning,
             );
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
@@ -1561,10 +1563,10 @@ impl NvencEncoder {
     /// HEVC frames carry `SLICES_PER_FRAME` slices; AV1 keeps one tile, since tiles cost bitrate
     /// and buy no quality, and tier 0, the only tier NVENC takes for it.
     ///
-    /// HEVC declares High tier: NVENC validates a CBR target against the MaxBR of the pinned
-    /// level, and the Main-tier ceiling of the 5.x levels (40 Mbit/s at 5.1) is one a 4K desktop
-    /// session reaches, where a Main-tier open is refused and a live rate change past it is
-    /// declined. The tier is a signalled cap every decoder of those levels takes, not a coding
+    /// HEVC declares the tier `h265_tier` names for its level, High: NVENC validates a CBR target
+    /// against the MaxBR of the pinned level, and the Main-tier ceiling of the 5.x levels
+    /// (40 Mbit/s at 5.1) is one a 4K desktop session reaches, where a Main-tier open is refused
+    /// and a live rate change past it is declined. The tier is a signalled cap, not a coding
     /// tool; it does change the codec string a client derives from the SPS (`H153` for `L153`).
     fn configure_codec(
         config: &mut NV_ENC_CONFIG,
@@ -1573,7 +1575,7 @@ impl NvencEncoder {
         width: u32,
         height: u32,
         fps: u32,
-        hevc_tier: u32,
+        tuning: &NvencTuning,
     ) {
         let level = nvenc_level(codec, width, height, fps);
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
@@ -1593,7 +1595,7 @@ impl NvencEncoder {
                 Codec::H265 => {
                     let c = &mut config.encodeCodecConfig.hevcConfig;
                     c.level = level;
-                    c.tier = hevc_tier;
+                    c.tier = if tuning.hevc_high_tier { h265_tier(level) } else { 0 };
                     c.sliceMode = SLICE_MODE_COUNT;
                     c.sliceModeData = SLICES_PER_FRAME;
                     c.idrPeriod = 0xFFFFFFFF;
@@ -2999,7 +3001,7 @@ mod gpu_tests {
             &s,
             ptr::null(),
             NvencTuning {
-                hevc_tier: 0,
+                hevc_high_tier: false,
                 ..NvencTuning::default()
             },
         );

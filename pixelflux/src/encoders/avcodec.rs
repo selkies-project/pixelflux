@@ -37,7 +37,8 @@ use libc::{close, dup, lseek, SEEK_END};
 
 use super::codec::{
     av1_is_key, av1_level, frame_type_from_key, h264_frame_type, h264_level, h265_frame_type,
-    h265_level, push_video_header, vp8_is_key, vp9_is_key, vpx_level, Codec, VIDEO_HEADER_LEN,
+    h265_level, h265_tier, push_video_header, vp8_is_key, vp9_is_key, vpx_level, Codec,
+    VIDEO_HEADER_LEN,
 };
 use super::software::convert_to_yuv_mt;
 use super::QP_HYSTERESIS_LIMIT;
@@ -781,8 +782,10 @@ impl AvcodecEncoder {
                 dict_set(opts, "level", &h264_level(w, h, fps).to_string());
             }
             Codec::H265 => {
+                let level = h265_level(w, h, fps);
                 dict_set(opts, "profile", if self.is_fullcolor() { "rext" } else { "main" });
-                dict_set(opts, "level", &h265_level(w, h, fps).to_string());
+                dict_set(opts, "level", &level.to_string());
+                dict_set(opts, "tier", if h265_tier(level) == 1 { "high" } else { "main" });
             }
             Codec::Av1 => {
                 dict_set(opts, "profile", "main");
