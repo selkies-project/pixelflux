@@ -1,4 +1,4 @@
-//! Host-capture mode: pixelflux as a CLIENT of an external Wayland compositor
+[Resource from github at repo://selkies-project/pixelflux/sha/bf07c6817d1b35036ab7bb6d70d7bac4bac4abde/contents/pixelflux/src/wayland/host.rs] //! Host-capture mode: pixelflux as a CLIENT of an external Wayland compositor
 //! (e.g. labwc running `WLR_BACKENDS=headless`), inverting the nested topology.
 //!
 //! The host compositor owns the session — one seat, one selection, one screen
@@ -783,6 +783,11 @@ pub struct HostSession {
     sizes: Arc<Mutex<Vec<(i32, i32)>>>,
     layouts: Arc<Mutex<LayoutLedger>>,
     alive: Arc<AtomicBool>,
+    /// Depressed-modifier mask mirrored to the host compositor.
+    /// zwp_virtual_keyboard_v1 requires the client to state modifier state
+    /// explicitly; a compositor does not infer it from the modifier keycode
+    /// it was just handed. Without this every chord arrives as its bare key.
+    mod_state: std::sync::atomic::AtomicU32,
 }
 
 impl HostSession {
@@ -919,6 +924,7 @@ impl HostSession {
             sizes,
             layouts,
             alive,
+            mod_state: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1210,6 +1216,26 @@ impl HostSession {
         let Some(vk) = &self.vk else { return };
         if xkb_keycode < 8 {
             return;
+        }
+        // xkb keycodes are evdev + 8. Bit positions follow the standard xkb
+        // modifier ordering shared by every common keymap:
+        //   Shift 1<<0, Lock 1<<1, Control 1<<2, Mod1/Alt 1<<3, Mod4/Logo 1<<6.
+        let bit: u32 = match xkb_keycode {
+            50 | 62 => 1 << 0,   // Shift_L / Shift_R
+            66 => 1 << 1,        // Caps_Lock
+            37 | 105 => 1 << 2,  // Control_L / Control_R
+            64 | 108 => 1 << 3,  // Alt_L / Alt_R
+            133 | 134 => 1 << 6, // Super_L / Super_R
+            _ => 0,
+        };
+        if bit != 0 {
+            use std::sync::atomic::Ordering as O;
+            let prev = self.mod_state.load(O::Relaxed);
+            let next = if pressed { prev | bit } else { prev & !bit };
+            self.mod_state.store(next, O::Relaxed);
+            // Announce the new state before the key event, so the compositor
+            // has it in hand when it resolves the binding this key belongs to.
+            vk.modifiers(next, 0, 0, 0);
         }
         vk.key(0, xkb_keycode - 8, if pressed { 1 } else { 0 });
         let _ = self.conn.flush();
