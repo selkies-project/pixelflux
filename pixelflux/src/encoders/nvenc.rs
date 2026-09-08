@@ -567,6 +567,10 @@ fn decide_caps(
 const HEADROOM_WIDTH: u32 = 4096;
 const HEADROOM_HEIGHT: u32 = 2160;
 
+/// The frame rate the level is read at when the session's is lower, so a live change between
+/// the common rates keeps the level, as the geometry headroom keeps it across a resize.
+const HEADROOM_FPS: u32 = 60;
+
 /// The in-place resize headroom for one axis: the requested size lifted to `floor` but never past
 /// the driver's reported maximum, so initializing with headroom cannot itself exceed what the GPU
 /// supports.
@@ -874,10 +878,12 @@ impl Drop for NvencEncoder {
 /// geometry that session can still reach: NVENC refuses an AV1 session whose level cannot hold
 /// `maxEncodeWidth` x `maxEncodeHeight`, and a level bump mid-GOP forces some hardware decoders
 /// to re-initialize. Reading the ladder at the headroom keeps one answer across the whole resize
-/// range and keeps it true of every frame the session may emit.
+/// range and keeps it true of every frame the session may emit; the frame rate is floored the
+/// same way, since a level moving with a live rate change is the same event.
 fn nvenc_level(codec: Codec, width: u32, height: u32, fps: u32) -> u32 {
     let w = width.max(HEADROOM_WIDTH);
     let h = height.max(HEADROOM_HEIGHT);
+    let fps = fps.max(HEADROOM_FPS);
     match codec {
         Codec::H265 => h265_level(w, h, fps),
         Codec::Av1 => av1_level(w, h, fps),
@@ -3765,6 +3771,13 @@ mod decision_tests {
                     "H.264 level at {w}x{h}@{fps} cannot hold the headroom"
                 );
             }
+        }
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            assert_eq!(
+                nvenc_level(codec, 1920, 1080, 30),
+                nvenc_level(codec, 1920, 1080, 60),
+                "{codec:?} level moved between 30 and 60 fps"
+            );
         }
         // The headroom spans UHD and DCI 4K, which is what keeps these levels low enough for a
         // hardware decoder to accept them.
