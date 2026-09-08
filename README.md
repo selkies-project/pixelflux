@@ -570,6 +570,10 @@ session settled on rather than what was asked for.
 *   **Built-in MP4 Recorder:** Crash-safe fragmented-MP4 recording without any FFmpeg `avformat` dependency.
 *   **AI Agent Control:** Computer Use API to dump screenshots and drive all facets of a desktop environment.
 
+## Development
+
+`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. The crate builds in two configurations, `cargo test --lib` (the default `gpl` feature, libx264) and `cargo test --lib --no-default-features --features openh264`, and both are expected to pass. The `#[ignore]`d `gpu_` tests run on an NVIDIA GPU with `cargo test gpu_ -- --ignored --nocapture --test-threads=1`, the `gpu_dmabuf_` ones need a render node, and the `gpu_bench_` ones print measurements. `pip wheel . --no-deps` builds the extension the way the released wheels are built (`PIXELFLUX_ENABLE_GPL=0` for the OpenH264 build), and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end suites. The `.devcontainer` installs the native dependencies the build needs.
+
 ## License
 
 This project is licensed under the **Mozilla Public License Version 2.0**.

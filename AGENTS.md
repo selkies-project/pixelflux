@@ -12,12 +12,18 @@ documentation that describe arbitrary code changes of previous states compared t
 explanation. The code commenting should reflect the current state of the codebase and be used to convey information
 to an LLM bot or developer.
 
-Empirical testing is a very useful way to develop this project, and empirical testing is possible for EVERYTHING,
-including implementation, auditing, validation, or verification. A few such options are by utilizing the currently
-installed Firefox and Chrome, as well as the WebKit engine provided by Playwright/Selenium/Puppeteer/Cypress in place
-of Safari, for end-to-end tests. HOWEVER, ask the user for permission to create a test environment (possibly using
-Miniforge; but note that it is likely the system `libgbm.so` should be used for GBM support on NVIDIA and other GPUs)
-and receive directives from the user on how the environment should be constructed and constrained.
+Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
+and every change is validated before it is reported. `cargo test --lib` in both feature configurations is the floor;
+the `#[ignore]`d `gpu_` tests need an NVIDIA GPU (`cargo test gpu_ -- --ignored --nocapture --test-threads=1`,
+serially, since concurrent session builds fault in the driver), the `gpu_dmabuf_` ones a render node as well, and the
+`gpu_bench_` ones print measurements to quote rather than assert. End to end, a change is a wheel
+(`pip wheel . --no-deps`) installed into a selkies sandbox as the Agentic Development section of that repository's
+`docs/development.md` describes, driven by its suites over both transports on X11 and Wayland with the installed
+Firefox and Chrome and Playwright/Selenium/Puppeteer/Cypress WebKit in place of Safari; the `.devcontainer` here
+builds the extension with its native dependencies. Ask before building an environment on a machine that was not set
+up for one (Miniforge serves a host with a closed package manager; keep the system `libgbm.so` for GBM on NVIDIA and
+other GPUs) and take the operator's directives on how it is constructed and constrained. Say which checks could not
+run where the hardware for them was not available.
 
 Note that parity between X11 and Wayland, as well as between WebSockets and WebRTC, or between the default dashboard
 and the wish dashboard, is considered a key focus (things that were not wired up correctly on either side, and similar
