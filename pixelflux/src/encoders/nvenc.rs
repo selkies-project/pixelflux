@@ -652,12 +652,37 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// and the presets above P4 buy nothing; a single pass saves half a millisecond but overshoots
 /// a CBR target by five to twelve percent; adaptive quantization moves neither time nor
 /// quality measurably.
+/// `sliceMode = 3` means "sliceModeData holds the number of slices in the picture"
+/// (nvEncodeAPI.h). The other three modes count macroblocks, bytes or macroblock rows,
+/// none of which stays a fixed division as the geometry changes.
+const SLICE_MODE_COUNT: u32 = 3;
+
+/// Slices per frame for H.264 and HEVC, matching what the VA-API path already asks
+/// libavcodec for (`slices = 4`, avcodec.rs) and what the OpenH264 path pins
+/// (`SM_FIXEDSLCNUM_SLICE`, oh264.rs, whose comment records that more than four upsets
+/// some Chromium decoders).
+///
+/// It exists for the CLIENT, not for this encoder: a browser decoding in software can
+/// slice-thread a frame across four cores, and a single-slice frame decodes on one.
+/// Until now an NVENC session handed that client one slice while a VA-API session of the
+/// same geometry and settings handed it four, so decode latency depended on which GPU the
+/// host happened to have. The cost is the same one to three percent of bitrate the other
+/// two backends already pay, which this project's own priority order accepts.
+///
+/// AV1 is deliberately excluded: its tiles are pinned at 1x1 below, and NVENC expresses
+/// AV1 partitioning through the tile fields rather than through sliceMode.
+const SLICES_PER_FRAME: u32 = 4;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NvencTuning {
     pub preset: GUID,
     pub multipass: NV_ENC_MULTI_PASS,
     pub spatial_aq: bool,
     pub temporal_aq: bool,
+    /// HEVC tier. 1 (High) is the shipping value; the field exists so
+    /// `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling` can open the same session
+    /// at the old tier 0 and report what the driver does with it.
+    pub hevc_tier: u32,
 }
 
 impl Default for NvencTuning {
@@ -667,6 +692,7 @@ impl Default for NvencTuning {
             multipass: NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION,
             spatial_aq: false,
             temporal_aq: false,
+            hevc_tier: 1,
         }
     }
 }
@@ -1294,7 +1320,15 @@ impl NvencEncoder {
             config.rcParams.set_strictGOPTarget(1);
             config.rcParams.set_enableLookahead(0);
             config.rcParams.lookaheadDepth = 0;
-            Self::configure_codec(&mut config, codec, is_444, width, height, settings.target_fps as u32);
+            Self::configure_codec(
+                &mut config,
+                codec,
+                is_444,
+                width,
+                height,
+                settings.target_fps as u32,
+                tuning.hevc_tier,
+            );
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
@@ -1491,7 +1525,15 @@ impl NvencEncoder {
     /// paths go through it, so every session declares limited. H.264 additionally restricts
     /// reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC; AV1 keeps
     /// one tile, since tiles cost bitrate and buy no quality.
-    fn configure_codec(config: &mut NV_ENC_CONFIG, codec: Codec, fullcolor: bool, width: u32, height: u32, fps: u32) {
+    fn configure_codec(
+        config: &mut NV_ENC_CONFIG,
+        codec: Codec,
+        fullcolor: bool,
+        width: u32,
+        height: u32,
+        fps: u32,
+        hevc_tier: u32,
+    ) {
         let level = nvenc_level(codec, width, height, fps);
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
         let transfer = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
@@ -1510,7 +1552,25 @@ impl NvencEncoder {
                 Codec::H265 => {
                     let c = &mut config.encodeCodecConfig.hevcConfig;
                     c.level = level;
-                    c.tier = 0;
+                    // High tier, because the level is pinned rather than
+                    // autoselected (see nvenc_level). NVENC validates
+                    // averageBitRate against the pinned level's MaxBR at
+                    // nvEncInitializeEncoder and nvEncReconfigureEncoder, and
+                    // Main tier caps level 5.2 at 60 Mbps for Main/Main10.
+                    // Above that a CBR open returns INVALID_PARAM and the
+                    // session falls through to software HEVC, while a live
+                    // update_rate hits "Rate reconfigure failed" and silently
+                    // keeps the old bitrate. High tier lifts the ceiling to
+                    // 240 Mbps and is a signalled cap only: every HEVC decoder
+                    // decodes it. It does change the derived codec string
+                    // (hvc1.1.6.H156 rather than L156), so a client that gates
+                    // hardware decode on that string sees a different one.
+                    //
+                    // AV1 below deliberately stays tier 0: NVENC answers
+                    // tier = 1 for AV1 with INVALID_PARAM.
+                    c.tier = hevc_tier;
+                    c.sliceMode = SLICE_MODE_COUNT;
+                    c.sliceModeData = SLICES_PER_FRAME;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
                     c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
@@ -1540,6 +1600,8 @@ impl NvencEncoder {
                 _ => {
                     let c = &mut config.encodeCodecConfig.h264Config;
                     c.level = level;
+                    c.sliceMode = SLICE_MODE_COUNT;
+                    c.sliceModeData = SLICES_PER_FRAME;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.chromaFormatIDC = if fullcolor { 3 } else { 1 };
                     c.set_repeatSPSPPS(1);
@@ -2802,6 +2864,63 @@ mod gpu_tests {
             .expect("encode 1080p");
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (1920, 1080));
+    }
+
+    /// The reason HEVC pins High tier: with the level pinned rather than autoselected,
+    /// NVENC validates the requested bitrate against that level's MaxBR, and Main tier's
+    /// ceiling is low enough that an ordinary 4K desktop session runs into it.
+    ///
+    /// The test opens the same CBR HEVC session twice, once at each tier, at a bitrate
+    /// above the Main-tier ceiling for the pinned level. Tier 1 must open. Tier 0 is
+    /// reported rather than asserted: what the driver does above the ceiling is the thing
+    /// being measured, and a future driver that stops rejecting it should not turn this
+    /// into a red test, it should just make the printed line say so.
+    #[test]
+    #[ignore]
+    fn gpu_hevc_high_tier_opens_above_the_main_tier_ceiling() {
+        let mut s = settings(3840, 2160, 60.0);
+        s.codec = Codec::H265;
+        s.video_cbr_mode = true;
+        // Main tier at level 5.2 and at level 6.0 both cap at 60 Mbps for Main/Main10.
+        s.video_bitrate_kbps = 100_000;
+
+        let high = NvencEncoder::new(&s, ptr::null());
+        match &high {
+            Ok(enc) => unsafe {
+                let c = enc.encode_config.encodeCodecConfig.hevcConfig;
+                assert_eq!(c.tier, 1);
+                println!(
+                    "HEVC High tier at {} kbps: opened, level {}",
+                    s.video_bitrate_kbps, c.level,
+                );
+            },
+            Err(e) => panic!("High tier must open above the Main-tier ceiling: {e}"),
+        }
+        drop(high);
+
+        // The same session with the tier this code used to send. Built through the tuned
+        // constructor so only the tier differs.
+        let main = NvencEncoder::new_tuned(
+            &s,
+            ptr::null(),
+            NvencTuning {
+                hevc_tier: 0,
+                ..NvencTuning::default()
+            },
+        );
+        match main {
+            Ok(enc) => unsafe {
+                println!(
+                    "HEVC Main tier at {} kbps: also opened (driver did not enforce MaxBR), level {}",
+                    s.video_bitrate_kbps,
+                    enc.encode_config.encodeCodecConfig.hevcConfig.level,
+                )
+            },
+            Err(e) => println!(
+                "HEVC Main tier at {} kbps: refused, which is the ceiling this change lifts: {e}",
+                s.video_bitrate_kbps,
+            ),
+        }
     }
 
     /// On a real GPU, print the device-memory cost of one 1080p session (via `nvidia-smi`),
