@@ -400,7 +400,7 @@ use encoders::vaapi::VaapiEncoder;
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 
 use wayland::cursor::{Cursor, CursorJob};
-use wayland::frontend::{AppState, ClientState, FocusTarget, FramePace, GpuEncoder, TickTrigger, next_serial, wayland_time, wayland_utime};
+use wayland::frontend::{AppState, ClientState, FocusTarget, FramePace, GpuEncoder, PointerHold, TickTrigger, next_serial, wayland_time, wayland_utime};
 
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;
@@ -4849,6 +4849,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         pointer_warp_state,
         relative_pointer_state,
         pointer_constraints_state,
+        cursor_position_hint: None,
         output_nodes: Vec::new(),
         pending_windows: Vec::new(),
         foreign_toplevel_list,
@@ -5324,49 +5325,32 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     // the physical rectangle at its layout offset, and the point maps
                     // through the CONTAINING output's scale (clamped into the nearest
                     // output when outside all of them).
-                    let p = state.layout_physical_to_logical(x, y);
+                    let mut p = state.layout_physical_to_logical(x, y);
 
                     if let Some(pointer) = state.seat.get_pointer() {
-                        // Layer surfaces live on the output under the point; their
-                        // geometry is output-local, so hit-test with the local point and
-                        // report the global location.
-                        let layer_hit = |state: &AppState, layers: &[smithay::wayland::shell::wlr_layer::Layer]| {
-                            let idx = state.node_idx_under(p)?;
-                            let node = &state.output_nodes[idx];
-                            let origin = Point::<i32, smithay::utils::Logical>::from(node.pos);
-                            let local = (p - origin.to_f64()).to_i32_round();
-                            let layer_map = layer_map_for_output(&node.output);
-                            for layer in layer_map.layers().rev() {
-                                if layers.contains(&layer.layer())
-                                    && let Some(bbox) = layer_map.layer_geometry(layer)
-                                    && bbox.contains(local) {
-                                            return Some((
-                                                FocusTarget::LayerSurface(layer.clone()),
-                                                (bbox.loc + origin).to_f64(),
-                                            ));
-                                        }
+                        state.settle_cursor_hint(&pointer);
+                        let current = pointer.current_location();
+                        let held = state.focus_under(current);
+                        match state.pointer_hold(&pointer, &held, current) {
+                            Some(PointerHold::Locked) => {
+                                // The pointer stays where the lock caught it; the move reaches
+                                // the holder as the delta it amounts to, so a client sending
+                                // positions still steers a game that locked its pointer.
+                                let delta = p - current;
+                                if delta.x != 0.0 || delta.y != 0.0 {
+                                    pointer.relative_motion(state, held, &RelativeMotionEvent {
+                                        utime: wayland_utime(), delta, delta_unaccel: delta,
+                                    });
+                                    pointer.frame(state);
+                                }
+                                return;
                             }
-                            None
-                        };
-
-                        let mut under = layer_hit(state, &[
-                            smithay::wayland::shell::wlr_layer::Layer::Overlay,
-                            smithay::wayland::shell::wlr_layer::Layer::Top,
-                        ]);
-
-                        if under.is_none() {
-                            under = state.space.element_under(p).map(|(window, loc)| {
-                                (FocusTarget::Window(window.clone()), loc.to_f64())
-                            });
+                            Some(PointerHold::Confined(region)) => {
+                                p = state.confine(&held, current, p, region.as_ref());
+                            }
+                            None => {}
                         }
-
-                        if under.is_none() {
-                            under = layer_hit(state, &[
-                                smithay::wayland::shell::wlr_layer::Layer::Bottom,
-                                smithay::wayland::shell::wlr_layer::Layer::Background,
-                            ]);
-                        }
-
+                        let under = state.focus_under(p);
                         let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
                         pointer.motion(state, under.clone(), &MotionEvent { location: p, serial, time });
                         // A nested wlroots session takes its cursor position from motion
@@ -5374,11 +5358,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         // or its cursor stays behind until the next move -- and a button
                         // landing first presses at that stale spot.
                         if entered && under.is_some() {
-                            pointer.motion(state, under, &MotionEvent {
+                            pointer.motion(state, under.clone(), &MotionEvent {
                                 location: p, serial: next_serial(), time,
                             });
                         }
                         pointer.frame(state);
+                        state.activate_constraint_under(&pointer, &under, p);
                     }
                 }
                 ThreadCommand::PointerRelativeMotion { dx, dy } => {
@@ -5391,25 +5376,29 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let serial = next_serial();
 
                     if let Some(pointer) = state.seat.get_pointer() {
+                        state.settle_cursor_hint(&pointer);
                         let current_pos = pointer.current_location();
-                        let new_pos = state.clamp_logical(
+                        let held = state.focus_under(current_pos);
+                        let event = RelativeMotionEvent {
+                            utime,
+                            delta: (dx, dy).into(),
+                            delta_unaccel: (dx, dy).into(),
+                        };
+                        let hold = state.pointer_hold(&pointer, &held, current_pos);
+                        if matches!(hold, Some(PointerHold::Locked)) {
+                            pointer.relative_motion(state, held, &event);
+                            pointer.frame(state);
+                            return;
+                        }
+                        let mut new_pos = state.clamp_logical(
                             (current_pos.x + dx, current_pos.y + dy).into(),
                         );
-
-                        let under = state.space.element_under(new_pos).map(|(window, loc)| {
-                            (FocusTarget::Window(window.clone()), loc.to_f64())
-                        });
-
+                        if let Some(PointerHold::Confined(region)) = hold {
+                            new_pos = state.confine(&held, current_pos, new_pos, region.as_ref());
+                        }
+                        let under = state.focus_under(new_pos);
                         let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
-                        pointer.motion(
-                            state, 
-                            under.clone(), 
-                            &MotionEvent { 
-                                location: new_pos, 
-                                serial, 
-                                time 
-                            }
-                        );
+                        pointer.motion(state, under.clone(), &MotionEvent { location: new_pos, serial, time });
                         // Same repeat as the absolute arm: an entered nested session
                         // learns the position only from a motion event.
                         if entered && under.is_some() {
@@ -5417,15 +5406,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                                 location: new_pos, serial: next_serial(), time,
                             });
                         }
-
-                        let event = RelativeMotionEvent {
-                            utime,
-                            delta: (dx, dy).into(),
-                            delta_unaccel: (dx, dy).into(),
-                        };
-                        pointer.relative_motion(state, under, &event);
-
+                        pointer.relative_motion(state, under.clone(), &event);
                         pointer.frame(state);
+                        state.activate_constraint_under(&pointer, &under, new_pos);
                     }
                 }
                 ThreadCommand::PointerButton { btn, state: btn_state_val } => {
