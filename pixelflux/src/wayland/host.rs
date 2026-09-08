@@ -889,12 +889,13 @@ impl HostSession {
             return Err("host compositor has no wl_output".into());
         }
 
+        let base_keymap = crate::wayland::vkclient::us_base_text();
         let vk = match &state.vk_mgr {
             Some(mgr) => {
                 let vk = mgr.create_virtual_keyboard(&seat, &qh, ());
                 // A keymap must precede any key event; selkies replaces this with
                 // its managed keymap through the ABI as soon as it starts.
-                if let Some(text) = crate::wayland::vkclient::us_base_text() {
+                if let Some(text) = base_keymap {
                     let mut data = text.as_bytes().to_vec();
                     data.push(0);
                     let fd = memfd_with(&data)?;
@@ -986,8 +987,10 @@ impl HostSession {
 
         let layout = Mutex::new(std::collections::BTreeMap::new());
         let mut keyboard = HostKeyboardState::default();
-        if let Some(text) = crate::wayland::vkclient::us_base_text() {
-            keyboard.set_keymap(text);
+        if vk.is_some() && base_keymap.and_then(|text| keyboard.set_keymap(text)).is_none() {
+            eprintln!(
+                "[HostCapture] base keymap unavailable: keys are dropped until selkies uploads its keymap."
+            );
         }
         Ok(Self {
             conn,
