@@ -809,16 +809,18 @@ fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
 /// socket instead. Set by selkies over the ScreenCapture ABI.
 static CU_APP_WAYLAND_DISPLAY: Mutex<Option<String>> = Mutex::new(None);
 
-/// Set (or clear, with None/empty) the app compositor socket for CU text injection.
+/// Set (or clear, with None/empty) the app compositor socket for CU text injection
+/// and for relative pointer motion into a nested KWin session.
 pub fn set_app_wayland_display(display: Option<String>) {
     *CU_APP_WAYLAND_DISPLAY.lock().unwrap() = display.filter(|s| !s.is_empty());
+    crate::wayland::ficlient::arm(app_wayland_socket_path());
 }
 
 /// Resolve the app compositor socket PATH for CU typing, or None to type on the
 /// local seat. The ABI value selkies set wins; a standalone CU (no selkies) falls
 /// back to PIXELFLUX_APP_WAYLAND_DISPLAY. A value naming pixelflux's own
 /// compositor means nothing is nested.
-fn app_wayland_socket_path() -> Option<String> {
+pub(crate) fn app_wayland_socket_path() -> Option<String> {
     let name = CU_APP_WAYLAND_DISPLAY
         .lock()
         .unwrap()

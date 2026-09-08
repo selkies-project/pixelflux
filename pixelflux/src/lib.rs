@@ -5408,6 +5408,14 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         host.pointer_motion_rel(dx, dy);
                         return;
                     }
+                    // A nested KWin drops the delta the seat's relative_motion carries;
+                    // its fake-input device takes it instead, ahead of the seat's
+                    // absolute move below. KWin sets its pointer from that move rather
+                    // than adding to it, so the two agree when aligned, and a KWin that
+                    // moved its pointer on its own (a screen change) is realigned by the
+                    // next delta. The seat's relative_motion is then withheld, since a
+                    // KWin that did bind the seat's relative pointer would count it twice.
+                    let via_fake_input = crate::wayland::ficlient::pointer_motion_rel(dx, dy);
                     let utime = wayland_utime();
                     let time = wayland_time();
                     let serial = next_serial();
@@ -5440,12 +5448,14 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             });
                         }
 
-                        let event = RelativeMotionEvent {
-                            utime,
-                            delta: (dx, dy).into(),
-                            delta_unaccel: (dx, dy).into(),
-                        };
-                        pointer.relative_motion(state, under, &event);
+                        if !via_fake_input {
+                            let event = RelativeMotionEvent {
+                                utime,
+                                delta: (dx, dy).into(),
+                                delta_unaccel: (dx, dy).into(),
+                            };
+                            pointer.relative_motion(state, under, &event);
+                        }
 
                         pointer.frame(state);
                     }
@@ -5817,6 +5827,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 
     crate::computer_use::register_wayland_backend(command_tx.clone());
     crate::computer_use::spawn_cu_from_env();
+    crate::wayland::ficlient::arm(crate::computer_use::app_wayland_socket_path());
 
     let _ = event_loop.run(None, &mut state, |state| {
         state.process_pending_clipboard_read();
@@ -6217,6 +6228,10 @@ impl WaylandBackend {
         Ok(())
     }
 
+    /// Move the pointer by a delta. On the seat this is an absolute move plus a
+    /// `zwp_relative_pointer_v1` event; a nested KWin session, which forwards no
+    /// delta from its host seat, receives it through its `org_kde_kwin_fake_input`
+    /// device on the app compositor socket named by `set_app_wayland_display`.
     fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> PyResult<()> {
         self.send(ThreadCommand::PointerRelativeMotion { dx, dy })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to inject relative motion: {}", e)))?;
@@ -7229,8 +7244,9 @@ impl ScreenCapture {
             .map_or(Ok(()), |be| be.bind(py).borrow().set_keymap_overlay(binds))
     }
     /// Compositor apps run under (a nested labwc/kwin session pixelflux captures),
-    /// the target for Computer-Use text injection; selkies resolves it and hands it
-    /// over. Empty clears it. Stored process-wide since the CU server is per-process.
+    /// the target for Computer-Use text injection and, under KWin, for relative
+    /// pointer motion through its fake-input device; selkies resolves it and hands
+    /// it over. Empty clears it. Stored process-wide since the CU server is per-process.
     fn set_app_wayland_display(&self, display: String) {
         crate::computer_use::set_app_wayland_display(
             if display.is_empty() { None } else { Some(display) },

@@ -27,5 +27,7 @@ pub mod outclient;
 pub mod kdeclient;
 /// Generated bindings for the KDE output protocols vendored under `protocols/`.
 pub mod kdeproto;
+/// Fake-input client delivering relative pointer motion into a nested KWin session.
+pub mod ficlient;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;
