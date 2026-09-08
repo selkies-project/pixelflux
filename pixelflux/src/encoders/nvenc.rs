@@ -577,6 +577,33 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     }
 }
 
+/// The CBR target of a session at `settings`, in bits per second.
+fn cbr_bps(settings: &RustCaptureSettings) -> u32 {
+    (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000)
+}
+
+/// The VBV of a CBR session at `bps`, from the session's frame rate, key-frame interval and
+/// explicit multiplier.
+fn cbr_vbv(settings: &RustCaptureSettings, bps: u32) -> u32 {
+    crate::encoders::vbv_bits(
+        bps,
+        settings.target_fps,
+        settings.keyframe_interval_s,
+        settings.video_vbv_multiplier,
+    )
+}
+
+/// Write a CBR target into `rc`: the average and peak rate, the VBV, and an initial delay of the
+/// whole buffer. That delay is the driver's default (`gpu_bench_cbr_policy` finds the two
+/// identical), stated so the HRD's starting point is explicit and a rate change restates it
+/// with the buffer it belongs to.
+fn set_cbr_rate(rc: &mut NV_ENC_RC_PARAMS, bps: u32, vbv: u32) {
+    rc.averageBitRate = bps;
+    rc.maxBitRate = bps;
+    rc.vbvBufferSize = vbv;
+    rc.vbvInitialDelay = vbv;
+}
+
 /// The driver's message for the last failure on `session`, or a stand-in when it has none: NVENC
 /// clears the string once a session is torn down, so it is only meaningful read straight after
 /// the call that failed.
@@ -1277,17 +1304,10 @@ impl NvencEncoder {
             config.version = sv(NvStruct::Config);
             config.profileGUID = profile_guid(codec, is_444);
             if settings.video_cbr_mode {
-                let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
+                let bps = cbr_bps(settings);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
                 config.rcParams.multiPass = tuning.multipass;
-                config.rcParams.averageBitRate = bps;
-                config.rcParams.maxBitRate = bps;
-                config.rcParams.vbvBufferSize = crate::encoders::vbv_bits(
-                    bps,
-                    settings.target_fps,
-                    settings.keyframe_interval_s,
-                    settings.video_vbv_multiplier,
-                );
+                set_cbr_rate(&mut config.rcParams, bps, cbr_vbv(settings, bps));
                 let lo = codec.nvenc_quantizer_bound(settings.video_min_qp);
                 if lo > 0 {
                     config.rcParams.set_enableMinQP(1);
@@ -1716,15 +1736,8 @@ impl NvencEncoder {
 
             self.set_level(new_w, new_h, settings.target_fps as u32);
             if is_cbr {
-                let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
-                self.encode_config.rcParams.averageBitRate = bps;
-                self.encode_config.rcParams.maxBitRate = bps;
-                self.encode_config.rcParams.vbvBufferSize = crate::encoders::vbv_bits(
-                    bps,
-                    settings.target_fps,
-                    settings.keyframe_interval_s,
-                    settings.video_vbv_multiplier,
-                );
+                let bps = cbr_bps(settings);
+                set_cbr_rate(&mut self.encode_config.rcParams, bps, cbr_vbv(settings, bps));
             } else {
                 let qp = self.codec.nvenc_quantizer(settings.video_crf);
                 self.encode_config.rcParams.constQP.qpInterP = qp;
@@ -1945,44 +1958,38 @@ impl NvencEncoder {
             };
 
             let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
-            if reconfig_fn(self.encoder_session, &mut reconfig_params)
-                == NVENCSTATUS::NV_ENC_SUCCESS
-            {
+            let status = reconfig_fn(self.encoder_session, &mut reconfig_params);
+            if status == NVENCSTATUS::NV_ENC_SUCCESS {
                 self.current_qp = target_qp;
                 return true;
-            } else {
-                eprintln!("[NVENC] Reconfigure failed.");
             }
+            eprintln!(
+                "[NVENC] Quantizer reconfigure refused ({status:?}): {}",
+                last_error(&self.nvenc_funcs, self.encoder_session)
+            );
         }
         false
     }
 
-    /// Apply a runtime rate-control / frame-rate change to the live session.
+    /// Apply a runtime rate-control / frame-rate change to the live session, and report whether
+    /// the session carries it afterwards.
     ///
-    /// In CBR mode the target bitrate, max bitrate and VBV buffer size are updated (the VBV is
-    /// ignored outside CBR); the target fps is updated in either mode. The session is reconfigured
-    /// only when one of these actually changed — no forced IDR, no RC reset — so calling it every
-    /// frame is cheap.
-    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) {
+    /// In CBR mode the target bitrate, max bitrate, VBV and its initial delay are updated (the VBV
+    /// is ignored outside CBR); the target fps is updated in either mode. The session is
+    /// reconfigured only when one of these actually changed — no forced IDR, no RC reset — so
+    /// calling it every frame is cheap. A reconfigure the driver refuses leaves the session
+    /// encoding at its previous rate, logged with the driver's reason.
+    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> bool {
         unsafe {
             let mut changed = false;
             if self.encode_config.rcParams.rateControlMode
                 == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
             {
-                let bps = (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000);
-                let vbv = crate::encoders::vbv_bits(
-                    bps,
-                    settings.target_fps,
-                    settings.keyframe_interval_s,
-                    settings.video_vbv_multiplier,
-                );
-                if self.encode_config.rcParams.averageBitRate != bps
-                    || self.encode_config.rcParams.maxBitRate != bps
-                    || self.encode_config.rcParams.vbvBufferSize != vbv
-                {
-                    self.encode_config.rcParams.averageBitRate = bps;
-                    self.encode_config.rcParams.maxBitRate = bps;
-                    self.encode_config.rcParams.vbvBufferSize = vbv;
+                let bps = cbr_bps(settings);
+                let vbv = cbr_vbv(settings, bps);
+                let rc = &mut self.encode_config.rcParams;
+                if rc.averageBitRate != bps || rc.maxBitRate != bps || rc.vbvBufferSize != vbv {
+                    set_cbr_rate(rc, bps, vbv);
                     changed = true;
                 }
             }
@@ -1994,7 +2001,7 @@ impl NvencEncoder {
                 changed = true;
             }
             if !changed {
-                return;
+                return true;
             }
             self.init_params.encodeConfig = &mut self.encode_config;
             let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
@@ -2003,11 +2010,15 @@ impl NvencEncoder {
                 ..Default::default()
             };
             let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
-            if reconfig_fn(self.encoder_session, &mut reconfig_params)
-                != NVENCSTATUS::NV_ENC_SUCCESS
-            {
-                eprintln!("[NVENC] Rate reconfigure failed.");
+            let status = reconfig_fn(self.encoder_session, &mut reconfig_params);
+            if status != NVENCSTATUS::NV_ENC_SUCCESS {
+                eprintln!(
+                    "[NVENC] Rate reconfigure refused ({status:?}): {}",
+                    last_error(&self.nvenc_funcs, self.encoder_session)
+                );
+                return false;
             }
+            true
         }
     }
 
@@ -2665,6 +2676,40 @@ mod gpu_tests {
         f
     }
 
+    /// Test helper: hand the session's `encode_config` to `nvEncReconfigureEncoder` as it stands,
+    /// for checks that vary one rate-control field, with the driver's answer.
+    fn reconfigure_raw(enc: &mut NvencEncoder) -> (NVENCSTATUS, String) {
+        unsafe {
+            enc.init_params.encodeConfig = &mut enc.encode_config;
+            let mut params = NV_ENC_RECONFIGURE_PARAMS {
+                version: sv(NvStruct::ReconfigureParams),
+                reInitEncodeParams: enc.init_params,
+                ..Default::default()
+            };
+            let status =
+                (enc.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(enc.encoder_session, &mut params);
+            let detail = if status == NVENCSTATUS::NV_ENC_SUCCESS {
+                "accepted".to_string()
+            } else {
+                last_error(&enc.nvenc_funcs, enc.encoder_session)
+            };
+            (status, detail)
+        }
+    }
+
+    /// Test helper: the gradient frame with a 256x256 block of another gradient moved `step`
+    /// blocks along its top rows, the frames of a steady desktop-like sequence.
+    fn moving_frame(w: usize, h: usize, step: usize) -> Vec<u8> {
+        let mut f = frame(w, h, 10);
+        let block = frame(256, 256, 200);
+        let x0 = (step * 64) % (w - 256);
+        for row in 0..256.min(h) {
+            let dst = (row * w + x0) * 4;
+            f[dst..dst + 256 * 4].copy_from_slice(&block[row * 256 * 4..(row + 1) * 256 * 4]);
+        }
+        f
+    }
+
     /// Test helper: read the big-endian width/height (bytes 6-9) from a 10-byte wire header.
     fn wire_dims(pkt: &[u8]) -> (u16, u16) {
         (
@@ -2852,6 +2897,52 @@ mod gpu_tests {
             .expect("encode 1080p");
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (1920, 1080));
+    }
+
+    /// On a real GPU, a live CBR rate change moves the VBV initial delay with the buffer: after
+    /// the bitrate is lowered the delay equals the new, smaller buffer, the driver takes the
+    /// reconfigure, and a steady desktop-like sequence lands at the new rate. What the driver
+    /// makes of a delay left above the buffer is printed rather than asserted. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_rate_reconfigure_moves_the_vbv_initial_delay_with_the_buffer() {
+        let (w, h) = (1920usize, 1080usize);
+        let mut s = settings(w as i32, h as i32, 60.0);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 8000;
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let rate = |enc: &NvencEncoder| {
+            let rc = enc.encode_config.rcParams;
+            (rc.averageBitRate, rc.vbvBufferSize, rc.vbvInitialDelay)
+        };
+        let vbv8 = cbr_vbv(&s, 8_000_000);
+        assert_eq!(rate(&enc), (8_000_000, vbv8, vbv8));
+        let frames: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(w, h, i)).collect();
+        enc.encode_cpu_argb(&frames[0], w * 4, 0, 25, true).expect("encode");
+
+        s.video_bitrate_kbps = 2000;
+        assert!(enc.reconfigure_rate(&s), "the driver takes the lower rate");
+        let vbv2 = cbr_vbv(&s, 2_000_000);
+        assert_eq!(rate(&enc), (2_000_000, vbv2, vbv2));
+        let n = 120u64;
+        let mut bytes = 0usize;
+        for i in 1..=n {
+            let pkt = enc
+                .encode_cpu_argb(&frames[i as usize % 16], w * 4, i, 25, false)
+                .expect("encode");
+            bytes += pkt.len() - VIDEO_HEADER_LEN;
+        }
+        let kbps = bytes as f64 * 8.0 * 60.0 / n as f64 / 1000.0;
+        println!("CBR 2000 kbps after the rate change: {kbps:.0} kbps over {n} steady frames");
+        assert!((1500.0..=2500.0).contains(&kbps), "the session encodes at the new rate: {kbps:.0} kbps");
+
+        enc.encode_config.rcParams.vbvInitialDelay = vbv2 * 4;
+        let (status, detail) = reconfigure_raw(&mut enc);
+        println!("a VBV initial delay of four buffers: {status:?} ({detail})");
+        enc.encode_config.rcParams.vbvInitialDelay = vbv2;
+        assert_eq!(reconfigure_raw(&mut enc).0, NVENCSTATUS::NV_ENC_SUCCESS);
+        enc.encode_cpu_argb(&frames[7], w * 4, n + 1, 25, false)
+            .expect("the session still encodes");
     }
 
     /// The reason HEVC pins High tier: with the level pinned rather than autoselected,
