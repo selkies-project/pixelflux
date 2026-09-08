@@ -1988,6 +1988,12 @@ fn host_layout_resolution(want: (i32, i32), current: Option<(i32, i32)>) -> Opti
     current.filter(|&c| c != want)
 }
 
+/// Periods without a fresh host frame before the timer treats the host as quiet and, in
+/// streaming mode, re-encodes the retained frame to hold the rate. A live host's frames come
+/// about a period apart, so a tick landing a hair ahead of one must not publish a duplicate
+/// the fresh frame then waits behind.
+const HOST_QUIET_PERIODS: f64 = 1.5;
+
 /// Refused mode requests in a row for one display before the log says plainly what to do: a
 /// host that keeps its own mode is asked again on every client resize, and each refusal
 /// restarts the capture at the mode the host runs.
@@ -2236,7 +2242,11 @@ fn start_capture_on_display(
         } else {
             None
         };
-        match crate::wayland::host::HostSession::connect(&settings.wayland_host_display, gbm_path) {
+        match crate::wayland::host::HostSession::connect(
+            &settings.wayland_host_display,
+            gbm_path,
+            state.host_frame_tx.clone(),
+        ) {
             Ok(h) => {
                 println!(
                     "[HostCapture] capturing host compositor '{}' ({} outputs).",
@@ -2982,6 +2992,15 @@ fn render_pass(state: &mut AppState, trigger: TickTrigger) -> bool {
     any_pool_busy
 }
 
+/// One display's render tick, for a trigger that concerns that display alone.
+fn render_display(state: &mut AppState, display_id: u32, trigger: TickTrigger) {
+    let mut nodes = std::mem::take(&mut state.output_nodes);
+    if let Some(node) = nodes.iter_mut().find(|n| n.id == display_id) {
+        render_node_tick(state, node, trigger);
+    }
+    state.output_nodes = nodes;
+}
+
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
@@ -3099,7 +3118,11 @@ fn render_node_tick(
         .unwrap_or(state.settings.watermark_location_enum);
     node.overlay_state.update_position(width, height, loc_enum);
 
-    if let Some(cap) = node.capture.as_mut() {
+    // Host-capture mode: the host compositor already blitted this display's frame
+    // into one of our buffers (screencopy); adopt it in place of compositing. Its tick
+    // is recorded below, once it is known a frame will be published.
+    let host_mode = state.host.as_ref().map(|h| h.has_output_for(node.id)).unwrap_or(false);
+    if !host_mode && let Some(cap) = node.capture.as_mut() {
         let period = capture_period(cap);
         cap.pace.ticked(trigger, period, Instant::now());
     }
@@ -3127,9 +3150,6 @@ fn render_node_tick(
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node.capture.as_ref().map(|c| c.needs_full_render).unwrap_or(!node.target_seeded);
 
-    // Host-capture mode: the host compositor already blitted this display's frame
-    // into one of our buffers (screencopy); adopt it in place of compositing.
-    let host_mode = state.host.as_ref().map(|h| h.has_output_for(node.id)).unwrap_or(false);
     if state.host.is_some() && !host_mode {
         // No host output backs this display (start_capture already warned):
         // produce nothing rather than the compositor's own empty content.
@@ -3189,14 +3209,41 @@ fn render_node_tick(
             .unwrap_or(false);
         let wm_active = node.overlay_state.is_active();
         let wm_animated = wm_active && node.overlay_state.is_animated();
-        if !have_new && !want_idr_for_host && !streaming && !take_screenshot && !wm_animated {
+        // Without a fresh frame, retained content is published for a reason of its own: a
+        // keyframe request, a screenshot, a moving watermark, or streaming mode's constant
+        // rate once the host has gone quiet. A live host's next frame is imminent and
+        // renders through its own wake, so the timer is held off rather than publishing a
+        // duplicate that frame would then queue behind.
+        let now = Instant::now();
+        let period = node.capture.as_ref().map(capture_period);
+        let host_quiet = node.capture.as_ref().is_none_or(|cap| {
+            cap.pace
+                .since_last_tick(now)
+                .is_none_or(|since| since >= capture_period(cap).mul_f64(HOST_QUIET_PERIODS))
+        });
+        if !have_new && !want_idr_for_host && !take_screenshot && !wm_animated && !(streaming && host_quiet) {
             if let Some((id, buf)) = pool_slot.take()
                 && let Some(cap) = node.capture.as_ref()
                 && let Some(ref pool) = cap.encode_pool {
                         pool.cancel(id, buf);
                     }
+            if let Some(cap) = node.capture.as_mut()
+                && let Some(period) = period
+            {
+                let held = if streaming {
+                    cap.pace.last_tick.map_or(now, |last| last + period.mul_f64(HOST_QUIET_PERIODS))
+                } else {
+                    now + period
+                };
+                cap.pace.defer(held.max(now + Duration::from_millis(1)));
+            }
             state.host = Some(host);
             return false;
+        }
+        if let Some(cap) = node.capture.as_mut()
+            && let Some(period) = period
+        {
+            cap.pace.ticked(trigger, period, now);
         }
         if let Some(f) = new_frame {
             host.retain_frame(host_idx, f);
@@ -4773,6 +4820,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         .expect("Failed to init keyboard");
     seat.add_pointer();
 
+    let (host_frame_tx, host_frame_rx) = smithay::reexports::calloop::channel::channel::<usize>();
+
     let mut state = AppState {
         compositor_state,
         fractional_scale_state,
@@ -4831,6 +4880,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         keymap_policy: wayland::keymap::KeymapPolicy::empty(),
         host: None,
         host_layout_pending: std::collections::HashMap::new(),
+        host_frame_tx,
         host_mode_refusals: std::collections::HashMap::new(),
         current_cursor_icon: None,
         cursor_surface_pending: false,
@@ -5559,7 +5609,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 send_idle_frame_callbacks(state);
             }
             // Input may pull a capture's due frame forward to its own phase (see
-            // FramePace); host capture frames arrive at the host's pace and cannot.
+            // FramePace). Not under host capture: a pull there would re-encode the frame
+            // the host already delivered, so the host's own frames wake the render instead.
             if had_input
                 && state.host.is_none()
                 && state.output_nodes.iter().any(|n| n.capture.is_some())
@@ -5567,6 +5618,26 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 state.space.refresh();
                 render_pass(state, TickTrigger::Input);
             }
+        })
+        .unwrap();
+
+    event_loop
+        .handle()
+        .insert_source(host_frame_rx, |event, _, state| {
+            // A host frame landed for one output: its display renders now, at most at frame
+            // pace (FramePace), rather than on a timer tick up to a period away. A wake the
+            // timer already served finds nothing queued and does nothing.
+            let smithay::reexports::calloop::channel::Event::Msg(index) = event else { return };
+            let Some(id) = state
+                .host
+                .as_ref()
+                .filter(|h| h.has_queued_frame(index))
+                .and_then(|h| h.display_for_output(index))
+            else {
+                return;
+            };
+            state.space.refresh();
+            render_display(state, id, TickTrigger::HostFrame);
         })
         .unwrap();
 

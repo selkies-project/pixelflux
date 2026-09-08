@@ -29,7 +29,7 @@
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -219,6 +219,28 @@ enum ToHost {
 
 enum CtrlMsg {
     Apply { epoch: u64, slots: Vec<LayoutSlot> },
+}
+
+/// The capture thread's end of one output's frame queue: the frames, an exact count of those
+/// queued and not yet taken (so a wake that the timer has already served is recognised as
+/// such), and the calloop wake that follows every frame.
+struct FrameSink {
+    tx: Sender<HostFrame>,
+    queued: Arc<AtomicI64>,
+    wake: smithay::reexports::calloop::channel::Sender<usize>,
+    index: usize,
+}
+
+impl FrameSink {
+    /// Queue `frame` and wake the consumer; false once the consumer is gone.
+    fn send(&self, frame: HostFrame) -> bool {
+        if self.tx.send(frame).is_err() {
+            return false;
+        }
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        let _ = self.wake.send(self.index);
+        true
+    }
 }
 
 /// Outcome ledger for layout requests: every Apply carries an epoch, and the
@@ -756,6 +778,9 @@ struct OutputHandle {
     to_thread: Sender<ToHost>,
     wake: OwnedFd,
     frames: Receiver<HostFrame>,
+    /// Frames sent and not yet received, the capture thread adding and the takers below
+    /// subtracting; exact, so it may read negative for an instant.
+    queued: Arc<AtomicI64>,
     /// Newest frame, kept (slot and all) until replaced so an IDR request on a
     /// static screen can re-encode current content like compositor mode does.
     retained: Mutex<Option<HostFrame>>,
@@ -867,8 +892,13 @@ impl HostSession {
     /// Connect to `display`, bring up input devices, enumerate the host's
     /// outputs and spawn one capture thread per output (idle until
     /// [`start_capture`]) plus the layout-control thread. `gbm_path` (this
-    /// process's render node) enables the zero-copy path.
-    pub fn connect(display: &str, gbm_path: Option<std::path::PathBuf>) -> Result<Self, String> {
+    /// process's render node) enables the zero-copy path; `frame_wake` is told the
+    /// output index every time a capture thread queues a frame.
+    pub fn connect(
+        display: &str,
+        gbm_path: Option<std::path::PathBuf>,
+        frame_wake: smithay::reexports::calloop::channel::Sender<usize>,
+    ) -> Result<Self, String> {
         let path = socket_path(display).ok_or("XDG_RUNTIME_DIR is unset")?;
         let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
         let conn = Connection::from_socket(stream).map_err(|e| format!("wayland setup: {e}"))?;
@@ -939,6 +969,13 @@ impl HostSession {
             let (wake_rd, wake_wr) = wake_pipe()?;
             let (to_thread, from_main) = std::sync::mpsc::channel::<ToHost>();
             let (frame_tx, frames) = std::sync::mpsc::channel::<HostFrame>();
+            let queued = Arc::new(AtomicI64::new(0));
+            let sink = FrameSink {
+                tx: frame_tx,
+                queued: queued.clone(),
+                wake: frame_wake.clone(),
+                index: i,
+            };
             let display = display.to_string();
             let expect = name.clone();
             let gbm_path = gbm_path.clone();
@@ -947,7 +984,7 @@ impl HostSession {
                 .name(format!("pf-host-cap{i}"))
                 .spawn(move || {
                     if let Err(e) =
-                        capture_loop(&display, i, expect, gbm_path, from_main, wake_rd, frame_tx)
+                        capture_loop(&display, i, expect, gbm_path, from_main, wake_rd, sink)
                     {
                         eprintln!("[HostCapture] output {i} capture ended: {e}");
                     }
@@ -960,6 +997,7 @@ impl HostSession {
                 to_thread,
                 wake: wake_wr,
                 frames,
+                queued,
                 retained: Mutex::new(None),
                 name,
             });
@@ -1026,6 +1064,19 @@ impl HostSession {
     /// True when an active capture on `display_id` has a host output behind it.
     pub fn has_output_for(&self, display_id: u32) -> bool {
         self.output_index_for(display_id).is_some()
+    }
+
+    /// The display captured from host output `index`, if an active capture sits on it.
+    pub fn display_for_output(&self, index: usize) -> Option<u32> {
+        let layout = self.layout.lock().unwrap();
+        layout.iter().filter(|(_, s)| s.active).nth(index).map(|(id, _)| *id)
+    }
+
+    /// Whether host output `index` has queued a frame no render has taken yet.
+    pub fn has_queued_frame(&self, index: usize) -> bool {
+        self.outputs
+            .get(index)
+            .is_some_and(|h| h.queued.load(Ordering::Acquire) > 0)
     }
 
     /// Record where selkies laid out `display_id` (union coordinates); pushed
@@ -1205,6 +1256,7 @@ impl HostSession {
             handle.send(ToHost::Release { generation: old.generation, slot: old.slot });
         }
         while let Ok(frame) = handle.frames.try_recv() {
+            handle.queued.fetch_sub(1, Ordering::AcqRel);
             handle.send(ToHost::Release { generation: frame.generation, slot: frame.slot });
         }
     }
@@ -1246,6 +1298,7 @@ impl HostSession {
         let handle = self.outputs.get(self.output_index_for(display_id)?)?;
         let mut newest: Option<HostFrame> = None;
         while let Ok(frame) = handle.frames.try_recv() {
+            handle.queued.fetch_sub(1, Ordering::AcqRel);
             if let Some(stale) = newest.replace(frame) {
                 handle.send(ToHost::Release { generation: stale.generation, slot: stale.slot });
             }
@@ -1738,7 +1791,7 @@ fn capture_loop(
     gbm_path: Option<std::path::PathBuf>,
     from_main: Receiver<ToHost>,
     wake_rd: OwnedFd,
-    frame_tx: Sender<HostFrame>,
+    frames: FrameSink,
 ) -> Result<(), String> {
     let path = socket_path(display).ok_or("XDG_RUNTIME_DIR is unset")?;
     let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
@@ -1784,7 +1837,7 @@ fn capture_loop(
     if force != "zwlr" && state.ext_capture.is_some() && state.ext_source_mgr.is_some() {
         match capture_loop_ext(
             &conn, &mut queue, &mut state, &output, gbm.as_ref(), wake, index, &from_main,
-            &frame_tx, &mut want,
+            &frames, &mut want,
         ) {
             ExtOutcome::Finished => return Ok(()),
             ExtOutcome::Unavailable(e) => {
@@ -2049,7 +2102,7 @@ fn capture_loop(
                 damage,
             },
         };
-        if frame_tx.send(out).is_err() {
+        if !frames.send(out) {
             return Ok(());
         }
     }
@@ -2076,7 +2129,7 @@ fn capture_loop_ext(
     wake: RawFd,
     index: usize,
     from_main: &Receiver<ToHost>,
-    frame_tx: &Sender<HostFrame>,
+    frames: &FrameSink,
     want: &mut Option<Want>,
 ) -> ExtOutcome {
     let qh = queue.handle();
@@ -2358,7 +2411,7 @@ fn capture_loop_ext(
                 damage,
             },
         };
-        if frame_tx.send(out).is_err() {
+        if !frames.send(out) {
             teardown(&session, &source);
             return ExtOutcome::Finished;
         }

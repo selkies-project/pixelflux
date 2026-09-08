@@ -217,40 +217,54 @@ pub enum GpuEncoder {
     Nvenc(NvencEncoder),
 }
 
-/// What asks a display for a frame: its frame timer, or fresh input that may pull the
-/// cadence's phase forward.
+/// What asks a display for a frame: its frame timer, fresh input, or (under host capture) a
+/// frame the host just delivered. The latter two may pull the cadence's phase forward.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TickTrigger {
     Timer,
     Input,
+    HostFrame,
+}
+
+impl TickTrigger {
+    /// Whether this trigger may render ahead of the timer, moving the cadence to its phase.
+    fn pulls_forward(self) -> bool {
+        matches!(self, TickTrigger::Input | TickTrigger::HostFrame)
+    }
 }
 
 /// The share of a frame period the timer's tick may run early by, absorbing its wakeup jitter.
 const TIMER_TICK_MIN_FRACTION: f64 = 0.9;
-/// The share of a frame period that has to pass before input may pull the next frame forward.
+/// The share of a frame period that has to pass before input or a host frame may pull the
+/// next frame forward.
 const INPUT_TICK_MIN_FRACTION: f64 = 0.5;
-/// The share of wall time that accrues as time input may pull frames forward by. A frame
+/// The share of wall time that accrues as time a pull may bring frames forward by. A frame
 /// pulled forward by some time is one the cadence earns that much later, so the sustained
 /// rate can rise above the configured one by at most this share.
 const INPUT_BORROW_REFILL: f64 = 1.0 / 32.0;
 
-/// A capture's frame pacing: the last frame it rendered, and how far input may still pull the
-/// next one forward.
+/// A capture's frame pacing: the last frame it rendered, and how far a pull may still bring
+/// the next one forward.
 ///
 /// The shared frame timer fires for the earliest due capture; each capture renders on it once
-/// its own period has (nearly) passed. Fresh input may also render a frame: a whole period
-/// after the last one it merely moves the cadence's phase to the input's, and from half a
-/// period on it pulls the frame forward, spending the time it comes early by from a budget
-/// that refills at `INPUT_BORROW_REFILL` and holds half a period at most. A pointer moving at
-/// the client's refresh rate is thus captured as it lands rather than up to a period later --
-/// the cadence locks to the input's phase on the first move and follows it for free -- while
-/// input at a rate the cadence cannot follow raises the output rate by no more than the refill.
+/// its own period has (nearly) passed. Fresh input may also render a frame, and so may a frame
+/// the host compositor delivers under host capture: a whole period after the last one the pull
+/// merely moves the cadence's phase to its own, and from half a period on it brings the frame
+/// forward, spending the time it comes early by from a budget that refills at
+/// `INPUT_BORROW_REFILL` and holds half a period at most. A pointer moving at the client's
+/// refresh rate is thus captured as it lands rather than up to a period later -- the cadence
+/// locks to the input's phase on the first move and follows it for free -- and a host's frames
+/// are published as they arrive rather than on the next timer tick, while either at a rate the
+/// cadence cannot follow raises the output rate by no more than the refill.
 #[derive(Debug, Default)]
 pub struct FramePace {
     /// Last tick this capture actually rendered.
     pub last_tick: Option<Instant>,
     /// The budget left when it was last spent, and when that was; a fresh capture holds the cap.
     borrow_budget: Option<(Duration, Instant)>,
+    /// Where the timer was held off to by a tick that rendered nothing (host capture with no
+    /// fresh frame), so it neither spins nor counts against the next frame.
+    deferred_until: Option<Instant>,
 }
 
 impl FramePace {
@@ -258,19 +272,17 @@ impl FramePace {
     pub fn due(&self, trigger: TickTrigger, period: Duration, now: Instant) -> bool {
         let Some(last) = self.last_tick else { return true };
         let elapsed = now.saturating_duration_since(last);
-        match trigger {
-            TickTrigger::Timer => elapsed >= period.mul_f64(TIMER_TICK_MIN_FRACTION),
-            TickTrigger::Input => {
-                elapsed >= period
-                    || (elapsed >= period.mul_f64(INPUT_TICK_MIN_FRACTION)
-                        && self.budget(period, now) >= period - elapsed)
-            }
+        if !trigger.pulls_forward() {
+            return elapsed >= period.mul_f64(TIMER_TICK_MIN_FRACTION);
         }
+        elapsed >= period
+            || (elapsed >= period.mul_f64(INPUT_TICK_MIN_FRACTION)
+                && self.budget(period, now) >= period - elapsed)
     }
 
     /// Record the frame rendered at `now`.
     pub fn ticked(&mut self, trigger: TickTrigger, period: Duration, now: Instant) {
-        if trigger == TickTrigger::Input
+        if trigger.pulls_forward()
             && let Some(last) = self.last_tick
             && now.saturating_duration_since(last) < period
         {
@@ -278,9 +290,22 @@ impl FramePace {
             self.borrow_budget = Some((self.budget(period, now).saturating_sub(borrowed), now));
         }
         self.last_tick = Some(now);
+        self.deferred_until = None;
     }
 
-    /// How far input may pull the next frame forward at `now`.
+    /// Hold the timer off this capture until `until` without a frame counting: a tick that
+    /// published nothing must neither spin the timer nor move the cadence a fresh frame is
+    /// measured against.
+    pub fn defer(&mut self, until: Instant) {
+        self.deferred_until = Some(until);
+    }
+
+    /// Time since this capture last rendered, if it has.
+    pub fn since_last_tick(&self, now: Instant) -> Option<Duration> {
+        self.last_tick.map(|last| now.saturating_duration_since(last))
+    }
+
+    /// How far a pull may bring the next frame forward at `now`.
     fn budget(&self, period: Duration, now: Instant) -> Duration {
         let cap = period.mul_f64(INPUT_TICK_MIN_FRACTION);
         match self.borrow_budget {
@@ -293,7 +318,8 @@ impl FramePace {
 
     /// When the timer is next due for this capture.
     pub fn next_due(&self, period: Duration, now: Instant) -> Instant {
-        self.last_tick.map_or(now, |last| last + period)
+        let due = self.last_tick.map_or(now, |last| last + period);
+        self.deferred_until.map_or(due, |held| held.max(due))
     }
 }
 
@@ -644,6 +670,10 @@ pub struct AppState {
     /// answer, then re-sizes the capture to the mode the host announces. Emptied with the
     /// host session.
     pub host_layout_pending: std::collections::HashMap<u32, PendingHostLayout>,
+    /// Wakes the calloop when a host capture thread has queued a frame, so its display
+    /// renders that frame at once (at frame pace, see `FramePace`) rather than on the next
+    /// timer tick.
+    pub host_frame_tx: smithay::reexports::calloop::channel::Sender<usize>,
     /// Per display, how many mode requests in a row the host has answered with a different
     /// mode; cleared when it applies one. Past a few, the log names the remedy.
     pub host_mode_refusals: std::collections::HashMap<u32, u32>,
@@ -2934,6 +2964,32 @@ mod pacing_tests {
         pace.ticked(TickTrigger::Input, PERIOD, at(base, 137));
         pace.ticked(TickTrigger::Timer, PERIOD, at(base, 500));
         assert!(pace.due(TickTrigger::Input, PERIOD, at(base, 510)), "the budget is whole again");
+    }
+
+    #[test]
+    fn a_host_frame_pulls_forward_like_input() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        pace.ticked(TickTrigger::Timer, PERIOD, base);
+        assert!(!pace.due(TickTrigger::HostFrame, PERIOD, at(base, 9)), "under half a period waits for the timer");
+        assert!(pace.due(TickTrigger::HostFrame, PERIOD, at(base, 10)));
+        pace.ticked(TickTrigger::HostFrame, PERIOD, at(base, 10));
+        assert_eq!(pace.next_due(PERIOD, at(base, 10)), at(base, 30), "the cadence follows the host's frames");
+        assert!(!pace.due(TickTrigger::Timer, PERIOD, at(base, 20)), "the old phase's tick is skipped");
+        assert!(!pace.due(TickTrigger::HostFrame, PERIOD, at(base, 25)), "the budget is spent for a second pull");
+        assert!(pace.due(TickTrigger::HostFrame, PERIOD, at(base, 30)), "a whole period on, the frame is due");
+    }
+
+    #[test]
+    fn a_deferred_tick_holds_the_timer_without_counting_a_frame() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        pace.ticked(TickTrigger::Timer, PERIOD, base);
+        pace.defer(at(base, 30));
+        assert_eq!(pace.next_due(PERIOD, at(base, 20)), at(base, 30), "the timer waits where it was held to");
+        assert!(pace.due(TickTrigger::HostFrame, PERIOD, at(base, 21)), "a frame a period on is still due at once");
+        pace.ticked(TickTrigger::HostFrame, PERIOD, at(base, 21));
+        assert_eq!(pace.next_due(PERIOD, at(base, 21)), at(base, 41), "a rendered frame lifts the hold");
     }
 
     #[test]
