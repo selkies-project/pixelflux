@@ -702,6 +702,9 @@ pub(crate) struct NvencTuning {
     pub preset: GUID,
     pub multipass: NV_ENC_MULTI_PASS,
     pub spatial_aq: bool,
+    /// Temporal adaptive quantization, refused at open where the driver reports no support for
+    /// it: a Volta HEVC session given it faults inside its first encode instead of failing to
+    /// open.
     pub temporal_aq: bool,
     /// The tier an HEVC session declares: High (1) in production, Main (0) to open the same
     /// session at the ceiling `gpu_hevc_high_tier_opens_above_the_main_tier_ceiling` measures.
@@ -1271,6 +1274,20 @@ impl NvencEncoder {
                     "[NVENC] {} 4:4:4 (YUV444) encoding unsupported on this GPU; encoding 4:2:0.",
                     codec.display()
                 );
+            }
+            if tuning.temporal_aq
+                && query_cap(
+                    &function_list,
+                    encoder_session,
+                    codec_guid,
+                    NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ,
+                ) == Some(0)
+            {
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                (cuda.cuMemFree_v2)(input_device_ptr);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err(format!("{} temporal AQ is not supported by this GPU", codec.display()));
             }
 
             let is_444 = caps.fullcolor;
