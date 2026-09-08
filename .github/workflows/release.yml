@@ -1,24 +1,42 @@
 name: Release
 
+# A tag push releases that tag. A manual run releases the tag it names and can
+# hold the release off the "Latest" badge, for a fix to an older series.
+
 on:
   push:
     tags:
       - '[0-9]+.[0-9]+.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish (e.g. 2.1.0)
+        type: string
+        required: true
+      latest:
+        description: Designate this release as the latest
+        type: boolean
+        default: true
 
 permissions:
   contents: read
+
+env:
+  # The tag this run releases: the pushed one, or the one a manual run names
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Verify release notes exist
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          if [ ! -f "release-notes/${TAG}.md" ]; then
-            echo "::error::release-notes/${TAG}.md not found"
+          if [ ! -f "release-notes/${RELEASE_TAG}.md" ]; then
+            echo "::error::release-notes/${RELEASE_TAG}.md not found"
             exit 1
           fi
 
@@ -39,6 +57,8 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - name: Build wheels (${{ matrix.platform }}_${{ matrix.target.arch }})
         uses: pypa/cibuildwheel@v4.2.0
@@ -62,6 +82,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -72,26 +94,36 @@ jobs:
       - name: Get release notes
         id: notes
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
           {
             echo "content<<EOF"
-            cat "release-notes/${TAG}.md"
+            cat "release-notes/${RELEASE_TAG}.md"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Classify the tag
         id: kind
+        env:
+          LATEST: ${{ inputs.latest }}
         run: |
-          # A pre-release tag must not take the "Latest release" badge
-          case "${GITHUB_REF#refs/tags/}" in
-            *[ab]*|*rc*|*dev*) echo "prerelease=true" ;;
-            *) echo "prerelease=false" ;;
-          esac >> "$GITHUB_OUTPUT"
+          # A pre-release tag never takes the "Latest release" badge; a release
+          # takes it unless a manual run holds it back
+          latest=true
+          if [ "${LATEST}" = "false" ]; then latest=false; fi
+          case "${RELEASE_TAG}" in
+            *[ab]*|*rc*|*dev*) prerelease=true; latest=false ;;
+            *) prerelease=false ;;
+          esac
+          {
+            echo "prerelease=${prerelease}"
+            echo "make_latest=${latest}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
           body: ${{ steps.notes.outputs.content }}
           prerelease: ${{ steps.kind.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.kind.outputs.make_latest }}
           files: wheelhouse/*.whl
