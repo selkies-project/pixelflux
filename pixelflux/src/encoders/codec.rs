@@ -491,7 +491,7 @@ pub fn av1_is_key(tu: &[u8]) -> bool {
 }
 
 /// The NAL units of an Annex-B stream, each without its start code and never empty.
-fn annexb_nals(au: &[u8]) -> impl Iterator<Item = &[u8]> {
+pub(crate) fn annexb_nals(au: &[u8]) -> impl Iterator<Item = &[u8]> {
     let mut starts = Vec::new();
     let mut i = 0usize;
     while i + 2 < au.len() {
