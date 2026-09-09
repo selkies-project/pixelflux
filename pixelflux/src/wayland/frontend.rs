@@ -65,10 +65,7 @@ use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
-use smithay::wayland::pointer_constraints::{
-    with_pointer_constraint, PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
-};
-use smithay::wayland::compositor::RegionAttributes;
+use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
 use smithay::input::pointer::PointerHandle;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::delegate_single_pixel_buffer;
@@ -692,9 +689,6 @@ pub struct AppState {
     pub pointer_warp_state: PointerWarpManager,
     pub relative_pointer_state: RelativePointerManagerState,
     pub pointer_constraints_state: PointerConstraintsState,
-    /// Where the holder of a pointer lock asked the pointer to surface when the lock ends, in
-    /// that surface's coordinates; the next motion applies it once the lock is gone.
-    pub cursor_position_hint: Option<(WlSurface, Point<f64, Logical>)>,
     pub render_node_path: String,
     pub auto_gpu_selected: bool,
     /// Computer-use screenshot request; served from that output's next render (the id
@@ -726,45 +720,18 @@ pub struct AppState {
     pub encode_reaper: Vec<std::thread::JoinHandle<Option<crate::GpuEncoder>>>,
 }
 
-/// Pointer-constraints protocol: a lock or confinement a client asks for on a surface holds
-/// while the pointer is over that surface. The motion arms consult `pointer_hold` before moving
-/// the pointer and `activate_constraint_under` after, so a constraint created while the pointer
-/// is already over its surface takes effect here at once and one created ahead of the pointer
-/// takes effect when the pointer arrives. A game reads a lock as permission to turn the view
-/// without the cursor leaving, and a nested KWin only listens for relative motion once the lock
-/// it mirrors from its own client is confirmed, so an unconfirmed lock leaves such a game deaf.
+/// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
+/// confinement region, so activation and cursor-position hints are accepted as no-ops; the global
+/// still exists so clients may bind it without error.
 impl PointerConstraintsHandler for AppState {
-    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
-        // Only a surface the pointer has entered may hold it: one that mapped under a
-        // resting pointer has its constraint activated by the motion that enters it.
-        let Some(focus) = pointer.current_focus() else { return };
-        if focus.wl_surface().as_deref() != Some(surface) {
-            return;
-        }
-        let location = pointer.current_location();
-        let under = self.focus_under(location);
-        if under.as_ref().map(|(target, _)| target) != Some(&focus) {
-            return;
-        }
-        self.activate_constraint_under(pointer, &under, location);
-    }
+    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
     fn cursor_position_hint(
         &mut self,
-        surface: &WlSurface,
+        _surface: &WlSurface,
         _pointer: &PointerHandle<Self>,
-        location: Point<f64, Logical>,
-    ) {
-        self.cursor_position_hint = Some((surface.clone(), location));
-    }
-}
-
-/// What an active pointer constraint asks of the next motion.
-pub(crate) enum PointerHold {
-    /// The pointer stays where it is; only relative motion reaches the holder.
-    Locked,
-    /// The pointer keeps to the region, in surface coordinates, or to the surface without one.
-    Confined(Option<RegionAttributes>),
+        _location: Point<f64, Logical>,
+    ) {}
 }
 
 /// Foreign-toplevel-list protocol: exposes the managed state so Smithay can advertise each
@@ -1193,142 +1160,6 @@ impl AppState {
             }
         }
         best.map(|(_, p)| p).unwrap_or_else(|| (0.0, 0.0).into())
-    }
-
-    /// What the pointer at `p` is over, with the target's origin: a top or overlay layer
-    /// surface first, then a toplevel, then a bottom or background layer surface. Layer
-    /// surfaces live on the output under the point with output-local geometry, so they are
-    /// hit-tested locally and reported at their global location.
-    pub(crate) fn focus_under(&self, p: Point<f64, Logical>) -> Option<(FocusTarget, Point<f64, Logical>)> {
-        use smithay::wayland::shell::wlr_layer::Layer;
-        let layer_hit = |layers: &[Layer]| {
-            let idx = self.node_idx_under(p)?;
-            let node = &self.output_nodes[idx];
-            let origin = Point::<i32, Logical>::from(node.pos);
-            let local = (p - origin.to_f64()).to_i32_round();
-            let layer_map = layer_map_for_output(&node.output);
-            for layer in layer_map.layers().rev() {
-                if layers.contains(&layer.layer())
-                    && let Some(bbox) = layer_map.layer_geometry(layer)
-                    && bbox.contains(local)
-                {
-                    return Some((FocusTarget::LayerSurface(layer.clone()), (bbox.loc + origin).to_f64()));
-                }
-            }
-            None
-        };
-        layer_hit(&[Layer::Overlay, Layer::Top])
-            .or_else(|| {
-                self.space
-                    .element_under(p)
-                    .map(|(window, loc)| (FocusTarget::Window(window.clone()), loc.to_f64()))
-            })
-            .or_else(|| layer_hit(&[Layer::Bottom, Layer::Background]))
-    }
-
-    /// The active constraint the pointer at `location` is subject to on the target under it.
-    pub(crate) fn pointer_hold(
-        &self,
-        pointer: &PointerHandle<Self>,
-        under: &Option<(FocusTarget, Point<f64, Logical>)>,
-        location: Point<f64, Logical>,
-    ) -> Option<PointerHold> {
-        let (target, origin) = under.as_ref()?;
-        // A constraint holds only the surface the pointer has entered; a surface that
-        // mapped over a resting pointer waits for the motion that enters it.
-        if pointer.current_focus().as_ref() != Some(target) {
-            return None;
-        }
-        let surface = target.wl_surface()?;
-        with_pointer_constraint(&surface, pointer, |constraint| {
-            let constraint = constraint?;
-            if !constraint.is_active() {
-                return None;
-            }
-            let local = (location - *origin).to_i32_round();
-            if !constraint.region().is_none_or(|region| region.contains(local)) {
-                return None;
-            }
-            Some(match &*constraint {
-                PointerConstraint::Locked(_) => PointerHold::Locked,
-                PointerConstraint::Confined(confined) => PointerHold::Confined(confined.region().cloned()),
-            })
-        })
-    }
-
-    /// Activates a constraint waiting on the target the pointer has come to rest over.
-    pub(crate) fn activate_constraint_under(
-        &self,
-        pointer: &PointerHandle<Self>,
-        under: &Option<(FocusTarget, Point<f64, Logical>)>,
-        location: Point<f64, Logical>,
-    ) {
-        let Some((target, origin)) = under.as_ref() else { return };
-        let Some(surface) = target.wl_surface() else { return };
-        with_pointer_constraint(&surface, pointer, |constraint| {
-            if let Some(constraint) = constraint
-                && !constraint.is_active()
-                && constraint
-                    .region()
-                    .is_none_or(|region| region.contains((location - *origin).to_i32_round()))
-            {
-                constraint.activate();
-            }
-        });
-    }
-
-    /// Where a confined pointer may go: `target`, with each axis held back that would leave the
-    /// confinement region, and `from` when the rest would leave the surface itself.
-    pub(crate) fn confine(
-        &self,
-        held: &Option<(FocusTarget, Point<f64, Logical>)>,
-        from: Point<f64, Logical>,
-        target: Point<f64, Logical>,
-        region: Option<&RegionAttributes>,
-    ) -> Point<f64, Logical> {
-        let Some((held_target, origin)) = held.as_ref() else { return target };
-        let mut to = target;
-        if let Some(region) = region {
-            if !region.contains((Point::<f64, Logical>::from((to.x, from.y)) - *origin).to_i32_round()) {
-                to.x = from.x;
-            }
-            if !region.contains((Point::<f64, Logical>::from((from.x, to.y)) - *origin).to_i32_round()) {
-                to.y = from.y;
-            }
-        }
-        let same_surface = self.focus_under(to).and_then(|(t, _)| t.wl_surface().map(|s| s.into_owned()))
-            == held_target.wl_surface().map(|s| s.into_owned());
-        if same_surface { to } else { from }
-    }
-
-    /// The global position of a toplevel's surface origin, for a surface the space holds.
-    pub(crate) fn surface_origin(&self, surface: &WlSurface) -> Option<Point<f64, Logical>> {
-        self.space.elements().find_map(|window| {
-            if window.wl_surface().as_deref() != Some(surface) {
-                return None;
-            }
-            self.space
-                .element_location(window)
-                .map(|loc| (loc - window.geometry().loc).to_f64())
-        })
-    }
-
-    /// Applies the cursor position hint a lock's holder committed, once that lock is gone: the
-    /// pointer surfaces where the client last drew it rather than where the lock caught it.
-    pub(crate) fn settle_cursor_hint(&mut self, pointer: &PointerHandle<Self>) {
-        let Some((surface, hint)) = self.cursor_position_hint.clone() else { return };
-        if with_pointer_constraint(&surface, pointer, |c| c.is_some_and(|c| c.is_active())) {
-            return;
-        }
-        self.cursor_position_hint = None;
-        if !surface.alive() {
-            return;
-        }
-        let Some(origin) = self.surface_origin(&surface) else { return };
-        let location = self.clamp_logical(origin + hint);
-        let under = self.focus_under(location);
-        pointer.motion(self, under, &MotionEvent { location, serial: next_serial(), time: wayland_time() });
-        pointer.frame(self);
     }
 
     /// Clamp a logical layout point into the nearest output's logical rectangle.
