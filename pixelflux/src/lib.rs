@@ -3124,7 +3124,8 @@ fn render_node_tick(
     let host_mode = state.host.as_ref().map(|h| h.has_output_for(node.id)).unwrap_or(false);
     if !host_mode && let Some(cap) = node.capture.as_mut() {
         let period = capture_period(cap);
-        cap.pace.ticked(trigger, period, Instant::now());
+        let paced = FramePace::input_paced(state.input_interval, period);
+        cap.pace.ticked(trigger, period, Instant::now(), paced);
     }
 
     // The cursor is composited only on the output the pointer is on, at that output's
@@ -3243,7 +3244,7 @@ fn render_node_tick(
         if let Some(cap) = node.capture.as_mut()
             && let Some(period) = period
         {
-            cap.pace.ticked(trigger, period, now);
+            cap.pace.ticked(trigger, period, now, false);
         }
         if let Some(f) = new_frame {
             host.retain_frame(host_idx, f);
@@ -4891,6 +4892,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         pending_screenshot: None,
         command_rx: None,
         last_input_at: None,
+        pointer_motion_at: None,
+        input_interval: None,
         frame_idle_long: false,
         last_idle_service_at: None,
         deliver_reaper: Vec::new(),
@@ -4965,6 +4968,22 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     /// wake the loop through the
     /// separate wake channel, and the render tick ALSO drains before starting its work, so
     /// queued input is applied ahead of a long render/encode instead of waiting it out.
+    /// Fold one pointer move into the smoothed spacing between moves, the cadence the client
+    /// sends its motion at; a gap of more than a few frame periods is a pause and is clamped so
+    /// the next moves read as paced again within a couple of them.
+    fn note_pointer_motion(state: &mut AppState) {
+        let now = Instant::now();
+        if let Some(prev) = state.pointer_motion_at {
+            let cap = frame_period(state.settings.target_fps) * 4;
+            let dt = now.saturating_duration_since(prev).min(cap);
+            state.input_interval = Some(match state.input_interval {
+                None => dt,
+                Some(avg) => avg.mul_f64(0.875) + dt.mul_f64(0.125),
+            });
+        }
+        state.pointer_motion_at = Some(now);
+    }
+
     fn drain_thread_commands(state: &mut AppState) -> bool {
         let Some(rx) = state.command_rx.take() else { return false };
         let mut had_input = false;
@@ -4978,6 +4997,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     | ThreadCommand::PointerButton { .. }
                     | ThreadCommand::PointerAxis { .. }
             );
+            if matches!(cmd, ThreadCommand::PointerMotion { .. } | ThreadCommand::PointerRelativeMotion { .. }) {
+                note_pointer_motion(state);
+            }
             handle_thread_command(state, cmd);
         }
         if had_input {
