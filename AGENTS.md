@@ -41,6 +41,17 @@ and "pre-existing" is not a reason to leave it. Fix it, or say precisely what is
 what you would do next. The same applies to a failure you cannot reproduce yet -- narrow it until it is either
 fixed or precisely described, and never let a test that fails for an unknown reason pass unremarked.
 
+A change is ready when four questions have answers, and the commit or pull request gives them to the reviewer:
+was the defect, or the missing behaviour, reproduced on the code before the change (a failing check or a measurement
+on the old tree, not an argument from the source); is it gone, or present, on the exact code being committed, through
+the path a user takes rather than a switch a user would never flip (a developer toggle, a debug key, a knob of the
+rig); can the change affect behaviour it was not aimed at, and what was run to know; and is the change stripped to what
+makes it work, since every line the first two answers do not need is noise the maintainers have to sift. A change in an
+area a maintainer has said they are working on goes to a branch and a pull request carrying those answers, never
+straight to `main`, whatever standing permission to push `main` exists. An optional path another component may offer
+(a protocol a compositor advertises, a driver feature, a device) is taken only when its presence is detected and never
+as the default: that it is exposed is not proof it works, and a reviewer has to be able to tell what runs where.
+
 Software H.264 is resolved at build time, never by a setting: the default `gpl` feature makes libx264 the
 encoder behind every CPU H.264 session (striped and full-frame), and a build without it
 (`PIXELFLUX_ENABLE_GPL=0` → `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same
