@@ -121,6 +121,9 @@ const DT_JMPREL: i64 = 23;
 // architecture, so keying on the x86-64 values alone would silently match nothing on aarch64 and
 // leave the multi-GPU filter a no-op there. `RELOC_ARCH_SUPPORTED` is false on any other
 // architecture, where `install` reports the filter unsupported rather than patching nothing.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const _: () = assert!(RELOC_ARCH_SUPPORTED);
+
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
         const RELOC_GLOB_DAT: u32 = 6;
@@ -702,7 +705,6 @@ mod tests {
     /// distinct codes, and both must be flagged supported.
     #[test]
     fn reloc_types_track_the_target_arch() {
-        assert!(RELOC_ARCH_SUPPORTED, "x86-64 / aarch64 builds are supported");
         assert_ne!(RELOC_JUMP_SLOT, RELOC_GLOB_DAT);
         #[cfg(target_arch = "x86_64")]
         {

@@ -139,7 +139,7 @@ fn convert_shm_row(src: &[u8], dst: &mut [u8], src_bpp: usize, swap_rb: bool) {
             dst[..n].copy_from_slice(&src[..n]);
         }
         (4, true) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
                 d[0] = s[2];
                 d[1] = s[1];
                 d[2] = s[0];
@@ -149,12 +149,12 @@ fn convert_shm_row(src: &[u8], dst: &mut [u8], src_bpp: usize, swap_rb: bool) {
         // One 4-byte store per pixel rather than four byte stores: measured ~1.7x on a
         // 3-byte source. The 4-byte arms above vectorize better as they stand.
         (_, true) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<3>().0) {
                 d.copy_from_slice(&[s[2], s[1], s[0], 0xff]);
             }
         }
         (_, false) => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+            for (d, s) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<3>().0) {
                 d.copy_from_slice(&[s[0], s[1], s[2], 0xff]);
             }
         }
@@ -403,17 +403,16 @@ impl Dispatch<wl_output::WlOutput, usize> for CtrlState {
                     o.1 = Some(name);
                 }
             }
-            wl_output::Event::Mode { flags, width, height, .. } => {
+            wl_output::Event::Mode { flags, width, height, .. }
                 if flags
                     .into_result()
-                    .is_ok_and(|f| f.contains(wl_output::Mode::Current))
-                {
-                    let mut sizes = state.sizes.lock().unwrap();
-                    if sizes.len() <= *idx {
-                        sizes.resize(*idx + 1, (0, 0));
-                    }
-                    sizes[*idx] = (width, height);
+                    .is_ok_and(|f| f.contains(wl_output::Mode::Current)) =>
+            {
+                let mut sizes = state.sizes.lock().unwrap();
+                if sizes.len() <= *idx {
+                    sizes.resize(*idx + 1, (0, 0));
                 }
+                sizes[*idx] = (width, height);
             }
             _ => {}
         }
@@ -624,8 +623,10 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
             }
             Event::DmabufFormat { format, modifiers } => {
                 let mods = modifiers
-                    .chunks_exact(8)
-                    .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_ne_bytes(*c))
                     .collect();
                 state.ext_pending_dma.push((format, mods));
             }
@@ -838,9 +839,7 @@ impl HostKeyboardState {
     fn update_key(&mut self, xkb_keycode: u32, pressed: bool) -> Option<SerializedMods> {
         // A key can only move a state that exists; with no keymap the caller sends no key
         // event, so the pressed set must not record the transition either.
-        if self.state.is_none() {
-            return None;
-        }
+        self.state.as_ref()?;
         let changed = if pressed {
             self.pressed.insert(xkb_keycode)
         } else {
@@ -2534,6 +2533,39 @@ mod tests {
         let mut keyboard = HostKeyboardState::default();
         assert!(keyboard.set_keymap(&text).is_some());
         keyboard
+    }
+
+    /// Every shm layout a compositor may announce, converted to BGRA.
+    #[test]
+    fn shm_rows_reach_bgra_from_each_announced_layout() {
+        let cases = [
+            (wl_shm::Format::Xrgb8888 as u32, vec![1u8, 2, 3, 4], vec![1u8, 2, 3, 4]),
+            (wl_shm::Format::Xbgr8888 as u32, vec![1u8, 2, 3, 9], vec![3u8, 2, 1, 9]),
+            (wl_shm::Format::Bgr888 as u32, vec![1u8, 2, 3], vec![3u8, 2, 1, 0xff]),
+            (wl_shm::Format::Rgb888 as u32, vec![1u8, 2, 3], vec![1u8, 2, 3, 0xff]),
+        ];
+        for (format, src, want) in cases {
+            let (bpp, swap) = shm_src_layout(format);
+            let mut dst = vec![0u8; 4];
+            convert_shm_row(&src, &mut dst, bpp, swap);
+            assert_eq!(dst, want, "format {format}");
+        }
+    }
+
+    /// A row wider than one pixel converts every pixel, not just the first.
+    #[test]
+    fn shm_rows_convert_every_pixel_of_the_row() {
+        let src: Vec<u8> = (0..12u8).collect();
+        let mut dst = vec![0u8; 16];
+        convert_shm_row(&src, &mut dst, 3, true);
+        assert_eq!(
+            dst,
+            vec![2, 1, 0, 0xff, 5, 4, 3, 0xff, 8, 7, 6, 0xff, 11, 10, 9, 0xff]
+        );
+        let src: Vec<u8> = (0..8u8).collect();
+        let mut dst = vec![0u8; 8];
+        convert_shm_row(&src, &mut dst, 4, true);
+        assert_eq!(dst, vec![2, 1, 0, 3, 6, 5, 4, 7]);
     }
 
     #[test]
