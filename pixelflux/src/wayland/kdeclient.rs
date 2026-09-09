@@ -127,10 +127,8 @@ impl Dispatch<ZkdeScreencastStreamUnstableV1, ()> for CastState {
             zkde_screencast_stream_unstable_v1::Event::Failed { error } => {
                 state.outcome = Some(Err(error))
             }
-            zkde_screencast_stream_unstable_v1::Event::Closed => {
-                if state.outcome.is_none() {
-                    state.outcome = Some(Err("the compositor closed the stream".to_string()));
-                }
+            zkde_screencast_stream_unstable_v1::Event::Closed if state.outcome.is_none() => {
+                state.outcome = Some(Err("the compositor closed the stream".to_string()));
             }
             _ => {}
         }
@@ -405,7 +403,7 @@ fn enabled_sorted(state: &KdeOutState) -> Vec<usize> {
 /// The session's enabled screens as `(name, x, y, width, height)` in screen
 /// order; the size is the current mode's, `(0, 0)` where none was announced.
 /// Empty when the compositor serves no `kde_output_device_v2` globals.
-pub fn list_screens(socket_path: &str) -> Result<Vec<(String, i32, i32, i32, i32)>, String> {
+pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> {
     let (_conn, _queue, state) = read_devices(socket_path)?;
     let screens = enabled_sorted(&state)
         .into_iter()

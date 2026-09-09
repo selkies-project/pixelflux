@@ -1632,7 +1632,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<GpuEnc
                     Err(e) => {
                         // One line per recovery window: a session failing at frame rate would
                         // otherwise write a line per frame for the life of the capture.
-                        if hw_error_streak % HW_ERROR_RECOVERY_THRESHOLD == 0 {
+                        if hw_error_streak.is_multiple_of(HW_ERROR_RECOVERY_THRESHOLD) {
                             eprintln!("[wl-encode] HW encode error: {e}");
                         }
                         hw_error_streak = hw_error_streak.saturating_add(1);
@@ -3749,14 +3749,16 @@ fn render_node_tick(
                         node.frame_buffer[..n].copy_from_slice(&buf[..n]);
                     }
                 if let Some((id, buf)) = pool_slot.take() {
-                    let is_animated = node.overlay_state.is_animated();
-                    cap.encode_pool.as_ref().unwrap().publish(WlFrame {
+                    let frame = WlFrame {
                         id,
                         buf,
                         frame_id: cap.frame_counter,
                         damage: std::mem::take(&mut damage_rects),
-                        is_animated,
-                    });
+                        is_animated: node.overlay_state.is_animated(),
+                    };
+                    if let Some(pool) = cap.encode_pool.as_ref() {
+                        pool.publish(frame);
+                    }
                     cap.frame_counter = cap.frame_counter.wrapping_add(1);
                 }
             } else if let Some(ref mut encoder) = cap.video_encoder {
@@ -3931,7 +3933,7 @@ fn render_node_tick(
                         crate::computer_use::encode_png_rgba(&node.frame_buffer, w, h)
                     } else {
                         let mut rgba = node.frame_buffer.clone();
-                        for px in rgba.chunks_exact_mut(4) {
+                        for px in rgba.as_chunks_mut::<4>().0 {
                             px.swap(0, 2);
                         }
                         crate::computer_use::encode_png_rgba(&rgba, w, h)
@@ -6034,6 +6036,7 @@ impl WaylandBackend {
     /// one display to the next, instead of stopping at the edge of the screen it started
     /// on. `x` and `y` are relative to `owner`'s output. False when the id is taken, the
     /// owner is unknown or itself a view, or the rectangle leaves the owner's output.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, owner, x, y, width, height))]
     fn create_view(
         &self,
@@ -7385,7 +7388,7 @@ impl ScreenCapture {
     /// other way to be checked against. The same ladder as
     /// `set_app_screen_layout` (zwlr, then KWin's output devices). Empty =
     /// that compositor manages no outputs for clients.
-    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<(String, i32, i32, i32, i32)>> {
+    fn list_app_screens(&self, py: Python<'_>, display: String) -> PyResult<Vec<crate::wayland::AppScreen>> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
@@ -7675,6 +7678,7 @@ impl ScreenCapture {
     }
     /// Add a display over a rectangle of an existing Wayland output (see
     /// `WaylandBackend.create_view`); false when no backend runs.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (id, owner, x, y, width, height))]
     fn create_view(
         &self,

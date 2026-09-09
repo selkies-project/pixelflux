@@ -181,7 +181,7 @@ fn pack_i444_as_vuyx(planar: &[u8], packed: &mut Vec<u8>, plane: usize) {
     packed.resize(plane * 4, 0);
     let (y, chroma) = planar.split_at(plane);
     let (u, v) = chroma.split_at(plane);
-    for (i, px) in packed.chunks_exact_mut(4).enumerate() {
+    for (i, px) in packed.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         px[0] = v[i];
         px[1] = u[i];
         px[2] = y[i];

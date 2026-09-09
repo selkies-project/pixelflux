@@ -31,3 +31,7 @@ pub mod kdeproto;
 pub mod ficlient;
 /// Host-capture mode: capture/inject as a client of an external compositor.
 pub mod host;
+
+/// An enabled screen as clients see it: name, layout position and the size of
+/// the mode it currently holds.
+pub type AppScreen = (String, i32, i32, i32, i32);
