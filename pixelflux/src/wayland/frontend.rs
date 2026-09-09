@@ -65,7 +65,9 @@ use smithay::wayland::pointer_warp::{PointerWarpHandler, PointerWarpManager};
 use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
-use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState};
+use smithay::wayland::pointer_constraints::{
+    with_pointer_constraint, PointerConstraint, PointerConstraintsHandler, PointerConstraintsState,
+};
 use smithay::input::pointer::PointerHandle;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::delegate_single_pixel_buffer;
@@ -775,11 +777,22 @@ pub struct AppState {
     pub encode_reaper: Vec<std::thread::JoinHandle<Option<crate::GpuEncoder>>>,
 }
 
-/// Pointer-constraints protocol wiring. The headless capture path never enforces a lock or
-/// confinement region, so activation and cursor-position hints are accepted as no-ops; the global
-/// still exists so clients may bind it without error.
+/// Pointer-constraints protocol. A lock is activated for the surface the pointer already holds,
+/// and `activate_constraint_under` picks up one asked for ahead of the pointer when the motion
+/// that enters it arrives: SDL asks as relative mode goes on, which is before it has the pointer.
+/// Confinement regions and cursor-position hints are still accepted as no-ops.
 impl PointerConstraintsHandler for AppState {
-    fn new_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        let Some(focus) = pointer.current_focus() else { return };
+        if focus.wl_surface().as_deref() != Some(surface) {
+            return;
+        }
+        with_pointer_constraint(surface, pointer, |constraint| {
+            if let Some(constraint) = constraint {
+                constraint.activate();
+            }
+        });
+    }
 
     fn cursor_position_hint(
         &mut self,
@@ -1215,6 +1228,51 @@ impl AppState {
             }
         }
         best.map(|(_, p)| p).unwrap_or_else(|| (0.0, 0.0).into())
+    }
+
+    /// Whether an active lock holds the pointer where it is, so a motion must carry the delta
+    /// alone. Only the surface the pointer has entered can hold it, and only inside the region
+    /// the lock names.
+    pub(crate) fn pointer_locked(
+        &self,
+        pointer: &PointerHandle<Self>,
+        under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        location: Point<f64, Logical>,
+    ) -> bool {
+        let Some((target, origin)) = under.as_ref() else { return false };
+        if pointer.current_focus().as_ref() != Some(target) {
+            return false;
+        }
+        let Some(surface) = target.wl_surface() else { return false };
+        with_pointer_constraint(&surface, pointer, |constraint| match constraint {
+            Some(constraint) if constraint.is_active() => {
+                let local = (location - *origin).to_i32_round();
+                constraint.region().is_none_or(|region| region.contains(local))
+                    && matches!(&*constraint, PointerConstraint::Locked(_))
+            }
+            _ => false,
+        })
+    }
+
+    /// Activates a constraint waiting on the surface the pointer has arrived over.
+    pub(crate) fn activate_constraint_under(
+        &self,
+        pointer: &PointerHandle<Self>,
+        under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        location: Point<f64, Logical>,
+    ) {
+        let Some((target, origin)) = under.as_ref() else { return };
+        let Some(surface) = target.wl_surface() else { return };
+        with_pointer_constraint(&surface, pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && !constraint.is_active()
+                && constraint
+                    .region()
+                    .is_none_or(|region| region.contains((location - *origin).to_i32_round()))
+            {
+                constraint.activate();
+            }
+        });
     }
 
     /// Clamp a logical layout point into the nearest output's logical rectangle.
