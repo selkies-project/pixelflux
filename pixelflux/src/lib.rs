@@ -5396,11 +5396,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         // or its cursor stays behind until the next move -- and a button
                         // landing first presses at that stale spot.
                         if entered && under.is_some() {
-                            pointer.motion(state, under, &MotionEvent {
+                            pointer.motion(state, under.clone(), &MotionEvent {
                                 location: p, serial: next_serial(), time,
                             });
                         }
                         pointer.frame(state);
+                        state.activate_constraint_under(&pointer, &under, p);
                     }
                 }
                 ThreadCommand::PointerRelativeMotion { dx, dy } => {
@@ -5422,6 +5423,24 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 
                     if let Some(pointer) = state.seat.get_pointer() {
                         let current_pos = pointer.current_location();
+                        let event = RelativeMotionEvent {
+                            utime,
+                            delta: (dx, dy).into(),
+                            delta_unaccel: (dx, dy).into(),
+                        };
+                        let resting = state.space.element_under(current_pos).map(|(window, loc)| {
+                            (FocusTarget::Window(window.clone()), loc.to_f64())
+                        });
+                        // A lock's holder is given the delta and nothing else: moved as well, it
+                        // reads the move a second time off the position it is handed, and a game
+                        // turns twice as far as the hand did.
+                        if state.pointer_locked(&pointer, &resting, current_pos) {
+                            if !via_fake_input {
+                                pointer.relative_motion(state, resting, &event);
+                            }
+                            pointer.frame(state);
+                            return;
+                        }
                         let new_pos = state.clamp_logical(
                             (current_pos.x + dx, current_pos.y + dy).into(),
                         );
@@ -5449,15 +5468,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         }
 
                         if !via_fake_input {
-                            let event = RelativeMotionEvent {
-                                utime,
-                                delta: (dx, dy).into(),
-                                delta_unaccel: (dx, dy).into(),
-                            };
-                            pointer.relative_motion(state, under, &event);
+                            pointer.relative_motion(state, under.clone(), &event);
                         }
 
                         pointer.frame(state);
+                        state.activate_constraint_under(&pointer, &under, new_pos);
                     }
                 }
                 ThreadCommand::PointerButton { btn, state: btn_state_val } => {
