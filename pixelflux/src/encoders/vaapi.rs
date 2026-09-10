@@ -379,7 +379,12 @@ impl VaapiEncoder {
     ///    dmabuf input, or plain BGRA for host input. `scale_vaapi` does the ARGB→YUV convert on the
     ///    GPU in **BT.709 limited range** (`out_range=tv`) so VA-API output matches the NVENC/x264
     ///    color — an explicit convert is used rather than trusting encoder-side RGB CSC, which
-    ///    varies across VA drivers.
+    ///    varies across VA drivers. `out_chroma_location=center` asks the VPP to average each
+    ///    horizontal pixel pair when it subsamples chroma to 4:2:0. Left unset, the Intel media
+    ///    driver defaults the target surface to left siting and its SFC downsampler then keeps the
+    ///    left pixel's chroma of every pair, so the coloured fringes of subpixel-antialiased text
+    ///    survive at full strength as blue/orange 2×2 blocks along glyph edges, where the CPU
+    ///    path's 2×2 average halves them. Center siting is the same average that path produces.
     /// 5. **Graph staging**: the chain is built with the segment API (parse → create filters →
     ///    attach the VA device to every filter → apply → link our endpoints to the dangling pads)
     ///    rather than the one-shot parser. `hwupload` initializes *during* the parse and fails
@@ -676,7 +681,7 @@ impl VaapiEncoder {
 
             let stage = if host_input { "hwupload" } else { "hwmap" };
             let filters_desc = CString::new(format!(
-                "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt709:out_range=tv",
+                "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt709:out_range=tv:out_chroma_location=center",
                 stage,
                 width,
                 height,
