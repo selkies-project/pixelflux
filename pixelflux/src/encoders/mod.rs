@@ -401,6 +401,65 @@ pub fn select_frame_encoder(
     }
 }
 
+/// The fixture the chroma-siting checks of every backend share.
+#[cfg(test)]
+pub(crate) mod chroma_siting {
+    /// Four colours averaging to grey, of which no pixel, row pair or column pair does: the
+    /// chroma of a block comes out neutral only where all four were averaged. A 4:2:0 convert
+    /// that keeps one pixel of the block, or one row or column of it, leaves the saturation
+    /// subpixel-antialiased text carries on its glyph edges in the picture as visible colour.
+    pub const TILE: [[u8; 3]; 4] = [[0, 0, 128], [0, 255, 0], [128, 128, 255], [255, 0, 0]];
+
+    /// `TILE` laid out as a `w`x`h` BGRA frame.
+    pub fn bgra(w: usize, h: usize) -> Vec<u8> {
+        let mut buf = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let p = TILE[(y % 2) * 2 + (x % 2)];
+                buf[(y * w + x) * 4..][..3].copy_from_slice(&[p[2], p[1], p[0]]);
+            }
+        }
+        buf
+    }
+
+    /// BT.601 limited-range chroma of an RGB triple, the conversion every 4:2:0 session declares.
+    pub fn chroma(rgb: [f64; 3]) -> (f64, f64) {
+        let [r, g, b] = rgb;
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        (128.0 + 224.0 * (b - y) / (2.0 * 0.886 * 255.0), 128.0 + 224.0 * (r - y) / (2.0 * 0.701 * 255.0))
+    }
+
+    /// The worst distance from neutral chroma over a decoded frame's chroma planes.
+    pub fn worst(f: &crate::webcam::convert::I420View<'_>) -> f64 {
+        let mut worst = 0.0f64;
+        for r in 0..f.chroma_height() {
+            for c in 0..f.chroma_width() {
+                let i = r * f.uv_stride + c;
+                worst = worst.max((f64::from(f.u[i]) - 128.0).hypot(f64::from(f.v[i]) - 128.0));
+            }
+        }
+        worst
+    }
+
+    /// The tile is a fixture, so its premise is checked where it lives: the four chromas cancel,
+    /// and every partial average a wrong siting would take is far from neutral.
+    #[test]
+    fn the_tile_separates_the_sitings() {
+        let c: Vec<(f64, f64)> = TILE.iter().map(|&p| chroma([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])).collect();
+        let mean = |of: &[usize]| {
+            let (u, v) = of.iter().fold((0.0, 0.0), |(u, v), &i| (u + c[i].0, v + c[i].1));
+            let n = of.len() as f64;
+            (u / n - 128.0).hypot(v / n - 128.0)
+        };
+        let all = mean(&[0, 1, 2, 3]);
+        assert!(all < 0.5, "the whole tile must average to neutral chroma, off by {all:.1}");
+        for part in [vec![0], vec![1], vec![2], vec![3], vec![0, 1], vec![2, 3], vec![0, 2], vec![1, 3]] {
+            let d = mean(&part);
+            assert!(d > 40.0, "pixels {part:?} average to chroma only {d:.1} from neutral");
+        }
+    }
+}
+
 /// The chroma format a session actually carries, which is not always the one requested: a
 /// hardware session only when the device carries it, the software path only when the build's
 /// encoder for the codec does. Every consumer of "is this stream 4:4:4" reads it from here.
