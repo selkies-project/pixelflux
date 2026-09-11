@@ -3362,6 +3362,65 @@ mod gpu_tests {
         }
     }
 
+    /// On a real GPU: where NVENC's fixed-function RGB→YUV sites chroma, per axis. Rows of
+    /// alternating colours whose pair averages to grey come back neutral, so the downsampler
+    /// averages the two rows of a block. Columns of the same pair come back three quarters of
+    /// the way to the left column's chroma, so horizontally it weights the pair 3:1 instead of
+    /// averaging it — chroma a quarter pixel left of the block centre, which keeps half the
+    /// colour a left-sited convert would leave on the glyph edges of subpixel-antialiased text,
+    /// where the software and VA-API converts keep none. The encode API exposes no siting
+    /// control, so this pins what the hardware does rather than asking for the centre.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_chroma_siting_of_the_hardware_csc() {
+        use crate::encoders::chroma_siting::chroma;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (w, h) = (256usize, 256usize);
+        let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
+        let pair = |by_column: bool| {
+            let mut b = vec![255u8; w * h * 4];
+            for y in 0..h {
+                for x in 0..w {
+                    let first = if by_column { x % 2 == 0 } else { y % 2 == 0 };
+                    let p = if first { blue } else { yellow };
+                    b[(y * w + x) * 4..][..3].copy_from_slice(&[p[2] as u8, p[1] as u8, p[0] as u8]);
+                }
+            }
+            b
+        };
+        let s = settings(w as i32, h as i32, 60.0);
+        let decode = |bgra: &[u8]| -> (f64, f64) {
+            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+            let pkt = enc.encode_cpu_packed(bgra, w * 4, false, 0, 20, true).expect("packed encode");
+            assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
+            let v = dec.frame().expect("decoded frame");
+            let (mut su, mut sv) = (0.0f64, 0.0f64);
+            let n = (v.chroma_height() * v.chroma_width()) as f64;
+            for r in 0..v.chroma_height() {
+                for c in 0..v.chroma_width() {
+                    let i = r * v.uv_stride + c;
+                    su += f64::from(v.u[i]);
+                    sv += f64::from(v.v[i]);
+                }
+            }
+            (su / n, sv / n)
+        };
+        let rows = decode(&pair(false));
+        let cols = decode(&pair(true));
+        let weighted = chroma([0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]));
+        println!("[chroma-siting] NVENC rows {rows:?} columns {cols:?} against 3:1 {weighted:?} and left {:?}", chroma(blue));
+        assert!(
+            (rows.0 - 128.0).hypot(rows.1 - 128.0) <= 2.0,
+            "NVENC averages the rows of a block, so {rows:?} must be neutral"
+        );
+        assert!(
+            (cols.0 - weighted.0).hypot(cols.1 - weighted.1) <= 2.0,
+            "NVENC weights the columns of a block 3:1: {cols:?} against {weighted:?}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn gpu_init_above_default_headroom() {

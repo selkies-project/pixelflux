@@ -1540,6 +1540,50 @@ mod tests {
             }
         }
     }
+
+    /// The host convert sites chroma at the centre of the block on both its paths, the
+    /// single-threaded one and the banded one, and a band boundary never splits a chroma pair.
+    #[test]
+    fn the_host_convert_sites_chroma_at_the_block_centre() {
+        use super::convert_to_yuv_mt;
+        let (w, h) = (64usize, 64usize);
+        let bgra = crate::encoders::chroma_siting::bgra(w, h);
+        for bands in [1usize, 4, 7] {
+            let (mut yp, mut up, mut vp) = (vec![0u8; w * h], vec![0u8; w * h / 4], vec![0u8; w * h / 4]);
+            convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, &mut yp, &mut up, &mut vp, (w, w / 2), bands)
+                .expect("convert");
+            let worst = up
+                .iter()
+                .zip(&vp)
+                .map(|(&u, &v)| (f64::from(u) - 128.0).hypot(f64::from(v) - 128.0))
+                .fold(0.0f64, f64::max);
+            assert!(worst <= 2.0, "{bands} bands: chroma sits {worst:.1} off neutral");
+        }
+    }
+
+    /// The JPEG stripes a WebSockets session sends by default hand BGRA to libjpeg-turbo, which
+    /// subsamples chroma itself, so the tile is held to the same neutral chroma there.
+    #[test]
+    fn the_jpeg_path_sites_chroma_at_the_block_centre() {
+        use super::Codec;
+        use crate::webcam::decode::new_decoder;
+        let (w, h) = (64usize, 64usize);
+        let bgra = crate::encoders::chroma_siting::bgra(w, h);
+        let mut comp = turbojpeg::Compressor::new().expect("turbojpeg compressor");
+        comp.set_quality(90).expect("quality");
+        let img = turbojpeg::Image {
+            pixels: &bgra[..],
+            width: w,
+            pitch: w * 4,
+            height: h,
+            format: turbojpeg::PixelFormat::BGRA,
+        };
+        let jpeg = comp.compress_to_vec(img).expect("compress");
+        let mut dec = new_decoder(Codec::Jpeg).expect("jpeg decoder");
+        assert!(dec.decode(&jpeg).expect("decode"), "the stripe decoded nothing");
+        let worst = crate::encoders::chroma_siting::worst(&dec.frame().expect("frame"));
+        assert!(worst <= 4.0, "JPEG chroma sits {worst:.1} off neutral");
+    }
 }
 
 #[cfg(test)]
