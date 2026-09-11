@@ -541,12 +541,17 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ### Colour conversion
 
-NVENC encodes the captured ARGB directly, so there is **no CUDA Toolkit / NVRTC requirement** —
-only the NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime.
-The driver's ARGB→YUV hardware conversion is fixed at BT.601 limited range (no encode-session
-flag retargets it), so pixelflux declares exactly that in the VUI — BT.709 primaries and
-transfer for the sRGB desktop source, SMPTE 170M matrix, limited range. Every other 4:2:0
-session follows the same posture: the VA-API convert (`scale_vaapi`) and the software encoders'
+NVENC takes the captured ARGB, so there is **no CUDA Toolkit / NVRTC requirement** — only the
+NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. The driver's
+ARGB→YUV hardware conversion is fixed at BT.601 limited range (no encode-session flag retargets
+it), so pixelflux declares exactly that in the VUI — BT.709 primaries and transfer for the sRGB
+desktop source, SMPTE 170M matrix, limited range. That conversion weights the two columns of a
+2x2 block 3:1 rather than averaging them, which leaves half the colour of a subpixel-antialiased
+glyph edge in the chroma plane, so a 4:2:0 NVENC session converts on the GPU instead: a small
+kernel shipped as PTX that `libcuda` JIT-compiles (still no toolkit and no runtime compiler),
+reading the frame where it already lies — the packed surface, a pitch-linear dmabuf import, or a
+texture over an array-typed one — and writing the NV12 the encoder takes. 4:4:4 subsamples no
+chroma and keeps the hardware conversion. Every other 4:2:0 session follows the same posture: the VA-API convert (`scale_vaapi`) and the software encoders'
 host conversion use the BT.601 matrix at limited range and declare it, because that is the
 matrix the browser engines' presentation paths invert exactly (Chromium and Firefox paint a
 BT.709-tagged frame with a BT.601-like inversion and WebKit honours either tag, measured
