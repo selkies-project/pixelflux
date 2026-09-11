@@ -848,8 +848,10 @@ impl ChromaConvert {
         }
         let (mut nv12, mut pitch): (CUdeviceptr, usize) = (0, 0);
         // NV12 is the luma plane followed by the interleaved chroma plane at the same pitch,
-        // which is the one allocation NVENC reads both halves of.
-        if (cuda.cuMemAllocPitch_v2)(&mut nv12, &mut pitch, width as usize, (height + height / 2) as usize, 4)
+        // which is the one allocation NVENC reads both halves of. The chroma rows round up, so
+        // the kernel's last row is inside the allocation even at an odd height, which the
+        // capture paths do not produce for a video codec but nothing here relies on.
+        if (cuda.cuMemAllocPitch_v2)(&mut nv12, &mut pitch, width as usize, (height + height.div_ceil(2)) as usize, 4)
             != CUresult::CUDA_SUCCESS
         {
             (cuda.cuModuleUnload)(module);
@@ -2945,12 +2947,6 @@ impl NvencEncoder {
             return Ok(ext.mapped);
         }
         self.unmap_external_input();
-        if pitch < self.width as usize * 4 || !pitch.is_multiple_of(4) {
-            return Err(format!(
-                "external input pitch {pitch} does not cover {}x{} at 4-byte alignment",
-                self.width, self.height
-            ));
-        }
         let mut reg_res = NV_ENC_REGISTER_RESOURCE {
             version: sv(NvStruct::RegisterResource),
             resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
@@ -3016,6 +3012,14 @@ impl NvencEncoder {
     ) -> Result<Vec<u8>, String> {
         unsafe {
             self.reconfigure_if_needed(crf);
+            // The pitch has to cover the session's rows whichever conversion reads them: the
+            // kernel indexes by it, and NVENC's own registration requires the 4-byte alignment.
+            if pitch < self.width as usize * 4 || !pitch.is_multiple_of(4) {
+                return Err(format!(
+                    "external input pitch {pitch} does not cover {}x{} at 4-byte alignment",
+                    self.width, self.height
+                ));
+            }
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
             let format = if rgba {
                 NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
@@ -3922,6 +3926,19 @@ mod gpu_tests {
             let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
             println!("[chart] NVENC 4:4:4 {fullcolor}: worst |dRGB| {worst:.1}");
             assert!(worst <= 8.0, "the session paints {worst:.1} off the chart");
+
+            // A resize rebuilds the convert's surface around the new geometry, so the chart is
+            // read back again at a size the session was not opened for.
+            let (w2, h2) = (w + 64, h + 32);
+            let grown = RustCaptureSettings { width: w2 as i32, height: h2 as i32, ..st };
+            assert!(enc.reconfigure_resolution(&grown).expect("resize"), "the resize was taken");
+            assert_eq!(enc.csc.is_some(), !fullcolor, "the convert followed the resize");
+            let pkt = enc.encode_cpu_packed(&chart_bgra(w2, h2), w2 * 4, false, 1, 20, true).expect("encode");
+            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+            assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
+            let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
+            println!("[chart] NVENC 4:4:4 {fullcolor} after a resize to {w2}x{h2}: worst |dRGB| {worst:.1}");
+            assert!(worst <= 8.0, "the resized session paints {worst:.1} off the chart");
         }
     }
 
@@ -3962,6 +3979,88 @@ mod gpu_tests {
             off(weighted_709) <= 2.0 && off(weighted_709) < off(weighted_601),
             "the hardware conversion did not follow the declared matrix: {hardware:?}"
         );
+    }
+
+    /// On a real GPU: the external-pointer path encodes the caller's buffer where it lies. The
+    /// session's own staging surface is painted a colour the frame does not contain first, so a
+    /// picture that had been copied through it would decode to that colour instead — this is the
+    /// X11 NvFBC hand-over, without needing NvFBC to reach it. A pitch that cannot cover the
+    /// session's rows is refused rather than read past. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_external_pointer_is_encoded_where_it_lies() {
+        use crate::encoders::chroma_siting::{ycbcr, BT709};
+        use crate::webcam::decode::AvDecoder;
+        let (w, h) = (256usize, 128usize);
+        let st = settings(w as i32, h as i32, 60.0);
+        let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+        let paint = [32u8, 192, 64];
+        let poison = [240u8, 16, 200];
+        let (external, external_pitch) = unsafe {
+            let cu = enc.cuda.clone();
+            (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
+            let (mut ptr_, mut pitch) = (0 as CUdeviceptr, 0usize);
+            assert_eq!(
+                (cu.cuMemAllocPitch_v2)(&mut ptr_, &mut pitch, w * 4, h, 16),
+                CUresult::CUDA_SUCCESS
+            );
+            paint_surface(&cu, ptr_, pitch, w, h, paint);
+            paint_surface(&cu, enc.input_device_ptr, enc.input_pitch, w, h, poison);
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+            (ptr_, pitch)
+        };
+        let pkt = enc
+            .encode_cuda_pitch(external, external_pitch, false, 0, 20, true)
+            .expect("external encode");
+        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let (mean, _) = decoded_means(&mut dec, &pkt, (0, 0, w as i32, h as i32));
+        let want = ycbcr(paint.map(f64::from), BT709);
+        println!("[external] decoded {mean:?} against the painted {want:?}");
+        for i in 0..3 {
+            assert!(
+                (mean[i] - want[i]).abs() <= 8.0,
+                "plane {i} came back {:.1}, not the painted {:.1}: the frame was staged, not read in place",
+                mean[i],
+                want[i]
+            );
+        }
+        assert!(
+            enc.encode_cuda_pitch(external, w * 4 - 4, false, 1, 20, false).is_err(),
+            "a pitch too short for the session's rows must be refused"
+        );
+        unsafe {
+            let cu = enc.cuda.clone();
+            (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
+            (cu.cuMemFree_v2)(external);
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+    }
+
+    /// Test helper: fill a pitched device surface with one BGRA colour.
+    unsafe fn paint_surface(
+        cuda: &CudaFunctions,
+        dst: CUdeviceptr,
+        dst_pitch: usize,
+        w: usize,
+        h: usize,
+        rgb: [u8; 3],
+    ) {
+        let mut host = vec![255u8; w * h * 4];
+        for px in host.as_chunks_mut::<4>().0 {
+            px[..3].copy_from_slice(&[rgb[2], rgb[1], rgb[0]]);
+        }
+        let copy = CUDA_MEMCPY2D {
+            srcMemoryType: CUmemorytype::CU_MEMORYTYPE_HOST,
+            srcHost: host.as_ptr() as *const c_void,
+            srcPitch: w * 4,
+            dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE,
+            dstDevice: dst,
+            dstPitch: dst_pitch,
+            WidthInBytes: w * 4,
+            Height: h,
+            ..Default::default()
+        };
+        assert_eq!((cuda.cuMemcpy2D_v2)(&copy), CUresult::CUDA_SUCCESS, "paint the surface");
     }
 
     /// A frame of two colours alternating by column or by row, so every 2x2 block averages to
@@ -4242,6 +4341,16 @@ mod gpu_tests {
             out
         };
 
+        // Painting the session's own staging surface a colour neither frame contains proves the
+        // direct arm never passes through it: a copied frame would decode to this instead.
+        if all_direct(&enc) {
+            unsafe {
+                let cu = enc.cuda.clone();
+                (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
+                paint_surface(&cu, enc.input_device_ptr, enc.input_pitch, w as usize, h as usize, [240, 16, 200]);
+                (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+            }
+        }
         let direct = run(&mut enc, "direct");
         println!(
             "driver mapped the dmabuf {}: {}",
