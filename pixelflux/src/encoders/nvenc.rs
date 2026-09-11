@@ -3811,7 +3811,7 @@ mod gpu_tests {
             }
         }
         let (u, cr) = (su / n, sv / n);
-        println!("[chroma-siting] dmabuf mapped as a {}: ({u:.1}, {cr:.1})", mapped_kind(&enc));
+        println!("[chroma-siting] dmabuf mapped as {}: ({u:.1}, {cr:.1})", mapped_kind(&enc));
         let off = (u - 128.0).hypot(cr - 128.0);
         assert!(off <= 2.0, "the zero-copy path leaves chroma {off:.1} off neutral");
     }
@@ -4305,8 +4305,8 @@ mod gpu_tests {
     fn mapped_kind(enc: &NvencEncoder) -> &'static str {
         match enc.dmabuf_cache.values().next().map(|c| c.egl_frame.frame_type) {
             Some(CU_EGL_FRAME_TYPE_PITCH) => "pitch-linear",
-            Some(CU_EGL_FRAME_TYPE_ARRAY) => "as a CUDA array",
-            _ => "in an unknown frame kind",
+            Some(CU_EGL_FRAME_TYPE_ARRAY) => "a CUDA array",
+            _ => "an unknown frame kind",
         }
     }
 
