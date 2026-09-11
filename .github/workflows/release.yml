@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and publish (e.g. 2.1.0 or 2.2.0rc1)
+        description: Release tag to build and publish, tagging this run's commit when it is new (e.g. 2.1.0 or 2.2.0rc1)
         type: string
         required: true
       latest:
@@ -30,9 +30,35 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       notes: ${{ steps.notes.outputs.path }}
     steps:
+      - name: Check the tag is a version pip keeps
+        # The tag is what the wheels are versioned as, so it has to be a PEP 440
+        # version spelled the way pip normalizes it, and it is checked before
+        # anything is created under that name
+        run: |
+          echo "${RELEASE_TAG}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)?$' \
+            || { echo "::error::${RELEASE_TAG} is not a PEP 440 version (2.1.0, 2.2.0rc1)"; exit 1; }
+
+      - name: Tag the commit this run started from
+        # A manual run names the release, so a tag it does not find yet is
+        # created here on the commit the run was started from; an existing one
+        # is left pointing where it does, which is what re-releases a tag.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null 2>&1; then
+            echo "${RELEASE_TAG} is already tagged"
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${RELEASE_TAG}" -f sha="${GITHUB_SHA}"
+            echo "${RELEASE_TAG} now tags ${GITHUB_SHA}"
+          fi
+
       - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
@@ -40,10 +66,6 @@ jobs:
       - name: Resolve the release notes
         id: notes
         run: |
-          # The tag is what the wheels are versioned as, so it has to be a
-          # PEP 440 version spelled the way pip normalizes it
-          echo "${RELEASE_TAG}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)?$' \
-            || { echo "::error::${RELEASE_TAG} is not a PEP 440 version (2.1.0, 2.2.0rc1)"; exit 1; }
           # A pre-release carries the notes of the release it leads to unless it
           # was given its own
           path="release-notes/${RELEASE_TAG}.md"
