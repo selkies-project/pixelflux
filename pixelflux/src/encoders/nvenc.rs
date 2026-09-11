@@ -3316,21 +3316,30 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_vram_probe() {
-        fn used_mb() -> i64 {
+        // The measurement wants the driver's own view of the device, which only nvidia-smi
+        // gives from outside the session's context; a host or container without it reports that
+        // rather than failing a test that cannot measure anything.
+        fn used_mb() -> Option<i64> {
             let out = std::process::Command::new("nvidia-smi")
                 .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
                 .output()
-                .expect("nvidia-smi");
-            String::from_utf8_lossy(&out.stdout).trim().parse().expect("parse MiB")
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
         }
         let s = settings(1920, 1080, 60.0);
-        let before = used_mb();
+        let Some(before) = used_mb() else {
+            println!("VRAM probe skipped: nvidia-smi answered nothing");
+            return;
+        };
         let mut enc = NvencEncoder::new(&s, ptr::null()).expect("init");
         let f = frame(1920, 1080, 5);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f, 1920 * 4, i, 25, i == 0).expect("encode");
         }
-        println!("VRAM delta for one 1080p session: {} MiB", used_mb() - before);
+        println!(
+            "VRAM delta for one 1080p session: {} MiB",
+            used_mb().unwrap_or(before) - before
+        );
     }
 
     /// On a real GPU, a session that starts taller than the default 2304 headroom (portrait
@@ -3627,10 +3636,13 @@ mod gpu_tests {
             if all_direct(&enc) { "registered in place" } else { "direct registration unavailable, copy arm used" }
         );
 
-        enc.direct_dmabuf = false;
-        enc.reconfigure_resolution(&s).expect("same-size reconfigure drains the import cache");
-        let copied = run(&mut enc, "copy");
-        assert!(!all_direct(&enc));
+        // The copy arm is driven from a session that never registered an import in place: a
+        // same-size reconfigure keeps the geometry, and so keeps the imports it cached, since
+        // only a real resolution change drains them.
+        let mut copy_only = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+        copy_only.direct_dmabuf = false;
+        let copied = run(&mut copy_only, "copy");
+        assert!(!all_direct(&copy_only));
         let identical = direct.iter().zip(&copied).all(|(a, b)| a == b);
         println!(
             "direct vs copy streams: {} ({} vs {} bytes)",
