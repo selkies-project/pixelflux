@@ -1155,15 +1155,11 @@ mod gpu_tests {
         true
     }
 
-    /// BT.601 limited-range Y/Cb/Cr of an 8-bit RGB triple — what NVENC's hardware CSC emits for
-    /// the packed input this path hands it.
-    fn ycbcr_601(rgb: (u8, u8, u8)) -> [f64; 3] {
-        let (r, g, b) = (rgb.0 as f64 / 255.0, rgb.1 as f64 / 255.0, rgb.2 as f64 / 255.0);
-        [
-            16.0 + 219.0 * (0.299 * r + 0.587 * g + 0.114 * b),
-            128.0 + 224.0 * (-0.168736 * r - 0.331264 * g + 0.5 * b),
-            128.0 + 224.0 * (0.5 * r - 0.418688 * g - 0.081312 * b),
-        ]
+    /// Limited-range Y/Cb/Cr of an 8-bit RGB triple — what the chroma convert emits for the
+    /// captured surface this path hands it in place.
+    fn painted_ycbcr(rgb: (u8, u8, u8)) -> [f64; 3] {
+        use crate::encoders::chroma_siting::{ycbcr, BT709};
+        ycbcr([rgb.0, rgb.1, rgb.2].map(f64::from), BT709)
     }
 
     /// Test helper: mean Y/Cb/Cr of a decoded picture.
@@ -1296,7 +1292,7 @@ mod gpu_tests {
             Some((crate::encoders::codec::Codec::H264, FRAME_KEY))
         );
         let mean = decoded_mean(&mut dec, &pkt[VIDEO_HEADER_LEN..]);
-        let want = ycbcr_601(FIRST);
+        let want = painted_ycbcr(FIRST);
         for i in 0..3 {
             assert!(
                 (mean[i] - want[i]).abs() <= 8.0,
@@ -1318,7 +1314,7 @@ mod gpu_tests {
         assert!(paint_root(SECOND), "the root was painted once, so a repaint must work");
         let pkt = encode(&mut gpu, 4, false, &mut pointers);
         let mean = decoded_mean(&mut dec, &pkt[VIDEO_HEADER_LEN..]);
-        let want = ycbcr_601(SECOND);
+        let want = painted_ycbcr(SECOND);
         for i in 0..3 {
             assert!(
                 (mean[i] - want[i]).abs() <= 8.0,

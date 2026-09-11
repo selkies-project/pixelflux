@@ -12,12 +12,12 @@
 //! NVENCAPI struct with the exact `NV_ENC_*_VER` word the negotiated SDK defines, so one binary
 //! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU two ways: a
 //! zero-copy dmabuf import (EGLImage → CUDA, the mapped plane registered with NVENC in place as
-//! pitch-linear memory or as a CUDA array), and a pinned host→device upload of packed BGRA / RGBA
-//! that the hardware CSC converts. The codec is a session parameter: the same rate control,
-//! GOP, VUI and latency posture is programmed into whichever of the three codec configurations
-//! the device offers, and a codec the device lacks (AV1 before Ada) is refused at open so the
-//! caller falls back. Sessions reconfigure resolution and rate control in place, so a resize or
-//! bitrate change costs a few milliseconds instead of a full rebuild.
+//! pitch-linear memory or as a CUDA array), and a pinned host→device upload of packed BGRA / RGBA.
+//! Colour is converted on the GPU either way. The codec is a session parameter: the same rate
+//! control, GOP, VUI and latency posture is programmed into whichever of the three codec
+//! configurations the device offers, and a codec the device lacks (AV1 before Ada) is refused at
+//! open so the caller falls back. Sessions reconfigure resolution and rate control in place, so a
+//! resize or bitrate change costs a few milliseconds instead of a full rebuild.
 
 // The NVENC and CUDA entry points are called through function pointers
 // resolved at runtime, so the safety contract is carried by the function
@@ -763,6 +763,11 @@ pub(crate) struct NvencTuning {
     /// Slices per H.264 and HEVC frame: `SLICES_PER_FRAME` in production, one to measure their
     /// cost (`gpu_bench_slices`).
     pub slices: u32,
+    /// Leave the chroma convert out, so the session encodes through NVENC's own conversion —
+    /// the path a driver refusing the kernel takes, which
+    /// `gpu_hardware_conversion_matches_the_declared_matrix` measures.
+    #[cfg(test)]
+    pub hardware_csc: bool,
 }
 
 impl Default for NvencTuning {
@@ -774,6 +779,8 @@ impl Default for NvencTuning {
             temporal_aq: false,
             hevc_high_tier: true,
             slices: SLICES_PER_FRAME,
+            #[cfg(test)]
+            hardware_csc: false,
         }
     }
 }
@@ -791,14 +798,17 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
 }
 
 /// The 4:2:0 convert that replaces NVENC's own, because the hardware's fixed-function
-/// RGB→YUV weights the two columns of a block 3:1 instead of averaging them, leaving half the
+/// conversion weights the two columns of a block 3:1 instead of averaging them, leaving half the
 /// colour of a subpixel-antialiased glyph edge in the chroma plane where the software and VA-API
-/// converts leave none.
+/// converts leave none. It follows the matrix the session declares
+/// (`gpu_hardware_conversion_matches_the_declared_matrix`), so only the siting is at stake, and
+/// 4:4:4 — which subsamples nothing — keeps it.
 ///
-/// The kernel ships as PTX the driver JIT-compiles (`cuModuleLoadData`), so the only library
+/// The kernels ship as PTX the driver JIT-compiles (`cuModuleLoadData`), so the only library
 /// involved is the `libcuda` NVENC already needs — nothing to install, and no runtime compiler.
-/// It reads the session's packed ARGB surface and writes the NV12 surface NVENC then encodes,
-/// averaging each 2x2 block's RGB before the matrix, which is what the host convert does.
+/// They read the session's packed ARGB surface, or a texture over an array-typed dmabuf import,
+/// and write the NV12 surface NVENC then encodes, averaging each block's RGB before the matrix
+/// as the host convert does.
 struct ChromaConvert {
     module: CUmodule,
     kernel: CUfunction,
@@ -811,7 +821,9 @@ struct ChromaConvert {
 
 impl ChromaConvert {
     /// JIT the module, allocate the `width`x`height` NV12 surface and register it with the
-    /// session. `None` where any step refuses: the session then encodes packed RGB as before.
+    /// session. `None` where any step refuses: the session then encodes the packed RGB itself,
+    /// which sites chroma at the left of each block but converts with the matrix the session
+    /// declares all the same.
     unsafe fn new(
         cuda: &CudaFunctions,
         funcs: &NV_ENCODE_API_FUNCTION_LIST,
@@ -1339,7 +1351,7 @@ impl NvencEncoder {
     ///    retain the device's primary CUDA context — shared and refcounted across every session on
     ///    that device rather than a fresh 100-300 MiB context each — pushing it current.
     /// 3. **Allocate input**: a pitched ARGB device buffer (`cuMemAllocPitch`, 16-byte element
-    ///    alignment) that hardware CSC turns into YUV.
+    ///    alignment) that the chroma convert, or hardware CSC, turns into YUV.
     /// 4. **Open the session and query caps**: create the function-list instance, open the session
     ///    with the negotiated `apiVersion`, refuse a codec the device lists no engine for, and
     ///    query `nvEncGetEncodeCaps` so init degrades rather than fails — a 4:4:4 request on a GPU
@@ -1354,10 +1366,10 @@ impl NvencEncoder {
     ///    or ConstQP; infinite GOP (`gopLength` / `idrPeriod` = `0xFFFFFFFF`); `zeroReorderDelay`
     ///    and, for H.264, a bitstream-restriction VUI (`max_num_reorder_frames=0`) so no-reorder
     ///    decoders don't buffer; an explicit level from `nvenc_level` pinned from frame 1 so the
-    ///    level never bumps mid-stream; BT.709 primaries and transfer for the sRGB source, with an
-    ///    SMPTE170M matrix and limited range to match the hardware ARGB CSC; repeated parameter
-    ///    sets on every key frame; H.264 CABAC; no AUD; one AV1 tile; strict GOP target; and
-    ///    lookahead disabled for real-time latency.
+    ///    level never bumps mid-stream; BT.709 primaries and transfer for the sRGB source, at
+    ///    limited range, with the matrix whichever conversion the session uses produces;
+    ///    repeated parameter sets on every key frame; H.264 CABAC; no AUD; one AV1 tile; strict
+    ///    GOP target; and lookahead disabled for real-time latency.
     /// 6. **Initialize with resize headroom**: `maxEncodeWidth` / `maxEncodeHeight` are raised to
     ///    at least `HEADROOM_WIDTH` x `HEADROOM_HEIGHT` so `reconfigure_resolution` can grow in
     ///    place, but never past the driver's reported maximum; this costs a few hundred MiB of
@@ -1626,9 +1638,7 @@ impl NvencEncoder {
                 &mut config,
                 codec,
                 is_444,
-                width,
-                height,
-                settings.target_fps as u32,
+                nvenc_level(codec, width, height, settings.target_fps as u32),
                 &tuning,
             );
 
@@ -1763,8 +1773,11 @@ impl NvencEncoder {
                 bitstream_buffers.push(bitstream_params.bitstreamBuffer);
             }
 
-            // 4:4:4 has no chroma to site, so only a 4:2:0 session converts; a driver that
-            // refuses the kernel leaves NVENC's own conversion in place.
+            // 4:4:4 subsamples nothing, so only a 4:2:0 session needs the kernel's siting; a
+            // driver that refuses it keeps NVENC's own conversion, which follows the declared
+            // matrix either way.
+            #[cfg(test)]
+            let is_444 = is_444 || tuning.hardware_csc;
             let csc = if is_444 {
                 None
             } else {
@@ -1829,16 +1842,16 @@ impl NvencEncoder {
         guids.iter().take(listed as usize).any(|g| guid_eq(g, codec))
     }
 
-    /// Program the codec-specific arm of `config`: the level for the geometry, an infinite IDR
-    /// period, the chroma format, 8-bit input and output, parameter sets repeated on every key
-    /// frame, and the colour description of the hardware CSC.
+    /// Program the codec-specific arm of `config`: `level`, an infinite IDR period, the chroma
+    /// format, 8-bit input and output, parameter sets repeated on every key frame, and the
+    /// colour description every session converts with.
     ///
-    /// Primaries and transfer describe the source, which is sRGB desktop pixels — sRGB shares
-    /// BT.709's primaries and transfer function. Only the matrix follows the encoder: NVENC's
-    /// ARGB hardware CSC is fixed at BT.601, so a client that inverts BT.709 shifts saturated
-    /// colour badly; that same CSC emits limited range in every chroma format, and both capture
-    /// paths go through it, so every session declares limited. H.264 additionally restricts
-    /// reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC. H.264 and
+    /// The whole description is BT.709 at limited range. Primaries and transfer describe the
+    /// source, sRGB desktop pixels, which shares both with BT.709; the matrix is what
+    /// `ChromaConvert` produces, and NVENC's own conversion — the fallback, and the 4:4:4
+    /// sessions — follows the matrix declared here at the limited range it emits, which
+    /// `gpu_hardware_conversion_matches_the_declared_matrix` holds it to. H.264 additionally
+    /// restricts reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC. H.264 and
     /// HEVC frames carry `SLICES_PER_FRAME` slices; AV1 keeps one tile, since tiles cost bitrate
     /// and buy no quality, and tier 0, the only tier NVENC takes for it.
     ///
@@ -1851,15 +1864,12 @@ impl NvencEncoder {
         config: &mut NV_ENC_CONFIG,
         codec: Codec,
         fullcolor: bool,
-        width: u32,
-        height: u32,
-        fps: u32,
+        level: u32,
         tuning: &NvencTuning,
     ) {
-        let level = nvenc_level(codec, width, height, fps);
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
         let transfer = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-        let matrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M;
+        let matrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
         let vui = |vui: &mut NV_ENC_CONFIG_H264_VUI_PARAMETERS| {
             vui.videoSignalTypePresentFlag = 1;
             vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT::NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
@@ -2733,9 +2743,9 @@ impl NvencEncoder {
     }
 
     /// Encode a host packed-pixel frame by uploading it straight into the packed input surface,
-    /// with no CPU-side colour conversion: NVENC's hardware RGB→YUV conversion is fixed at BT.601
-    /// limited range, which is what the session VUI declares, and a CPU prepass to BT.709 would
-    /// cost this path its copy-free property.
+    /// with no CPU-side colour conversion: the surface is either the chroma convert's source or,
+    /// where the kernel did not load, NVENC's own conversion's; a host prepass would cost this
+    /// path its copy-free property.
     ///
     /// `rgba_input` names the byte order — `false` for B,G,R,A (X11 XShm, the pixman framebuffer),
     /// `true` for R,G,B,A (a GLES readback) — and the input surface is registered with NVENC in
@@ -2815,7 +2825,7 @@ impl NvencEncoder {
             }
 
             let (mapped, submitted) = match self.convert_packed(self.input_device_ptr, self.input_pitch, rgba_input) {
-                Ok(Some(mapped)) => (mapped, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
+                Ok(Some(nv12)) => (nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
                 Ok(None) => (self.mapped_input_buffer, self.input_format),
                 Err(e) => {
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
@@ -3026,6 +3036,42 @@ impl NvencEncoder {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every codec's arm declares the BT.709 matrix the session converts with, in both chroma
+    /// formats and with no device involved. A stream whose pixels and signal disagree shifts
+    /// every saturated colour on the client, and only a GPU would otherwise report it.
+    #[test]
+    fn every_codec_declares_the_conversion_matrix() {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            for fullcolor in [false, true] {
+                let mut config = NV_ENC_CONFIG { version: sv(NvStruct::Config), ..Default::default() };
+                NvencEncoder::configure_codec(
+                    &mut config,
+                    codec,
+                    fullcolor,
+                    nvenc_level(codec, 1280, 720, 60),
+                    &NvencTuning::default(),
+                );
+                let got = unsafe {
+                    match codec {
+                        Codec::H265 => config.encodeCodecConfig.hevcConfig.hevcVUIParameters.colourMatrix,
+                        Codec::Av1 => config.encodeCodecConfig.av1Config.matrixCoefficients,
+                        _ => config.encodeCodecConfig.h264Config.h264VUIParameters.colourMatrix,
+                    }
+                };
+                assert_eq!(
+                    got as u32,
+                    NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709 as u32,
+                    "{codec:?} 4:4:4={fullcolor}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod gpu_tests {
     use super::*;
 
@@ -3105,7 +3151,7 @@ mod gpu_tests {
     }
 
     /// Test helper: luma PSNR of one decoded access unit against the BGRA frame it encodes, the
-    /// source taken through the limited-range BT.601 luma the hardware CSC applies.
+    /// source taken through the limited-range BT.709 luma the session converts with.
     fn luma_psnr(
         dec: &mut crate::webcam::decode::AvDecoder,
         pkt: &[u8],
@@ -3120,8 +3166,10 @@ mod gpu_tests {
         for y in 0..h {
             for x in 0..w {
                 let p = &src[(y * w + x) * 4..(y * w + x) * 4 + 3];
-                let luma = 16.0
-                    + 219.0 * (0.299 * p[2] as f64 + 0.587 * p[1] as f64 + 0.114 * p[0] as f64) / 255.0;
+                let luma = crate::encoders::chroma_siting::ycbcr(
+                    [p[2], p[1], p[0]].map(f64::from),
+                    crate::encoders::chroma_siting::BT709,
+                )[0];
                 let d = v.y[y * v.y_stride + x] as f64 - luma;
                 se += d * d;
             }
@@ -3693,14 +3741,15 @@ mod gpu_tests {
     /// On a real GPU, a session that starts taller than the default 2304 headroom (portrait
     /// 4K: 2160×4096, within NVENC's 4096 H.264 cap) takes its own size as the `maxEncode` ceiling
     /// and encodes at that resolution. Ignored by default.
-    /// The VUI has to describe what the session actually emits. NVENC converts its ARGB
-    /// input with a fixed BT.601 matrix at limited range in both chroma formats, so the
-    /// matrix and range follow the hardware; the primaries and transfer follow the source,
-    /// which is sRGB desktop pixels and therefore BT.709. A client that inverts the wrong
-    /// matrix, or expands a limited-range frame as full-range, shifts colour visibly.
+    /// The VUI has to describe what the session actually emits, on a real GPU and through the
+    /// same caps negotiation a session takes: BT.709 at limited range, which is what the kernel
+    /// writes for 4:2:0 and what NVENC's own conversion follows for 4:4:4. Primaries and
+    /// transfer follow the source, which is sRGB desktop pixels and therefore BT.709 too. A
+    /// client that inverts the wrong matrix, or expands a limited-range frame as full-range,
+    /// shifts colour visibly.
     #[test]
     #[ignore]
-    fn gpu_vui_describes_the_hardware_csc() {
+    fn gpu_vui_describes_the_conversion() {
         for fullcolor in [false, true] {
             let mut s = settings(1280, 720, 60.0);
             s.video_fullcolor = fullcolor;
@@ -3709,7 +3758,7 @@ mod gpu_tests {
             let h264 = unsafe { &enc.encode_config.encodeCodecConfig.h264Config };
             let vui = &h264.h264VUIParameters;
             assert_eq!(vui.colourMatrix as u32,
-                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M as u32);
+                NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709 as u32, "fullcolor={fullcolor}");
             assert_eq!(vui.colourPrimaries as u32,
                 NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709 as u32);
             assert_eq!(vui.transferCharacteristics as u32,
@@ -3792,12 +3841,15 @@ mod gpu_tests {
     /// neutral. NVENC's own conversion averages the rows but weights the columns 3:1, which is
     /// what `ChromaConvert` replaces; with the convert disabled the column case lands three
     /// quarters of the way to the left column's chroma, which is the colour subpixel-antialiased
-    /// text would keep on its glyph edges. A 4:4:4 session subsamples nothing, so it keeps the
-    /// hardware's conversion and takes no convert of its own. Ignored by default.
+    /// text would keep on its glyph edges. That conversion follows the BT.709 the session
+    /// declares, so the mix is compared against BT.709 here and against BT.601 in
+    /// `gpu_hardware_conversion_matches_the_declared_matrix`, which declares that instead. A
+    /// 4:4:4 session subsamples nothing, so it keeps the hardware conversion. Ignored by
+    /// default.
     #[test]
     #[ignore]
     fn gpu_chroma_is_sited_at_the_block_centre() {
-        use crate::encoders::chroma_siting::chroma;
+        use crate::encoders::chroma_siting::{chroma, BT709};
         let (w, h) = (256usize, 256usize);
         let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
         let st = settings(w as i32, h as i32, 60.0);
@@ -3819,7 +3871,7 @@ mod gpu_tests {
             (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
         let hardware = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
-        let weighted = chroma([0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]));
+        let weighted = chroma([0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]), BT709);
         println!("[chroma-siting] hardware: columns {hardware:?} against 3:1 {weighted:?}");
         assert!(
             (hardware.0 - weighted.0).hypot(hardware.1 - weighted.1) <= 2.0,
@@ -3831,6 +3883,76 @@ mod gpu_tests {
         if enc444.is_fullcolor() {
             assert!(enc444.csc.is_none(), "a 4:4:4 session has no chroma to site and takes no convert");
         }
+    }
+
+    /// On a real GPU, in both chroma formats: the colour chart decodes back to the painted
+    /// colour when the matrix the VUI declares is inverted, which is what a client does with
+    /// every frame. 4:2:0 comes through the kernel and 4:4:4 through NVENC's own conversion, so
+    /// this is what holds both to the declared matrix — the siting check cannot see a wrong one,
+    /// its tile being neutral whichever matrix converts it. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_chart_decodes_to_the_colour_that_was_painted() {
+        use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (w, h) = (256usize, 128usize);
+        for fullcolor in [false, true] {
+            let st = RustCaptureSettings {
+                video_fullcolor: fullcolor,
+                ..settings(w as i32, h as i32, 60.0)
+            };
+            let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            if fullcolor && !enc.is_fullcolor() {
+                println!("[chart] this GPU carries no 4:4:4 H.264");
+                continue;
+            }
+            assert_eq!(enc.csc.is_some(), !fullcolor, "the convert follows the chroma format");
+            let pkt = enc.encode_cpu_packed(&chart_bgra(w, h), w * 4, false, 0, 20, true).expect("encode");
+            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+            assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
+            let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
+            println!("[chart] NVENC 4:4:4 {fullcolor}: worst |dRGB| {worst:.1}");
+            assert!(worst <= 8.0, "the session paints {worst:.1} off the chart");
+        }
+    }
+
+    /// On a real GPU, the path a driver that refuses the PTX takes: a session the kernel is
+    /// kept out of still encodes, and NVENC's own conversion follows the BT.709 its VUI
+    /// declares — the same session with the matrix declared as SMPTE170M measures the BT.601
+    /// mix instead, which is how that dependency was established and why the fallback can
+    /// declare a matrix at all. Only the siting differs, the columns landing on the 3:1
+    /// weighting. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_hardware_conversion_matches_the_declared_matrix() {
+        use crate::encoders::chroma_siting::{chart_bgra, chart_error, chroma, BT601, BT709};
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let (w, h) = (256usize, 256usize);
+        let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
+        let st = settings(w as i32, h as i32, 60.0);
+        let tuning = NvencTuning { hardware_csc: true, ..Default::default() };
+        let mut enc = NvencEncoder::new_tuned(&st, ptr::null(), tuning).expect("NVENC init");
+        assert!(enc.csc.is_none(), "the session was asked for NVENC's own conversion");
+
+        let pkt = enc.encode_cpu_packed(&chart_bgra(w, h), w * 4, false, 0, 20, true).expect("encode");
+        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
+        let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
+        println!("[csc] NVENC's own conversion: chart worst |dRGB| {worst:.1}");
+        assert!(worst <= 8.0, "the hardware conversion paints {worst:.1} off the declared matrix");
+
+        let hardware = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
+        let mix = [0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]);
+        let (weighted_601, weighted_709) = (chroma(mix, BT601), chroma(mix, BT709));
+        let off = |c: (f64, f64)| (hardware.0 - c.0).hypot(hardware.1 - c.1);
+        println!(
+            "[csc] NVENC's own conversion: columns {hardware:?} against the 3:1 mix under \
+             BT.709 {weighted_709:?} and BT.601 {weighted_601:?}"
+        );
+        assert!(
+            off(weighted_709) <= 2.0 && off(weighted_709) < off(weighted_601),
+            "the hardware conversion did not follow the declared matrix: {hardware:?}"
+        );
     }
 
     /// A frame of two colours alternating by column or by row, so every 2x2 block averages to
@@ -3893,7 +4015,7 @@ mod gpu_tests {
             let mut host = f64::MAX;
             for _ in 0..20 {
                 let t = std::time::Instant::now();
-                convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, &mut y, &mut u, &mut v, (w, cw), 8)
+                convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, false, &mut y, &mut u, &mut v, (w, cw), 8)
                     .expect("host convert");
                 host = host.min(t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -3964,14 +4086,10 @@ mod gpu_tests {
     const BG: [f32; 3] = [0.1, 0.2, 0.8];
     const FG: [f32; 3] = [0.9, 0.3, 0.1];
 
-    /// BT.601 limited-range Y/Cb/Cr of an RGB triple in 0..1 — what NVENC's hardware CSC emits.
-    fn ycbcr_601(rgb: [f32; 3]) -> [f64; 3] {
-        let [r, g, b] = rgb.map(|c| c as f64);
-        [
-            16.0 + 219.0 * (0.299 * r + 0.587 * g + 0.114 * b),
-            128.0 + 224.0 * (-0.168736 * r - 0.331264 * g + 0.5 * b),
-            128.0 + 224.0 * (0.5 * r - 0.418688 * g - 0.081312 * b),
-        ]
+    /// Limited-range Y/Cb/Cr of a painted colour, whose components are 0..1.
+    fn painted_ycbcr(rgb: [f32; 3]) -> [f64; 3] {
+        use crate::encoders::chroma_siting::{ycbcr, BT709};
+        ycbcr(rgb.map(|c| f64::from(c) * 255.0), BT709)
     }
 
     /// Where the foreground block of a `seed`-painted `w×h` frame sits: a quarter-size block
@@ -4049,10 +4167,10 @@ mod gpu_tests {
         (mean(0), mean(1))
     }
 
-    /// Assert decoded region means sit within `tol` of the BT.601 limited-range values of the
-    /// painted colours — a wrong pitch, byte order or stale buffer lands far outside this.
+    /// Assert decoded region means sit within `tol` of the limited-range values of the painted
+    /// colours — a wrong pitch, byte order or stale buffer lands far outside this.
     fn assert_painted(label: &str, block: [f64; 3], bg: [f64; 3], tol: f64) {
-        let (eb, eg) = (ycbcr_601(FG), ycbcr_601(BG));
+        let (eb, eg) = (painted_ycbcr(FG), painted_ycbcr(BG));
         for i in 0..3 {
             assert!(
                 (block[i] - eb[i]).abs() <= tol,

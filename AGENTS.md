@@ -69,21 +69,27 @@ resolved at build time, never by a setting: the default `gpl` feature makes libx
 CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
 `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
 (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies derives its rate-control
-default from the exported names. Every 4:2:0 session, on every backend, converts with the BT.601 matrix
-at limited range and declares it (it is the matrix browser presentation paths invert exactly), and
-sites chroma at the centre of each 2x2 block: NVENC's own conversion weights the two columns of a
-block 3:1, so a 4:2:0 session converts with `ChromaConvert`, a PTX kernel the driver JIT-compiles
-(`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) which reads the packed surface or a
-texture over an array-typed dmabuf import and writes the NV12 NVENC encodes; 4:4:4 subsamples
-nothing and keeps the hardware conversion. The software 4:4:4 sessions convert BT.709 at full range
-and declare that. `AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
+default from the exported names. Every session, on every backend, converts with the BT.709 matrix — the sRGB
+desktop's own primaries and transfer — at limited range for 4:2:0 and full range for the software
+4:4:4 sessions, and declares it; VP8 is the exception its bitstream forces, one colour-space bit
+whose only defined value is BT.601 — told BT.709 out of band, Firefox reads neither the decoder
+configuration nor the RTP colour-space extension and inverts the other matrix. Chroma sits at
+the centre of each 2x2 block, which NVENC's own conversion does not: it weights the two columns
+of a block 3:1 (its matrix follows what the session declares, measured on Volta and Pascal, so
+only the siting is at stake). A 4:2:0 session therefore converts with `ChromaConvert`, a PTX
+kernel the driver JIT-compiles (`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) that reads
+the packed surface, a pitch-linear dmabuf import or a texture over an array-typed one and writes
+the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
+driver that refuses the kernel.
+`AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
 encoder to it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
 ultrafast with wavefront threads) and NVENC at preset P3 with two-pass quarter-resolution rate control
 (`gpu_bench_tuning` measures the alternatives); the VP8, VP9 and AV1 quantizer tables in `codec.rs` were
 measured at those settings and must be re-measured whenever they change (`encoders::codec` documents the
-method). VP9 carries 4:4:4 as profile 1 at the same limited-range BT.601 signal as its 4:2:0. The CBR
+method). VP9 carries 4:4:4 as profile 1 at the same limited range as its 4:2:0, so the decoder hint the
+client sends for it stays true. The CBR
 sessions of x264 and x265 cap the quantizer at 51: both libraries default to an out-of-spec range above
 it that forces macroblock skips on a VBV underflow, which freezes rows of a screen for a few frames, so a
 budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test both configurations (`cargo test --lib` and

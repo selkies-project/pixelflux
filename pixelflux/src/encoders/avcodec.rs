@@ -17,11 +17,10 @@
 //!
 //! Chroma follows `video_fullcolor` where the codec carries 4:4:4 (H.264 and H.265): a
 //! hardware session negotiates the 4:4:4 surface format the driver reports, a software one
-//! takes planar 4:4:4 at full range like x264. Anything else encodes 4:2:0. The colour matrix
-//! follows NVENC: hardware sessions and 4:2:0 software sessions convert with BT.601 at limited
-//! range, the matrix browser presentation paths invert exactly, and declare it with BT.709
-//! primaries and transfer for the sRGB source; software 4:4:4 converts BT.709 at full range and
-//! declares that, like x264.
+//! takes planar 4:4:4 at full range like x264. Anything else encodes 4:2:0. Every session
+//! converts with the BT.709 matrix the sRGB source's own primaries and transfer belong to and
+//! declares it, at limited range for 4:2:0 and full range for software 4:4:4, like x264; VP8 is
+//! held to BT.601, the only matrix its bitstream can name.
 
 // Every operation in these functions is an FFmpeg or VA-API call, or a dereference of a
 // pointer one handed back; the safety contract is carried by the function signatures.
@@ -145,16 +144,16 @@ fn color_space_name(space: ff::AVColorSpace) -> String {
     }
 }
 
-/// The matrix a session converts with and declares, for `codec` at `full_range`. VP9 names
-/// BT.601 by its own header code, the one Chromium's decoder maps; the SMPTE 170M code lands
-/// there as unspecified.
-fn declared_colorspace(codec: Codec, full_range: bool) -> ff::AVColorSpace {
-    if codec == Codec::Vp9 {
-        ff::AVColorSpace::AVCOL_SPC_BT470BG
-    } else if full_range {
-        ff::AVColorSpace::AVCOL_SPC_BT709
-    } else {
+/// The matrix a session converts with and declares: BT.709, whose primaries and transfer the
+/// sRGB desktop source already carries. VP8 is held to BT.601, the only matrix its keyframe
+/// header's one colour-space bit can name: told BT.709 out of band, Chromium and WebKit paint
+/// it correctly but Firefox reads the bit and inverts BT.601, which shifts saturated colour by
+/// 20 levels.
+fn declared_colorspace(codec: Codec) -> ff::AVColorSpace {
+    if codec == Codec::Vp8 {
         ff::AVColorSpace::AVCOL_SPC_SMPTE170M
+    } else {
+        ff::AVColorSpace::AVCOL_SPC_BT709
     }
 }
 
@@ -454,8 +453,8 @@ impl AvcodecEncoder {
     }
 
     /// Whether the session signals full range: the software 4:4:4 of x264's kind (x265), never
-    /// a hardware session, and not VP9, whose 4:4:4 keeps the limited-range BT.601 signal of
-    /// its 4:2:0 so the decoder hint the client sends for VP9 stays true.
+    /// a hardware session, and not VP9, whose 4:4:4 keeps the limited range of its 4:2:0 so the
+    /// decoder hint the client sends for VP9 stays true.
     pub fn is_full_range(&self) -> bool {
         self.is_fullcolor() && self.backend == Backend::Software && self.codec != Codec::Vp9
     }
@@ -463,7 +462,7 @@ impl AvcodecEncoder {
     /// The matrix this session converts with and declares, the one rule the codec context and
     /// the VA-VPP convert both read.
     fn colorspace(&self) -> ff::AVColorSpace {
-        declared_colorspace(self.codec, self.is_full_range())
+        declared_colorspace(self.codec)
     }
 
     /// Open the VA-API device, surface pool and filter graph, then the codec.
@@ -1226,7 +1225,8 @@ impl AvcodecEncoder {
             let y = std::slice::from_raw_parts_mut((*self.frame).data[0], ys * h);
             let u = std::slice::from_raw_parts_mut((*self.frame).data[1], us * uv_rows);
             let v = std::slice::from_raw_parts_mut((*self.frame).data[2], vs * uv_rows);
-            convert_to_yuv_mt(pixels, stride as u32, w, h, rgba, i444, full_range, y, u, v, (ys, us), self.threads as usize)
+            let bt601 = self.codec == Codec::Vp8;
+            convert_to_yuv_mt(pixels, stride as u32, w, h, rgba, i444, full_range, bt601, y, u, v, (ys, us), self.threads as usize)
                 .map_err(|e| format!("rgb-to-yuv conversion failed: {e:?}"))?;
             self.encode_frame(self.frame, frame_number, force_idr)
         }
@@ -1275,51 +1275,56 @@ mod tests {
         let filter = unsafe { ff::avfilter_get_by_name(c"scale_vaapi".as_ptr()) };
         assert!(!filter.is_null(), "this FFmpeg carries no scale_vaapi");
         for codec in Codec::VIDEO {
-            for full_range in [false, true] {
-                let space = declared_colorspace(codec, full_range);
-                let matrix = color_space_name(space);
-                let parsed = unsafe {
-                    ff::av_color_space_from_name(CString::new(matrix.clone()).unwrap().as_ptr())
-                };
-                assert_eq!(parsed, space as c_int, "{matrix} did not parse back");
-                for stage in ["hwmap", "hwupload"] {
-                    for fmt in [ff::AVPixelFormat::AV_PIX_FMT_NV12].into_iter().chain(FULLCOLOR_SW_FORMATS) {
-                        let chain = vpp_chain(stage, 128, 128, &pix_fmt_name(fmt), &matrix);
-                        let args = CString::new(chain.split_once("scale_vaapi=").unwrap().1).unwrap();
-                        unsafe {
-                            let mut graph = ff::avfilter_graph_alloc();
-                            let vpp = ff::avfilter_graph_alloc_filter(graph, filter, c"vpp".as_ptr());
-                            let ret = ff::avfilter_init_str(vpp, args.as_ptr());
-                            let mut loc: *mut u8 = ptr::null_mut();
-                            let got = if ret >= 0 {
-                                ff::av_opt_get(
-                                    vpp as *mut c_void,
-                                    c"out_chroma_location".as_ptr(),
-                                    ff::AV_OPT_SEARCH_CHILDREN,
-                                    &mut loc,
-                                )
-                            } else {
-                                ret
-                            };
-                            let sited = if got >= 0 {
-                                let name = ff::av_chroma_location_from_name(loc as *const c_char);
-                                ff::av_free(loc as *mut c_void);
-                                name
-                            } else {
-                                got
-                            };
-                            ff::avfilter_graph_free(&mut graph);
-                            assert!(ret >= 0, "{chain}: {}", ff_err_str(ret));
-                            assert_eq!(
-                                sited,
-                                ff::AVChromaLocation::AVCHROMA_LOC_CENTER as c_int,
-                                "{chain} does not site chroma at the block centre"
-                            );
-                        }
-                    }
+            let space = declared_colorspace(codec);
+            let matrix = color_space_name(space);
+            let parsed =
+                unsafe { ff::av_color_space_from_name(CString::new(matrix.clone()).unwrap().as_ptr()) };
+            assert_eq!(parsed, space as c_int, "{matrix} did not parse back");
+            assert!(matrix_chains(filter, &matrix) > 0, "{codec:?} exercised no convert");
+        }
+    }
+
+    /// Every convert chain for `matrix`, initialized and read back: the count of chains checked.
+    fn matrix_chains(filter: *const ff::AVFilter, matrix: &str) -> usize {
+        let mut checked = 0;
+        for stage in ["hwmap", "hwupload"] {
+            for fmt in [ff::AVPixelFormat::AV_PIX_FMT_NV12].into_iter().chain(FULLCOLOR_SW_FORMATS) {
+                let chain = vpp_chain(stage, 128, 128, &pix_fmt_name(fmt), matrix);
+                let args = CString::new(chain.split_once("scale_vaapi=").unwrap().1).unwrap();
+                unsafe {
+                    let mut graph = ff::avfilter_graph_alloc();
+                    let vpp = ff::avfilter_graph_alloc_filter(graph, filter, c"vpp".as_ptr());
+                    let ret = ff::avfilter_init_str(vpp, args.as_ptr());
+                    let mut loc: *mut u8 = ptr::null_mut();
+                    let got = if ret >= 0 {
+                        ff::av_opt_get(
+                            vpp as *mut c_void,
+                            c"out_chroma_location".as_ptr(),
+                            ff::AV_OPT_SEARCH_CHILDREN,
+                            &mut loc,
+                        )
+                    } else {
+                        ret
+                    };
+                    let sited = if got >= 0 {
+                        let name = ff::av_chroma_location_from_name(loc as *const c_char);
+                        ff::av_free(loc as *mut c_void);
+                        name
+                    } else {
+                        got
+                    };
+                    ff::avfilter_graph_free(&mut graph);
+                    assert!(ret >= 0, "{chain}: {}", ff_err_str(ret));
+                    assert_eq!(
+                        sited,
+                        ff::AVChromaLocation::AVCHROMA_LOC_CENTER as c_int,
+                        "{chain} does not site chroma at the block centre"
+                    );
                 }
+                checked += 1;
             }
         }
+        checked
     }
 
     /// Every VA-API encoder name this module can ask for is one FFmpeg registers, whether or
@@ -1373,6 +1378,48 @@ mod tests {
                 let worst = chroma_siting::worst(&dec.frame().expect("frame"));
                 println!("[chroma-siting] {backend:?} {codec:?}: worst |C-128| {worst:.1}");
                 assert!(worst <= 8.0, "{backend:?} {codec:?} sites chroma {worst:.1} off neutral");
+                measured += 1;
+            }
+        }
+        assert!(measured > 0, "no session opened to measure");
+    }
+
+    /// The eight-patch chart, encoded and decoded, comes back as the colour that was painted
+    /// when a receiver inverts the matrix the session declares — the check a client's
+    /// presentation path performs on every frame. A convert or a declaration that name
+    /// different matrices leaves the neutrals exact and the saturated patches tens of levels
+    /// out, which is what the browsers show as washed-out or shifted colour.
+    #[test]
+    fn the_chart_decodes_to_the_colour_that_was_painted() {
+        use crate::encoders::chroma_siting;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        const N: usize = 256;
+        let bgra = chroma_siting::chart_bgra(N, N / 2);
+        let settings = RustCaptureSettings {
+            width: N as c_int,
+            height: (N / 2) as c_int,
+            target_fps: 30.0,
+            video_crf: 20,
+            ..Default::default()
+        };
+        let mut measured = 0;
+        for backend in [Backend::Software, Backend::Vaapi] {
+            for codec in Codec::VIDEO {
+                let mut enc = match AvcodecEncoder::new(&settings, codec, backend, Input::Host { rgba: false }) {
+                    Ok(enc) => enc,
+                    Err(_) => continue,
+                };
+                let out = enc.encode_host(&bgra, N * 4, 0, 20, true).expect("encode");
+                let mut dec = AvDecoder::new(codec).expect("decoder");
+                assert!(dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false), "{backend:?} {codec:?}");
+                let k = if declared_colorspace(codec) == ff::AVColorSpace::AVCOL_SPC_BT709 {
+                    chroma_siting::BT709
+                } else {
+                    chroma_siting::BT601
+                };
+                let worst = chroma_siting::chart_error(&dec.frame().expect("frame"), k);
+                println!("[chart] {backend:?} {codec:?}: worst |dRGB| {worst:.1}");
+                assert!(worst <= 12.0, "{backend:?} {codec:?} paints {worst:.1} off the chart");
                 measured += 1;
             }
         }
@@ -1489,7 +1536,7 @@ mod software_tests {
     }
 
     /// Luma PSNR of a decoded frame against the BGRA source it came from, with the source's
-    /// luma derived by the BT.601 limited-range formula the encoder's conversion uses.
+    /// luma derived by the BT.709 limited-range formula the encoder's conversion uses.
     fn luma_psnr(decoded: &I420View<'_>, bgra: &[u8]) -> f64 {
         assert_eq!((decoded.width, decoded.height), (W, H));
         let mut mse = 0f64;
@@ -1497,7 +1544,7 @@ mod software_tests {
             for x in 0..W {
                 let i = (y * W + x) * 4;
                 let (b, g, r) = (bgra[i] as f64, bgra[i + 1] as f64, bgra[i + 2] as f64);
-                let luma = 16.0 + (0.299 * r + 0.587 * g + 0.114 * b) * 219.0 / 255.0;
+                let luma = 16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * b) * 219.0 / 255.0;
                 let d = decoded.y[y * decoded.y_stride + x] as f64 - luma;
                 mse += d * d;
             }
@@ -1635,21 +1682,21 @@ mod software_tests {
         }
     }
 
-    /// Every 4:2:0 session declares the BT.601 matrix it converts with, at limited range:
-    /// VP9 by its own header code, which reads back as BT.470BG, VP8 by declaring none, which
-    /// its decoder takes as that matrix. The x265 4:4:4 session declares BT.709 at full range
-    /// like x264.
+    /// Every session declares the BT.709 matrix it converts with, at limited range for 4:2:0
+    /// and full range for the x265 4:4:4 one, like x264. VP8 reads back as BT.470BG whatever it
+    /// is handed: its keyframe header holds one colour-space bit and BT.601 is its only defined
+    /// value, so the transports carry the real matrix for that codec themselves.
     #[test]
     fn sessions_declare_the_matrix_they_convert_with() {
         use ff::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
-        use ff::AVColorSpace::{AVCOL_SPC_BT470BG, AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
+        use ff::AVColorSpace::{AVCOL_SPC_BT470BG, AVCOL_SPC_BT709};
         for codec in software_codecs() {
             let mut s = settings(codec);
             let mut enc = session(codec, &s, false);
             let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).expect("encode");
             let mut dec = AvDecoder::new(codec).expect("decoder");
             assert!(decode_one(&mut dec, &out));
-            let want = if matches!(codec, Codec::Vp8 | Codec::Vp9) { AVCOL_SPC_BT470BG } else { AVCOL_SPC_SMPTE170M };
+            let want = if codec == Codec::Vp8 { AVCOL_SPC_BT470BG } else { AVCOL_SPC_BT709 };
             assert_eq!(dec.colour_tags(), Some((want, AVCOL_RANGE_MPEG)), "{codec:?}");
             if super::super::software_fullcolor(codec) {
                 s.video_fullcolor = true;
@@ -1658,7 +1705,7 @@ mod software_tests {
                 let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).expect("encode");
                 let mut dec = AvDecoder::new(codec).expect("decoder");
                 assert!(decode_one(&mut dec, &out));
-                let want = if codec == Codec::Vp9 { (AVCOL_SPC_BT470BG, AVCOL_RANGE_MPEG) } else { (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG) };
+                let want = if codec == Codec::Vp9 { (AVCOL_SPC_BT709, AVCOL_RANGE_MPEG) } else { (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG) };
                 assert_eq!(dec.colour_tags(), Some(want), "{codec:?} 4:4:4");
             }
         }

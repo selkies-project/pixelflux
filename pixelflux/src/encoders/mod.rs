@@ -422,11 +422,90 @@ pub(crate) mod chroma_siting {
         buf
     }
 
-    /// BT.601 limited-range chroma of an RGB triple, the conversion every 4:2:0 session declares.
-    pub fn chroma(rgb: [f64; 3]) -> (f64, f64) {
-        let [r, g, b] = rgb;
-        let y = 0.299 * r + 0.587 * g + 0.114 * b;
-        (128.0 + 224.0 * (b - y) / (2.0 * 0.886 * 255.0), 128.0 + 224.0 * (r - y) / (2.0 * 0.701 * 255.0))
+    /// The luma weights `(Kr, Kb)` of the matrix every session converts with and declares.
+    pub const BT709: (f64, f64) = (0.2126, 0.0722);
+
+    /// BT.601's weights, the other matrix a receiver might invert, which the checks use as the
+    /// contrast: a mis-declared stream lands tens of levels away under them.
+    pub const BT601: (f64, f64) = (0.299, 0.114);
+
+    /// Limited-range Y/Cb/Cr of an RGB triple under the matrix `k` names.
+    pub fn ycbcr(rgb: [f64; 3], k: (f64, f64)) -> [f64; 3] {
+        let ([r, g, b], (kr, kb)) = (rgb, k);
+        let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+        [
+            16.0 + 219.0 * y / 255.0,
+            128.0 + 224.0 * (b - y) / (2.0 * (1.0 - kb) * 255.0),
+            128.0 + 224.0 * (r - y) / (2.0 * (1.0 - kr) * 255.0),
+        ]
+    }
+
+    /// Its chroma pair alone.
+    pub fn chroma(rgb: [f64; 3], k: (f64, f64)) -> (f64, f64) {
+        let c = ycbcr(rgb, k);
+        (c[1], c[2])
+    }
+
+    /// The inverse: the RGB a receiver paints from a limited-range Y/Cb/Cr under the matrix `k`
+    /// names, which is what a client's presentation path computes.
+    pub fn rgb(ycc: [f64; 3], k: (f64, f64)) -> [f64; 3] {
+        let (kr, kb) = k;
+        let (y, cb, cr) = ((ycc[0] - 16.0) / 219.0, (ycc[1] - 128.0) / 224.0, (ycc[2] - 128.0) / 224.0);
+        let r = y + 2.0 * (1.0 - kr) * cr;
+        let b = y + 2.0 * (1.0 - kb) * cb;
+        let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
+        [r, g, b].map(|c| (c * 255.0).clamp(0.0, 255.0))
+    }
+
+    /// The eight-patch colour chart the matrix checks paint: the neutrals, whose chroma a wrong
+    /// matrix leaves alone, and the saturated corners, which it moves by tens of levels.
+    pub const CHART: [[u8; 3]; 8] = [
+        [255, 255, 255], [128, 128, 128], [0, 0, 0], [255, 0, 0],
+        [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255],
+    ];
+
+    /// `CHART` as a `w`x`h` BGRA frame of eight columns.
+    pub fn chart_bgra(w: usize, h: usize) -> Vec<u8> {
+        let mut buf = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let p = CHART[(x * CHART.len() / w).min(CHART.len() - 1)];
+                buf[(y * w + x) * 4..][..3].copy_from_slice(&[p[2], p[1], p[0]]);
+            }
+        }
+        buf
+    }
+
+    /// The worst channel error, over `CHART`'s patches, between the RGB a receiver paints from a
+    /// decoded frame — inverting the matrix `k` names — and the RGB that was painted. Each
+    /// patch is sampled well inside its column, so neither the 4:2:0 chroma edges nor the
+    /// encoder's ringing at the boundaries counts.
+    pub fn chart_error(f: &crate::webcam::convert::I420View<'_>, k: (f64, f64)) -> f64 {
+        let cols = CHART.len();
+        let mut worst = 0.0f64;
+        for (i, want) in CHART.iter().enumerate() {
+            let (x0, x1) = (f.width * i / cols, f.width * (i + 1) / cols);
+            let (lo, hi) = (x0 + (x1 - x0) / 4, x1 - (x1 - x0) / 4);
+            let (mut acc, mut n) = ([0.0f64; 3], 0.0f64);
+            for y in f.height / 4..f.height * 3 / 4 {
+                for x in lo..hi {
+                    let ycc = [
+                        f64::from(f.y[y * f.y_stride + x]),
+                        f64::from(f.u[(y / 2) * f.uv_stride + x / 2]),
+                        f64::from(f.v[(y / 2) * f.uv_stride + x / 2]),
+                    ];
+                    let got = rgb(ycc, k);
+                    for c in 0..3 {
+                        acc[c] += got[c];
+                    }
+                    n += 1.0;
+                }
+            }
+            for c in 0..3 {
+                worst = worst.max((acc[c] / n - f64::from(want[c])).abs());
+            }
+        }
+        worst
     }
 
     /// The worst distance from neutral chroma over a decoded frame's chroma planes.
@@ -445,7 +524,7 @@ pub(crate) mod chroma_siting {
     /// and every partial average a wrong siting would take is far from neutral.
     #[test]
     fn the_tile_separates_the_sitings() {
-        let c: Vec<(f64, f64)> = TILE.iter().map(|&p| chroma([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])])).collect();
+        let c: Vec<(f64, f64)> = TILE.iter().map(|&p| chroma(p.map(f64::from), BT709)).collect();
         let mean = |of: &[usize]| {
             let (u, v) = of.iter().fold((0.0, 0.0), |(u, v), &i| (u + c[i].0, v + c[i].1));
             let n = of.len() as f64;
