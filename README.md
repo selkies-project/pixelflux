@@ -555,7 +555,8 @@ chroma and keeps the hardware conversion. Every other 4:2:0 session follows the 
 host conversion use the BT.601 matrix at limited range and declare it, because that is the
 matrix the browser engines' presentation paths invert exactly (Chromium and Firefox paint a
 BT.709-tagged frame with a BT.601-like inversion and WebKit honours either tag, measured
-against a painted colour chart), so clients decode the same colour from every backend. The
+against a painted colour chart; VP8 in WebKit inverts BT.709 instead, for want of a colour
+description of its own), so clients decode the same colour from every backend. The
 software 4:4:4 sessions (x264, x265) convert BT.709 at full range and declare that. Nothing
 extra to install at build or runtime beyond the driver.
 
