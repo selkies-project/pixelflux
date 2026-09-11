@@ -300,6 +300,9 @@ pub struct AvcodecEncoder {
     current_qp: u32,
     qp_hysteresis_counter: u32,
     cbr_mode: bool,
+    /// Whether a constant-rate session still names a maximum bitrate. Cleared for good the
+    /// first time an encoder refuses to open with one.
+    rate_ceiling: bool,
     current_bitrate_kbps: i32,
     current_vbv_mult: f64,
     current_kf_s: f64,
@@ -392,6 +395,7 @@ impl AvcodecEncoder {
                 current_qp: codec.quantizer(settings.video_crf),
                 qp_hysteresis_counter: 0,
                 cbr_mode: settings.video_cbr_mode,
+                rate_ceiling: true,
                 current_bitrate_kbps: settings.video_bitrate_kbps,
                 current_vbv_mult: settings.video_vbv_multiplier,
                 current_kf_s: settings.keyframe_interval_s,
@@ -745,8 +749,10 @@ impl AvcodecEncoder {
             // VBV falls under above 75 fps.
             let vbv = if self.library == "svt-av1" { vbv.max(bps / 50) } else { vbv };
             (*ctx).bit_rate = bps;
-            (*ctx).rc_max_rate = bps;
-            (*ctx).rc_min_rate = bps;
+            if self.rate_ceiling {
+                (*ctx).rc_max_rate = bps;
+                (*ctx).rc_min_rate = bps;
+            }
             (*ctx).rc_buffer_size = vbv.min(i32::MAX as i64) as i32;
             (*ctx).rc_initial_buffer_occupancy = (*ctx).rc_buffer_size;
             let (lo, hi) = (
@@ -770,6 +776,20 @@ impl AvcodecEncoder {
             // A failed open leaves the context unopened; it is freed outright so the encode
             // entry points refuse it and the caller rebuilds the session.
             ff::avcodec_free_context(&mut self.encoder_ctx);
+            // The rate ceiling is the one option a constant-rate session can do without: an
+            // encoder that takes a maximum bitrate only in its quality mode (SVT-AV1 before 4.0
+            // says so outright) refuses the open, and the target alone still holds the rate. It
+            // is dropped once per session, so a later re-open does not pay for the refusal again.
+            if self.cbr_mode && self.rate_ceiling {
+                self.rate_ceiling = false;
+                eprintln!(
+                    "[{}] refused a {} kbps rate ceiling ({}); encoding to the target alone.",
+                    self.library,
+                    self.current_bitrate_kbps,
+                    ff_err_str(ret)
+                );
+                return self.open_codec(qp);
+            }
             return Err(format!("Failed to open {}: {}", self.library, ff_err_str(ret)));
         }
         self.current_qp = qp;
