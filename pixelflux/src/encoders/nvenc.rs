@@ -2993,10 +2993,11 @@ impl NvencEncoder {
     ///
     /// This is the zero-copy hand-over: `device_ptr` addresses packed pixels in this session's own
     /// CUDA context — the X11 NvFBC capture buffer the NVIDIA driver composited the screen into —
-    /// so no upload, conversion or `cuMemcpy` stands between the screen and the bitstream. The
-    /// hardware CSC does the colour conversion the session's VUI declares, as it does for every
-    /// other packed input. `rgba` names the byte order (`false` for the B,G,R,A the driver's
-    /// native format delivers), and `pitch` is the buffer's row stride in bytes.
+    /// so no upload or `cuMemcpy` stands between the screen and the bitstream. The chroma convert
+    /// reads that buffer where it lies, as it does for every other input, and a session without
+    /// one hands the packed surface to NVENC's own conversion instead, registered in place.
+    /// `rgba` names the byte order (`false` for the B,G,R,A the driver's native format delivers),
+    /// and `pitch` is the buffer's row stride in bytes.
     ///
     /// The caller must keep the buffer alive and unmodified until this returns; the blocking
     /// bitstream lock inside means the encoder has finished reading by then, so the next capture
@@ -3018,14 +3019,19 @@ impl NvencEncoder {
             } else {
                 NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
             };
-            let mapped = match self.register_external_input(device_ptr, pitch, format) {
-                Ok(m) => m,
+            let submitted = match self.convert_packed(device_ptr, pitch, rgba) {
+                Ok(Some(nv12)) => Ok((nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12)),
+                Ok(None) => self.register_external_input(device_ptr, pitch, format).map(|m| (m, format)),
+                Err(e) => Err(e),
+            };
+            let (mapped, submitted) = match submitted {
+                Ok(pair) => pair,
                 Err(e) => {
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     return Err(e);
                 }
             };
-            let result = self.submit_frame(mapped, format, frame_number, force_idr);
+            let result = self.submit_frame(mapped, submitted, frame_number, force_idr);
             if result.is_err() {
                 (self.cuda.cuStreamSynchronize)(ptr::null_mut());
             }
