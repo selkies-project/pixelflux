@@ -133,6 +133,44 @@ fn pix_fmt_name(fmt: ff::AVPixelFormat) -> String {
     }
 }
 
+/// libavutil's name for `space`, which is what the VPP's `out_color_matrix` parses.
+fn color_space_name(space: ff::AVColorSpace) -> String {
+    unsafe {
+        let name = ff::av_color_space_name(space);
+        if name.is_null() {
+            format!("{space:?}")
+        } else {
+            CStr::from_ptr(name).to_string_lossy().into_owned()
+        }
+    }
+}
+
+/// The matrix a session converts with and declares, for `codec` at `full_range`. VP9 names
+/// BT.601 by its own header code, the one Chromium's decoder maps; the SMPTE 170M code lands
+/// there as unspecified.
+fn declared_colorspace(codec: Codec, full_range: bool) -> ff::AVColorSpace {
+    if codec == Codec::Vp9 {
+        ff::AVColorSpace::AVCOL_SPC_BT470BG
+    } else if full_range {
+        ff::AVColorSpace::AVCOL_SPC_BT709
+    } else {
+        ff::AVColorSpace::AVCOL_SPC_SMPTE170M
+    }
+}
+
+/// The VA-VPP convert that lands an input on a `format` surface, behind `stage`: `hwmap` for a
+/// dmabuf mapped in place, `hwupload` for a packed host frame. `matrix` is libavutil's name for
+/// the matrix the session declares, so the pixels cannot drift from the signal. Chroma is sited
+/// at the centre of each 2x2 block, the average the software convert produces; left unset, the
+/// Intel driver keeps the left pixel of each pair and subpixel-antialiased text holds the
+/// coloured fringes of its glyph edges.
+fn vpp_chain(stage: &str, width: i32, height: i32, format: &str, matrix: &str) -> String {
+    format!(
+        "{stage},scale_vaapi=w={width}:h={height}:format={format}\
+:out_color_matrix={matrix}:out_range=tv:out_chroma_location=center"
+    )
+}
+
 /// The 4:4:4 surface format to encode into on this VA device, or `None` when the driver
 /// carries none. This answers only the driver half: `av_hwframe_ctx_init` and
 /// `avcodec_open2` still have to accept the format, and each reports its own refusal.
@@ -418,6 +456,12 @@ impl AvcodecEncoder {
         self.is_fullcolor() && self.backend == Backend::Software && self.codec != Codec::Vp9
     }
 
+    /// The matrix this session converts with and declares, the one rule the codec context and
+    /// the VA-VPP convert both read.
+    fn colorspace(&self) -> ff::AVColorSpace {
+        declared_colorspace(self.codec, self.is_full_range())
+    }
+
     /// Open the VA-API device, surface pool and filter graph, then the codec.
     unsafe fn open_vaapi(&mut self, settings: &RustCaptureSettings, fullcolor: bool) -> Result<(), String> {
         let render_node = if settings.encode_node_index >= 0 {
@@ -526,13 +570,14 @@ impl AvcodecEncoder {
     }
 
     /// Build the `buffersrc` → `hwmap`/`hwupload` + `scale_vaapi` → `buffersink` chain that
-    /// lands every input on a GPU surface in `sw_format`, BT.601 limited range.
+    /// lands every input on a GPU surface in `sw_format`, converted as `vpp_chain` describes.
     ///
     /// The chain is staged with the segment API (parse, create filters, attach the VA device
     /// to every filter, apply) rather than the one-shot parser, because `hwupload`
     /// initializes during the parse and fails without a device, and a host buffersrc carries
     /// no frames context to derive one from.
     unsafe fn build_graph(&mut self, host_format: ff::AVPixelFormat) -> Result<(), String> {
+        let matrix = color_space_name(self.colorspace());
         let session = self.hw.as_mut().unwrap();
         session.filter_graph = ff::avfilter_graph_alloc();
         let graph = session.filter_graph;
@@ -582,12 +627,12 @@ impl AvcodecEncoder {
         }
 
         let stage = if self.input == Input::Dmabuf { "hwmap" } else { "hwupload" };
-        let filters_desc = CString::new(format!(
-            "{},scale_vaapi=w={}:h={}:format={}:out_color_matrix=bt601:out_range=tv",
+        let filters_desc = CString::new(vpp_chain(
             stage,
             self.width,
             self.height,
-            pix_fmt_name(self.sw_format)
+            &pix_fmt_name(self.sw_format),
+            &matrix,
         ))
         .unwrap();
         let mut seg: *mut ff::AVFilterGraphSegment = ptr::null_mut();
@@ -672,15 +717,7 @@ impl AvcodecEncoder {
         } else {
             ff::AVColorRange::AVCOL_RANGE_MPEG
         };
-        // VP9 names BT.601 by its own header code, the one Chromium's decoder maps; the
-        // SMPTE 170M code lands there as unspecified.
-        (*ctx).colorspace = if self.codec == Codec::Vp9 {
-            ff::AVColorSpace::AVCOL_SPC_BT470BG
-        } else if full_range {
-            ff::AVColorSpace::AVCOL_SPC_BT709
-        } else {
-            ff::AVColorSpace::AVCOL_SPC_SMPTE170M
-        };
+        (*ctx).colorspace = self.colorspace();
         (*ctx).color_primaries = ff::AVColorPrimaries::AVCOL_PRI_BT709;
         (*ctx).color_trc = ff::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         if let Some(session) = self.hw.as_ref() {
@@ -1209,6 +1246,62 @@ mod tests {
         }
     }
 
+    /// The convert a hardware session is handed has to parse where no VA device exists, since a
+    /// driver is otherwise the only thing that reports an unparsable one. Every option name is
+    /// one the filter registers, the matrix is the one the session declares, and chroma is sited
+    /// at the centre of each 2x2 block, which is where the software convert puts it.
+    #[test]
+    fn the_convert_chain_parses_and_carries_the_declared_matrix() {
+        let filter = unsafe { ff::avfilter_get_by_name(c"scale_vaapi".as_ptr()) };
+        assert!(!filter.is_null(), "this FFmpeg carries no scale_vaapi");
+        for codec in Codec::VIDEO {
+            for full_range in [false, true] {
+                let space = declared_colorspace(codec, full_range);
+                let matrix = color_space_name(space);
+                let parsed = unsafe {
+                    ff::av_color_space_from_name(CString::new(matrix.clone()).unwrap().as_ptr())
+                };
+                assert_eq!(parsed, space as c_int, "{matrix} did not parse back");
+                for stage in ["hwmap", "hwupload"] {
+                    for fmt in [ff::AVPixelFormat::AV_PIX_FMT_NV12].into_iter().chain(FULLCOLOR_SW_FORMATS) {
+                        let chain = vpp_chain(stage, 128, 128, &pix_fmt_name(fmt), &matrix);
+                        let args = CString::new(chain.split_once("scale_vaapi=").unwrap().1).unwrap();
+                        unsafe {
+                            let mut graph = ff::avfilter_graph_alloc();
+                            let vpp = ff::avfilter_graph_alloc_filter(graph, filter, c"vpp".as_ptr());
+                            let ret = ff::avfilter_init_str(vpp, args.as_ptr());
+                            let mut loc: *mut u8 = ptr::null_mut();
+                            let got = if ret >= 0 {
+                                ff::av_opt_get(
+                                    vpp as *mut c_void,
+                                    c"out_chroma_location".as_ptr(),
+                                    ff::AV_OPT_SEARCH_CHILDREN,
+                                    &mut loc,
+                                )
+                            } else {
+                                ret
+                            };
+                            let sited = if got >= 0 {
+                                let name = ff::av_chroma_location_from_name(loc as *const c_char);
+                                ff::av_free(loc as *mut c_void);
+                                name
+                            } else {
+                                got
+                            };
+                            ff::avfilter_graph_free(&mut graph);
+                            assert!(ret >= 0, "{chain}: {}", ff_err_str(ret));
+                            assert_eq!(
+                                sited,
+                                ff::AVChromaLocation::AVCHROMA_LOC_CENTER as c_int,
+                                "{chain} does not site chroma at the block centre"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Every VA-API encoder name this module can ask for is one FFmpeg registers, whether or
     /// not a device exists to run it.
     #[test]
@@ -1220,6 +1313,50 @@ mod tests {
                 "{codec:?}"
             );
         }
+    }
+
+    /// Four colours whose 2x2 average is grey, tiled: a decoded block's chroma comes out
+    /// neutral only where the session sited chroma at the centre of the block, and saturated
+    /// wherever it kept one pixel, row or column of it — the colour a browser then shows along
+    /// the glyph edges of subpixel-antialiased text. Every session this host can open is
+    /// measured, since a hardware one runs the driver's own downsampler and a unit test cannot
+    /// pin that.
+    #[test]
+    fn decoded_chroma_is_neutral_on_a_tile_that_averages_to_grey() {
+        use crate::encoders::chroma_siting;
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        const N: usize = 128;
+        let bgra = chroma_siting::bgra(N, N);
+        let settings = RustCaptureSettings {
+            width: N as c_int,
+            height: N as c_int,
+            target_fps: 30.0,
+            video_crf: 20,
+            ..Default::default()
+        };
+        let mut measured = 0;
+        for backend in [Backend::Software, Backend::Vaapi] {
+            for codec in Codec::VIDEO {
+                let mut enc = match AvcodecEncoder::new(&settings, codec, backend, Input::Host { rgba: false }) {
+                    Ok(enc) => enc,
+                    Err(_) => continue,
+                };
+                let out = match enc.encode_host(&bgra, N * 4, 0, 20, true) {
+                    Ok(out) => out,
+                    Err(e) => panic!("{backend:?} {codec:?} encode: {e}"),
+                };
+                let mut dec = AvDecoder::new(codec).expect("decoder");
+                assert!(
+                    dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false),
+                    "{backend:?} {codec:?} decoded nothing"
+                );
+                let worst = chroma_siting::worst(&dec.frame().expect("frame"));
+                println!("[chroma-siting] {backend:?} {codec:?}: worst |C-128| {worst:.1}");
+                assert!(worst <= 8.0, "{backend:?} {codec:?} sites chroma {worst:.1} off neutral");
+                measured += 1;
+            }
+        }
+        assert!(measured > 0, "no session opened to measure");
     }
 
     /// Construction either stands a session up or says why it could not; a half-built
