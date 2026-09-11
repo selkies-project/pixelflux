@@ -1,7 +1,9 @@
 name: Release
 
-# A tag push releases that tag. A manual run releases the tag it names and can
-# hold the release off the "Latest" badge, for a fix to an older series.
+# A tag push releases that tag, which is the version the wheels carry: a
+# pre-release such as 2.2.0rc1 is released as one. A manual run releases the tag
+# it names and can hold the release off the "Latest" badge, for a fix to an
+# older series.
 
 on:
   push:
@@ -10,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and publish (e.g. 2.1.0)
+        description: Existing release tag to build and publish (e.g. 2.1.0 or 2.2.0rc1)
         type: string
         required: true
       latest:
@@ -28,17 +30,31 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.path }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
-      - name: Verify release notes exist
+      - name: Resolve the release notes
+        id: notes
         run: |
-          if [ ! -f "release-notes/${RELEASE_TAG}.md" ]; then
-            echo "::error::release-notes/${RELEASE_TAG}.md not found"
+          # The tag is what the wheels are versioned as, so it has to be a
+          # PEP 440 version spelled the way pip normalizes it
+          echo "${RELEASE_TAG}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)?$' \
+            || { echo "::error::${RELEASE_TAG} is not a PEP 440 version (2.1.0, 2.2.0rc1)"; exit 1; }
+          # A pre-release carries the notes of the release it leads to unless it
+          # was given its own
+          path="release-notes/${RELEASE_TAG}.md"
+          if [ ! -f "${path}" ]; then
+            path="release-notes/$(echo "${RELEASE_TAG}" | sed -E 's/((a|b|rc)[0-9]+|\.post[0-9]+|\.dev[0-9]+)$//').md"
+          fi
+          if [ ! -f "${path}" ]; then
+            echo "::error::no release notes for ${RELEASE_TAG}"
             exit 1
           fi
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: check
@@ -60,6 +76,11 @@ jobs:
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
 
+      - name: Version the wheels as the tag
+        run: |
+          sed -i "s|^\( *\)version=.*|\1version=\"${RELEASE_TAG}\",|" setup.py
+          grep -q "version=\"${RELEASE_TAG}\"," setup.py
+
       - name: Build wheels (${{ matrix.platform }}_${{ matrix.target.arch }})
         uses: pypa/cibuildwheel@v4.2.0
         env:
@@ -76,7 +97,7 @@ jobs:
           compression-level: 0
 
   release:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -93,10 +114,12 @@ jobs:
 
       - name: Get release notes
         id: notes
+        env:
+          NOTES: ${{ needs.check.outputs.notes }}
         run: |
           {
             echo "content<<EOF"
-            cat "release-notes/${RELEASE_TAG}.md"
+            cat "${NOTES}"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
