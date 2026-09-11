@@ -60,12 +60,13 @@ fn main() -> std::io::Result<()> {
     let nvenc_out = out.join("nvenc.rs");
     bindgen::builder()
         .header(nvenc_header)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_type("NV.*")
         .allowlist_function("Nv.*")
         .allowlist_var("NVENC.*")
         .allowlist_var("NV_MAX.*")
         .size_t_is_usize(true)
+        .layout_tests(true)
         .default_enum_style(bindgen::EnumVariation::Rust { non_exhaustive: false })
         .newtype_enum("_NVENCSTATUS")
         .newtype_enum("_NV_ENC_PIC_TYPE")
@@ -134,11 +135,13 @@ fn main() -> std::io::Result<()> {
             "cuExternalMemoryGetMappedMipmappedArray", "cuMipmappedArrayGetLevel",
             "cuMipmappedArrayDestroy", "cuDestroyExternalMemory", "cuDestroyExternalSemaphore",
             "cuWaitExternalSemaphoresAsync", "cuSignalExternalSemaphoresAsync",
+            "cuTexObjectCreate", "cuTexObjectDestroy",
         ];
         let mut cuda_builder = bindgen::builder()
             .header(&cuda_header)
-            .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .size_t_is_usize(true)
+            .layout_tests(true)
             .default_enum_style(bindgen::EnumVariation::Rust { non_exhaustive: false })
             .newtype_enum("cudaError_enum")
             .newtype_enum("CUmemorytype_enum")
