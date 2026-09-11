@@ -1684,6 +1684,31 @@ mod qp_bound_sweep {
         }
     }
 
+    /// The colour chart, converted by the host path and encoded by x264, decodes back to the
+    /// colour that was painted when the BT.709 the stream declares is inverted — the check a
+    /// client's presentation path performs on every frame, here with no browser in the way.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_paints_the_chart_it_converts() {
+        use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use super::convert_to_yuv_mt;
+        let (w, h) = (256usize, 128usize);
+        let bgra = chart_bgra(w, h);
+        let (mut y, mut u, mut v) = (vec![0u8; w * h], vec![0u8; w * h / 4], vec![0u8; w * h / 4]);
+        convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, false, &mut y, &mut u, &mut v, (w, w / 2), 4)
+            .expect("convert");
+        let mut enc = H264EncoderWrapper::new(w as i32, h as i32, 20, false, 30.0, 1, false, 0, 0, 0, 0)
+            .expect("x264 init");
+        let mut out = Vec::new();
+        assert!(enc.encode_with_headers(&y, &u, &v, w as i32, (w / 2) as i32, (w / 2) as i32, 0, 0, true, true, &mut out));
+        let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+        assert!(dec.decode(&out).expect("decode"));
+        let worst = chart_error(&dec.frame().expect("frame"), BT709);
+        println!("[chart] x264: worst |dRGB| {worst:.1}");
+        assert!(worst <= 12.0, "the software H.264 path paints {worst:.1} off the chart");
+    }
+
     /// Encode the same scrolling-text sequence through the OpenH264 full-frame encoder (luma
     /// broadcast to a grey BGRA frame), returning each frame's bitstream for comparison with the
     /// x264 run.
