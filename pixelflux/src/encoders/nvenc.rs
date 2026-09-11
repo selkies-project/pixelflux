@@ -727,8 +727,8 @@ const SLICE_MODE_COUNT: u32 = 3;
 /// Slices per H.264 and HEVC frame, the count the VA-API (`slices = 4`) and OpenH264
 /// (`SM_FIXEDSLCNUM_SLICE`) sessions emit too: a client decoding in software threads a frame
 /// across its slices, and more than four upsets some Chromium decoders. What the slices cost at
-/// a fixed quantizer is measured by `gpu_bench_slices`. AV1 partitions by tiles instead, pinned
-/// at 1x1 in `configure_codec`.
+/// a fixed quantizer is measured by `gpu_bench_slices`. AV1 partitions by tiles instead, asked
+/// for as 1x1 in `configure_codec`.
 const SLICES_PER_FRAME: u32 = 4;
 
 /// Output bitstream buffers per session: one, because `submit_frame` locks, copies and unlocks
@@ -1851,9 +1851,12 @@ impl NvencEncoder {
     /// `ChromaConvert` produces, and NVENC's own conversion — the fallback, and the 4:4:4
     /// sessions — follows the matrix declared here at the limited range it emits, which
     /// `gpu_hardware_conversion_matches_the_declared_matrix` holds it to. H.264 additionally
-    /// restricts reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC. H.264 and
-    /// HEVC frames carry `SLICES_PER_FRAME` slices; AV1 keeps one tile, since tiles cost bitrate
-    /// and buy no quality, and tier 0, the only tier NVENC takes for it.
+    /// restricts reordering in its VUI so no-reorder decoders don't buffer, and codes CABAC.
+    /// H.264 and HEVC frames carry `SLICES_PER_FRAME` slices; AV1 asks for one tile, since tiles
+    /// cost bitrate and buy no quality, and tier 0, the only tier NVENC takes for it. The driver
+    /// honours a 1x1 request below 1986 pixels of picture height; above that it forces a second
+    /// tile row whatever is asked for, in the low-latency presets this one is among but not from
+    /// P5 up, so a 4K AV1 session codes two tile rows.
     ///
     /// HEVC declares the tier `h265_tier` names for its level, High: NVENC validates a CBR target
     /// against the MaxBR of the pinned level, and the Main-tier ceiling of the 5.x levels
