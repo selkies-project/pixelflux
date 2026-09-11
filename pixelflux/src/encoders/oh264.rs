@@ -16,14 +16,14 @@
 //! on-demand `force_intra_frame`, never a fixed cadence — so a mostly-static screen
 //! spends no bitrate on keyframes nothing requested, matching the NVENC/x264
 //! strict-GOP streaming behavior. Host ARGB is converted to I420 with the same
-//! BT.601 limited-range path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
+//! BT.709 limited-range path the x264 encoder uses, then fed to OpenH264 as borrowed planes.
 
 use crate::encoders::codec::{push_video_header, Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN};
 use crate::encoders::QP_HYSTERESIS_LIMIT;
 use crate::RustCaptureSettings;
 use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
-    MatrixCoefficients, QpRange, RateControlMode, UsageType, VuiConfig,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, QpRange,
+    RateControlMode, UsageType, VuiConfig,
 };
 use openh264::formats::YUVSlices;
 use openh264::OpenH264API;
@@ -124,11 +124,10 @@ impl Openh264Encoder {
     ///
     /// 3. **Base config** (shared by both rate modes): screen-content real-time usage, low
     ///    complexity, an effectively infinite intra period, a VUI declaring the conversion
-    ///    (BT.709 primaries and transfer, BT.601 matrix, limited range; without it a WebRTC
-    ///    receiver infers the range from the SDP profile and can display the picture visibly
-    ///    darker), and the thread
-    ///    count. Frame skip is **enabled** so the rate controller can actually hold the target
-    ///    bitrate — skip-less bitrate control is only approximate. A skipped frame is not encoded
+    ///    (BT.709 primaries, transfer and matrix at limited range; without it a WebRTC receiver
+    ///    infers the range from the SDP profile and can display the picture visibly darker), and
+    ///    the thread count. Frame skip is **enabled** so the rate controller can actually hold
+    ///    the target bitrate — skip-less bitrate control is only approximate. A skipped frame is not encoded
     ///    and the next P-frame references the last *encoded* frame, so the reference chain stays
     ///    intact. Adaptive quantization and background detection are set explicitly to `false` to
     ///    silence the init warnings (both are auto-disabled for screen content anyway). Scene-change
@@ -244,7 +243,7 @@ impl Openh264Encoder {
             // `i_scenecut_threshold = 0` allows.
             .debug(settings.debug_logging)
             .intra_frame_period(IntraFramePeriod::from_num_frames(INFINITE_INTRA_PERIOD))
-            .vui(VuiConfig::bt709().matrix_coefficients(MatrixCoefficients::Smpte170M))
+            .vui(VuiConfig::bt709())
             .num_threads(threads);
         let config = if settings.video_cbr_mode {
             let min_qp = settings.video_min_qp.clamp(1, 51) as u8;
@@ -513,6 +512,7 @@ impl Openh264Encoder {
             rgba_input,
             false,
             false,
+            false,
             &mut self.y_buf,
             &mut self.u_buf,
             &mut self.v_buf,
@@ -597,17 +597,17 @@ mod tests {
         f
     }
 
-    /// The stream declares the matrix its input was converted with: BT.601 at limited range.
+    /// The stream declares the matrix its input was converted with: BT.709 at limited range.
     #[test]
     fn declares_the_conversion_matrix() {
         use crate::webcam::decode::{AvDecoder, Decoder};
-        use ffmpeg_sys_next::{AVColorRange::AVCOL_RANGE_MPEG, AVColorSpace::AVCOL_SPC_SMPTE170M};
+        use ffmpeg_sys_next::{AVColorRange::AVCOL_RANGE_MPEG, AVColorSpace::AVCOL_SPC_BT709};
         let s = RustCaptureSettings { width: 128, height: 96, target_fps: 30.0, ..Default::default() };
         let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
         let idr = enc.encode_host_argb(&busy_frame(128, 96, 0), 128 * 4, 0, true, false).expect("encode");
         let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
         assert!(dec.decode(&idr[VIDEO_HEADER_LEN..]).expect("decode"));
-        assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_SMPTE170M, AVCOL_RANGE_MPEG)));
+        assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)));
     }
 
     /// A forced first frame is emitted as a typed IDR with a valid wire header and Annex-B

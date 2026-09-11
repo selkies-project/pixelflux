@@ -49,13 +49,12 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// 1. **Plane strides**: `strides` gives the Y and chroma row pitches of the output planes
 ///    (tightly packed for the stripe buffers, padded for an AVFrame); the chroma planes are
 ///    `width` wide for 4:4:4 (`i444 == true`) or `width / 2` for 4:2:0. `rgba_input` selects
-///    the source byte order, `i444` the subsampling and `full_range` the signal: **Full** range
-///    with the **BT.709** matrix is the 4:4:4 signal x264 and x265 declare; everything else is
-///    **Limited** range with the **BT.601** matrix, the matrix NVENC's hardware conversion is
-///    fixed at and the one browser presentation paths invert exactly (Chromium and Firefox paint
-///    a BT.709-tagged frame with a BT.601-like inversion, WebKit honours either), so every
-///    backend's stream decodes to the same colour. Each encoder declares the matrix it was fed.
-///    All four `yuv` crate routines run in the **Fast** conversion mode.
+///    the source byte order and `i444` the subsampling; `full_range` selects the signal range,
+///    **Full** for the 4:4:4 stream x264 and x265 declare and **Limited** for everything else.
+///    The matrix is **BT.709**, whose primaries and transfer the sRGB desktop source already
+///    carries, unless `bt601` marks a codec whose bitstream can name no other matrix (VP8).
+///    Every encoder declares the matrix it was fed. All four `yuv` crate routines run in the
+///    **Fast** conversion mode.
 /// 2. **Band split**: `band_h` is `height / bands` floored to an even number and at least 2 rows
 ///    (a band under 2 rows is not worth a task). Keeping band boundaries even ensures a 4:2:0
 ///    chroma pair never straddles a seam. When `bands <= 1` or the whole image fits one band, the
@@ -74,6 +73,7 @@ pub(crate) fn convert_to_yuv_mt(
     rgba_input: bool,
     i444: bool,
     full_range: bool,
+    bt601: bool,
     y_buf: &mut [u8],
     u_buf: &mut [u8],
     v_buf: &mut [u8],
@@ -81,11 +81,8 @@ pub(crate) fn convert_to_yuv_mt(
     bands: usize,
 ) -> Result<(), yuv::YuvError> {
     let (y_stride, uv_stride) = strides;
-    let (range, matrix) = if full_range {
-        (YuvRange::Full, YuvStandardMatrix::Bt709)
-    } else {
-        (YuvRange::Limited, YuvStandardMatrix::Bt601)
-    };
+    let range = if full_range { YuvRange::Full } else { YuvRange::Limited };
+    let matrix = if bt601 { YuvStandardMatrix::Bt601 } else { YuvStandardMatrix::Bt709 };
 
     let convert_band = |src_band: &[u8], y: &mut [u8], u: &mut [u8], v: &mut [u8], h: usize| {
         let mut img = YuvPlanarImageMut {
@@ -228,9 +225,9 @@ impl H264EncoderWrapper {
     ///      when the VBV underflows, which leaves rows of the picture frozen on old content. A
     ///      budget the content cannot meet overshoots instead, as NVENC and libvpx do.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
-    /// 4. **Colour**: I444 (full range, BT.709 matrix) or I420 (limited range, BT.601 matrix)
-    ///    CSP, a VUI declaring that matrix with BT.709 primaries and transfer for the sRGB
-    ///    source, and the matching `high444` / `baseline` profile.
+    /// 4. **Colour**: I444 at full range or I420 at limited range, a VUI declaring that range
+    ///    with the BT.709 primaries, transfer and matrix the sRGB source and the conversion
+    ///    carry, and the matching `high444` / `baseline` profile.
     /// 5. **Coding tools**: CABAC and the 8x8 transform are disabled, matching the low-latency
     ///    baseline profile — CAVLC entropy coding with no 8x8 DCT — for minimal encode cost.
     /// 6. **Output**: repeated headers (SPS/PPS before each keyframe) and Annex-B framing, with
@@ -280,7 +277,7 @@ impl H264EncoderWrapper {
             param.vui.b_fullrange = if is_i444 { 1 } else { 0 };
             param.vui.i_colorprim = 1;
             param.vui.i_transfer = 1;
-            param.vui.i_colmatrix = if is_i444 { 1 } else { 6 };
+            param.vui.i_colmatrix = 1;
 
             let profile = CString::new(if is_i444 { "high444" } else { "baseline" }).unwrap();
             x264_sys::x264_param_apply_profile(&mut param, profile.as_ptr());
@@ -1030,6 +1027,7 @@ pub fn encode_cpu(
                             use_gpu,
                             video_fullcolor,
                             video_fullcolor,
+                            false,
                             &mut stripe_state.y_buf,
                             &mut stripe_state.u_buf,
                             &mut stripe_state.v_buf,
@@ -1550,7 +1548,7 @@ mod tests {
         let bgra = crate::encoders::chroma_siting::bgra(w, h);
         for bands in [1usize, 4, 7] {
             let (mut yp, mut up, mut vp) = (vec![0u8; w * h], vec![0u8; w * h / 4], vec![0u8; w * h / 4]);
-            convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, &mut yp, &mut up, &mut vp, (w, w / 2), bands)
+            convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, false, &mut yp, &mut up, &mut vp, (w, w / 2), bands)
                 .expect("convert");
             let worst = up
                 .iter()
@@ -1662,15 +1660,15 @@ mod qp_bound_sweep {
             .collect()
     }
 
-    /// The x264 stream declares the matrix its input was converted with: BT.601 at limited
-    /// range for I420, BT.709 at full range for I444.
+    /// The x264 stream declares the signal its input was converted with: the BT.709 matrix in
+    /// both chroma formats, at full range for I444 and limited for I420.
     #[cfg(feature = "gpl")]
     #[test]
     fn x264_declares_the_conversion_matrix() {
         use crate::webcam::decode::{AvDecoder, Decoder as _};
         use ffmpeg_sys_next::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
-        use ffmpeg_sys_next::AVColorSpace::{AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
-        for (i444, want) in [(false, (AVCOL_SPC_SMPTE170M, AVCOL_RANGE_MPEG)), (true, (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG))] {
+        use ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT709;
+        for (i444, want) in [(false, (AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)), (true, (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG))] {
             let (w, h) = (128usize, 96usize);
             let mut enc = H264EncoderWrapper::new(w as i32, h as i32, 25, i444, 30.0, 1, false, 0, 0, 0, 0)
                 .expect("x264 init");

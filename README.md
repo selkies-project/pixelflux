@@ -541,25 +541,40 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ### Colour conversion
 
+The desktop source is sRGB, which shares BT.709's primaries and transfer function, so every
+session converts with the **BT.709 matrix** and declares it: the software encoders' host
+conversion, the VA-API convert (`scale_vaapi`), and NVENC's GPU kernel, at limited range for
+4:2:0 and full range for the software 4:4:4 sessions (x264, x265). Chroma sits at the centre of
+each 2x2 block — the average of all four pixels — so the colour a subpixel-antialiased glyph
+edge carries cancels instead of tinting the chroma plane.
+
 NVENC takes the captured ARGB, so there is **no CUDA Toolkit / NVRTC requirement** — only the
-NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. The driver's
-ARGB→YUV hardware conversion is fixed at BT.601 limited range (no encode-session flag retargets
-it), so pixelflux declares exactly that in the VUI — BT.709 primaries and transfer for the sRGB
-desktop source, SMPTE 170M matrix, limited range. That conversion weights the two columns of a
-2x2 block 3:1 rather than averaging them, which leaves half the colour of a subpixel-antialiased
-glyph edge in the chroma plane, so a 4:2:0 NVENC session converts on the GPU instead: a small
-kernel shipped as PTX that `libcuda` JIT-compiles (still no toolkit and no runtime compiler),
-reading the frame where it already lies — the packed surface, a pitch-linear dmabuf import, or a
-texture over an array-typed one — and writing the NV12 the encoder takes. 4:4:4 subsamples no
-chroma and keeps the hardware conversion. Every other 4:2:0 session follows the same posture: the VA-API convert (`scale_vaapi`) and the software encoders'
-host conversion use the BT.601 matrix at limited range and declare it, because that is the
-matrix the browser engines' presentation paths invert exactly (Chromium and Firefox paint a
-BT.709-tagged frame with a BT.601-like inversion and WebKit honours either tag, measured
-against a painted colour chart; VP8 on WebKit's GStreamer ports inverts BT.709 instead, that
-port dropping the colour space the client declares for a codec that carries none), so clients
-decode the same colour from every backend. The
-software 4:4:4 sessions (x264, x265) convert BT.709 at full range and declare that. Nothing
-extra to install at build or runtime beyond the driver.
+NVIDIA driver runtime (`libnvidia-encode`, `libcuda`), which is loaded at runtime. Its
+fixed-function ARGB→YUV conversion follows the matrix the session declares, measured on Volta
+and Pascal, but weights the two columns of a 4:2:0 block 3:1 rather than averaging them. A
+4:2:0 session therefore converts on the GPU itself, with a small kernel shipped as PTX that
+`libcuda` JIT-compiles (still no toolkit and no runtime compiler), reading the frame where it
+already lies — the packed surface, a pitch-linear dmabuf import, or a texture over an
+array-typed one — and writing the NV12 the encoder takes. 4:4:4 subsamples nothing, so it keeps
+the hardware conversion, and so does a driver that refuses the kernel: the matrix is right
+either way and only the siting differs.
+
+VP8 is the one codec that cannot carry this: its keyframe header holds a single colour-space bit
+whose only defined value is BT.601. Told BT.709 out of band instead — in the decoder
+configuration a client passes and in the RTP colour-space header extension — Chromium and WebKit
+paint it correctly, while Firefox reads neither and inverts BT.601, shifting saturated colour by
+20 levels on both transports, so VP8 converts and declares BT.601 (WebKit's GStreamer ports
+invert BT.709 there whatever it carries, that port dropping the colour space the client declares).
+JPEG stripes are JFIF, which is BT.601 at full range by definition. Nothing extra to install at
+build or runtime beyond the driver.
+
+Two receiver-side caveats, measured rather than inferred. Chromium and Firefox both convert YUV
+through libyuv, whose default build clamps the BT.709 Cb→B coefficient to 2.0 because the true
+2.112 does not fit its fixed-point constant, so saturated blue arrives up to 12 levels short of
+the source wherever that conversion runs on the CPU; BT.601's coefficient is clamped the same way
+and loses 2. And Firefox drops the colour description of an **AV1** stream it receives over
+WebRTC, painting it as BT.601 — its WebCodecs path and every other codec on both transports
+honour what the stream declares.
 
 ## VA-API 4:4:4
 

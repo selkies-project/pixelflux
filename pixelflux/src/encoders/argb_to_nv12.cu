@@ -4,7 +4,41 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// ARGB/ABGR -> NV12 with BT.601 limited-range coefficients, chroma averaged over each 2x2 block.
+// ARGB/ABGR -> NV12, BT.709 at limited range. NVENC's own conversion follows the matrix a
+// session declares but weights the two columns of a 4:2:0 block 3:1 instead of averaging them,
+// which is what these kernels replace.
+
+__device__ __forceinline__ float luma(float r, float g, float b)
+{
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+__device__ __forceinline__ unsigned char clamp8(float v)
+{
+    return (unsigned char)__float2int_rn(fminf(fmaxf(v, 0.0f), 255.0f));
+}
+
+__device__ __forceinline__ unsigned char luma8(float r, float g, float b)
+{
+    return clamp8(16.0f + luma(r, g, b) * (219.0f / 255.0f));
+}
+
+// The chroma pair of a 2x2 block's average RGB.
+__device__ __forceinline__ void chroma8(float r, float g, float b, unsigned char* cb, unsigned char* cr)
+{
+    float y = luma(r, g, b);
+    *cb = clamp8(128.0f + (b - y) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.0722f)));
+    *cr = clamp8(128.0f + (r - y) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.2126f)));
+}
+
+// A pixel's B, G and R, from either byte order.
+__device__ __forceinline__ void unpack(const unsigned char* px, int swap_rb, float* r, float* g, float* b)
+{
+    *b = px[swap_rb ? 2 : 0];
+    *g = px[1];
+    *r = px[swap_rb ? 0 : 2];
+}
+
 extern "C" __global__ void argb_to_nv12(
     const unsigned char* __restrict__ src, int src_pitch,
     unsigned char* __restrict__ dst, int dst_pitch,
@@ -19,22 +53,16 @@ extern "C" __global__ void argb_to_nv12(
     for (int dy = 0; dy < 2; ++dy) {
         int y = min(cy * 2 + dy, height - 1);
         const unsigned char* row = src + (long)src_pitch * y;
-        unsigned char* luma = dst + (long)dst_pitch * y;
+        unsigned char* luma_row = dst + (long)dst_pitch * y;
         for (int dx = 0; dx < 2; ++dx) {
             int x = min(cx * 2 + dx, width - 1);
-            const unsigned char* px = row + (long)x * 4;
-            float b = px[swap_rb ? 2 : 0], g = px[1], r = px[swap_rb ? 0 : 2];
+            float r, g, b;
+            unpack(row + (long)x * 4, swap_rb, &r, &g, &b);
             sr += r; sg += g; sb += b;
-            float yf = 0.299f * r + 0.587f * g + 0.114f * b;
-            luma[x] = (unsigned char)__float2int_rn(16.0f + yf * (219.0f / 255.0f));
+            luma_row[x] = luma8(r, g, b);
         }
     }
-    sr *= 0.25f; sg *= 0.25f; sb *= 0.25f;
-    float yf = 0.299f * sr + 0.587f * sg + 0.114f * sb;
-    float cb = 128.0f + (sb - yf) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.114f));
-    float cr = 128.0f + (sr - yf) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.299f));
-    uv[0] = (unsigned char)__float2int_rn(fminf(fmaxf(cb, 0.0f), 255.0f));
-    uv[1] = (unsigned char)__float2int_rn(fminf(fmaxf(cr, 0.0f), 255.0f));
+    chroma8(sr * 0.25f, sg * 0.25f, sb * 0.25f, &uv[0], &uv[1]);
 }
 
 // The same convert for an import the driver hands back as a CUDA array rather than linear
@@ -53,20 +81,14 @@ extern "C" __global__ void argb_tex_to_nv12(
     unsigned char* uv = dst + (long)dst_pitch * height + (long)dst_pitch * cy + cx * 2;
     for (int dy = 0; dy < 2; ++dy) {
         int y = min(cy * 2 + dy, height - 1);
-        unsigned char* luma = dst + (long)dst_pitch * y;
+        unsigned char* luma_row = dst + (long)dst_pitch * y;
         for (int dx = 0; dx < 2; ++dx) {
             int x = min(cx * 2 + dx, width - 1);
             uchar4 px = tex2D<uchar4>(src, x, y);
             float b = swap_rb ? px.z : px.x, g = px.y, r = swap_rb ? px.x : px.z;
             sr += r; sg += g; sb += b;
-            float yf = 0.299f * r + 0.587f * g + 0.114f * b;
-            luma[x] = (unsigned char)__float2int_rn(16.0f + yf * (219.0f / 255.0f));
+            luma_row[x] = luma8(r, g, b);
         }
     }
-    sr *= 0.25f; sg *= 0.25f; sb *= 0.25f;
-    float yf = 0.299f * sr + 0.587f * sg + 0.114f * sb;
-    float cb = 128.0f + (sb - yf) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.114f));
-    float cr = 128.0f + (sr - yf) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.299f));
-    uv[0] = (unsigned char)__float2int_rn(fminf(fmaxf(cb, 0.0f), 255.0f));
-    uv[1] = (unsigned char)__float2int_rn(fminf(fmaxf(cr, 0.0f), 255.0f));
+    chroma8(sr * 0.25f, sg * 0.25f, sb * 0.25f, &uv[0], &uv[1]);
 }
