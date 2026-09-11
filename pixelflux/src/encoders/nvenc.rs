@@ -45,6 +45,17 @@ use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
 
+/// Opaque CUDA module and kernel handles; the driver API's own types, which the committed
+/// bindings do not carry.
+type CUmodule = *mut c_void;
+type CUfunction = *mut c_void;
+
+/// The ARGB/ABGR → NV12 convert, as PTX the driver JIT-compiles at session open. PTX is the
+/// portable form: `libcuda` compiles it for whatever GPU is present, so nothing beyond the
+/// driver NVENC already needs has to be installed, and `.version 3.1`/`.target sm_30` keeps
+/// every NVENC-capable GPU in range.
+const ARGB_TO_NV12_PTX: &[u8] = include_bytes!("argb_to_nv12.ptx");
+
 /// EGL C-interop type aliases and the `EGL_*` attribute constants used to wrap a dmabuf as
 /// an `EGLImageKHR` for CUDA import.
 type EGLDisplay = *const c_void;
@@ -75,6 +86,10 @@ const CU_EGL_FRAME_TYPE_ARRAY: u32 = 0;
 const CU_EGL_FRAME_TYPE_PITCH: u32 = 1;
 /// `CUeglFrame::cu_format` of an 8-bit-per-channel plane (`CU_AD_FORMAT_UNSIGNED_INT8`).
 const CU_AD_FORMAT_U8: u32 = 1;
+
+/// `CU_TRSF_READ_AS_INTEGER`, a `cuda.h` macro the bindings do not carry: a texture fetch
+/// returns the stored bytes rather than normalized floats.
+const CU_TRSF_READ_AS_INTEGER: u32 = 1;
 
 /// A CUDA frame mapped from an EGLImage: the `cuGraphicsResourceGetMappedEglFrame` result
 /// describing the imported dmabuf's plane pointers, geometry, pitch and pixel format.
@@ -156,6 +171,31 @@ struct CudaFunctions {
     cuMemcpy2D_v2: unsafe extern "C" fn(pCopy: *const CUDA_MEMCPY2D) -> CUresult,
     cuMemcpy2DAsync_v2: unsafe extern "C" fn(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) -> CUresult,
     cuStreamSynchronize: unsafe extern "C" fn(hStream: CUstream) -> CUresult,
+    cuModuleLoadData: unsafe extern "C" fn(module: *mut CUmodule, image: *const c_void) -> CUresult,
+    cuModuleGetFunction:
+        unsafe extern "C" fn(hfunc: *mut CUfunction, hmod: CUmodule, name: *const c_char) -> CUresult,
+    cuModuleUnload: unsafe extern "C" fn(hmod: CUmodule) -> CUresult,
+    cuTexObjectCreate: unsafe extern "C" fn(
+        tex: *mut CUtexObject,
+        res: *const CUDA_RESOURCE_DESC,
+        sampling: *const CUDA_TEXTURE_DESC,
+        view: *const c_void,
+    ) -> CUresult,
+    cuTexObjectDestroy: unsafe extern "C" fn(tex: CUtexObject) -> CUresult,
+    #[allow(clippy::type_complexity)]
+    cuLaunchKernel: unsafe extern "C" fn(
+        f: CUfunction,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
+        shared: u32,
+        stream: CUstream,
+        params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> CUresult,
     cuMemHostRegister_v2: unsafe extern "C" fn(p: *mut c_void, bytesize: usize, flags: u32) -> CUresult,
     cuMemHostUnregister: unsafe extern "C" fn(p: *mut c_void) -> CUresult,
     cuGraphicsEGLRegisterImage: unsafe extern "C" fn(
@@ -399,6 +439,9 @@ struct CachedDmaBuf {
     cuda_resource: CUgraphicsResource,
     egl_frame: CUeglFrame,
     input: DmaBufInput,
+    /// The texture the chroma convert reads an array-typed import through, so its RGB is never
+    /// copied into linear memory. Zero where the import is linear or carries no convert.
+    tex: CUtexObject,
 }
 
 /// An input surface the session does not own: a device pointer produced by another component on
@@ -747,6 +790,205 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
     }
 }
 
+/// The 4:2:0 convert that replaces NVENC's own, because the hardware's fixed-function
+/// RGB→YUV weights the two columns of a block 3:1 instead of averaging them, leaving half the
+/// colour of a subpixel-antialiased glyph edge in the chroma plane where the software and VA-API
+/// converts leave none.
+///
+/// The kernel ships as PTX the driver JIT-compiles (`cuModuleLoadData`), so the only library
+/// involved is the `libcuda` NVENC already needs — nothing to install, and no runtime compiler.
+/// It reads the session's packed ARGB surface and writes the NV12 surface NVENC then encodes,
+/// averaging each 2x2 block's RGB before the matrix, which is what the host convert does.
+struct ChromaConvert {
+    module: CUmodule,
+    kernel: CUfunction,
+    kernel_tex: CUfunction,
+    nv12: CUdeviceptr,
+    pitch: usize,
+    registered: NV_ENC_REGISTERED_PTR,
+    mapped: NV_ENC_INPUT_PTR,
+}
+
+impl ChromaConvert {
+    /// JIT the module, allocate the `width`x`height` NV12 surface and register it with the
+    /// session. `None` where any step refuses: the session then encodes packed RGB as before.
+    unsafe fn new(
+        cuda: &CudaFunctions,
+        funcs: &NV_ENCODE_API_FUNCTION_LIST,
+        session: *mut c_void,
+        width: u32,
+        height: u32,
+    ) -> Option<Self> {
+        let mut ptx = ARGB_TO_NV12_PTX.to_vec();
+        ptx.push(0);
+        let mut module: CUmodule = ptr::null_mut();
+        if (cuda.cuModuleLoadData)(&mut module, ptx.as_ptr() as *const c_void) != CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let mut kernel: CUfunction = ptr::null_mut();
+        let mut kernel_tex: CUfunction = ptr::null_mut();
+        if (cuda.cuModuleGetFunction)(&mut kernel, module, c"argb_to_nv12".as_ptr()) != CUresult::CUDA_SUCCESS
+            || (cuda.cuModuleGetFunction)(&mut kernel_tex, module, c"argb_tex_to_nv12".as_ptr())
+                != CUresult::CUDA_SUCCESS
+        {
+            (cuda.cuModuleUnload)(module);
+            return None;
+        }
+        let (mut nv12, mut pitch): (CUdeviceptr, usize) = (0, 0);
+        // NV12 is the luma plane followed by the interleaved chroma plane at the same pitch,
+        // which is the one allocation NVENC reads both halves of.
+        if (cuda.cuMemAllocPitch_v2)(&mut nv12, &mut pitch, width as usize, (height + height / 2) as usize, 4)
+            != CUresult::CUDA_SUCCESS
+        {
+            (cuda.cuModuleUnload)(module);
+            return None;
+        }
+        let mut reg = NV_ENC_REGISTER_RESOURCE {
+            version: sv(NvStruct::RegisterResource),
+            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            width,
+            height,
+            resourceToRegister: nv12 as *mut c_void,
+            pitch: pitch as u32,
+            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+            bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
+            ..Default::default()
+        };
+        if (funcs.nvEncRegisterResource.unwrap())(session, &mut reg) != NVENCSTATUS::NV_ENC_SUCCESS {
+            (cuda.cuMemFree_v2)(nv12);
+            (cuda.cuModuleUnload)(module);
+            return None;
+        }
+        let mut map = NV_ENC_MAP_INPUT_RESOURCE {
+            version: sv(NvStruct::MapInputResource),
+            registeredResource: reg.registeredResource,
+            ..Default::default()
+        };
+        if (funcs.nvEncMapInputResource.unwrap())(session, &mut map) != NVENCSTATUS::NV_ENC_SUCCESS {
+            (funcs.nvEncUnregisterResource.unwrap())(session, reg.registeredResource);
+            (cuda.cuMemFree_v2)(nv12);
+            (cuda.cuModuleUnload)(module);
+            return None;
+        }
+        Some(ChromaConvert {
+            module,
+            kernel,
+            kernel_tex,
+            nv12,
+            pitch,
+            registered: reg.registeredResource,
+            mapped: map.mappedResource,
+        })
+    }
+
+    /// Convert the `width`x`height` packed surface at `src`/`src_pitch` into the NV12 surface,
+    /// on the default stream so it is ordered behind the upload and ahead of the encode.
+    /// `swap_rb` marks an RGBA byte order rather than BGRA.
+    unsafe fn run(
+        &self,
+        cuda: &CudaFunctions,
+        src: CUdeviceptr,
+        src_pitch: usize,
+        width: u32,
+        height: u32,
+        swap_rb: bool,
+    ) -> Result<(), String> {
+        let (mut src, mut sp) = (src, src_pitch as i32);
+        let (mut dst, mut dp) = (self.nv12, self.pitch as i32);
+        let (mut w, mut h, mut swap) = (width as i32, height as i32, i32::from(swap_rb));
+        let mut params: [*mut c_void; 7] = [
+            &mut src as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut dst as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut swap as *mut _ as *mut c_void,
+        ];
+        self.launch(cuda, self.kernel, &mut params, width, height)
+    }
+
+    /// The same convert reading an array-typed import through `tex`, which leaves its RGB where
+    /// the compositor put it instead of copying it into linear memory first.
+    unsafe fn run_texture(
+        &self,
+        cuda: &CudaFunctions,
+        tex: CUtexObject,
+        width: u32,
+        height: u32,
+        swap_rb: bool,
+    ) -> Result<(), String> {
+        let mut tex = tex;
+        let (mut dst, mut dp) = (self.nv12, self.pitch as i32);
+        let (mut w, mut h, mut swap) = (width as i32, height as i32, i32::from(swap_rb));
+        let mut params: [*mut c_void; 6] = [
+            &mut tex as *mut _ as *mut c_void,
+            &mut dst as *mut _ as *mut c_void,
+            &mut dp as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut swap as *mut _ as *mut c_void,
+        ];
+        self.launch(cuda, self.kernel_tex, &mut params, width, height)
+    }
+
+    /// One chroma sample per thread, on the default stream so the convert is ordered behind
+    /// whatever produced the source and ahead of the encode.
+    unsafe fn launch(
+        &self,
+        cuda: &CudaFunctions,
+        kernel: CUfunction,
+        params: &mut [*mut c_void],
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        const BLOCK: u32 = 16;
+        let grid = (width.div_ceil(2).div_ceil(BLOCK), height.div_ceil(2).div_ceil(BLOCK));
+        if (cuda.cuLaunchKernel)(
+            kernel,
+            grid.0,
+            grid.1,
+            1,
+            BLOCK,
+            BLOCK,
+            1,
+            0,
+            ptr::null_mut(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ) != CUresult::CUDA_SUCCESS
+        {
+            return Err("the chroma convert kernel failed to launch".into());
+        }
+        Ok(())
+    }
+
+    /// A point-sampled, byte-valued texture over an array-typed import, or zero where the driver
+    /// refuses one — the frame then stays on NVENC's own conversion.
+    unsafe fn texture_for(cuda: &CudaFunctions, array: CUarray) -> CUtexObject {
+        let mut res: CUDA_RESOURCE_DESC = std::mem::zeroed();
+        res.resType = CUresourcetype::CU_RESOURCE_TYPE_ARRAY;
+        res.res.array.hArray = array;
+        let mut sampling: CUDA_TEXTURE_DESC = std::mem::zeroed();
+        sampling.addressMode = [CUaddress_mode::CU_TR_ADDRESS_MODE_CLAMP; 3];
+        sampling.filterMode = CUfilter_mode::CU_TR_FILTER_MODE_POINT;
+        sampling.flags = CU_TRSF_READ_AS_INTEGER;
+        let mut tex: CUtexObject = 0;
+        if (cuda.cuTexObjectCreate)(&mut tex, &res, &sampling, ptr::null()) != CUresult::CUDA_SUCCESS {
+            return 0;
+        }
+        tex
+    }
+
+    /// Inner handle before outer, as the rest of the teardown does.
+    unsafe fn release(&self, cuda: &CudaFunctions, funcs: &NV_ENCODE_API_FUNCTION_LIST, session: *mut c_void) {
+        (funcs.nvEncUnmapInputResource.unwrap())(session, self.mapped);
+        (funcs.nvEncUnregisterResource.unwrap())(session, self.registered);
+        (cuda.cuMemFree_v2)(self.nv12);
+        (cuda.cuModuleUnload)(self.module);
+    }
+}
+
 /// A live NVENC encoder session with its CUDA context and interop resources.
 ///
 /// One instance owns a CUDA context bound to a specific GPU plus an NVENC session and everything
@@ -806,6 +1048,9 @@ pub struct NvencEncoder {
     /// Resolved once at init from `PIXELFLUX_NVENC_DIRECT`: register pitch-linear dmabuf imports
     /// with NVENC in place instead of copying them into the packed input each frame.
     direct_dmabuf: bool,
+    /// The 4:2:0 chroma convert, where the driver took the kernel and the session is not 4:4:4.
+    /// `None` leaves NVENC's own conversion in place.
+    csc: Option<ChromaConvert>,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -832,6 +1077,9 @@ impl Drop for NvencEncoder {
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
 
             self.unmap_external_input();
+            if let Some(csc) = self.csc.take() {
+                csc.release(&self.cuda, &self.nvenc_funcs, self.encoder_session);
+            }
             if !self.mapped_input_buffer.is_null() {
                 (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
                     self.encoder_session,
@@ -982,6 +1230,12 @@ impl NvencEncoder {
                 cuMemcpy2D_v2: load!(lib, b"cuMemcpy2D_v2\0"),
                 cuMemcpy2DAsync_v2: load!(lib, b"cuMemcpy2DAsync_v2\0"),
                 cuStreamSynchronize: load!(lib, b"cuStreamSynchronize\0"),
+                cuModuleLoadData: load!(lib, b"cuModuleLoadData\0"),
+                cuModuleGetFunction: load!(lib, b"cuModuleGetFunction\0"),
+                cuModuleUnload: load!(lib, b"cuModuleUnload\0"),
+                cuTexObjectCreate: load!(lib, b"cuTexObjectCreate\0"),
+                cuTexObjectDestroy: load!(lib, b"cuTexObjectDestroy\0"),
+                cuLaunchKernel: load!(lib, b"cuLaunchKernel\0"),
                 cuMemHostRegister_v2: load!(lib, b"cuMemHostRegister_v2\0"),
                 cuMemHostUnregister: load!(lib, b"cuMemHostUnregister\0"),
                 cuGraphicsEGLRegisterImage: load!(lib, b"cuGraphicsEGLRegisterImage\0"),
@@ -1509,7 +1763,19 @@ impl NvencEncoder {
                 bitstream_buffers.push(bitstream_params.bitstreamBuffer);
             }
 
-            println!("[NVENC] {} initialized (4:4:4 mode: {}).", codec.display(), is_444);
+            // 4:4:4 has no chroma to site, so only a 4:2:0 session converts; a driver that
+            // refuses the kernel leaves NVENC's own conversion in place.
+            let csc = if is_444 {
+                None
+            } else {
+                ChromaConvert::new(&cuda, &function_list, encoder_session, width, height)
+            };
+            println!(
+                "[NVENC] {} initialized (4:4:4 mode: {}, chroma convert: {}).",
+                codec.display(),
+                is_444,
+                if csc.is_some() { "kernel" } else { "hardware" }
+            );
 
             Ok(Self {
                 encoder_session,
@@ -1541,6 +1807,7 @@ impl NvencEncoder {
                 node_index: settings.encode_node_index.max(0),
                 pin_uploads: std::env::var("PIXELFLUX_NVENC_PIN").as_deref() != Ok("0"),
                 direct_dmabuf: std::env::var("PIXELFLUX_NVENC_DIRECT").as_deref() != Ok("0"),
+                csc,
             })
         }
     }
@@ -1737,6 +2004,9 @@ impl NvencEncoder {
         unsafe {
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
             self.unmap_external_input();
+            if let Some(csc) = self.csc.take() {
+                csc.release(&self.cuda, &self.nvenc_funcs, self.encoder_session);
+            }
             if !self.mapped_input_buffer.is_null() {
                 (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
                     self.encoder_session,
@@ -1849,6 +2119,15 @@ impl NvencEncoder {
             self.input_pitch = input_pitch;
             self.registered_input_resource = reg_res.registeredResource;
             self.mapped_input_buffer = map_params.mappedResource;
+            if !self.fullcolor {
+                self.csc = ChromaConvert::new(
+                    &self.cuda,
+                    &self.nvenc_funcs,
+                    self.encoder_session,
+                    new_w,
+                    new_h,
+                );
+            }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
         self.omit_stripe_headers = settings.omit_stripe_headers;
@@ -1892,6 +2171,9 @@ impl NvencEncoder {
     /// resource, then the EGLImage it was built from. The encode that last read the import has
     /// completed (`submit_frame` waits for the bitstream), so nothing is still in flight on it.
     unsafe fn release_dmabuf_import(&self, cache: CachedDmaBuf) {
+        if cache.tex != 0 {
+            (self.cuda.cuTexObjectDestroy)(cache.tex);
+        }
         if let DmaBufInput::Direct { registered, mapped, .. } = cache.input {
             (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(self.encoder_session, mapped);
             (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(self.encoder_session, registered);
@@ -2280,6 +2562,13 @@ impl NvencEncoder {
                     }
                 );
 
+                // An array-typed import is read through a texture, so the convert never needs
+                // it copied into linear memory.
+                let tex = if self.csc.is_some() && egl_frame.frame_type == CU_EGL_FRAME_TYPE_ARRAY {
+                    ChromaConvert::texture_for(&self.cuda, egl_frame.frame.p_array[0])
+                } else {
+                    0
+                };
                 self.dmabuf_cache.insert(
                     fd,
                     CachedDmaBuf {
@@ -2288,13 +2577,14 @@ impl NvencEncoder {
                         cuda_resource,
                         egl_frame,
                         input,
+                        tex,
                     },
                 );
             }
 
-            let (egl_frame, input) = {
+            let (egl_frame, input, tex) = {
                 let cached = self.dmabuf_cache.get(&fd).unwrap();
-                (cached.egl_frame, cached.input)
+                (cached.egl_frame, cached.input, cached.tex)
             };
             let (mapped, format) = match input {
                 DmaBufInput::Direct { mapped, format, .. } => (mapped, format),
@@ -2337,6 +2627,26 @@ impl NvencEncoder {
                         return Err("Sanitization copy failed".into());
                     }
                     (self.mapped_input_buffer, self.input_format)
+                }
+            };
+
+            // The convert reads the frame where it already is: the import itself when the driver
+            // mapped it pitch-linear or handed back an array a texture covers, the session's own
+            // surface when the frame was copied into it. No case adds a copy of its own.
+            let swap = format == NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR;
+            let converted = match input {
+                DmaBufInput::Copy => self.convert_packed(self.input_device_ptr, self.input_pitch, swap),
+                DmaBufInput::Direct { .. } if egl_frame.frame_type == CU_EGL_FRAME_TYPE_PITCH => {
+                    self.convert_packed(egl_frame.frame.p_pitch[0] as CUdeviceptr, egl_frame.pitch as usize, swap)
+                }
+                DmaBufInput::Direct { .. } => self.convert_texture(tex, swap),
+            };
+            let (mapped, format) = match converted {
+                Ok(Some(nv12)) => (nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
+                Ok(None) => (mapped, format),
+                Err(e) => {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err(e);
                 }
             };
 
@@ -2475,7 +2785,11 @@ impl NvencEncoder {
             } else {
                 NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
             };
-            if let Err(e) = self.set_input_format(format) {
+            // With the convert in place the packed surface is the kernel's source and needs no
+            // registration of its own; NVENC is handed the NV12 the kernel writes.
+            if self.csc.is_none()
+                && let Err(e) = self.set_input_format(format)
+            {
                 (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                 return Err(e);
             }
@@ -2500,17 +2814,51 @@ impl NvencEncoder {
                 return Err("packed host->device upload failed".into());
             }
 
-            let result = self.submit_frame(
-                self.mapped_input_buffer,
-                self.input_format,
-                frame_number,
-                force_idr,
-            );
+            let (mapped, submitted) = match self.convert_packed(self.input_device_ptr, self.input_pitch, rgba_input) {
+                Ok(Some(mapped)) => (mapped, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
+                Ok(None) => (self.mapped_input_buffer, self.input_format),
+                Err(e) => {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err(e);
+                }
+            };
+            let result = self.submit_frame(mapped, submitted, frame_number, force_idr);
             if result.is_err() {
                 (self.cuda.cuStreamSynchronize)(ptr::null_mut());
             }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
+        }
+    }
+
+    /// Run the chroma convert over an array-typed import through `tex`, answering the NV12 input
+    /// NVENC should be handed. `None` where the session has no convert, or where the driver gave
+    /// no texture for the import and NVENC's own conversion stands in.
+    unsafe fn convert_texture(&self, tex: CUtexObject, rgba_input: bool) -> Result<Option<NV_ENC_INPUT_PTR>, String> {
+        match self.csc.as_ref() {
+            Some(csc) if tex != 0 => {
+                csc.run_texture(&self.cuda, tex, self.width, self.height, rgba_input)?;
+                Ok(Some(csc.mapped))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Run the chroma convert over a packed surface, answering the NV12 input NVENC should be
+    /// handed, or `None` where the session has no convert and encodes the packed surface itself.
+    /// The caller holds the CUDA context current.
+    unsafe fn convert_packed(
+        &self,
+        src: CUdeviceptr,
+        src_pitch: usize,
+        rgba_input: bool,
+    ) -> Result<Option<NV_ENC_INPUT_PTR>, String> {
+        match self.csc.as_ref() {
+            Some(csc) => {
+                csc.run(&self.cuda, src, src_pitch, self.width, self.height, rgba_input)?;
+                Ok(Some(csc.mapped))
+            }
+            None => Ok(None),
         }
     }
 
@@ -3371,63 +3719,201 @@ mod gpu_tests {
         }
     }
 
-    /// On a real GPU: where NVENC's fixed-function RGB→YUV sites chroma, per axis. Rows of
-    /// alternating colours whose pair averages to grey come back neutral, so the downsampler
-    /// averages the two rows of a block. Columns of the same pair come back three quarters of
-    /// the way to the left column's chroma, so horizontally it weights the pair 3:1 instead of
-    /// averaging it — chroma a quarter pixel left of the block centre, which keeps half the
-    /// colour a left-sited convert would leave on the glyph edges of subpixel-antialiased text,
-    /// where the software and VA-API converts keep none. The encode API exposes no siting
-    /// control, so this pins what the hardware does rather than asking for the centre.
+    /// On a real GPU with a render node: the chroma convert reaches the zero-copy path too. A
+    /// dmabuf painted with alternating single-pixel columns whose pair averages to grey comes
+    /// back with neutral chroma, whichever way the driver mapped the import — pitch-linear, read
+    /// in place, or a CUDA array, read through a texture. Neither case copies the RGB.
     /// Ignored by default.
     #[test]
     #[ignore]
-    fn gpu_chroma_siting_of_the_hardware_csc() {
+    fn gpu_dmabuf_chroma_is_sited_at_the_block_centre() {
+        use crate::webcam::decode::{AvDecoder, Codec, Decoder as _};
+        let (w, h) = (256u32, 256u32);
+        let s = settings(w as i32, h as i32, 60.0);
+        let (gbm, mut renderer) = gpu_render();
+        let egl_display = renderer.egl_context().display().get_display_handle().handle;
+        let (_bo, dmabuf) = column_dmabuf(&gbm, &mut renderer, w, h);
+        let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+        assert!(enc.csc.is_some(), "this GPU took no chroma convert");
+        let pkt = enc.encode(&dmabuf, 0, 20, true).expect("dmabuf encode");
+        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture");
+        let v = dec.frame().expect("decoded frame");
+        let (mut su, mut sv) = (0.0f64, 0.0f64);
+        let n = (v.chroma_height() * v.chroma_width()) as f64;
+        for r in 0..v.chroma_height() {
+            for c in 0..v.chroma_width() {
+                let i = r * v.uv_stride + c;
+                su += f64::from(v.u[i]);
+                sv += f64::from(v.v[i]);
+            }
+        }
+        let (u, cr) = (su / n, sv / n);
+        println!("[chroma-siting] dmabuf mapped as a {}: ({u:.1}, {cr:.1})", mapped_kind(&enc));
+        let off = (u - 128.0).hypot(cr - 128.0);
+        assert!(off <= 2.0, "the zero-copy path leaves chroma {off:.1} off neutral");
+    }
+
+    /// A dmabuf painted with alternating single-pixel columns of blue and yellow, whose pair
+    /// averages to grey.
+    fn column_dmabuf(
+        gbm: &gbm::Device<std::fs::File>,
+        renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
+        w: u32,
+        h: u32,
+    ) -> (gbm::BufferObject<()>, Dmabuf) {
+        use gbm::{BufferObjectFlags, Format as GbmFormat};
+        use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
+        use smithay::utils::{Physical, Rectangle, Size, Transform};
+        let bo = gbm
+            .create_buffer_object::<()>(w, h, GbmFormat::Argb8888, BufferObjectFlags::RENDERING)
+            .expect("GBM buffer");
+        let mut dmabuf = crate::create_dmabuf_from_bo(&bo);
+        {
+            let mut fb = renderer.bind(&mut dmabuf).expect("bind dmabuf");
+            let size: Size<i32, Physical> = (w as i32, h as i32).into();
+            let mut frame = renderer.render(&mut fb, size, Transform::Normal).expect("render");
+            let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+            frame.clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[full]).expect("clear");
+            for x in (1..w as i32).step_by(2) {
+                let column: Rectangle<i32, Physical> = Rectangle::new((x, 0).into(), (1, h as i32).into());
+                frame
+                    .draw_solid(column, &[Rectangle::from_size(column.size)], Color32F::new(1.0, 1.0, 0.0, 1.0))
+                    .expect("draw column");
+            }
+            let sync = frame.finish().expect("finish");
+            let _ = sync.wait();
+        }
+        (bo, dmabuf)
+    }
+
+    /// On a real GPU: a 4:2:0 session sites chroma at the centre of the block on both axes.
+    /// Rows of a colour pair that averages to grey, and columns of the same pair, both come back
+    /// neutral. NVENC's own conversion averages the rows but weights the columns 3:1, which is
+    /// what `ChromaConvert` replaces; with the convert disabled the column case lands three
+    /// quarters of the way to the left column's chroma, which is the colour subpixel-antialiased
+    /// text would keep on its glyph edges. A 4:4:4 session subsamples nothing, so it keeps the
+    /// hardware's conversion and takes no convert of its own. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_chroma_is_sited_at_the_block_centre() {
         use crate::encoders::chroma_siting::chroma;
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
         let (w, h) = (256usize, 256usize);
         let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
-        let pair = |by_column: bool| {
-            let mut b = vec![255u8; w * h * 4];
-            for y in 0..h {
-                for x in 0..w {
-                    let first = if by_column { x % 2 == 0 } else { y % 2 == 0 };
-                    let p = if first { blue } else { yellow };
-                    b[(y * w + x) * 4..][..3].copy_from_slice(&[p[2] as u8, p[1] as u8, p[0] as u8]);
-                }
+        let st = settings(w as i32, h as i32, 60.0);
+        let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+        assert!(enc.csc.is_some(), "this GPU took no chroma convert");
+        let rows = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, false));
+        let cols = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
+        println!("[chroma-siting] convert: rows {rows:?} columns {cols:?}");
+        for (label, (u, v)) in [("rows", rows), ("columns", cols)] {
+            let off = (u - 128.0).hypot(v - 128.0);
+            assert!(off <= 2.0, "{label} come back {off:.1} off neutral chroma");
+        }
+        unsafe {
+            let cu = enc.cuda.clone();
+            (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
+            if let Some(csc) = enc.csc.take() {
+                csc.release(&cu, &enc.nvenc_funcs, enc.encoder_session);
             }
-            b
-        };
-        let s = settings(w as i32, h as i32, 60.0);
-        let decode = |bgra: &[u8]| -> (f64, f64) {
-            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
-            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
-            let pkt = enc.encode_cpu_packed(bgra, w * 4, false, 0, 20, true).expect("packed encode");
-            assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
-            let v = dec.frame().expect("decoded frame");
-            let (mut su, mut sv) = (0.0f64, 0.0f64);
-            let n = (v.chroma_height() * v.chroma_width()) as f64;
-            for r in 0..v.chroma_height() {
-                for c in 0..v.chroma_width() {
-                    let i = r * v.uv_stride + c;
-                    su += f64::from(v.u[i]);
-                    sv += f64::from(v.v[i]);
-                }
-            }
-            (su / n, sv / n)
-        };
-        let rows = decode(&pair(false));
-        let cols = decode(&pair(true));
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+        let hardware = encode_and_measure(&mut enc, &colour_pair(w, h, blue, yellow, true));
         let weighted = chroma([0, 1, 2].map(|i| 0.75 * blue[i] + 0.25 * yellow[i]));
-        println!("[chroma-siting] NVENC rows {rows:?} columns {cols:?} against 3:1 {weighted:?} and left {:?}", chroma(blue));
+        println!("[chroma-siting] hardware: columns {hardware:?} against 3:1 {weighted:?}");
         assert!(
-            (rows.0 - 128.0).hypot(rows.1 - 128.0) <= 2.0,
-            "NVENC averages the rows of a block, so {rows:?} must be neutral"
+            (hardware.0 - weighted.0).hypot(hardware.1 - weighted.1) <= 2.0,
+            "NVENC's own conversion weights the columns 3:1: {hardware:?} against {weighted:?}"
         );
-        assert!(
-            (cols.0 - weighted.0).hypot(cols.1 - weighted.1) <= 2.0,
-            "NVENC weights the columns of a block 3:1: {cols:?} against {weighted:?}"
-        );
+
+        let full = RustCaptureSettings { video_fullcolor: true, ..st };
+        let enc444 = NvencEncoder::new(&full, ptr::null()).expect("NVENC init");
+        if enc444.is_fullcolor() {
+            assert!(enc444.csc.is_none(), "a 4:4:4 session has no chroma to site and takes no convert");
+        }
+    }
+
+    /// A frame of two colours alternating by column or by row, so every 2x2 block averages to
+    /// the grey between them.
+    fn colour_pair(w: usize, h: usize, a: [f64; 3], b: [f64; 3], by_column: bool) -> Vec<u8> {
+        let mut f = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let p = if (if by_column { x } else { y }) % 2 == 0 { a } else { b };
+                f[(y * w + x) * 4..][..3].copy_from_slice(&[p[2] as u8, p[1] as u8, p[0] as u8]);
+            }
+        }
+        f
+    }
+
+    /// Encode one key frame of `bgra` and return the mean chroma of the decoded picture.
+    fn encode_and_measure(enc: &mut NvencEncoder, bgra: &[u8]) -> (f64, f64) {
+        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        let w = enc.width() as usize;
+        let pkt = enc.encode_cpu_packed(bgra, w * 4, false, 0, 20, true).expect("packed encode");
+        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
+        let v = dec.frame().expect("decoded frame");
+        let (mut su, mut sv) = (0.0f64, 0.0f64);
+        let n = (v.chroma_height() * v.chroma_width()) as f64;
+        for r in 0..v.chroma_height() {
+            for c in 0..v.chroma_width() {
+                let i = r * v.uv_stride + c;
+                su += f64::from(v.u[i]);
+                sv += f64::from(v.v[i]);
+            }
+        }
+        (su / n, sv / n)
+    }
+
+    /// On a real GPU: what the chroma convert costs a frame, against NVENC converting the packed
+    /// input itself, and how far its luma lands from the host convert's. Prints; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_chroma_convert() {
+        use crate::encoders::software::convert_to_yuv_mt;
+        for (w, h) in [(1920usize, 1080usize), (3840, 2160)] {
+            let st = settings(w as i32, h as i32, 60.0);
+            let bgra = crate::encoders::chroma_siting::bgra(w, h);
+            let mut kernel = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            assert!(kernel.csc.is_some());
+            let with = bench_frames(&mut kernel, &bgra);
+            let mut hardware = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            unsafe {
+                let cu = hardware.cuda.clone();
+                (cu.cuCtxPushCurrent_v2)(hardware.cuda_context);
+                if let Some(csc) = hardware.csc.take() {
+                    csc.release(&cu, &hardware.nvenc_funcs, hardware.encoder_session);
+                }
+                (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+            }
+            let without = bench_frames(&mut hardware, &bgra);
+            let (cw, ch) = (w / 2, h / 2);
+            let (mut y, mut u, mut v) = (vec![0u8; w * h], vec![0u8; cw * ch], vec![0u8; cw * ch]);
+            let mut host = f64::MAX;
+            for _ in 0..20 {
+                let t = std::time::Instant::now();
+                convert_to_yuv_mt(&bgra, (w * 4) as u32, w, h, false, false, false, &mut y, &mut u, &mut v, (w, cw), 8)
+                    .expect("host convert");
+                host = host.min(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "[bench] {w}x{h}: encode {with:.2} ms with the convert, {without:.2} ms on NVENC's own; the host convert costs {host:.2} ms on 8 threads"
+            );
+        }
+    }
+
+    /// Mean per-frame `encode_cpu_packed` time over 60 frames, after a warm-up.
+    fn bench_frames(enc: &mut NvencEncoder, bgra: &[u8]) -> f64 {
+        let w = enc.width() as usize;
+        for i in 0..10 {
+            enc.encode_cpu_packed(bgra, w * 4, false, i, 25, i == 0).expect("warm-up");
+        }
+        let t = std::time::Instant::now();
+        for i in 0..60u64 {
+            enc.encode_cpu_packed(bgra, w * 4, false, 10 + i, 25, false).expect("encode");
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / 60.0
     }
 
     #[test]
@@ -3690,24 +4176,41 @@ mod gpu_tests {
         let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
         let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
         let stride = (w * 4) as usize;
-        for (i, (buf, is_rgba)) in [(&bgra, false), (&rgba, true), (&bgra, false), (&rgba, true)]
-            .into_iter()
-            .enumerate()
-        {
-            let pkt = enc
-                .encode_cpu_packed(buf, stride, is_rgba, i as u64, 25, i == 0)
-                .expect("packed encode");
-            assert_eq!(
-                enc.input_format,
-                if is_rgba {
-                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
-                } else {
-                    NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+        // Byte order reaches the chroma convert as its own argument and the hardware conversion
+        // as the packed surface's registered format, so both mechanisms are driven here: the
+        // second pass is the path a GPU whose driver refuses the kernel takes.
+        let pass = |enc: &mut NvencEncoder, dec: &mut AvDecoder, tag: &str| {
+            for (i, (buf, is_rgba)) in [(&bgra, false), (&rgba, true), (&bgra, false), (&rgba, true)]
+                .into_iter()
+                .enumerate()
+            {
+                let pkt = enc
+                    .encode_cpu_packed(buf, stride, is_rgba, i as u64, 25, i == 0)
+                    .expect("packed encode");
+                if enc.csc.is_none() {
+                    assert_eq!(
+                        enc.input_format,
+                        if is_rgba {
+                            NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
+                        } else {
+                            NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
+                        }
+                    );
                 }
-            );
-            let (block, bg) = decoded_means(&mut dec, &pkt, rect);
-            assert_painted(&format!("frame {i} rgba={is_rgba}"), block, bg, 6.0);
+                let (block, bg) = decoded_means(dec, &pkt, rect);
+                assert_painted(&format!("{tag} frame {i} rgba={is_rgba}"), block, bg, 6.0);
+            }
+        };
+        pass(&mut enc, &mut dec, "convert");
+        unsafe {
+            let cu = enc.cuda.clone();
+            (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
+            if let Some(csc) = enc.csc.take() {
+                csc.release(&cu, &enc.nvenc_funcs, enc.encoder_session);
+            }
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
+        pass(&mut enc, &mut dec, "hardware");
     }
 
     /// On a real GPU: per-frame wall time of every NVENC preset, rate-control pass mode and

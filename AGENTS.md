@@ -70,8 +70,12 @@ CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_E
 `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
 (`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies derives its rate-control
 default from the exported names. Every 4:2:0 session, on every backend, converts with the BT.601 matrix
-at limited range and declares it (NVENC's hardware conversion is fixed there, and it is the matrix
-browser presentation paths invert exactly); the software 4:4:4 sessions convert BT.709 at full range
+at limited range and declares it (it is the matrix browser presentation paths invert exactly), and
+sites chroma at the centre of each 2x2 block: NVENC's own conversion weights the two columns of a
+block 3:1, so a 4:2:0 session converts with `ChromaConvert`, a PTX kernel the driver JIT-compiles
+(`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) which reads the packed surface or a
+texture over an array-typed dmabuf import and writes the NV12 NVENC encodes; 4:4:4 subsamples
+nothing and keeps the hardware conversion. The software 4:4:4 sessions convert BT.709 at full range
 and declare that. `AvDecoder::colour_tags` reads what a stream declares, and the unit tests hold each
 encoder to it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
