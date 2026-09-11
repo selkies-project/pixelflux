@@ -17,5 +17,5 @@ regen = ["bindgen", "regex"]
 
 [build-dependencies]
 # Pinned to the version that produced the committed bindings so a regen reproduces them.
-bindgen = { version = "=0.59.2", default-features = false, features = ["runtime"], optional = true }
+bindgen = { version = "=0.73.2", default-features = false, features = ["runtime"], optional = true }
 regex = { version = "1", optional = true }
