@@ -610,6 +610,32 @@ mod tests {
         assert_eq!(dec.colour_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)));
     }
 
+    /// The colour chart, handed to the encoder as host ARGB, decodes back to the colour that was
+    /// painted when the BT.709 the stream declares is inverted — the check a client's
+    /// presentation path performs on every frame, here with no browser in the way.
+    #[test]
+    fn paints_the_chart_it_converts() {
+        use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
+        use crate::webcam::decode::{AvDecoder, Decoder};
+        let (w, h) = (256usize, 128usize);
+        let s = RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            target_fps: 30.0,
+            video_crf: 20,
+            ..Default::default()
+        };
+        let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
+        let idr = enc
+            .encode_host_argb(&chart_bgra(w, h), w * 4, 0, true, false)
+            .expect("encode");
+        let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+        assert!(dec.decode(&idr[VIDEO_HEADER_LEN..]).expect("decode"));
+        let worst = chart_error(&dec.frame().expect("frame"), BT709);
+        println!("[chart] OpenH264: worst |dRGB| {worst:.1}");
+        assert!(worst <= 12.0, "the OpenH264 path paints {worst:.1} off the chart");
+    }
+
     /// A forced first frame is emitted as a typed IDR with a valid wire header and Annex-B
     /// payload; re-encoding identical content (no scene change) yields a typed delta (P) frame
     /// whose header carries the passed frame number.
