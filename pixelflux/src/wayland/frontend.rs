@@ -1751,6 +1751,7 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
     "image/bmp",
     "image/svg+xml",
     "image/svg",
+    "text/html",
     "text/plain;charset=utf-8",
     "UTF8_STRING",
     "text/plain",
@@ -1762,7 +1763,7 @@ const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
 /// the Python-owned payload `(mime, bytes)` served to pasting clients when Python holds the
 /// selection.
 impl SelectionHandler for AppState {
-    type SelectionUserData = std::sync::Arc<(String, Vec<u8>)>;
+    type SelectionUserData = std::sync::Arc<Vec<(String, Vec<u8>)>>;
 
     /// A client took the clipboard: pick the best offered mime and stage it for the loop to
     /// read.
@@ -1810,7 +1811,7 @@ impl SelectionHandler for AppState {
     fn send_selection(
         &mut self,
         ty: SelectionTarget,
-        _mime_type: String,
+        mime_type: String,
         fd: std::os::fd::OwnedFd,
         _seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
@@ -1818,11 +1819,23 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard && ty != SelectionTarget::Primary {
             return;
         }
-        let payload = user_data.clone();
+        // The text aliases are all advertised for one text entry, so a request for any of
+        // them takes it; anything else unmatched takes the first entry rather than nothing.
+        let entries = user_data.clone();
+        let index = entries
+            .iter()
+            .position(|(mime, _)| *mime == mime_type)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .position(|(mime, _)| mime.starts_with("text/plain"))
+                    .filter(|_| !mime_type.contains('/') || mime_type.starts_with("text/plain"))
+            })
+            .unwrap_or(0);
         std::thread::spawn(move || {
             let _ = crate::wayland::wlclient::write_fd_all(
                 &fd,
-                &payload.1,
+                &entries[index].1,
                 crate::wayland::wlclient::IO_TIMEOUT,
             );
         });
