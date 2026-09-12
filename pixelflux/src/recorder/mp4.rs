@@ -659,6 +659,17 @@ mod tests {
         assert_eq!(nals[2], &[0x65, 0x00, 0x00, 0x03, 0x01, 0xDD]);
     }
 
+    /// Nothing to split yields no NALs, and a stream cut right after a start code
+    /// yields no empty one either -- an empty payload would be written as a
+    /// zero-length sample.
+    #[test]
+    fn split_annexb_emits_no_empty_nals() {
+        assert!(split_annexb(&[]).is_empty());
+        assert!(split_annexb(&[0x67, 0xAA, 0xBB]).is_empty());
+        assert!(split_annexb(&[0, 0, 0, 1]).is_empty());
+        assert_eq!(split_annexb(&[0, 0, 1, 0x68, 0, 0, 0, 1]), vec![&[0x68u8][..]]);
+    }
+
     /// Dimensions from real x264 SPS across the profiles the project's encoders emit,
     /// including the frame-cropping and 4:4:4 chroma paths.
     #[test]

@@ -487,4 +487,21 @@ mod tests {
         assert_eq!(u_out[0].1, 0);
         assert!(compile_keymap(&p.keymap_text()).is_some());
     }
+
+    /// What a typed character asks for: Latin-1 printables keep their legacy keysyms
+    /// (the form a keymap names its keys by, so they resolve without an overlay slot),
+    /// `\n` types Return rather than the Linefeed the raw table gives, other control
+    /// characters their function keysyms, and everything else the Unicode form.
+    #[test]
+    fn typed_characters_map_to_the_keysyms_a_keymap_names() {
+        assert_eq!(keysym_for_char('a'), 0x61);
+        assert_eq!(keysym_for_char('~'), 0x7E);
+        assert_eq!(keysym_for_char('\u{FC}'), 0xFC);
+        assert_eq!(keysym_for_char('\n'), 0xFF0D);
+        assert_eq!(keysym_for_char('\r'), 0xFF0D);
+        assert_eq!(keysym_for_char('\t'), 0xFF09);
+        assert_eq!(keysym_for_char('\u{1B}'), 0xFF1B);
+        assert_eq!(keysym_for_char('\u{4E2D}'), 0x0100_4E2D);
+        assert_eq!(keysym_for_char('\u{1F600}'), 0x0101_F600);
+    }
 }
