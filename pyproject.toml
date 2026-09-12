@@ -74,7 +74,7 @@ before-all = """
 
     build_x265() {
         (cd /tmp && \
-            clone_source 4.1 x265 https://bitbucket.org/multicoreware/x265_git.git && \
+            clone_source 4.2 x265 https://bitbucket.org/multicoreware/x265_git.git && \
             cd x265 && \
             cmake -S source -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
                 -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF && \
