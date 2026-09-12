@@ -625,9 +625,9 @@ pub enum ThreadCommand {
     ListWindows { reply: std::sync::mpsc::Sender<Vec<WindowDesc>> },
     SetCursorCallback(Option<Py<PyAny>>),
     SetClipboardCallback(Py<PyAny>),
-    /// Server-side clipboard offer: the compositor owns the selection and serves `data` as
-    /// `mime` (plus text aliases) to pasting clients.
-    SetClipboard { mime: String, data: Vec<u8> },
+    /// Server-side clipboard offer: the compositor owns the selection and serves one payload
+    /// per `(mime, data)` entry (plus text aliases), so a paste takes the flavour it asks for.
+    SetClipboard { entries: Vec<(String, Vec<u8>)> },
     KeyboardKey { scancode: u32, state: u32 },
     /// A whole ordered run of key events in one message. Typing a paste one event at a
     /// time costs a channel send and a calloop wake per event, which competes with the
@@ -4763,14 +4763,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         state.pending_clipboard_read = Some(mime);
                     }
                 }
-                ThreadCommand::SetClipboard { mime, data } => {
-                    let mimes: Vec<String> = if mime.starts_with("text/plain") {
-                        ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
-                         "STRING", "TEXT"].iter().map(|s| s.to_string()).collect()
-                    } else {
-                        vec![mime.clone()]
-                    };
-                    let payload = std::sync::Arc::new((mime, data));
+                ThreadCommand::SetClipboard { entries } => {
+                    let mut mimes: Vec<String> = Vec::new();
+                    for (mime, _) in &entries {
+                        if mime.starts_with("text/plain") {
+                            mimes.extend(["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
+                                          "STRING", "TEXT"].iter().map(|s| s.to_string()));
+                        } else {
+                            mimes.push(mime.clone());
+                        }
+                    }
+                    let payload = std::sync::Arc::new(entries);
                     smithay::wayland::selection::data_device::set_data_device_selection(
                         &state.dh,
                         &state.seat.clone(),
@@ -5767,9 +5770,12 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
-    fn set_clipboard(&self, mime: String, data: Vec<u8>) -> PyResult<()> {
-        self.send(ThreadCommand::SetClipboard { mime, data })
+    /// Compositor-side clipboard offer: serve one payload per `(mime, data)` entry, so a
+    /// client pasting rich text takes the markup and one pasting into a plain field takes
+    /// the text the source itself wrote, instead of both taking whichever flavour was
+    /// picked for them.
+    fn set_clipboard(&self, entries: Vec<(String, Vec<u8>)>) -> PyResult<()> {
+        self.send(ThreadCommand::SetClipboard { entries })
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard: {}", e)))?;
         Ok(())
     }
@@ -7210,10 +7216,10 @@ impl ScreenCapture {
             )),
         }
     }
-    /// Compositor-side clipboard offer: serve `data` as `mime` to pasting clients.
-    fn set_clipboard(&self, py: Python<'_>, mime: String, data: Vec<u8>) -> PyResult<()> {
+    /// Compositor-side clipboard offer: serve one payload per `(mime, data)` entry.
+    fn set_clipboard(&self, py: Python<'_>, entries: Vec<(String, Vec<u8>)>) -> PyResult<()> {
         match wayland_backend_running(py) {
-            Some(be) => be.bind(py).borrow().set_clipboard(mime, data),
+            Some(be) => be.bind(py).borrow().set_clipboard(entries),
             None => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "wayland backend not running",
             )),
