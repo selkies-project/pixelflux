@@ -176,8 +176,6 @@ pub struct H264EncoderWrapper {
     current_bitrate: i32,
     current_vbv: i32,
     current_fps: u32,
-    #[allow(dead_code)]
-    full_range: bool,
     /// Open-time parameters retained so a frame-rate change can reopen the session: x264's live
     /// reconfigure cannot alter the frame rate, and CBR/VBV budgets are derived from it.
     threads: i32,
@@ -304,7 +302,6 @@ impl H264EncoderWrapper {
                     current_bitrate: bitrate_kbps.saturating_abs(),
                     current_vbv: vbv_kbit,
                     current_fps: if fps < 1.0 { 30 } else { fps as u32 },
-                    full_range: param.vui.b_fullrange == 1,
                     threads,
                     min_qp,
                     max_qp,

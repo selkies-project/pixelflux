@@ -4776,7 +4776,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let payload = std::sync::Arc::new(entries);
                     smithay::wayland::selection::data_device::set_data_device_selection(
                         &state.dh,
-                        &state.seat.clone(),
+                        &state.seat,
                         mimes.clone(),
                         payload.clone(),
                     );
@@ -4784,7 +4784,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     // offer backs the primary selection too.
                     smithay::wayland::selection::primary_selection::set_primary_selection(
                         &state.dh,
-                        &state.seat.clone(),
+                        &state.seat,
                         mimes,
                         payload,
                     );
