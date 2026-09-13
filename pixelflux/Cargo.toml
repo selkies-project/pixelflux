@@ -47,8 +47,8 @@ libloading = "0.9"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image. Pure-Rust XCB; links the system libxcb.
-x11rb = { version = "0.13", features = ["shm", "xfixes", "xtest", "randr"] }
-image = "=0.25.9"
+x11rb = { version = "0.14", features = ["shm", "xfixes", "xtest", "randr"] }
+image = "=0.25.10"
 # The crate's build.rs probes the FFmpeg found via pkg-config and emits
 # per-version cfgs; one crate version supports FFmpeg 3.0 UP TO the release it
 # is named after (8.1.0 = "at most 8.1", not "exactly 8.1"). The VAAPI encoder
@@ -57,7 +57,7 @@ image = "=0.25.9"
 # (avutil is implicit), so the default avformat/avdevice/swscale/swresample
 # components — and their dev packages — are not required.
 ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avcodec", "avfilter"] }
-base64 = "0.22"
+base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
