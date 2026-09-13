@@ -749,7 +749,8 @@ where
     let mut pending_force_idr = false;
     let mut next_frame = Instant::now();
     let mut geometry_check = GEOMETRY_POLL_FRAMES;
-    let mut error_streak = 0u32;
+    let mut grab_errors = 0u32;
+    let mut encode_errors = 0u32;
     let mut last_log = Instant::now();
     let mut sent_frames: u64 = 0;
     let mut new_frames: u64 = 0;
@@ -826,13 +827,13 @@ where
 
         let frame = match gpu.nvfbc.grab(frame_dur) {
             Ok(f) => {
-                error_streak = 0;
+                grab_errors = 0;
                 f
             }
             Err(e) => {
-                error_streak += 1;
+                grab_errors += 1;
                 let recovery = recovery_for(&e);
-                if recovery == Recovery::None || error_streak > 5 {
+                if recovery == Recovery::None || grab_errors > 5 {
                     return Some(Err(format!("NvFBC capture ended: {e}")));
                 }
                 let (region, size) = resolve_region(gpu.screen, &gpu.request);
@@ -887,7 +888,7 @@ where
                 decision.force_idr,
             ) {
                 Ok(data) if !data.is_empty() => {
-                    error_streak = 0;
+                    encode_errors = 0;
                     let stripes = vec![EncodedStripe {
                         data: Arc::new(data),
                         codec: gpu.settings.codec,
@@ -904,11 +905,12 @@ where
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    error_streak += 1;
-                    if error_streak % crate::HW_ERROR_RECOVERY_THRESHOLD == 1 {
+                    // Its own count: a grab that keeps succeeding must not clear it.
+                    encode_errors += 1;
+                    if encode_errors % crate::HW_ERROR_RECOVERY_THRESHOLD == 1 {
                         eprintln!("[x11] NVENC encode error on the zero-copy path: {e}");
                     }
-                    if error_streak >= crate::HW_ERROR_RECOVERY_THRESHOLD {
+                    if encode_errors >= crate::HW_ERROR_RECOVERY_THRESHOLD {
                         return Some(Err("NVENC failed repeatedly on the zero-copy path".to_string()));
                     }
                 }
