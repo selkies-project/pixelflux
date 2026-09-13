@@ -44,8 +44,59 @@ pub enum ScaleOutcome {
     Unsupported,
 }
 
-/// An announced head with its name, enabled state and layout position.
-type Head = (ZwlrOutputHeadV1, Option<String>, bool, (i32, i32));
+/// An announced head with its name, enabled state, layout position and scale.
+struct Head {
+    head: ZwlrOutputHeadV1,
+    name: Option<String>,
+    enabled: bool,
+    pos: (i32, i32),
+    scale: f64,
+}
+
+/// An enabled screen as a plan sees it: its head, logical position, current mode
+/// and scale.
+#[derive(Clone)]
+struct Screen {
+    head: ZwlrOutputHeadV1,
+    pos: (i32, i32),
+    mode: (i32, i32),
+    scale: f64,
+}
+
+/// The logical size wlroots gives a mode at a scale (each axis truncated).
+fn logical_size(mode: (i32, i32), scale: f64) -> (i32, i32) {
+    ((mode.0 as f64 / scale) as i32, (mode.1 as f64 / scale) as i32)
+}
+
+/// Rectangles arranged in one space, each about to take a new size: the same
+/// arrangement in the space of the new sizes. One whose edge met another's far
+/// edge meets it still; every other coordinate is kept. A session places its
+/// screens in its logical space, where a scaled screen is smaller than its mode,
+/// so an arrangement stated in capture pixels closes up around it here, and a
+/// screen changing scale carries its neighbours with it.
+pub(crate) fn close_gaps(
+    rects: &[(i32, i32, i32, i32)],
+    sizes: &[(i32, i32)],
+) -> Vec<(i32, i32, i32, i32)> {
+    let mut out: Vec<(i32, i32, i32, i32)> =
+        rects.iter().zip(sizes).map(|(r, s)| (r.0, r.1, s.0, s.1)).collect();
+    // Each axis in the order of the old coordinate, so a neighbour is placed
+    // before the rectangle that follows it.
+    let mut order: Vec<usize> = (0..out.len()).collect();
+    order.sort_by_key(|&i| rects[i].0);
+    for &i in &order {
+        if let Some(&j) = order.iter().find(|&&j| rects[j].0 < rects[i].0 && rects[j].0 + rects[j].2 == rects[i].0) {
+            out[i].0 = out[j].0 + out[j].2;
+        }
+    }
+    order.sort_by_key(|&i| rects[i].1);
+    for &i in &order {
+        if let Some(&j) = order.iter().find(|&&j| rects[j].1 < rects[i].1 && rects[j].1 + rects[j].3 == rects[i].1) {
+            out[i].1 = out[j].1 + out[j].3;
+        }
+    }
+    out
+}
 
 #[derive(Default)]
 struct OutState {
@@ -68,6 +119,40 @@ struct OutState {
 impl SyncState for OutState {
     fn sync_done_mut(&mut self) -> &mut bool {
         &mut self.sync_done
+    }
+}
+
+impl OutState {
+    /// The size of the mode a head holds; `(0, 0)` where it announced none.
+    fn mode_size(&self, head: &ZwlrOutputHeadV1) -> (i32, i32) {
+        self.current
+            .iter()
+            .find(|(h, _)| h == head)
+            .and_then(|(_, mode)| self.modes.iter().find(|(m, _)| m == mode))
+            .map(|(_, size)| *size)
+            .unwrap_or((0, 0))
+    }
+
+    /// The enabled screens in the order their names put them (WL-1, WL-2, ...),
+    /// which is the order a session opens them in and so the order they map to
+    /// displays; the manager's own announcement order carries no such promise.
+    fn screens(&self) -> Vec<Screen> {
+        let mut screens: Vec<(String, Screen)> = self
+            .heads
+            .iter()
+            .filter(|h| h.enabled)
+            .map(|h| {
+                let screen = Screen {
+                    head: h.head.clone(),
+                    pos: h.pos,
+                    mode: self.mode_size(&h.head),
+                    scale: h.scale,
+                };
+                (h.name.clone().unwrap_or_default(), screen)
+            })
+            .collect();
+        screens.sort_by_key(|(name, _)| (trailing_number(name), name.clone()));
+        screens.into_iter().map(|(_, s)| s).collect()
     }
 }
 impl_sync_callback!(OutState);
@@ -100,9 +185,13 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for OutState {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            zwlr_output_manager_v1::Event::Head { head } => {
-                state.heads.push((head, None, false, (0, 0)))
-            }
+            zwlr_output_manager_v1::Event::Head { head } => state.heads.push(Head {
+                head,
+                name: None,
+                enabled: false,
+                pos: (0, 0),
+                scale: 1.0,
+            }),
             // Every configuration is built against the serial of the state it
             // was read from; a stale one is refused by the compositor.
             zwlr_output_manager_v1::Event::Done { serial } => state.serial = Some(serial),
@@ -124,13 +213,14 @@ impl Dispatch<ZwlrOutputHeadV1, ()> for OutState {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let Some(entry) = state.heads.iter_mut().find(|(h, _, _, _)| h == head) else {
+        let Some(entry) = state.heads.iter_mut().find(|h| h.head == *head) else {
             return;
         };
         match event {
-            zwlr_output_head_v1::Event::Name { name } => entry.1 = Some(name),
-            zwlr_output_head_v1::Event::Enabled { enabled } => entry.2 = enabled != 0,
-            zwlr_output_head_v1::Event::Position { x, y } => entry.3 = (x, y),
+            zwlr_output_head_v1::Event::Name { name } => entry.name = Some(name),
+            zwlr_output_head_v1::Event::Enabled { enabled } => entry.enabled = enabled != 0,
+            zwlr_output_head_v1::Event::Position { x, y } => entry.pos = (x, y),
+            zwlr_output_head_v1::Event::Scale { scale } => entry.scale = scale,
             zwlr_output_head_v1::Event::CurrentMode { mode } => {
                 let head = head.clone();
                 state.current.retain(|(h, _)| *h != head);
@@ -195,14 +285,44 @@ pub fn set_output_scale(
     if !(0.1..=16.0).contains(&scale) {
         return Err(format!("scale {scale} out of range"));
     }
-    configure(socket_path, |heads| {
-        let target = heads
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("no enabled screen at index {index}"))?;
-        Ok(vec![(target, Plan { scale: Some(scale), ..Plan::default() })])
-    })
-    .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
+    configure(socket_path, |screens| rescale(screens, index, None, scale))
+        .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
+}
+
+/// The plan that gives screen `index` a scale, and the mode asked for, and
+/// closes the others up around the logical size it takes.
+fn rescale(
+    screens: &[Screen],
+    index: usize,
+    mode: Option<(i32, i32)>,
+    scale: f64,
+) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String> {
+    if index >= screens.len() {
+        return Err(format!("no enabled screen at index {index}"));
+    }
+    let rects: Vec<(i32, i32, i32, i32)> = screens
+        .iter()
+        .map(|s| {
+            let (w, h) = logical_size(s.mode, s.scale);
+            (s.pos.0, s.pos.1, w, h)
+        })
+        .collect();
+    let mut sizes: Vec<(i32, i32)> = rects.iter().map(|r| (r.2, r.3)).collect();
+    sizes[index] = logical_size(mode.unwrap_or(screens[index].mode), scale);
+    let placed = close_gaps(&rects, &sizes);
+    Ok(screens
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let position = (placed[i].0, placed[i].1);
+            let mut plan = Plan { position: (position != s.pos).then_some(position), ..Plan::default() };
+            if i == index {
+                plan.mode = mode;
+                plan.scale = Some(scale);
+            }
+            (i == index || plan.position.is_some()).then(|| (s.head.clone(), plan))
+        })
+        .collect())
 }
 
 /// Give the `index`-th screen of the compositor on `socket_path` this mode and
@@ -224,14 +344,8 @@ pub fn set_screen_geometry(
     if size.0 <= 0 || size.1 <= 0 {
         return Err(format!("size {}x{} out of range", size.0, size.1));
     }
-    configure(socket_path, move |heads| {
-        let target = heads
-            .get(index)
-            .cloned()
-            .ok_or_else(|| format!("no enabled screen at index {index}"))?;
-        Ok(vec![(target, Plan { mode: Some(size), scale: Some(scale), ..Plan::default() })])
-    })
-    .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
+    configure(socket_path, move |screens| rescale(screens, index, Some(size), scale))
+        .map(|changed| if changed == 0 { ScaleOutcome::Unsupported } else { ScaleOutcome::Applied })
 }
 
 /// The session's enabled screens as `(name, x, y, width, height)`, in screen
@@ -252,22 +366,13 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> 
         return Ok(Vec::new());
     };
     bounded_roundtrip(&conn, &mut queue, &mut state)?;
-    let size_of = |head: &ZwlrOutputHeadV1| -> (i32, i32) {
-        state
-            .current
-            .iter()
-            .find(|(h, _)| h == head)
-            .and_then(|(_, mode)| state.modes.iter().find(|(m, _)| m == mode))
-            .map(|(_, size)| *size)
-            .unwrap_or((0, 0))
-    };
     let mut screens: Vec<(String, i32, i32, i32, i32)> = state
         .heads
         .iter()
-        .filter(|(_, _, on, _)| *on)
-        .map(|(head, name, _, pos)| {
-            let (w, h) = size_of(head);
-            (name.clone().unwrap_or_default(), pos.0, pos.1, w, h)
+        .filter(|h| h.enabled)
+        .map(|h| {
+            let (w, hgt) = state.mode_size(&h.head);
+            (h.name.clone().unwrap_or_default(), h.pos.0, h.pos.1, w, hgt)
         })
         .collect();
     screens.sort_by_key(|(name, _, _, _, _)| (trailing_number(name), name.clone()));
@@ -285,6 +390,9 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> 
 /// capture one, is what places windows and carries the pointer between screens.
 /// Every screen is positioned in one configuration: applied one at a time, an
 /// intermediate state overlaps two screens and the compositor reflows around it.
+/// The rectangles are capture pixels; the positions land in the session's logical
+/// space, where a scaled screen is its mode over its scale, closed up so a screen
+/// beside a scaled one meets its logical edge rather than its pixel edge.
 ///
 /// Returns how many screens were positioned; 0 when the compositor manages no
 /// outputs for clients, which is where a session on KWin lands (it offers
@@ -297,12 +405,17 @@ pub fn set_screen_layout(
     if rects.iter().any(|(_, _, w, h)| *w <= 0 || *h <= 0) {
         return Err("a screen rectangle has a non-positive size".to_string());
     }
-    configure(socket_path, move |heads| {
-        Ok(heads
+    configure(socket_path, move |screens| {
+        let n = screens.len().min(rects.len());
+        let sizes: Vec<(i32, i32)> =
+            screens.iter().zip(&rects).map(|(s, r)| logical_size((r.2, r.3), s.scale)).collect();
+        let placed = close_gaps(&rects[..n], &sizes);
+        Ok(screens
             .iter()
-            .zip(rects.iter())
-            .map(|(h, (x, y, w, hgt))| {
-                (h.clone(), Plan { mode: Some((*w, *hgt)), position: Some((*x, *y)), ..Plan::default() })
+            .zip(&rects)
+            .zip(placed)
+            .map(|((s, r), p)| {
+                (s.head.clone(), Plan { mode: Some((r.2, r.3)), position: Some((p.0, p.1)), ..Plan::default() })
             })
             .collect())
     })
@@ -317,12 +430,11 @@ pub fn hold_spare_screens(
     keep: usize,
     size: (i32, i32),
 ) -> Result<usize, String> {
-    configure(socket_path, move |heads| {
-        Ok(heads
+    configure(socket_path, move |screens| {
+        Ok(screens
             .iter()
             .skip(keep)
-            .cloned()
-            .map(|h| (h, Plan { mode: Some(size), ..Plan::default() }))
+            .map(|s| (s.head.clone(), Plan { mode: Some(size), ..Plan::default() }))
             .collect())
     })
 }
@@ -366,14 +478,14 @@ impl From<String> for ConfigErr {
 /// up leaves the display on a capture-side scale until something asks again.
 const CONFIGURE_BUDGET: Duration = Duration::from_secs(1);
 
-/// Apply `plan` to the compositor's enabled heads, retrying while the
-/// compositor cancels. `plan` receives them in announcement order and answers
-/// with the ones to change; heads it leaves out keep their configuration. It is
-/// called once per attempt, against the heads of that attempt. 0 = the
+/// Apply `plan` to the compositor's enabled screens, retrying while the
+/// compositor cancels. `plan` receives them in screen order and answers with
+/// the heads to change; heads it leaves out keep their configuration. It is
+/// called once per attempt, against the screens of that attempt. 0 = the
 /// compositor manages no outputs, or the plan asked for nothing.
 fn configure<F>(socket_path: &str, plan: F) -> Result<usize, String>
 where
-    F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
+    F: Fn(&[Screen]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
 {
     let deadline = Instant::now() + CONFIGURE_BUDGET;
     let mut stale = 0;
@@ -398,7 +510,7 @@ where
 /// connection holds do not survive that.
 fn configure_once<F>(socket_path: &str, plan: &F) -> Result<usize, ConfigErr>
 where
-    F: Fn(&[ZwlrOutputHeadV1]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
+    F: Fn(&[Screen]) -> Result<Vec<(ZwlrOutputHeadV1, Plan)>, String>,
 {
     let stream =
         UnixStream::connect(socket_path).map_err(|e| format!("connect {socket_path}: {e}"))?;
@@ -416,18 +528,8 @@ where
     let serial = state
         .serial
         .ok_or_else(|| "output manager sent no state serial".to_string())?;
-    // Screens in the order their names put them (WL-1, WL-2, ...), which is the
-    // order a session opens them in and so the order they map to displays; the
-    // manager's own announcement order carries no such promise.
-    let mut named: Vec<(ZwlrOutputHeadV1, String)> = state
-        .heads
-        .iter()
-        .filter(|(_, _, on, _)| *on)
-        .map(|(h, name, _, _)| (h.clone(), name.clone().unwrap_or_default()))
-        .collect();
-    named.sort_by_key(|(_, name)| (trailing_number(name), name.clone()));
-    let enabled: Vec<ZwlrOutputHeadV1> = named.into_iter().map(|(h, _)| h).collect();
-    let wanted = plan(&enabled)?;
+    let screens = state.screens();
+    let wanted = plan(&screens)?;
     if wanted.is_empty() {
         manager.stop();
         let _ = queue.flush();
@@ -436,9 +538,9 @@ where
 
     // A configuration describes every head: one left out would be disabled.
     let config = manager.create_configuration(serial, &qh, ());
-    for head in &enabled {
-        let cfg_head = config.enable_head(head, &qh, ());
-        if let Some((_, want)) = wanted.iter().find(|(h, _)| h == head) {
+    for screen in &screens {
+        let cfg_head = config.enable_head(&screen.head, &qh, ());
+        if let Some((_, want)) = wanted.iter().find(|(h, _)| *h == screen.head) {
             if let Some((w, h)) = want.mode {
                 cfg_head.set_custom_mode(w, h, 0);
             }
@@ -466,5 +568,42 @@ where
         _ => Err(ConfigErr::Other(
             "the compositor refused the configuration".to_string(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::close_gaps;
+
+    /// The arrangement of the capture outputs, in pixels, becomes the session's
+    /// logical one: a screen at scale 2 is half its mode there, and whichever
+    /// screen sat against it closes up to that edge, on either axis and down a
+    /// chain; nothing moves at scale 1.
+    #[test]
+    fn scaled_screens_close_up() {
+        let primary_right = [(3024, 0, 1920, 992), (0, 0, 3024, 1764)];
+        assert_eq!(
+            close_gaps(&primary_right, &[(1920, 992), (1512, 882)]),
+            vec![(1512, 0, 1920, 992), (0, 0, 1512, 882)]
+        );
+        let primary_left = [(0, 0, 1920, 1080), (1920, 0, 1920, 1080)];
+        assert_eq!(
+            close_gaps(&primary_left, &[(960, 540), (1920, 1080)]),
+            vec![(0, 0, 960, 540), (960, 0, 1920, 1080)]
+        );
+        assert_eq!(
+            close_gaps(&primary_left, &[(1920, 1080), (1920, 1080)]),
+            primary_left.to_vec()
+        );
+        let below = [(0, 1764, 1920, 992), (0, 0, 3024, 1764)];
+        assert_eq!(
+            close_gaps(&below, &[(1920, 992), (1512, 882)]),
+            vec![(0, 882, 1920, 992), (0, 0, 1512, 882)]
+        );
+        let chain = [(0, 0, 1000, 500), (1000, 0, 1000, 500), (2000, 0, 1000, 500)];
+        assert_eq!(
+            close_gaps(&chain, &[(500, 250), (500, 250), (1000, 500)]),
+            vec![(0, 0, 500, 250), (500, 0, 500, 250), (1000, 0, 1000, 500)]
+        );
     }
 }

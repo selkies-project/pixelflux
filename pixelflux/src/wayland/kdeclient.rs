@@ -262,6 +262,7 @@ struct Device {
     name: Option<String>,
     enabled: bool,
     pos: (i32, i32),
+    scale: f64,
     current: Option<KdeOutputDeviceModeV2>,
 }
 
@@ -303,6 +304,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for KdeOutState {
                     name: None,
                     enabled: false,
                     pos: (0, 0),
+                    scale: 1.0,
                     current: None,
                 });
             }
@@ -327,6 +329,7 @@ impl Dispatch<KdeOutputDeviceV2, ()> for KdeOutState {
             kde_output_device_v2::Event::Name { name } => entry.name = Some(name),
             kde_output_device_v2::Event::Enabled { enabled } => entry.enabled = enabled != 0,
             kde_output_device_v2::Event::Geometry { x, y, .. } => entry.pos = (x, y),
+            kde_output_device_v2::Event::Scale { factor } => entry.scale = factor,
             kde_output_device_v2::Event::CurrentMode { mode } => entry.current = Some(mode),
             _ => {}
         }
@@ -423,8 +426,10 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> 
 
 /// Position the session's screens at `rects`, one `(x, y, width, height)` per
 /// screen in screen order; sizes are validated but not applied, because a
-/// nested KWin screen's size follows its host window. Returns how many were
-/// positioned; 0 when the compositor serves no `kde_output_management_v2`.
+/// nested KWin screen's size follows its host window. The rectangles are
+/// capture pixels and the positions land in the session's logical space, closed
+/// up around each screen's scale (`outclient::close_gaps`). Returns how many
+/// were positioned; 0 when the compositor serves no `kde_output_management_v2`.
 pub fn set_screen_layout(
     socket_path: &str,
     rects: Vec<(i32, i32, i32, i32)>,
@@ -437,10 +442,20 @@ pub fn set_screen_layout(
         return Ok(0);
     };
     let qh = queue.handle();
-    let placed: Vec<(KdeOutputDeviceV2, (i32, i32))> = enabled_sorted(&state)
-        .into_iter()
-        .map(|i| state.devices[i].dev.clone())
-        .zip(rects.iter().map(|(x, y, _, _)| (*x, *y)))
+    let order = enabled_sorted(&state);
+    let n = order.len().min(rects.len());
+    let sizes: Vec<(i32, i32)> = order
+        .iter()
+        .zip(&rects)
+        .map(|(&i, r)| {
+            let scale = state.devices[i].scale;
+            ((r.2 as f64 / scale).round() as i32, (r.3 as f64 / scale).round() as i32)
+        })
+        .collect();
+    let placed: Vec<(KdeOutputDeviceV2, (i32, i32))> = order
+        .iter()
+        .zip(crate::wayland::outclient::close_gaps(&rects[..n], &sizes))
+        .map(|(&i, p)| (state.devices[i].dev.clone(), (p.0, p.1)))
         .collect();
     if placed.is_empty() {
         return Ok(0);
