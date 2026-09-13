@@ -311,6 +311,8 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 
 For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat` dependency) with the `start_recording(...)`, `stop_recording()`, and `recording_status()` Python functions, controllable through the `PIXELFLUX_RECORD*` environment variables. Recording taps the encoded full-frame H.264 stream, and HTTP endpoints allow remote trigger/stop/status.
 
+`start_recording(path, settings=None, audio_socket="")` adds an Opus audio track when `audio_socket` (or `PIXELFLUX_RECORD_AUDIO`) names a Unix socket serving an Ogg Opus stream, such as [pcmflux](https://github.com/selkies-project/pcmflux)'s `output_socket`: the recorder connects, keeps the packets as they are, and places them by their granule positions against the video clock, so the file is muxed without a decode or re-encode. `recording_status()` counts them as `audio_frames`.
+
 ## Screenshots
 
 `screenshot_png(display=0)` returns a PNG of one display with the cursor drawn in, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture.

@@ -30,9 +30,16 @@
 //! queue drops frames (never blocks the pipeline), and all muxing happens on the recorder's own
 //! writer thread. Timestamps are wall-clock, so the damage-driven, variable-rate frame flow
 //! lands at its true times in the MP4.
+//!
+//! Sound comes from an Ogg Opus stream on a Unix socket, the shape pcmflux serves, read by a
+//! thread of its own: the `OpusHead` declares the track, and each packet's decode time is
+//! its granule position laid onto the recording clock from the first packet's arrival.
 
 pub mod mp4;
+pub mod ogg;
 
+use std::collections::VecDeque;
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -48,9 +55,17 @@ use crate::ThreadCommand;
 /// falls this far behind loses frames instead of growing memory or blocking the encoder.
 const QUEUE_CAP: usize = 256;
 
-/// A queued frame: `Arc`-shared encoded payload, byte offset where the Annex-B stream
-/// starts (past the wire header when present), and the wall-clock capture time.
-type TapFrame = (Arc<Vec<u8>>, usize, u64);
+/// What crosses into the writer: a video frame as its `Arc`-shared encoded payload, the byte
+/// offset where the Annex-B stream starts (past the wire header when present) and the
+/// wall-clock capture time; or an audio packet with its decode time on the 48 kHz clock.
+enum Tap {
+    Video(Arc<Vec<u8>>, usize, u64),
+    Audio(Vec<u8>, u64),
+}
+
+/// Audio packets held before the video's first IDR opens the file: ten seconds of 20 ms
+/// packets, the oldest dropped past that.
+const EARLY_AUDIO_CAP: usize = 500;
 
 /// Which capture system feeds the recording.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,6 +93,8 @@ pub struct RecordOptions {
     /// Full capture settings for a recorder-owned capture; `None` derives them (full root /
     /// current output geometry, H.264 full-frame).
     pub capture: Option<RustCaptureSettings>,
+    /// Unix socket serving an Ogg Opus stream to record as the audio track; empty for none.
+    pub audio_socket: String,
 }
 
 impl RecordOptions {
@@ -97,6 +114,7 @@ impl RecordOptions {
             keyframe_interval_s: f("PIXELFLUX_RECORD_KEYFRAME_S").unwrap_or(0.0),
             backend,
             capture: None,
+            audio_socket: std::env::var("PIXELFLUX_RECORD_AUDIO").unwrap_or_default(),
         }
     }
 
@@ -118,6 +136,7 @@ struct RecShared {
     skipped_non_h264: AtomicU64,
     muxed: AtomicU64,
     sync_frames: AtomicU64,
+    audio_muxed: AtomicU64,
     bytes: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
@@ -134,6 +153,7 @@ impl RecShared {
             skipped_non_h264: AtomicU64::new(0),
             muxed: AtomicU64::new(0),
             sync_frames: AtomicU64::new(0),
+            audio_muxed: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
@@ -160,6 +180,7 @@ pub struct RecordingStatus {
     pub mode: &'static str,
     pub frames: u64,
     pub sync_frames: u64,
+    pub audio_frames: u64,
     pub dropped: u64,
     pub skipped_non_h264: u64,
     pub bytes: u64,
@@ -174,7 +195,7 @@ pub struct RecordingStatus {
 #[derive(Clone)]
 struct WlTap {
     display_id: u32,
-    tx: Sender<TapFrame>,
+    tx: Sender<Tap>,
     shared: Arc<RecShared>,
     /// Standard request-IDR path for attached recordings (`None` when the recorder owns the
     /// capture and scheduled keyframes ride in its settings).
@@ -214,9 +235,11 @@ struct ActiveRecording {
     backend: &'static str,
     mode_name: &'static str,
     mode: RecordingMode,
-    tx: Sender<TapFrame>,
+    tx: Sender<Tap>,
     shared: Arc<RecShared>,
     writer: thread::JoinHandle<()>,
+    audio_stop: Arc<AtomicBool>,
+    audio: Option<thread::JoinHandle<()>>,
 }
 
 static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
@@ -264,7 +287,7 @@ fn pace_idr_requests(shared: &RecShared, idr: &IdrRequester, interval_us: u64) {
 /// Enqueue one delivered frame for muxing. Only a single full-frame H.264 stripe is
 /// recordable; JPEG or striped output is counted and skipped so the surfaces can report a
 /// clear "nothing recordable" error instead of writing a corrupt file.
-fn offer_frame(shared: &RecShared, tx: &Sender<TapFrame>, stripes: &[EncodedStripe]) {
+fn offer_frame(shared: &RecShared, tx: &Sender<Tap>, stripes: &[EncodedStripe]) {
     if stripes.is_empty() {
         return;
     }
@@ -281,7 +304,7 @@ fn offer_frame(shared: &RecShared, tx: &Sender<TapFrame>, stripes: &[EncodedStri
         return;
     }
     let pts_us = shared.start.elapsed().as_micros() as u64;
-    match tx.try_send((s.data.clone(), offset, pts_us)) {
+    match tx.try_send(Tap::Video(s.data.clone(), offset, pts_us)) {
         Ok(()) => {
             shared.enqueued.fetch_add(1, Ordering::Relaxed);
         }
@@ -293,21 +316,42 @@ fn offer_frame(shared: &RecShared, tx: &Sender<TapFrame>, stripes: &[EncodedStri
 }
 
 /// Writer-thread body: drain the queue, convert Annex-B to AVCC, and mux. Output starts at
-/// the first IDR with parameter sets; earlier frames are discarded. Runs until every sender
-/// is dropped (stop) or a write error occurs, then finalizes the file and publishes the
-/// final status.
+/// the first IDR with parameter sets; earlier frames are discarded and audio packets held.
+/// Runs until every sender is dropped (stop) or a write error occurs, then finalizes the
+/// file and publishes the final status.
 fn writer_thread(
-    rx: Receiver<TapFrame>,
+    rx: Receiver<Tap>,
     file: std::fs::File,
     path: String,
     backend: &'static str,
     mode_name: &'static str,
+    audio: Option<mp4::AudioTrackConfig>,
     shared: Arc<RecShared>,
 ) {
     let mut writer = mp4::FragmentWriter::new(std::io::BufWriter::new(file));
+    if let Some(cfg) = audio {
+        writer = writer.with_audio(cfg);
+    }
     let mut builder = mp4::H264SampleBuilder::new();
+    let mut early_audio: VecDeque<(Vec<u8>, u64)> = VecDeque::new();
 
-    'recv: for (buf, offset, pts_us) in rx.iter() {
+    'recv: for item in rx.iter() {
+        let (buf, offset, pts_us) = match item {
+            Tap::Video(buf, offset, pts_us) => (buf, offset, pts_us),
+            Tap::Audio(packet, dts) => {
+                if !writer.init_written() {
+                    if early_audio.len() >= EARLY_AUDIO_CAP {
+                        early_audio.pop_front();
+                    }
+                    early_audio.push_back((packet, dts));
+                } else if let Err(e) = writer.push_audio(packet, dts) {
+                    shared.set_error(format!("MP4 write failed: {e}"));
+                    break 'recv;
+                }
+                shared.audio_muxed.store(writer.stats().audio_samples, Ordering::Relaxed);
+                continue;
+            }
+        };
         let Some(sample) = builder.build_sample(&buf[offset..]) else { continue };
         if !writer.init_written() {
             if !sample.sync || !builder.have_parameter_sets() {
@@ -322,6 +366,12 @@ fn writer_thread(
             if let Err(e) = writer.write_init(&cfg) {
                 shared.set_error(format!("MP4 init write failed: {e}"));
                 break 'recv;
+            }
+            for (packet, dts) in early_audio.drain(..) {
+                if let Err(e) = writer.push_audio(packet, dts) {
+                    shared.set_error(format!("MP4 write failed: {e}"));
+                    break 'recv;
+                }
             }
         }
         if let Err(e) = writer.push_sample(sample.data, sample.sync, pts_us) {
@@ -357,6 +407,7 @@ fn writer_thread(
         mode: mode_name,
         frames: final_stats.samples,
         sync_frames: final_stats.sync_samples,
+        audio_frames: final_stats.audio_samples,
         dropped: shared.dropped.load(Ordering::Relaxed),
         skipped_non_h264: shared.skipped_non_h264.load(Ordering::Relaxed),
         bytes: final_stats.bytes,
@@ -366,10 +417,68 @@ fn writer_thread(
         error: shared.error.lock().unwrap().clone(),
     };
     println!(
-        "[recorder] finished {}: {} frames ({} sync), {:.2}s, {} bytes",
-        status.path, status.frames, status.sync_frames, status.duration_s, status.bytes
+        "[recorder] finished {}: {} frames ({} sync), {} audio packets, {:.2}s, {} bytes",
+        status.path, status.frames, status.sync_frames, status.audio_frames, status.duration_s, status.bytes
     );
     *LAST_FINISHED.lock().unwrap() = Some(status);
+}
+
+/// Connect to the audio sink within a moment and read its headers: the reader positioned
+/// at the first audio packet, and the `OpusHead` the track is declared from.
+fn open_audio(path: &str) -> Result<(ogg::PageReader<UnixStream>, ogg::OpusHead), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let stream = loop {
+        match UnixStream::connect(path) {
+            Ok(s) => break s,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("audio socket {path}: {e}")),
+        }
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
+    let mut reader = ogg::PageReader::new(stream);
+    let (first, _) = reader
+        .next_packet()
+        .map_err(|e| format!("audio socket {path}: {e}"))?
+        .ok_or_else(|| format!("audio socket {path} closed before its headers"))?;
+    let head = ogg::parse_opus_head(&first)
+        .ok_or_else(|| format!("audio socket {path} does not start with OpusHead"))?;
+    reader.next_packet().map_err(|e| format!("audio socket {path}: {e}"))?;
+    Ok((reader, head))
+}
+
+/// Audio-thread body: each packet's granule position, laid onto the recording clock from
+/// the first packet's arrival, is its decode time. Ends with the stream, or on stop.
+fn audio_thread(mut reader: ogg::PageReader<UnixStream>, tx: Sender<Tap>, shared: Arc<RecShared>,
+                stop: Arc<AtomicBool>) {
+    let _ = reader.inner_mut().set_read_timeout(Some(Duration::from_millis(200)));
+    let mut position: u64 = 0;
+    let mut anchor: Option<(u64, u64)> = None;
+    while !stop.load(Ordering::Relaxed) {
+        let (packet, granule) = match reader.next_packet() {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) => {
+                eprintln!("[recorder] audio stream ended: {e}");
+                break;
+            }
+        };
+        let (clock, base) = *anchor.get_or_insert_with(|| {
+            (shared.start.elapsed().as_micros() as u64 * (mp4::OPUS_TIMESCALE as u64) / 1_000_000, position)
+        });
+        let dts = clock + position.saturating_sub(base);
+        position = granule.unwrap_or(position + mp4::opus_packet_samples(&packet) as u64);
+        match tx.try_send(Tap::Audio(packet, dts)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                shared.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => break,
+        }
+    }
 }
 
 /// Capture settings for a recorder-owned capture: explicit settings when given (validated
@@ -446,7 +555,18 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
     let file = std::fs::File::create(&opts.path)
         .map_err(|e| format!("cannot create {}: {e}", opts.path))?;
     let shared = RecShared::new();
-    let (tx, rx) = bounded::<TapFrame>(QUEUE_CAP);
+    let (tx, rx) = bounded::<Tap>(QUEUE_CAP);
+    let audio_source = if opts.audio_socket.is_empty() {
+        None
+    } else {
+        match open_audio(&opts.audio_socket) {
+            Ok(source) => Some(source),
+            Err(e) => {
+                eprintln!("[recorder] recording without sound: {e}");
+                None
+            }
+        }
+    };
 
     let (mode, mode_name, backend_name) = match backend {
         PreferredBackend::Wayland => {
@@ -553,12 +673,25 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         }
     };
 
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let (audio_cfg, audio) = match audio_source {
+        Some((reader, head)) => {
+            let cfg = mp4::AudioTrackConfig { sample_entry: mp4::opus_sample_entry(&head) };
+            let (tx, shared, stop) = (tx.clone(), shared.clone(), audio_stop.clone());
+            let join = thread::Builder::new()
+                .name("pf-recorder-audio".to_string())
+                .spawn(move || audio_thread(reader, tx, shared, stop))
+                .map_err(|e| format!("failed to spawn recorder audio thread: {e}"))?;
+            (Some(cfg), Some(join))
+        }
+        None => (None, None),
+    };
     let writer = {
         let shared = shared.clone();
         let path = opts.path.clone();
         thread::Builder::new()
             .name("pf-recorder".to_string())
-            .spawn(move || writer_thread(rx, file, path, backend_name, mode_name, shared))
+            .spawn(move || writer_thread(rx, file, path, backend_name, mode_name, audio_cfg, shared))
             .map_err(|e| format!("failed to spawn recorder writer thread: {e}"))?
     };
 
@@ -573,6 +706,7 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         mode: mode_name,
         frames: 0,
         sync_frames: 0,
+        audio_frames: 0,
         dropped: 0,
         skipped_non_h264: 0,
         bytes: 0,
@@ -589,6 +723,8 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         tx,
         shared,
         writer,
+        audio_stop,
+        audio,
     });
     Ok(status)
 }
@@ -631,6 +767,12 @@ pub fn stop() -> Result<RecordingStatus, String> {
         }
         RecordingMode::WaylandAttached => {}
     }
+    // The audio thread holds a sender of its own: it goes first, so the writer's queue
+    // closes once the last packet is in.
+    active.audio_stop.store(true, Ordering::Relaxed);
+    if let Some(join) = active.audio {
+        let _ = join.join();
+    }
     drop(active.tx);
     let _ = active.writer.join();
     let finished = LAST_FINISHED.lock().unwrap().clone().ok_or_else(|| {
@@ -654,6 +796,7 @@ pub fn status() -> Option<RecordingStatus> {
             mode: a.mode_name,
             frames: a.shared.muxed.load(Ordering::Relaxed),
             sync_frames: a.shared.sync_frames.load(Ordering::Relaxed),
+            audio_frames: a.shared.audio_muxed.load(Ordering::Relaxed),
             dropped: a.shared.dropped.load(Ordering::Relaxed),
             skipped_non_h264: a.shared.skipped_non_h264.load(Ordering::Relaxed),
             bytes: a.shared.bytes.load(Ordering::Relaxed),
@@ -729,6 +872,7 @@ pub fn status_to_json(s: &RecordingStatus) -> serde_json::Value {
         "mode": s.mode,
         "frames": s.frames,
         "sync_frames": s.sync_frames,
+        "audio_frames": s.audio_frames,
         "dropped": s.dropped,
         "skipped_non_h264": s.skipped_non_h264,
         "bytes": s.bytes,

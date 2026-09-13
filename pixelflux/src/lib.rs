@@ -7439,6 +7439,7 @@ fn recording_status_dict(py: Python<'_>, s: &crate::recorder::RecordingStatus) -
     d.set_item("mode", s.mode)?;
     d.set_item("frames", s.frames)?;
     d.set_item("sync_frames", s.sync_frames)?;
+    d.set_item("audio_frames", s.audio_frames)?;
     d.set_item("dropped", s.dropped)?;
     d.set_item("skipped_non_h264", s.skipped_non_h264)?;
     d.set_item("bytes", s.bytes)?;
@@ -7454,15 +7455,20 @@ fn recording_status_dict(py: Python<'_>, s: &crate::recorder::RecordingStatus) -
 /// compositor) and taps a live streaming session instead of restarting it. `settings` is an
 /// optional `CaptureSettings` for a recorder-owned capture (H.264 only; `display_id`
 /// selects the Wayland output); when omitted, `PIXELFLUX_RECORD_*` environment variables
-/// and full-screen defaults apply.
+/// and full-screen defaults apply. `audio_socket` names a Unix socket serving an Ogg Opus
+/// stream, the shape pcmflux's `output_socket` serves, recorded as the audio track.
 #[pyfunction]
-#[pyo3(signature = (path, settings = None))]
+#[pyo3(signature = (path, settings = None, audio_socket = ""))]
 fn start_recording(
     py: Python<'_>,
     path: String,
     settings: Option<&Bound<'_, PyAny>>,
+    audio_socket: &str,
 ) -> PyResult<Py<PyAny>> {
     let mut opts = crate::recorder::RecordOptions::from_env(path);
+    if !audio_socket.is_empty() {
+        opts.audio_socket = audio_socket.to_string();
+    }
     if let Some(s) = settings {
         let rs = extract_settings(s)?;
         if rs.codec != Codec::H264 {

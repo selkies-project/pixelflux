@@ -745,6 +745,8 @@ struct RecordStartRequest {
     fps: Option<f64>,
     /// Bitrate override in kbps for a recorder-owned capture.
     bitrate_kbps: Option<i32>,
+    /// Unix socket serving an Ogg Opus stream to record as the audio track.
+    audio_socket: Option<String>,
 }
 
 /// Handle the recorder REST endpoints sharing the CU server: `record_start`,
@@ -780,6 +782,9 @@ fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
             }
             if let Some(b) = req.bitrate_kbps {
                 opts.bitrate_kbps = b;
+            }
+            if let Some(a) = req.audio_socket {
+                opts.audio_socket = a;
             }
             match crate::recorder::start(opts) {
                 Ok(s) => crate::recorder::status_to_json(&s).to_string(),
