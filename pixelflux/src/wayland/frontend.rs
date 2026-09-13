@@ -629,8 +629,8 @@ pub type ScreenshotRequest = (u32, std::sync::mpsc::Sender<Result<Vec<u8>, Strin
 /// 3. **Keyframes** (`pending_force_idr`): set by an IDR request (client reconnect / decoder reset)
 ///    and consumed once on the next captured frame to force an immediate keyframe.
 ///
-/// 4. **Clipboard** (`pending_clipboard_read`): stages the mime chosen in `new_selection`; the loop
-///    drains it only after the dispatch that stores the new client source, so the read targets the
+/// 4. **Clipboard** (`pending_clipboard_read`): stages the mimes chosen in `new_selection`; the loop
+///    drains them only after the dispatch that stores the new client source, so the read targets the
 ///    new selection rather than the previous one.
 ///
 /// 5. **GPU selection** (`auto_gpu_selected`): records that automatic (not explicit) selection
@@ -685,11 +685,12 @@ pub struct AppState {
     /// Cursor delivery jobs to the `wl-cursor` worker (PNG encode + Python call off-thread).
     pub cursor_tx: std::sync::mpsc::Sender<CursorJob>,
     pub clipboard_callback: Option<Py<PyAny>>,
-    pub pending_clipboard_read: Option<String>,
-    /// Preferred mime of the current CLIENT-owned clipboard selection, recorded even while
+    /// The mimes of the current client selection staged for one read, delivered together.
+    pub pending_clipboard_read: Vec<String>,
+    /// The mimes chosen from the current CLIENT-owned clipboard selection, recorded even while
     /// no callback is registered so `SetClipboardCallback` can re-stage a read of a copy made
-    /// in the gap; `None` when the selection is cleared or compositor-owned.
-    pub current_selection_mime: Option<String>,
+    /// in the gap; empty when the selection is cleared or compositor-owned.
+    pub current_selection_mimes: Vec<String>,
 
     pub last_log_time: Instant,
     pub start_time: Instant,
@@ -1416,21 +1417,21 @@ impl AppState {
         true
     }
 
-    /// Drain a clipboard read staged by `new_selection` and hand `(mime, bytes)` to the
-    /// Python callback off-thread.
+    /// Drain the clipboard read staged by `new_selection` and hand its `(mime, bytes)` entries,
+    /// the flavours of one copy, to the Python callback off-thread.
     ///
-    /// Runs from the loop *after* the dispatch that stored the new client source, so the request
-    /// targets the current selection rather than the previous one. It clones the callback, opens a
-    /// pipe, and asks the owning client source to write the chosen mime into the pipe's writer. A
-    /// spawned reader thread then reads the response. The overall bound is by SIZE (64 MiB, then
-    /// delivered truncated) so a hostile client cannot balloon memory; time only bounds
-    /// INACTIVITY — a producer that keeps bytes flowing may take as long as it needs (a large
-    /// transfer from a slow source still delivers), while one that goes silent for 10 s without
-    /// closing its fd is dropped so each clipboard change cannot leak a pinned thread + pipe.
-    /// The `PY_SHUTDOWN` checks keep this off a shutting-down interpreter.
+    /// Runs from the loop *after* the dispatch that stored the new client source, so the requests
+    /// target the current selection rather than the previous one. It clones the callback, opens a
+    /// pipe per mime, and asks the owning client source to write each into its pipe's writer. A
+    /// spawned reader thread then reads the responses in turn. The overall bound is by SIZE (64
+    /// MiB per flavour, then delivered truncated) so a hostile client cannot balloon memory; time
+    /// only bounds INACTIVITY — a producer that keeps bytes flowing may take as long as it needs
+    /// (a large transfer from a slow source still delivers), while one that goes silent for 10 s
+    /// without closing its fd is dropped so each clipboard change cannot leak a pinned thread +
+    /// pipe. The `PY_SHUTDOWN` checks keep this off a shutting-down interpreter.
     pub(crate) fn process_pending_clipboard_read(&mut self) {
-        let Some(mime) = self.pending_clipboard_read.take() else { return };
-        if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        let mimes = std::mem::take(&mut self.pending_clipboard_read);
+        if mimes.is_empty() || crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let Some(cb) = self
@@ -1440,65 +1441,30 @@ impl AppState {
         else {
             return;
         };
-        let Ok((reader, writer)) = std::io::pipe() else { return };
-        if request_data_device_client_selection::<AppState>(&self.seat, mime.clone(), writer.into())
-            .is_err()
-        {
+        let mut pipes = Vec::new();
+        for mime in mimes {
+            let Ok((reader, writer)) = std::io::pipe() else { continue };
+            if request_data_device_client_selection::<AppState>(&self.seat, mime.clone(), writer.into())
+                .is_ok()
+            {
+                pipes.push((mime, reader));
+            }
+        }
+        if pipes.is_empty() {
             return;
         }
         std::thread::spawn(move || {
-            use std::io::Read;
-            use std::os::fd::AsRawFd;
-            const CAP: usize = 64 * 1024 * 1024;
-            const IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
-            let mut last_data = Instant::now();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 65536];
-            loop {
-                let Some(remaining) = IDLE_DEADLINE.checked_sub(last_data.elapsed()) else {
-                    return;
-                };
-                let mut pfd = libc::pollfd {
-                    fd: reader.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
-                let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-                if ready < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return;
-                }
-                if ready == 0 {
-                    continue;
-                }
-                match (&reader).read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        last_data = Instant::now();
-                        let room = CAP - buf.len();
-                        let take_n = n.min(room);
-                        buf.extend_from_slice(&chunk[..take_n]);
-                        if buf.len() == CAP {
-                            break;
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted
-                        || e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(_) => return,
-                }
-            }
-            if buf.is_empty() {
-                return;
-            }
-            if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            let entries: Vec<(String, Vec<u8>)> = pipes
+                .into_iter()
+                .filter_map(|(mime, reader)| read_selection(reader).map(|bytes| (mime, bytes)))
+                .collect();
+            if entries.is_empty() || crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
             Python::attach(|py| {
-                let bytes = PyBytes::new(py, &buf);
-                let _ = cb.call1(py, (mime.as_str(), bytes));
+                let entries: Vec<(String, Bound<'_, PyBytes>)> =
+                    entries.iter().map(|(mime, bytes)| (mime.clone(), PyBytes::new(py, bytes))).collect();
+                let _ = cb.call1(py, (entries,));
             });
         });
     }
@@ -1769,37 +1735,70 @@ impl AppState {
     }
 }
 
-/// Clipboard mime types the bridge can hand to Python, most specific first; `new_selection`
-/// picks the first of these that the client's source offers.
-const CLIPBOARD_MIME_PREFERENCE: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/webp",
-    "image/bmp",
-    "image/svg+xml",
-    "image/svg",
-    "text/html",
-    "text/plain;charset=utf-8",
-    "UTF8_STRING",
-    "text/plain",
-    "STRING",
-    "TEXT",
-];
+/// Clipboard mime types the bridge hands to Python. A picture is read as the first of the
+/// image types the client's source offers; text as its markup, when it offers any, and the
+/// first of the plain-text names beneath it, so a paste gets the text the source itself wrote.
+const CLIPBOARD_IMAGE_MIMES: &[&str] =
+    &["image/png", "image/jpeg", "image/webp", "image/bmp", "image/svg+xml", "image/svg"];
+const CLIPBOARD_TEXT_MIMES: &[&str] =
+    &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
+
+/// One staged clipboard flavour read to its end: the source's bytes, or nothing for a source
+/// that wrote none or went silent.
+fn read_selection(reader: std::io::PipeReader) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    const CAP: usize = 64 * 1024 * 1024;
+    const IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last_data = Instant::now();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 65536];
+    loop {
+        let remaining = IDLE_DEADLINE.checked_sub(last_data.elapsed())?;
+        let mut pfd = libc::pollfd { fd: reader.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128).max(1) as i32;
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ready == 0 {
+            continue;
+        }
+        match (&reader).read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                last_data = Instant::now();
+                let take_n = n.min(CAP - buf.len());
+                buf.extend_from_slice(&chunk[..take_n]);
+                if buf.len() == CAP {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted
+                || e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => return None,
+        }
+    }
+    (!buf.is_empty()).then_some(buf)
+}
 
 /// Selection (clipboard) bridge between Wayland clients and Python. `SelectionUserData` is
-/// the Python-owned payload `(mime, bytes)` served to pasting clients when Python holds the
-/// selection.
+/// the Python-owned payload, one `(mime, bytes)` entry per offered flavour, served to
+/// pasting clients when Python holds the selection.
 impl SelectionHandler for AppState {
     type SelectionUserData = std::sync::Arc<Vec<(String, Vec<u8>)>>;
 
-    /// A client took the clipboard: pick the best offered mime and stage it for the loop to
-    /// read.
+    /// A client took the clipboard: pick the flavours to read and stage them for the loop.
     ///
     /// Only client-owned clipboard (not primary) selections are relayed to Python. Among the
-    /// source's offered mimes it chooses the most specific match from `CLIPBOARD_MIME_PREFERENCE`
-    /// and records it in `pending_clipboard_read`. The read itself is deferred: the new source is
-    /// stored only after this handler returns, so `process_pending_clipboard_read` runs
-    /// post-dispatch and reads the new selection rather than the previous one.
+    /// source's offered mimes it chooses the picture, else the markup and the plain text
+    /// (`CLIPBOARD_IMAGE_MIMES`, `CLIPBOARD_TEXT_MIMES`), and records them in
+    /// `pending_clipboard_read`. The read itself is deferred: the new source is stored only
+    /// after this handler returns, so `process_pending_clipboard_read` runs post-dispatch and
+    /// reads the new selection rather than the previous one.
     fn new_selection(
         &mut self,
         ty: SelectionTarget,
@@ -1810,25 +1809,30 @@ impl SelectionHandler for AppState {
             return;
         }
         let Some(source) = source else {
-            self.current_selection_mime = None;
+            self.current_selection_mimes.clear();
             return;
         };
         let mimes = source.mime_types();
-        let mime = CLIPBOARD_MIME_PREFERENCE
-            .iter()
-            .find(|want| mimes.iter().any(|m| m == *want))
-            .map(|s| s.to_string());
+        let offered = |want: &str| mimes.iter().any(|m| m == want);
+        let chosen: Vec<String> = match CLIPBOARD_IMAGE_MIMES.iter().find(|m| offered(m)) {
+            Some(image) => vec![image.to_string()],
+            None => ["text/html"]
+                .iter()
+                .filter(|m| offered(m))
+                .chain(CLIPBOARD_TEXT_MIMES.iter().find(|m| offered(m)))
+                .map(|s| s.to_string())
+                .collect(),
+        };
         // Recorded even with no callback armed, so SetClipboardCallback can re-stage a
         // read of a copy made while nobody was listening.
-        self.current_selection_mime = mime.clone();
+        self.current_selection_mimes = chosen.clone();
         if crate::PY_SHUTDOWN.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         if self.clipboard_callback.is_none() {
             return;
         }
-        let Some(mime) = mime else { return };
-        self.pending_clipboard_read = Some(mime);
+        self.pending_clipboard_read = chosen;
         let _ = seat;
     }
 
@@ -1846,10 +1850,10 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard && ty != SelectionTarget::Primary {
             return;
         }
-        // The text aliases are all advertised for one text entry, so a request for any of
-        // them takes it; anything else unmatched takes the first entry rather than nothing.
+        // The text aliases are all advertised for the first text entry, so a request for
+        // any of them takes it; every other advertised mime is an entry of its own.
         let entries = user_data.clone();
-        let index = entries
+        let Some(index) = entries
             .iter()
             .position(|(mime, _)| *mime == mime_type)
             .or_else(|| {
@@ -1858,7 +1862,9 @@ impl SelectionHandler for AppState {
                     .position(|(mime, _)| mime.starts_with("text/plain"))
                     .filter(|_| !mime_type.contains('/') || mime_type.starts_with("text/plain"))
             })
-            .unwrap_or(0);
+        else {
+            return;
+        };
         std::thread::spawn(move || {
             let _ = crate::wayland::wlclient::write_fd_all(
                 &fd,

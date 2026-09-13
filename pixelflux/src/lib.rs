@@ -4465,8 +4465,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             RustCaptureSettings::default().cursor_size_cap,
         ),
         clipboard_callback: None,
-        pending_clipboard_read: None,
-        current_selection_mime: None,
+        pending_clipboard_read: Vec::new(),
+        current_selection_mimes: Vec::new(),
         last_log_time: Instant::now(),
         start_time: Instant::now(),
         clock: Clock::new(),
@@ -4759,18 +4759,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     // Re-stage a read of the CURRENT selection so a copy made before this
                     // callback was (re)armed is delivered rather than lost; the post-dispatch
                     // drain performs the read (a compositor-owned selection is skipped there).
-                    if let Some(mime) = state.current_selection_mime.clone() {
-                        state.pending_clipboard_read = Some(mime);
-                    }
+                    state.pending_clipboard_read = state.current_selection_mimes.clone();
                 }
                 ThreadCommand::SetClipboard { entries } => {
+                    // Every text alias is offered once, for the first text entry.
                     let mut mimes: Vec<String> = Vec::new();
                     for (mime, _) in &entries {
-                        if mime.starts_with("text/plain") {
+                        if !mime.starts_with("text/plain") {
+                            mimes.push(mime.clone());
+                        } else if !mimes.iter().any(|m| m == "TEXT") {
                             mimes.extend(["text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
                                           "STRING", "TEXT"].iter().map(|s| s.to_string()));
-                        } else {
-                            mimes.push(mime.clone());
                         }
                     }
                     let payload = std::sync::Arc::new(entries);
@@ -4790,7 +4789,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     );
                     // The selection is compositor-owned now; a later SetClipboardCallback
                     // must not try to re-read a client source that no longer holds it.
-                    state.current_selection_mime = None;
+                    state.current_selection_mimes.clear();
                 }
                 ThreadCommand::SetCursorCallback(cb) => {
                     state.cursor_callback_set = cb.is_some();
@@ -5765,7 +5764,8 @@ impl WaylandBackend {
             .unwrap_or(false))
     }
 
-    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// cb(entries: list[tuple[str, bytes]]) fires when a client app copies to the clipboard,
+    /// with the flavours of the copy: the picture, or the markup and the text beneath it.
     fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         self.send(ThreadCommand::SetClipboardCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard callback: {}", e)))?;
@@ -7209,7 +7209,8 @@ impl ScreenCapture {
         wayland_backend_running(py)
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))
     }
-    /// cb(mime: str, data: bytes) fires when a client app copies to the clipboard.
+    /// cb(entries: list[tuple[str, bytes]]) fires when a client app copies to the clipboard,
+    /// with the flavours of the copy: the picture, or the markup and the text beneath it.
     fn set_clipboard_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard_callback(callback),
