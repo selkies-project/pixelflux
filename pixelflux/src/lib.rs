@@ -4986,6 +4986,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             ]);
                         }
 
+                        state.release_grab_across_screens(&pointer, &under, serial, time);
                         let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
                         pointer.motion(state, under.clone(), &MotionEvent { location: p, serial, time });
                         // A nested wlroots session takes its cursor position from motion
@@ -5046,6 +5047,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                             (FocusTarget::Window(window.clone()), loc.to_f64())
                         });
 
+                        state.release_grab_across_screens(&pointer, &under, serial, time);
                         let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
                         pointer.motion(
                             state, 

@@ -115,7 +115,7 @@ use smithay::{
             AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, CursorImageStatus, GestureHoldBeginEvent,
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
-            GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
+            GestureSwipeUpdateEvent, GrabStartData, MotionEvent, PointerTarget, RelativeMotionEvent,
         },
         touch::{DownEvent, OrientationEvent, ShapeEvent, TouchTarget, UpEvent},
         Seat, SeatHandler, SeatState,
@@ -1299,6 +1299,33 @@ impl AppState {
         let idx = self.node_idx_for_id(id)?;
         let geo = self.output_nodes[idx].logical_geometry()?;
         Some((geo.size.w, geo.size.h))
+    }
+
+    /// A nested session opens one host toplevel per screen, and a drag it carries from
+    /// one screen to the next is its own to continue: the implicit grab that would keep
+    /// handing the first window motion past its edge is released at the crossing, so
+    /// the pointer enters the next screen's window and the session places its cursor
+    /// through that window, at that screen's scale. Only a click grab still holding the
+    /// window it started on is released, and only for another window of the same client.
+    pub(crate) fn release_grab_across_screens(
+        &mut self,
+        pointer: &PointerHandle<Self>,
+        under: &Option<(FocusTarget, Point<f64, Logical>)>,
+        serial: Serial,
+        time: u32,
+    ) {
+        let Some((FocusTarget::Window(next), _)) = under else { return };
+        let Some(GrabStartData { focus: Some((FocusTarget::Window(held), _)), .. }) = pointer.grab_start_data()
+        else {
+            return;
+        };
+        if held == *next || pointer.current_focus() != Some(FocusTarget::Window(held.clone())) {
+            return;
+        }
+        let client_of = |w: &Window| w.wl_surface().and_then(|s| s.client()).map(|c| c.id());
+        if client_of(&held).is_some() && client_of(&held) == client_of(next) {
+            pointer.unset_grab(self, serial, time);
+        }
     }
 
     /// The display id under the pointer (primary when indeterminate).
