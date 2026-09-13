@@ -4028,6 +4028,7 @@ mod gpu_tests {
             enc.encode_cuda_pitch(external, w * 4 - 4, false, 1, 20, false).is_err(),
             "a pitch too short for the session's rows must be refused"
         );
+        enc.release_external_input();
         unsafe {
             let cu = enc.cuda.clone();
             (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
