@@ -311,6 +311,10 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 
 For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat` dependency) with the `start_recording(...)`, `stop_recording()`, and `recording_status()` Python functions, controllable through the `PIXELFLUX_RECORD*` environment variables. Recording taps the encoded full-frame H.264 stream, and HTTP endpoints allow remote trigger/stop/status.
 
+## Screenshots
+
+`screenshot_png(display=0)` returns a PNG of one display with the cursor drawn in, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture.
+
 ## Recording Sink
 
 The capture session can output the raw video stream directly to a Unix domain socket for external recording: Annex-B for H.264 and H.265, an OBU stream for AV1, and IVF for VP8 and VP9.

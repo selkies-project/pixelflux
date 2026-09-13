@@ -7693,6 +7693,19 @@ fn start_computer_use(bind: String) {
     crate::computer_use::start_cu_server(&bind);
 }
 
+/// PNG of one display's framebuffer with the cursor drawn in, the same image the
+/// Computer-Use server serves: the in-process Wayland compositor's output when one runs
+/// (`display` 0 is the primary, else a live output id), otherwise the root of the X server
+/// named by DISPLAY. No capture has to be running.
+#[pyfunction]
+#[pyo3(signature = (display = 0))]
+fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
+    let png = py
+        .detach(|| crate::computer_use::resolve_backend().and_then(|b| b.screenshot_png(display)))
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+    Ok(pyo3::types::PyBytes::new(py, &png).into_any().unbind())
+}
+
 /// `gil_used = true`: the module has not been audited for free-threaded Python. The
 /// detached compositor, capture, encode and delivery threads attach to the interpreter
 /// and several native encoder sessions (NVENC/CUDA, VA-API) assume the GIL serializes
@@ -7724,6 +7737,7 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(stop_recording, m)?)?;
     m.add_function(wrap_pyfunction!(recording_status, m)?)?;
     m.add_function(wrap_pyfunction!(start_computer_use, m)?)?;
+    m.add_function(wrap_pyfunction!(screenshot_png, m)?)?;
     m.add(
         "VirtualKeyboardUnavailable",
         m.py().get_type::<VirtualKeyboardUnavailable>(),

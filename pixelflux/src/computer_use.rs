@@ -1000,7 +1000,7 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// Pick the backend for one request: the registered Wayland compositor when present,
 /// otherwise a fresh private connection to `DISPLAY`. The X11 connection is per-request so a
 /// restarted X server never leaves the CU thread holding a dead connection.
-fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
+pub(crate) fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
     if let Some(tx) = WAYLAND_TX.lock().unwrap().clone() {
         return Ok(Box::new(CuWaylandBackend { tx }));
     }
