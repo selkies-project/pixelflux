@@ -1,6 +1,5 @@
 # pixelflux
 
-[![PyPI version](https://badge.fury.io/py/pixelflux.svg)](https://badge.fury.io/py/pixelflux)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 [![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selkies-project.github.io/pixelflux/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/selkies-project/pixelflux)
@@ -60,12 +59,12 @@ sudo apt-get install -y \
 
 ### 3. Install the Package
 
-**Option A: Install from PyPI**
-```bash
-pip install pixelflux
-```
+**Option A: Install a prebuilt wheel**
 
-Prebuilt wheels are published on the GitHub Releases page (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9–3.14). PyPI serves them automatically on supported platforms; on other platforms pip builds from source with the prerequisites above.
+Every release on the [GitHub Releases page](https://github.com/selkies-project/pixelflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9–3.14), the pre-releases cut per commit included; take the one for your interpreter and platform:
+```bash
+pip install ./pixelflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+```
 
 **Option B: Install from local source**
 ```bash
