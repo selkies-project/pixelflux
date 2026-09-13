@@ -243,8 +243,8 @@ NATIVE: Dict[str, Dict[str, object]] = {
                  note="libm, libpthread, libdl are part of it"),
     "libloading": dict(
         library="libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), "
-                "libwayland-server.so.0 (MIT), libcuda.so.1/libnvidia-encode.so.1/"
-                "libnvidia-fbc.so.1 "
+                "libwayland-server.so.0 (MIT), libva.so.2 (MIT), "
+                "libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 "
                 "(proprietary)",
         license="MIT and proprietary driver libraries", rank=PERMISSIVE,
         how="dlopen at run time, never linked", note="see nvcodec-sys"),

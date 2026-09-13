@@ -602,14 +602,16 @@ honour what the stream declares.
 ## VA-API 4:4:4
 
 `video_fullcolor = True` is carried into the VA-API session rather than ruled out in advance. The
-encoder asks the device which 4:4:4 surface format it holds (planar `yuv444p` is preferred, since
-the readback path uploads its I444 buffer to that one untouched; packed `vuyx` is taken when it is
-all a driver offers), builds the surface pool and the `scale_vaapi` convert around it, and lets
-FFmpeg match a profile to that format instead of pinning `high`.
+encoder asks the device which 4:4:4 surface formats it allocates and which of those its video
+processor renders, since every frame reaches the codec through the `scale_vaapi` convert, and
+takes one on both lists (planar `yuv444p` ahead of packed `vuyx` where a driver renders both;
+Intel's iHD allocates planar `444P` but renders 4:4:4 only as packed `XYUV`, so it encodes from
+`vuyx`). The session builds the surface pool and the convert around that format, names it in its
+init line, and lets FFmpeg match a profile to it instead of pinning `high`.
 
 Three layers can refuse, and each says so in the log line that precedes the fallback: the driver
-carrying no 4:4:4 surface format, the driver refusing to allocate one, and `h264_vaapi` having no
-profile that matches it. **On every current driver the third is what answers**: H.264 4:4:4 has no
+rendering no 4:4:4 surface format, the driver refusing to allocate one, and `h264_vaapi` having no
+profile that matches it. **For H.264, on every current driver the third is what answers**: it has no
 `VAProfile` in libva at all, so FFmpeg's `h264_vaapi` advertises only 4:2:0 profiles (plus 10-bit
 4:2:0 from libva 1.18). A refusal falls back to the software path, where x264 does carry 4:4:4 —
 the request is honoured, on the CPU, rather than silently downgraded to 4:2:0 (a GPL-free build's

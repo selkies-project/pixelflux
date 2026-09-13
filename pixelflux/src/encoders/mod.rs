@@ -365,9 +365,10 @@ pub fn select_frame_encoder(
             match AvcodecEncoder::new(settings, codec, Backend::Vaapi, input) {
                 Ok(enc) => {
                     println!(
-                        "[{tag}] VAAPI {} encoder initialized ({}).",
+                        "[{tag}] VAAPI {} encoder initialized ({} on {} surfaces).",
                         codec.display(),
-                        if enc.is_fullcolor() { "4:4:4" } else { "4:2:0" }
+                        if enc.is_fullcolor() { "4:4:4" } else { "4:2:0" },
+                        enc.sw_format_name()
                     );
                     return Some(FrameEncoder::Avcodec(enc));
                 }

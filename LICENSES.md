@@ -46,7 +46,7 @@ contains it.
 | libvpx | BSD-3-Clause | permissive | both | linked by libavcodec (`libvpx`, `libvpx-vp9`); bundled into the wheels | software VP8 and VP9 |
 | SVT-AV1 | BSD-3-Clause-Clear (with the Alliance for Open Media patent license) | permissive | both | linked by libavcodec (`libsvtav1`); bundled into the wheels | software AV1 |
 | dav1d | BSD-2-Clause | permissive | both | linked by libavcodec (`libdav1d`); bundled into the wheels | the virtual camera's AV1 decoder |
-| libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec, not by pixelflux; excluded from the wheel (`auditwheel --exclude`), the host's copy is used | VA-API |
+| libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec; pixelflux also opens libva at run time (`libloading`) to query the video processor's surface formats; excluded from the wheel (`auditwheel --exclude`), the host's copy is used | VA-API |
 | libdrm | MIT | permissive | both | linked by libavutil; excluded from the wheel. `drm-sys`/`drm-ffi` only carry bindings and issue the ioctls themselves, no libdrm symbol is linked by pixelflux | DRM/KMS |
 | libgbm (Mesa) | MIT | permissive | both | linked shared library (`gbm-sys`); excluded from the wheel | GPU buffer allocation |
 | libpixman-1 | MIT | permissive | both | linked shared library (`pixman-sys`); excluded from the wheel | software renderer of the compositor |
@@ -192,8 +192,8 @@ table below.
 | itoa | 1.0.18 | MIT OR Apache-2.0 | permissive | both |  |
 | lebe | 0.5.3 | BSD-3-Clause | permissive | both |  |
 | libc | 0.2.189 | MIT OR Apache-2.0 | permissive | both | C runtime (glibc, or musl on musllinux wheels) (LGPL-2.1-or-later (glibc), MIT (musl), weak copyleft) |
-| libloading | 0.8.9 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary): MIT and proprietary driver libraries (permissive) |
-| libloading | 0.9.0 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary): MIT and proprietary driver libraries (permissive) |
+| libloading | 0.8.9 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary): MIT and proprietary driver libraries (permissive) |
+| libloading | 0.9.0 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary): MIT and proprietary driver libraries (permissive) |
 | libm | 0.2.16 | MIT | permissive | both |  |
 | libudev-sys | 0.1.4 | MIT | permissive | both | libudev (systemd): LGPL-2.1-or-later (weak copyleft) |
 | linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
@@ -352,7 +352,8 @@ table below.
   runtimes (glibc LGPL-2.1-or-later or musl MIT; libgcc_s/libstdc++ with the
   GCC runtime exception), and through FFmpeg libva/libdrm/libX11 (MIT);
 - loaded at run time only when present: libwayland-server, libEGL,
-  libpipewire-0.3 (MIT), and the NVIDIA driver's libcuda/libnvidia-encode
+  libpipewire-0.3 (MIT), libva (MIT, the copy libavutil already links, for
+  the VA-API surface probe), and the NVIDIA driver's libcuda/libnvidia-encode
   (proprietary, never shipped);
 - no GPL code. The build is only as GPL-free as the FFmpeg it links: the
   project's non-GPL wheel recipe builds FFmpeg n8.1 without `--enable-gpl`,
