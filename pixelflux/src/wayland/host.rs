@@ -6,9 +6,10 @@
 //! frames via `ext_image_copy_capture_v1` where the host offers it (wlroots
 //! 0.19+, KWin 6.2+, cosmic) and `zwlr_screencopy_v1` (v3 `copy_with_damage`)
 //! everywhere else — both damage-gated, so idle screens cost nothing
-//! (`PIXELFLUX_HOST_CAPTURE=zwlr` forces the fallback); keyboard via a
-//! persistent `zwp_virtual_keyboard_v1` device carrying selkies' own keymap
-//! text, pointer via `zwlr_virtual_pointer_v1`. Zero-copy is preserved by
+//! (`PIXELFLUX_HOST_CAPTURE=zwlr` forces the fallback); input over libei where
+//! the backend grants an EIS socket, else a persistent `zwp_virtual_keyboard_v1`
+//! device carrying selkies' own keymap text with `zwlr_virtual_pointer_v1`, else
+//! kernel uinput devices where `/dev/uinput` is writable. Zero-copy is preserved by
 //! allocating the capture buffers from pixelflux's OWN GBM device (render node —
 //! no privileges): the compositor blits straight into the dmabufs the encoder
 //! imports, so no CPU ever touches a frame. A host that cannot import our
@@ -29,8 +30,13 @@
 //! A host without those protocols (GNOME, KDE before ext-image-copy-capture) is captured
 //! through xdg-desktop-portal instead: one RemoteDesktop session hands out a PipeWire stream per
 //! monitor and takes the input the seat lacks a virtual device for (`portal`, `pwcapture`).
-//! Each rung is chosen per capability from the registry — frames, keyboard and pointer each
-//! take the Wayland protocol where the host offers it and the portal where it does not — so a
+//! Each rung is chosen per capability, ordered by measured delivery cost: a socket write to the
+//! compositor (libei, then the virtual-input protocols) runs about 4 us, a uinput write reaching
+//! evdev about 12 us, and a portal `Notify*` D-Bus call about 2 ms, so the kernel serves as the
+//! universal fallback rather than the first choice, and the portal comes last. A uinput pointer
+//! declares a normalized absolute axis, since the layout extent changes while a device's range
+//! cannot. Frames take the Wayland protocol where the host offers it and the portal where it does
+//! not — so a
 //! KWin that serves ext-image-copy-capture but no virtual pointer still gets its pointer from
 //! the portal. Portal keys go by keysym, resolved from selkies' own keymap, so the host applies
 //! its layout to the symbol rather than to a keycode from another layout. The compositor owns
@@ -939,6 +945,9 @@ pub struct HostSession {
     vk: Option<ZwpVirtualKeyboardV1>,
     keyboard: Mutex<HostKeyboardState>,
     vptr: Option<ZwlrVirtualPointerV1>,
+    /// Kernel input devices, taken ahead of every protocol rung where
+    /// `/dev/uinput` can serve them.
+    uinput: Option<crate::uinput::Pair>,
     /// The portal session when frames or an input device come through xdg-desktop-portal.
     portal: Option<Arc<PortalCtl>>,
     /// Output geometry by rank, pairing portal streams with outputs.
@@ -1137,11 +1146,16 @@ impl HostSession {
                 "[HostCapture] base keymap unavailable: keys are dropped until selkies uploads its keymap."
             );
         }
+        let uinput = crate::uinput::Pair::open();
+        if uinput.is_some() {
+            println!("[HostCapture] input goes through kernel uinput devices.");
+        }
         Ok(Self {
             conn,
             vk,
             keyboard: Mutex::new(keyboard),
             vptr,
+            uinput,
             portal,
             geoms,
             ctrl_tx,
@@ -1492,22 +1506,27 @@ impl HostSession {
         let Some(mods) = keyboard.update_key(xkb_keycode, pressed) else {
             return;
         };
+        let sym = keyboard.base_keysym(xkb_keycode);
+        drop(keyboard);
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().key(xkb_keycode, sym, pressed);
+            return;
+        }
         if let Some(vk) = &self.vk {
             vk.key(0, xkb_keycode - 8, if pressed { 1 } else { 0 });
             vk.modifiers(mods.depressed, mods.latched, mods.locked, mods.group);
             let _ = self.conn.flush();
             return;
         }
-        let sym = keyboard.base_keysym(xkb_keycode);
-        drop(keyboard);
-        if let Some(live) = self.portal_ei() {
-            live.ei.as_ref().unwrap().key(xkb_keycode, sym, pressed);
-        } else {
-            self.with_portal(|p| match sym {
-                Some(sym) => p.keysym(sym as i32, pressed),
-                None => p.keycode(xkb_keycode as i32 - 8, pressed),
-            });
+        if let Some(u) = &self.uinput {
+            let _ = u.keyboard.emit(crate::uinput::EV_KEY, (xkb_keycode - 8) as u16,
+                                    if pressed { 1 } else { 0 });
+            return;
         }
+        self.with_portal(|p| match sym {
+            Some(sym) => p.keysym(sym as i32, pressed),
+            None => p.keycode(xkb_keycode as i32 - 8, pressed),
+        });
     }
 
     /// Run `f` with the portal session while one is live.
@@ -1560,12 +1579,24 @@ impl HostSession {
     }
 
     pub fn pointer_motion_abs(&self, x: f64, y: f64) {
+        if let Some(live) = self.portal_ei() {
+            let (w, h) = self.extent();
+            if w > 0 && h > 0 {
+                let ei = live.ei.as_ref().unwrap();
+                ei.pointer_motion_abs(x.clamp(0.0, (w - 1) as f64), y.clamp(0.0, (h - 1) as f64));
+            }
+            return;
+        }
         let Some(vp) = &self.vptr else {
-            if let Some(live) = self.portal_ei() {
+            if let Some(u) = &self.uinput {
                 let (w, h) = self.extent();
-                if w > 0 && h > 0 {
-                    let ei = live.ei.as_ref().unwrap();
-                    ei.pointer_motion_abs(x.clamp(0.0, (w - 1) as f64), y.clamp(0.0, (h - 1) as f64));
+                if w > 1 && h > 1 {
+                    let scale = |v: f64, span: i32| {
+                        (v.clamp(0.0, (span - 1) as f64) / (span - 1) as f64
+                            * crate::uinput::ABS_RANGE as f64).round() as i32
+                    };
+                    let _ = u.pointer.emit(crate::uinput::EV_ABS, crate::uinput::ABS_X, scale(x, w));
+                    let _ = u.pointer.emit(crate::uinput::EV_ABS, crate::uinput::ABS_Y, scale(y, h));
                 }
             } else if let Some((node, sx, sy)) = self.portal_target(x, y) {
                 self.with_portal(|p| p.pointer_motion_abs(node, sx, sy));
@@ -1592,9 +1623,14 @@ impl HostSession {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().pointer_motion(dx, dy);
+            return;
+        }
         let Some(vp) = &self.vptr else {
-            if let Some(live) = self.portal_ei() {
-                live.ei.as_ref().unwrap().pointer_motion(dx, dy);
+            if let Some(u) = &self.uinput {
+                let _ = u.pointer.emit(crate::uinput::EV_REL, crate::uinput::REL_X, dx.round() as i32);
+                let _ = u.pointer.emit(crate::uinput::EV_REL, crate::uinput::REL_Y, dy.round() as i32);
             } else {
                 self.with_portal(|p| p.pointer_motion(dx, dy));
             }
@@ -1606,9 +1642,13 @@ impl HostSession {
     }
 
     pub fn pointer_button(&self, btn: u32, pressed: bool) {
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().pointer_button(btn as i32, pressed);
+            return;
+        }
         let Some(vp) = &self.vptr else {
-            if let Some(live) = self.portal_ei() {
-                live.ei.as_ref().unwrap().pointer_button(btn as i32, pressed);
+            if let Some(u) = &self.uinput {
+                let _ = u.pointer.emit(crate::uinput::EV_KEY, btn as u16, if pressed { 1 } else { 0 });
             } else {
                 self.with_portal(|p| p.pointer_button(btn as i32, pressed));
             }
@@ -1632,18 +1672,29 @@ impl HostSession {
             return;
         }
         let steps = |value: f64| (value * crate::SCROLL_V120_PER_UNIT / 120.0).round() as i32;
-        let Some(vp) = &self.vptr else {
-            let scroll = |axis: u32, value: f64, cont: &dyn Fn(f64, f64, bool), disc: &dyn Fn(u32, i32)| {
-                match steps(value) {
-                    0 => cont(if axis == 1 { value } else { 0.0 }, if axis == 0 { value } else { 0.0 }, true),
-                    n => disc(axis, n),
+        let scroll = |axis: u32, value: f64, cont: &dyn Fn(f64, f64, bool), disc: &dyn Fn(u32, i32)| {
+            match steps(value) {
+                0 => cont(if axis == 1 { value } else { 0.0 }, if axis == 0 { value } else { 0.0 }, true),
+                n => disc(axis, n),
+            }
+        };
+        if let Some(live) = self.portal_ei() {
+            let ei = live.ei.as_ref().unwrap();
+            for (axis, value) in [(0u32, dy), (1u32, dx)] {
+                if value != 0.0 {
+                    scroll(axis, value, &|x, y, f| ei.pointer_axis(x, y, f), &|a, n| ei.pointer_axis_discrete(a, n));
                 }
-            };
-            if let Some(live) = self.portal_ei() {
-                let ei = live.ei.as_ref().unwrap();
-                for (axis, value) in [(0u32, dy), (1u32, dx)] {
-                    if value != 0.0 {
-                        scroll(axis, value, &|x, y, f| ei.pointer_axis(x, y, f), &|a, n| ei.pointer_axis_discrete(a, n));
+            }
+            return;
+        }
+        let Some(vp) = &self.vptr else {
+            if let Some(u) = &self.uinput {
+                // A wheel counts up where the axis counts down, so the vertical step is negated.
+                for (code, value, sign) in [(crate::uinput::REL_WHEEL, dy, -1),
+                                            (crate::uinput::REL_HWHEEL, dx, 1)] {
+                    match steps(value) {
+                        0 => {}
+                        n => { let _ = u.pointer.emit(crate::uinput::EV_REL, code, n * sign); }
                     }
                 }
             } else {

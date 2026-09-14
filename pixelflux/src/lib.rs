@@ -146,6 +146,8 @@ pub mod recording_sink;
 pub mod recorder;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
+/// Kernel uinput devices, the first rung of host-capture input injection.
+pub mod uinput;
 /// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
 /// Run-time libpipewire binding and SPA pod encoding shared by the webcam sink and host capture.

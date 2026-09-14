@@ -114,11 +114,13 @@ rung per capability from the host's registry, never by a setting: frames through
 `ext-image-copy-capture` or `wlr-screencopy` into pixelflux-allocated dmabufs, else through an
 xdg-desktop-portal RemoteDesktop/ScreenCast session whose PipeWire streams are imported where they lie
 (`wayland/portal.rs` over the pure-Rust zbus client, `wayland/pwcapture.rs` over the run-time
-libpipewire binding shared with the webcam sink in `pipewire.rs`); keyboard and pointer through the
-virtual-keyboard and virtual-pointer protocols where offered, else through the portal — over libei
+libpipewire binding shared with the webcam sink in `pipewire.rs`); keyboard and pointer over libei
 (`wayland/eiclient.rs`, the pure-Rust `reis` client) where the backend answers `ConnectToEIS`, since
-that is the lower-latency channel and takes keyboard, pointer and touch, and otherwise the portal's
-own `Notify*` methods by keysym. A successful `ConnectToEIS` makes the session refuse `Notify*`, so
+it carries keyboard, pointer and touch on one socket, else the virtual-keyboard and virtual-pointer
+protocols where the host offers them, else kernel uinput devices where `/dev/uinput` is writable, and
+the portal's own `Notify*` methods by keysym last. That order is measured rather than assumed: a
+socket write to the compositor runs about 4 us, a uinput write reaching its evdev node about 12 us,
+and a `Notify*` D-Bus call about 2 ms. A successful `ConnectToEIS` makes the session refuse `Notify*`, so
 libei is committed to only once its handshake binds a device, and the compositor's own keymap
 (delivered over EIS, read-only) resolves each key's base keysym with a raw-keycode fallback. A portal
 that refuses those devices is asked again for capture alone. The KDE 5.27 session the sandbox can run (`kwin_wayland --virtual` with
