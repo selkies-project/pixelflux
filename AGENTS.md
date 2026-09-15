@@ -134,19 +134,29 @@ that refuses those devices is asked again for capture alone. The KDE 5.27 sessio
 no consent dialog to an unsandboxed app and offers memfd frames only, so the dmabuf import of a portal
 stream is verified against GNOME or KDE 6 on a GPU host.
 
-X11 capture has two backends and picks between them itself (`x11::run_capture`): NvFBC
+X11 capture has three backends and picks between them itself (`x11::run_capture`): NvFBC
 (`x11/nvfbc.rs`) where the NVIDIA driver composites the screen into video memory and the buffer is
-registered with NVENC in place, which is zero-copy and the lower-latency path, and the general
-XShm path otherwise. NvFBC is declined -- with one line saying why -- for a codec NVENC has no
-engine for, software encoding, a non-NVIDIA encode node, a watermark, or a driver without it.
-There is no setting either way: the driver's own answer decides, and a host without NvFBC pays
-about 7 ms once per capture start to find that out. The NvFBC structures are hand-written FFI checked
+registered with NVENC in place, which is zero-copy and the lower-latency path; DRI3
+(`x11/dri3.rs`) on any server whose screen lives on the GPU (XLibre's Xvfb with glamor, an Xorg
+on a DRM driver), where the server blits the root into dmabufs pixelflux allocated through GBM on
+the server's own render node and wrapped as pixmaps, the blit is waited for with a one-pixel
+`GetImage`, the Damage extension stands in for content hashing, the XFixes cursor is composited by
+the server through Render, and the hardware session imports each dmabuf in place through the same
+`encode_dmabuf` the Wayland zero-copy path uses; and the general XShm path otherwise. Each
+zero-copy backend is declined -- with one line saying why -- for a codec its engine does not
+serve, software encoding, a watermark, a server or device that does not qualify (DRI3 also asks
+that the server draw on the encode node and that the encoder read the first frame), and NvFBC
+for a non-NVIDIA encode node or a driver without it. There is no setting either way: the server's
+and the driver's own answers decide, and a host without NvFBC pays about 7 ms once per capture
+start to find that out. The NvFBC structures are hand-written FFI checked
 against the SDK by the layout and version assertions in that module, and `libnvidia-fbc.so.1` is
 loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
 (`cargo test gpu_nvfbc -- --ignored --nocapture --test-threads=1` with `DISPLAY` on an NVIDIA X
-server). They capture and paint the root of whatever `DISPLAY` names, so on a host where that is a
-live desktop a `gpu_` sweep runs with `--skip nvfbc` and the NvFBC checks run only against an X
-server of their own.
+server; `cargo test gpu_dri3 -- --ignored --nocapture --test-threads=1` with `DISPLAY` on a
+server whose screen lives on the GPU and a hardware encoder on the same device). They capture and
+paint the root of whatever `DISPLAY` names, so on a host where that is a live desktop a `gpu_`
+sweep runs with `--skip nvfbc --skip dri3` and those checks run only against an X server of their
+own; `x11::gpu_test_support` holds the painting and decoding helpers they share.
 
 The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
 `AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the

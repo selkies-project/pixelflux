@@ -1236,61 +1236,9 @@ mod region_tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+    use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
     use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
-    use crate::webcam::decode::{AvDecoder, Codec as DecCodec, Decoder};
-
-    /// Test helper: full-frame capture settings for `codec` at CRF 25.
-    fn settings(codec: crate::encoders::codec::Codec) -> RustCaptureSettings {
-        RustCaptureSettings {
-            codec,
-            target_fps: 60.0,
-            video_crf: 25,
-            video_streaming_mode: true,
-            ..Default::default()
-        }
-    }
-
-    /// Test helper: paint the whole root of `$DISPLAY` one solid color and let the server
-    /// finish, so the next capture has a known picture in it.
-    ///
-    /// The screen saver is turned off first: a test display sees no input, so a server left with
-    /// the default ten-minute blanking timeout hands the capture a black screen and every color
-    /// comparison below fails for a reason that has nothing to do with the capture.
-    fn paint_root(rgb: (u8, u8, u8)) -> bool {
-        let _ = std::process::Command::new("xset").args(["s", "off", "s", "noblank"]).output();
-        let _ = std::process::Command::new("xset").arg("s").arg("reset").output();
-        let spec = format!("#{:02x}{:02x}{:02x}", rgb.0, rgb.1, rgb.2);
-        let out = std::process::Command::new("xsetroot").args(["-solid", &spec]).output();
-        if !out.map(|o| o.status.success()).unwrap_or(false) {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(120));
-        true
-    }
-
-    /// Limited-range Y/Cb/Cr of an 8-bit RGB triple — what the chroma convert emits for the
-    /// captured surface this path hands it in place.
-    fn painted_ycbcr(rgb: (u8, u8, u8)) -> [f64; 3] {
-        use crate::encoders::chroma_siting::{ycbcr, BT709};
-        ycbcr([rgb.0, rgb.1, rgb.2].map(f64::from), BT709)
-    }
-
-    /// Test helper: mean Y/Cb/Cr of a decoded picture.
-    fn decoded_mean(dec: &mut AvDecoder, payload: &[u8]) -> [f64; 3] {
-        assert!(dec.decode(payload).expect("decode"), "no picture from this access unit");
-        let v = dec.frame().expect("decoded frame");
-        let mut acc = [0f64; 3];
-        let mut n = 0f64;
-        for y in 0..v.height {
-            for x in 0..v.width {
-                acc[0] += v.y[y * v.y_stride + x] as f64;
-                acc[1] += v.u[(y / 2) * v.uv_stride + x / 2] as f64;
-                acc[2] += v.v[(y / 2) * v.uv_stride + x / 2] as f64;
-                n += 1.0;
-            }
-        }
-        [acc[0] / n, acc[1] / n, acc[2] / n]
-    }
+    use crate::webcam::decode::{AvDecoder, Codec as DecCodec};
 
     /// Thread CPU time, for the per-frame CPU cost of the path independent of GPU waiting.
     fn thread_cpu() -> Duration {

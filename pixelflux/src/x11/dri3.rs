@@ -1,0 +1,1010 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+//! DRI3 zero-copy X11 capture: the X server blits the screen into GPU buffers this process
+//! allocated, and the hardware encoder reads them where they lie.
+//!
+//! It serves a server whose screen lives on the GPU (XLibre's Xvfb with glamor, an Xorg on a
+//! DRM driver), where the XShm path in [`super`] would read the screen back into host memory
+//! for the hardware session to upload again. A small pool of dmabufs is allocated through GBM
+//! on the render node the server draws with, each is wrapped in an X pixmap
+//! (`PixmapFromBuffers`), and every frame is one `CopyArea` from the root window into the next
+//! pixmap, which glamor runs as a GPU-to-GPU blit. The encoder then imports the dmabuf in place,
+//! through the same [`FrameEncoder::encode_dmabuf`] the Wayland zero-copy path uses, so a frame
+//! is never touched by the CPU between the screen and the bitstream.
+//!
+//! Completion is waited for with a one-pixel `GetImage` of the destination pixmap: the server
+//! answers only after the blit it ordered before has landed, so the encoder never reads a
+//! half-copied frame, and no fence object or implicit-sync assumption is involved.
+//!
+//! What stands in for the XShm path's per-stripe content hashing is the Damage extension on the
+//! root window: a frame is encoded when the server reported drawing since the last one. The
+//! XFixes cursor is composited by the server through Render, on the GPU, so the `capture_cursor`
+//! overlay costs no readback either; the server keeps its own software cursor out of a copy from
+//! the screen, so the cursor is never drawn twice.
+//!
+//! Everything that can be checked is checked before a frame is delivered, and the path is
+//! declined otherwise: a codec no hardware engine serves, software encoding, a watermark (which
+//! is blended into host pixels), a server without DRI3 1.2, Damage or Render, a server drawing
+//! on a device other than the encode node, a buffer the server will not import, or a first frame
+//! the encoder cannot read. The capture then runs the XShm path with nothing half-built.
+
+use std::ffi::c_void;
+use std::fs::File;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as GbmFormat};
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::gbm::GbmDevice;
+use smithay::backend::egl::EGLDisplay;
+use x11rb::connection::Connection;
+use x11rb::protocol::damage::{self, ConnectionExt as DamageExt};
+use x11rb::protocol::dri3::ConnectionExt as Dri3Ext;
+use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
+use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
+use x11rb::protocol::xproto::{self, ConnectionExt as XprotoExt, ImageFormat, ImageOrder};
+use x11rb::protocol::Event;
+use x11rb::rust_connection::RustConnection;
+
+use super::{clamp_offset, cursor_image_origin, require_32bpp, resolve_dims, Controls};
+use crate::encoders::software::{EncodedStripe, FrameTiming, StripeState};
+use crate::encoders::{self, FrameEncoder, FrameSource};
+use crate::pipeline::decide_hw_fullframe;
+use crate::recording_sink::RecordingSink;
+use crate::RustCaptureSettings;
+
+/// GPU buffers the screen is blitted into, used round-robin so an encoder still reading the
+/// previous frame never has the next blitted over it.
+const POOL_N: usize = 3;
+
+/// Frames between framebuffer-size polls, matching the XShm path's geometry cadence.
+const GEOMETRY_POLL_FRAMES: i32 = 30;
+
+/// Consecutive X request failures before the capture reports itself dead: the server is gone
+/// rather than momentarily late, and the Python watchdog restarts the display.
+const MAX_X_FAILURES: u32 = 5;
+
+/// One dmabuf the server blits into: the GBM allocation, the encoder-side description of it,
+/// and the pixmap and Render picture the server knows it as.
+struct GpuBuffer {
+    _bo: BufferObject<()>,
+    dmabuf: Dmabuf,
+    pixmap: xproto::Pixmap,
+    picture: render::Picture,
+}
+
+/// The XFixes cursor image uploaded once per cursor change as an ARGB pixmap the server
+/// composites over each frame.
+struct CursorSprite {
+    pixmap: xproto::Pixmap,
+    picture: render::Picture,
+    gc: xproto::Gcontext,
+    width: u16,
+    height: u16,
+    serial: u32,
+}
+
+/// The X side of the capture: the private connection and the server objects the blit needs.
+struct XScreen {
+    conn: RustConnection,
+    root: xproto::Window,
+    depth: u8,
+    byte_order: ImageOrder,
+    gc: xproto::Gcontext,
+    damage: damage::Damage,
+    /// The Render format of the screen's depth, for the destination pictures.
+    rgb_format: render::Pictformat,
+    /// The Render format of a premultiplied ARGB cursor image.
+    argb_format: render::Pictformat,
+    /// What the server accepts for buffers of the screen's depth; empty leaves the driver's
+    /// choice and the server learns the layout from the modifier the allocation reports.
+    modifiers: Vec<u64>,
+    device: String,
+}
+
+/// A running zero-copy capture, on the thread that owns every context in it.
+///
+/// Field order is drop order: the encoder releases its imports before the buffers they
+/// describe go, and both go before the GBM device and EGL display they were made on.
+struct GpuCapture {
+    /// `None` only while a rebuild is replacing the session; a rebuild that fails ends the
+    /// capture before another frame is encoded.
+    encoder: Option<FrameEncoder>,
+    buffers: Vec<GpuBuffer>,
+    cursor: Option<CursorSprite>,
+    x: XScreen,
+    gbm: RawGbmDevice<File>,
+    _egl: Option<EGLDisplay>,
+    egl_display: *const c_void,
+    next: usize,
+    /// The live session: its geometry is what is captured and encoded, and its rate and quality
+    /// fields follow the cross-thread controls.
+    settings: RustCaptureSettings,
+    /// The geometry that was asked for, which a region change updates and every region is
+    /// resolved from, kept apart from `settings` so a capture following the root keeps following.
+    request: RustCaptureSettings,
+    cap_x: i16,
+    cap_y: i16,
+    root_w: u16,
+    root_h: u16,
+}
+
+/// Take `chosen` out of the modifiers the next allocation may pick. A choice the list never
+/// named came from the driver itself, so the whole list goes and the driver picks again
+/// unconstrained.
+fn prune_modifier(modifiers: &mut Vec<u64>, chosen: u64) {
+    let before = modifiers.len();
+    modifiers.retain(|&m| m != chosen);
+    if modifiers.len() == before {
+        modifiers.clear();
+    }
+}
+
+/// Why the DRI3 path was not taken, for the one line that says so.
+fn declined(reason: &str) -> Option<GpuCapture> {
+    println!("[x11] GPU capture (DRI3) unavailable: {reason}. Capturing through XShm.");
+    None
+}
+
+fn x_err(what: &str, e: impl std::fmt::Display) -> String {
+    format!("{what}: {e}")
+}
+
+/// The DRM device a file descriptor names, as the kernel numbers it.
+fn device_of_fd(fd: &OwnedFd) -> Result<u64, String> {
+    let file = File::from(fd.try_clone().map_err(|e| x_err("dup of the DRI3 device", e))?);
+    file.metadata().map(|m| m.rdev()).map_err(|e| x_err("fstat of the DRI3 device", e))
+}
+
+impl XScreen {
+    /// Connect and negotiate everything the blit needs, or say what the server lacks.
+    fn open(node: i32) -> Result<(Self, OwnedFd), String> {
+        let (conn, screen_num) = x11rb::connect(None).map_err(|e| x_err("X11 connect failed", e))?;
+        require_32bpp(&conn, screen_num)?;
+        let screen = &conn.setup().roots[screen_num];
+        let root = screen.root;
+        let depth = screen.root_depth;
+        let byte_order = conn.setup().image_byte_order;
+
+        let dri3 = conn
+            .dri3_query_version(1, 2)
+            .map_err(|e| x_err("DRI3 query", e))?
+            .reply()
+            .map_err(|e| x_err("the server has no DRI3", e))?;
+        if dri3.major_version < 1 || (dri3.major_version == 1 && dri3.minor_version < 2) {
+            return Err(format!(
+                "the server's DRI3 is {}.{}, and buffers with modifiers need 1.2",
+                dri3.major_version, dri3.minor_version
+            ));
+        }
+        conn.damage_query_version(1, 1)
+            .map_err(|e| x_err("Damage query", e))?
+            .reply()
+            .map_err(|e| x_err("the server has no Damage extension", e))?;
+        conn.xfixes_query_version(5, 0)
+            .map_err(|e| x_err("XFixes query", e))?
+            .reply()
+            .map_err(|e| x_err("the server has no XFixes", e))?;
+        let formats = conn
+            .render_query_pict_formats()
+            .map_err(|e| x_err("Render query", e))?
+            .reply()
+            .map_err(|e| x_err("the server has no Render extension", e))?
+            .formats;
+        let direct = |f: &render::Pictforminfo, d: u8| f.type_ == render::PictType::DIRECT && f.depth == d;
+        let rgb_format = formats
+            .iter()
+            .find(|f| direct(f, depth) && f.direct.red_shift == 16 && f.direct.blue_shift == 0)
+            .map(|f| f.id)
+            .ok_or_else(|| format!("no Render format for the depth-{depth} screen"))?;
+        let argb_format = formats
+            .iter()
+            .find(|f| direct(f, 32) && f.direct.alpha_mask == 0xff && f.direct.red_shift == 16)
+            .map(|f| f.id)
+            .ok_or("no premultiplied ARGB32 Render format for the cursor")?;
+
+        let opened = conn
+            .dri3_open(root, 0)
+            .map_err(|e| x_err("DRI3 open", e))?
+            .reply()
+            .map_err(|e| x_err("the server refused DRI3 open", e))?;
+        let device_fd = opened.device_fd;
+        let encode_path = format!("/dev/dri/renderD{}", 128 + node);
+        let encode_dev = std::fs::metadata(&encode_path)
+            .map(|m| m.rdev())
+            .map_err(|e| x_err(&format!("encode node {encode_path}"), e))?;
+        let server_dev = device_of_fd(&device_fd)?;
+        if server_dev != encode_dev {
+            return Err(format!(
+                "the X server draws on DRM device {}:{}, not on encode node {encode_path}",
+                libc::major(server_dev),
+                libc::minor(server_dev)
+            ));
+        }
+
+        let modifiers_reply = conn
+            .dri3_get_supported_modifiers(root, depth, 32)
+            .map_err(|e| x_err("DRI3 modifiers", e))?
+            .reply()
+            .map_err(|e| x_err("the server listed no buffer modifiers", e))?;
+        let modifiers = if modifiers_reply.window_modifiers.is_empty() {
+            modifiers_reply.screen_modifiers
+        } else {
+            modifiers_reply.window_modifiers
+        };
+
+        let gc = conn.generate_id().map_err(|e| x_err("GC id", e))?;
+        conn.create_gc(
+            gc,
+            root,
+            &xproto::CreateGCAux::new()
+                .subwindow_mode(xproto::SubwindowMode::INCLUDE_INFERIORS)
+                .graphics_exposures(0),
+        )
+        .map_err(|e| x_err("CreateGC", e))?
+        .check()
+        .map_err(|e| x_err("CreateGC", e))?;
+        let damage_id = conn.generate_id().map_err(|e| x_err("Damage id", e))?;
+        conn.damage_create(damage_id, root, damage::ReportLevel::NON_EMPTY)
+            .map_err(|e| x_err("DamageCreate", e))?
+            .check()
+            .map_err(|e| x_err("DamageCreate", e))?;
+
+        Ok((
+            Self {
+                conn,
+                root,
+                depth,
+                byte_order,
+                gc,
+                damage: damage_id,
+                rgb_format,
+                argb_format,
+                modifiers,
+                device: encode_path,
+            },
+            device_fd,
+        ))
+    }
+
+    /// Whether the server drew on the root since the last call. The Damage object reports once
+    /// per accumulation, so it is re-armed here whenever it fired.
+    fn take_damage(&self) -> Result<bool, String> {
+        let mut dirty = false;
+        while let Some(event) = self.conn.poll_for_event().map_err(|e| x_err("X event poll", e))? {
+            match event {
+                Event::DamageNotify(_) => dirty = true,
+                Event::Error(e) => eprintln!("[x11] DRI3 capture: X error {e:?}"),
+                _ => {}
+            }
+        }
+        if dirty {
+            self.conn
+                .damage_subtract(self.damage, x11rb::NONE, x11rb::NONE)
+                .map_err(|e| x_err("DamageSubtract", e))?;
+        }
+        Ok(dirty)
+    }
+
+    /// Wait for the blit into `pixmap` to land: the reply to a read of one of its pixels comes
+    /// back only after the server's GPU work ordered before it has completed.
+    fn await_blit(&self, pixmap: xproto::Pixmap) -> Result<(), String> {
+        self.conn
+            .get_image(ImageFormat::Z_PIXMAP, pixmap, 0, 0, 1, 1, !0u32)
+            .map_err(|e| x_err("blit sync", e))?
+            .reply()
+            .map_err(|e| x_err("blit sync reply", e))?;
+        Ok(())
+    }
+
+    fn free_buffer(&self, b: &GpuBuffer) {
+        let _ = self.conn.render_free_picture(b.picture);
+        let _ = self.conn.free_pixmap(b.pixmap);
+    }
+
+    fn free_cursor(&self, c: &CursorSprite) {
+        let _ = self.conn.render_free_picture(c.picture);
+        let _ = self.conn.free_gc(c.gc);
+        let _ = self.conn.free_pixmap(c.pixmap);
+    }
+}
+
+impl GpuCapture {
+    /// One buffer of the pool: a single-plane allocation the server and the encoder both
+    /// describe with one fd, stride and offset. A modifier that spreads the buffer over
+    /// auxiliary planes (a compressed layout) is dropped from the server's list and the
+    /// allocation retried, down to the driver's own choice.
+    fn alloc_bo(&mut self, w: u16, h: u16) -> Result<BufferObject<()>, String> {
+        loop {
+            let bo = if self.x.modifiers.is_empty() {
+                self.gbm
+                    .create_buffer_object::<()>(w as u32, h as u32, GbmFormat::Argb8888, BufferObjectFlags::RENDERING)
+            } else {
+                self.gbm.create_buffer_object_with_modifiers2::<()>(
+                    w as u32,
+                    h as u32,
+                    GbmFormat::Argb8888,
+                    self.x.modifiers.iter().map(|&m| gbm::Modifier::from(m)),
+                    BufferObjectFlags::RENDERING,
+                )
+            };
+            let bo = match bo {
+                Ok(bo) => bo,
+                Err(e) if !self.x.modifiers.is_empty() => {
+                    if self.settings.debug_logging {
+                        println!("[x11] DRI3 capture: allocation with the server's modifiers failed ({e:?}); trying without");
+                    }
+                    self.x.modifiers.clear();
+                    continue;
+                }
+                Err(e) => return Err(format!("GBM allocation {w}x{h}: {e:?}")),
+            };
+            if bo.plane_count() <= 1 {
+                return Ok(bo);
+            }
+            let chosen: u64 = bo.modifier().into();
+            if self.settings.debug_logging {
+                println!(
+                    "[x11] DRI3 capture: modifier {chosen:#x} lays the buffer out in {} planes; trying another",
+                    bo.plane_count()
+                );
+            }
+            drop(bo);
+            prune_modifier(&mut self.x.modifiers, chosen);
+        }
+    }
+
+    /// Allocate the buffer pool at `w` x `h` and hand each buffer to the server as a pixmap.
+    fn alloc_buffers(&mut self, w: u16, h: u16) -> Result<(), String> {
+        let mut fresh = Vec::with_capacity(POOL_N);
+        for _ in 0..POOL_N {
+            let bo = self.alloc_bo(w, h)?;
+            let dmabuf = crate::create_dmabuf_from_bo(&bo);
+            let server_fd = bo.fd().map_err(|e| format!("dmabuf fd for the server: {e:?}"))?;
+            let modifier: u64 = bo.modifier().into();
+            let pixmap = self.x.conn.generate_id().map_err(|e| x_err("pixmap id", e))?;
+            self.x
+                .conn
+                .dri3_pixmap_from_buffers(
+                    pixmap,
+                    self.x.root,
+                    w,
+                    h,
+                    bo.stride(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    self.x.depth,
+                    32,
+                    modifier,
+                    vec![server_fd],
+                )
+                .map_err(|e| x_err("PixmapFromBuffers", e))?
+                .check()
+                .map_err(|e| format!("the server did not import the buffer (modifier {modifier:#x}): {e}"))?;
+            let picture = self.x.conn.generate_id().map_err(|e| x_err("picture id", e))?;
+            self.x
+                .conn
+                .render_create_picture(picture, pixmap, self.x.rgb_format, &render::CreatePictureAux::new())
+                .map_err(|e| x_err("CreatePicture", e))?
+                .check()
+                .map_err(|e| x_err("CreatePicture", e))?;
+            fresh.push(GpuBuffer { _bo: bo, dmabuf, pixmap, picture });
+        }
+        self.free_buffers();
+        self.buffers = fresh;
+        self.next = 0;
+        Ok(())
+    }
+
+    fn free_buffers(&mut self) {
+        for b in self.buffers.drain(..) {
+            self.x.free_buffer(&b);
+        }
+    }
+
+    /// Bring the pool and the encoder to a new capture size. NVENC follows in place; a session
+    /// that cannot is rebuilt through the same ladder that chose it.
+    fn reshape(&mut self, w: u16, h: u16) -> Result<(), String> {
+        self.alloc_buffers(w, h)?;
+        self.settings.width = w as i32;
+        self.settings.height = h as i32;
+        let in_place = match self.encoder.as_mut() {
+            Some(FrameEncoder::Nvenc(enc)) => enc.reconfigure_resolution(&self.settings).map(|_| ()),
+            Some(FrameEncoder::Avcodec(_)) => Err("a VA-API session is rebuilt at a new size".to_string()),
+            None => Err("no session to reconfigure".to_string()),
+        };
+        if let Err(e) = in_place {
+            if self.settings.debug_logging {
+                println!("[x11] DRI3 capture: {e}");
+            }
+            self.rebuild_encoder()?;
+        }
+        Ok(())
+    }
+
+    fn enc(&mut self) -> &mut FrameEncoder {
+        self.encoder.as_mut().expect("the DRI3 capture always carries an encoder between frames")
+    }
+
+    /// The encoder's name for the logs.
+    fn backend(&self) -> &'static str {
+        self.encoder.as_ref().map(|e| e.backend_name()).unwrap_or("none")
+    }
+
+    /// Replace the encoder with the startup construction, releasing the old session first so
+    /// the two never hold device memory at once.
+    fn rebuild_encoder(&mut self) -> Result<(), String> {
+        drop(self.encoder.take());
+        let source = FrameSource::Dmabuf { egl_display: self.egl_display };
+        let mut settings = self.settings.clone();
+        match encoders::select_frame_encoder(&mut settings, source, None, "x11") {
+            Some(enc) if enc.is_hardware() => {
+                self.encoder = Some(enc);
+                self.settings = settings;
+                Ok(())
+            }
+            Some(_) => Err("no hardware encoder is left for the zero-copy path".to_string()),
+            None => Err("no encoder could be rebuilt for the zero-copy path".to_string()),
+        }
+    }
+
+    /// Blit the capture region into the next pool buffer, composite the cursor if asked, and
+    /// wait for the server's GPU work to land. Returns the buffer to encode.
+    fn grab(&mut self, with_cursor: bool) -> Result<usize, String> {
+        let idx = self.next;
+        self.next = (self.next + 1) % self.buffers.len();
+        let (w, h) = (self.settings.width as u16, self.settings.height as u16);
+        let dst = self.buffers[idx].pixmap;
+        self.x
+            .conn
+            .copy_area(self.x.root, dst, self.x.gc, self.cap_x, self.cap_y, 0, 0, w, h)
+            .map_err(|e| x_err("CopyArea", e))?;
+        if with_cursor {
+            self.composite_cursor(idx)?;
+        } else if let Some(c) = self.cursor.take() {
+            self.x.free_cursor(&c);
+        }
+        self.x.await_blit(dst)?;
+        Ok(idx)
+    }
+
+    /// Draw the XFixes cursor over the freshly blitted frame, uploading its image only when the
+    /// cursor changed. The server paints it through Render, on the GPU.
+    fn composite_cursor(&mut self, idx: usize) -> Result<(), String> {
+        let Some(c) = self
+            .x
+            .conn
+            .xfixes_get_cursor_image()
+            .ok()
+            .and_then(|c| c.reply().ok())
+        else {
+            return Ok(());
+        };
+        if c.width == 0 || c.height == 0 {
+            return Ok(());
+        }
+        let stale = self
+            .cursor
+            .as_ref()
+            .is_none_or(|s| s.serial != c.cursor_serial || s.width != c.width || s.height != c.height);
+        if stale {
+            if let Some(old) = self.cursor.take() {
+                self.x.free_cursor(&old);
+            }
+            let conn = &self.x.conn;
+            let pixmap = conn.generate_id().map_err(|e| x_err("cursor pixmap id", e))?;
+            conn.create_pixmap(32, pixmap, self.x.root, c.width, c.height)
+                .map_err(|e| x_err("cursor CreatePixmap", e))?;
+            let gc = conn.generate_id().map_err(|e| x_err("cursor GC id", e))?;
+            conn.create_gc(gc, pixmap, &xproto::CreateGCAux::new().graphics_exposures(0))
+                .map_err(|e| x_err("cursor CreateGC", e))?;
+            let picture = conn.generate_id().map_err(|e| x_err("cursor picture id", e))?;
+            conn.render_create_picture(picture, pixmap, self.x.argb_format, &render::CreatePictureAux::new())
+                .map_err(|e| x_err("cursor CreatePicture", e))?;
+            let mut data = Vec::with_capacity(c.cursor_image.len() * 4);
+            for px in &c.cursor_image {
+                let bytes = if self.x.byte_order == ImageOrder::LSB_FIRST { px.to_le_bytes() } else { px.to_be_bytes() };
+                data.extend_from_slice(&bytes);
+            }
+            conn.put_image(ImageFormat::Z_PIXMAP, pixmap, gc, c.width, c.height, 0, 0, 0, 32, &data)
+                .map_err(|e| x_err("cursor PutImage", e))?;
+            self.cursor = Some(CursorSprite { pixmap, picture, gc, width: c.width, height: c.height, serial: c.cursor_serial });
+        }
+        let sprite = self.cursor.as_ref().unwrap();
+        let (img_x, img_y) = cursor_image_origin(c.x, c.y, c.xhot, c.yhot, self.cap_x as i32, self.cap_y as i32);
+        let (fw, fh) = (self.settings.width, self.settings.height);
+        if img_x >= fw || img_y >= fh || img_x + c.width as i32 <= 0 || img_y + c.height as i32 <= 0 {
+            return Ok(());
+        }
+        self.x
+            .conn
+            .render_composite(
+                render::PictOp::OVER,
+                sprite.picture,
+                x11rb::NONE,
+                self.buffers[idx].picture,
+                0,
+                0,
+                0,
+                0,
+                img_x.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                img_y.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
+                sprite.width,
+                sprite.height,
+            )
+            .map_err(|e| x_err("cursor Composite", e))?;
+        Ok(())
+    }
+}
+
+impl Drop for GpuCapture {
+    fn drop(&mut self) {
+        if let Some(c) = self.cursor.take() {
+            self.x.free_cursor(&c);
+        }
+        self.free_buffers();
+        let _ = self.x.conn.damage_destroy(self.x.damage);
+        let _ = self.x.conn.free_gc(self.x.gc);
+        let _ = self.x.conn.flush();
+    }
+}
+
+/// Build the zero-copy capture for these settings, or report why it cannot serve them.
+///
+/// Everything fallible happens here, before a single frame is delivered, so the caller can fall
+/// back to the XShm path with nothing half-built. The server is asked first, over a connection
+/// of our own, because whether it draws on the GPU at all, and on which device, is its answer to
+/// give; the encoder is built on the device the server named.
+fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
+    if !settings.codec.is_video() {
+        return declined("the codec is JPEG");
+    }
+    if settings.use_cpu || settings.encode_node_index == -1 {
+        return declined("software encoding was requested");
+    }
+    if !settings.watermark_path.is_empty() {
+        return declined("a watermark is composited into the frame");
+    }
+    let node = settings.encode_node_index.max(0);
+    let driver = crate::get_gpu_driver(node);
+    if driver.is_empty() {
+        return declined(&format!("encode node {node} has no readable render node"));
+    }
+    let (x, device_fd) = match XScreen::open(node) {
+        Ok(v) => v,
+        Err(e) => return declined(&e),
+    };
+
+    let alloc_file = File::from(device_fd);
+    let egl_file = match alloc_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => return declined(&format!("dup of the DRI3 device: {e}")),
+    };
+    let gbm = match RawGbmDevice::new(alloc_file) {
+        Ok(d) => d,
+        Err(e) => return declined(&format!("no GBM device on {}: {e:?}", x.device)),
+    };
+    // NVENC imports through an EGL display on the same device; VA-API needs none.
+    let wants_egl = crate::driver_selects_nvenc(&driver);
+    let egl = GbmDevice::new(egl_file)
+        .ok()
+        .and_then(|dev| unsafe { EGLDisplay::new(dev) }.ok());
+    if wants_egl && egl.is_none() {
+        return declined(&format!("no EGL display on {} for the NVENC import", x.device));
+    }
+    let egl_display = egl
+        .as_ref()
+        .map(|e| e.get_display_handle().handle)
+        .unwrap_or(std::ptr::null());
+
+    let geo = match x.conn.get_geometry(x.root).ok().and_then(|c| c.reply().ok()) {
+        Some(g) => g,
+        None => return declined("the root geometry could not be read"),
+    };
+    let request = settings.clone();
+    let mut live = settings.clone();
+    let (w, h) = resolve_dims(geo.width, geo.height, &request);
+    live.width = w as i32;
+    live.height = h as i32;
+
+    let mut gpu = GpuCapture {
+        encoder: None,
+        buffers: Vec::new(),
+        cursor: None,
+        cap_x: clamp_offset(request.capture_x, geo.width),
+        cap_y: clamp_offset(request.capture_y, geo.height),
+        root_w: geo.width,
+        root_h: geo.height,
+        x,
+        gbm,
+        _egl: egl,
+        egl_display,
+        next: 0,
+        settings: live,
+        request,
+    };
+    if let Err(e) = gpu.alloc_buffers(w, h) {
+        return declined(&e);
+    }
+    let mut live = gpu.settings.clone();
+    gpu.encoder = match encoders::select_frame_encoder(&mut live, FrameSource::Dmabuf { egl_display }, None, "x11") {
+        Some(enc) if enc.is_hardware() => Some(enc),
+        Some(_) => return declined("the session encodes in software"),
+        None => return declined("no hardware encoder opened for this session"),
+    };
+    gpu.settings = live;
+    println!(
+        "[x11] GPU capture (DRI3) active: {}x{} blitted by the X server into {} GPU buffers on {} and encoded in place on {}.",
+        gpu.settings.width,
+        gpu.settings.height,
+        POOL_N,
+        gpu.x.device,
+        gpu.backend()
+    );
+    Some(gpu)
+}
+
+/// Run the zero-copy X11 capture until `controls.stop` is set, or report that it cannot start.
+///
+/// `None` means DRI3 cannot serve this session and nothing was delivered, which is the caller's
+/// signal to run the XShm path instead. That includes a first frame the encoder could not read,
+/// since a buffer the server imported is not yet proof the encoder can. Anything else means the
+/// capture ran, every frame going from the server's blit into the encoder without a copy, and
+/// carries how it ended.
+///
+/// Each iteration paces to the live target rate, applies the cross-thread controls on the thread
+/// that owns the sessions, follows the root geometry, asks the server whether anything was drawn,
+/// and only then blits, waits and encodes through the same send / quality / key-frame policy every
+/// full-frame encoder obeys.
+pub fn run_capture<F>(
+    settings: RustCaptureSettings,
+    controls: Arc<Controls>,
+    encode_tid_tx: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    on_frame: &mut F,
+) -> Option<Result<(), String>>
+where
+    F: FnMut(Vec<EncodedStripe>),
+{
+    let mut gpu = open(&settings)?;
+    controls.codec.store(gpu.enc().codec().id(), Ordering::Relaxed);
+
+    let recording_sink = RecordingSink::try_bind(&settings.recording_socket, settings.target_fps);
+    let mut state = StripeState::default();
+    let mut frame_counter: u16 = 0;
+    let mut pending_force_idr = true;
+    let mut next_frame = Instant::now();
+    let mut geometry_check = GEOMETRY_POLL_FRAMES;
+    let mut x_failures = 0u32;
+    let mut encode_errors = 0u32;
+    let mut encoder_rebuilt = false;
+    // Capture and encode share this thread, so it is what the re-entrant-stop guard watches;
+    // it is named only once the path is committed, because a decline on the first frame hands
+    // the session to XShm, whose own encode thread must then be the one on the channel.
+    let mut delivered_any = false;
+    let mut last_log = Instant::now();
+    let mut sent_frames: u64 = 0;
+    let mut damaged_frames: u64 = 0;
+    let mut first_frame = true;
+    let mut tid_sent = false;
+
+    while !controls.stop.load(Ordering::Relaxed) {
+        let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
+        let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
+        let now = Instant::now();
+        if now < next_frame {
+            std::thread::sleep(next_frame - now);
+        }
+        next_frame += frame_dur;
+        let now = Instant::now();
+        if next_frame < now {
+            next_frame = now;
+        }
+        if controls.stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        for frame_id in std::mem::take(&mut *controls.invalid_frames.lock().unwrap()) {
+            if !gpu.enc().invalidate_reference(frame_id) {
+                pending_force_idr = true;
+            }
+        }
+        if controls.force_idr.swap(false, Ordering::Relaxed)
+            || recording_sink.as_ref().is_some_and(|s| s.should_force_idr())
+        {
+            pending_force_idr = true;
+        }
+        if controls.rate_dirty.swap(false, Ordering::Acquire) {
+            gpu.settings.video_bitrate_kbps = controls.bitrate_kbps.load(Ordering::Relaxed);
+            gpu.settings.video_vbv_multiplier = controls.vbv_mult_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+            gpu.settings.target_fps = fps;
+            let live = gpu.settings.clone();
+            if let Err(e) = gpu.enc().reconfigure_rate(&live) {
+                eprintln!("[x11] DRI3 capture: rate reconfigure failed ({e}); rebuilding the encoder.");
+                if let Err(e) = gpu.rebuild_encoder() {
+                    return Some(Err(format!("DRI3 capture ended: {e}")));
+                }
+                state = StripeState::default();
+                pending_force_idr = true;
+            }
+        }
+        if controls.tunables_dirty.swap(false, Ordering::Acquire)
+            && let Some(t) = controls.tunables.lock().unwrap().take()
+        {
+            t.apply_to(&mut gpu.settings);
+        }
+
+        let want_cursor = controls.capture_cursor.load(Ordering::Relaxed);
+        let mut recheck_geometry = controls.region_dirty.swap(false, Ordering::Acquire);
+        if recheck_geometry {
+            let (nx, ny, nw, nh) = *controls.region.lock().unwrap();
+            gpu.request.capture_x = nx;
+            gpu.request.capture_y = ny;
+            gpu.request.width = nw;
+            gpu.request.height = nh;
+            gpu.request.auto_adjust_screen_capture_size = nw <= 0 || nh <= 0;
+        }
+        geometry_check -= 1;
+        if geometry_check <= 0 {
+            geometry_check = GEOMETRY_POLL_FRAMES;
+            recheck_geometry = true;
+        }
+        if recheck_geometry {
+            match gpu.x.conn.get_geometry(gpu.x.root).ok().and_then(|c| c.reply().ok()) {
+                Some(g) => {
+                    gpu.root_w = g.width;
+                    gpu.root_h = g.height;
+                }
+                None => {
+                    x_failures += 1;
+                    if x_failures > MAX_X_FAILURES {
+                        return Some(Err("DRI3 capture ended: the X server stopped answering".to_string()));
+                    }
+                    continue;
+                }
+            }
+            gpu.cap_x = clamp_offset(gpu.request.capture_x, gpu.root_w);
+            gpu.cap_y = clamp_offset(gpu.request.capture_y, gpu.root_h);
+            let (w, h) = resolve_dims(gpu.root_w, gpu.root_h, &gpu.request);
+            if w as i32 != gpu.settings.width || h as i32 != gpu.settings.height {
+                if let Err(e) = gpu.reshape(w, h) {
+                    return Some(Err(format!("DRI3 capture could not follow the new geometry: {e}")));
+                }
+                state = StripeState::default();
+                pending_force_idr = true;
+            }
+        }
+
+        let is_dirty = match gpu.x.take_damage() {
+            Ok(d) => d || first_frame,
+            Err(e) => {
+                x_failures += 1;
+                if x_failures > MAX_X_FAILURES {
+                    return Some(Err(format!("DRI3 capture ended: {e}")));
+                }
+                continue;
+            }
+        };
+        first_frame = false;
+        damaged_frames += is_dirty as u64;
+
+        let decision = decide_hw_fullframe(
+            &mut state,
+            &gpu.settings,
+            frame_counter,
+            !gpu.settings.video_streaming_mode && is_dirty,
+            false,
+            pending_force_idr,
+        );
+        let mut delivered = false;
+        if decision.send {
+            let idx = match gpu.grab(want_cursor) {
+                Ok(i) => {
+                    x_failures = 0;
+                    i
+                }
+                Err(e) => {
+                    x_failures += 1;
+                    if x_failures > MAX_X_FAILURES {
+                        return Some(Err(format!("DRI3 capture ended: {e}")));
+                    }
+                    frame_counter = frame_counter.wrapping_add(1);
+                    continue;
+                }
+            };
+            let grabbed_ns = crate::wayland::host::now_ns();
+            let encode_start_ns = crate::wayland::host::now_ns();
+            let dmabuf = gpu.buffers[idx].dmabuf.clone();
+            let result = gpu.enc().encode_dmabuf(&dmabuf, frame_counter as u64, decision.target_qp, decision.force_idr);
+            match result {
+                Ok(data) if !data.is_empty() => {
+                    encode_errors = 0;
+                    let stripes = vec![EncodedStripe {
+                        data: Arc::new(data),
+                        codec: gpu.settings.codec,
+                        stripe_y_start: 0,
+                        stripe_height: gpu.settings.height,
+                        frame_id: frame_counter as i32,
+                        timing: FrameTiming {
+                            capture_ns: grabbed_ns,
+                            encode_start_ns,
+                            encode_end_ns: crate::wayland::host::now_ns(),
+                        },
+                        reference: gpu.enc().last_reference(),
+                    }];
+                    if let Some(sink) = &recording_sink {
+                        sink.write_frame(&stripes, gpu.settings.width, gpu.settings.height);
+                    }
+                    sent_frames += 1;
+                    delivered = true;
+                    delivered_any = true;
+                    on_frame(stripes);
+                }
+                Ok(_) => {
+                    encode_errors = 0;
+                    delivered_any = true;
+                }
+                Err(e) => {
+                    if !delivered_any {
+                        // Nothing has reached a client, so this is still the time to decline.
+                        drop(gpu);
+                        declined(&format!("the encoder could not read the server's buffer: {e}"));
+                        return None;
+                    }
+                    encode_errors += 1;
+                    if encode_errors % crate::HW_ERROR_RECOVERY_THRESHOLD == 1 {
+                        eprintln!("[x11] hardware encode error on the DRI3 path: {e}");
+                    }
+                    if encode_errors >= crate::HW_ERROR_RECOVERY_THRESHOLD {
+                        if encoder_rebuilt {
+                            return Some(Err("the encoder failed repeatedly on the DRI3 path".to_string()));
+                        }
+                        eprintln!("[x11] rebuilding the encoder after repeated errors on the DRI3 path.");
+                        if let Err(e) = gpu.rebuild_encoder() {
+                            return Some(Err(format!("DRI3 capture ended: {e}")));
+                        }
+                        encoder_rebuilt = true;
+                        encode_errors = 0;
+                        state = StripeState::default();
+                        pending_force_idr = true;
+                    }
+                }
+            }
+        }
+        if delivered_any && !tid_sent {
+            let _ = encode_tid_tx.send(std::thread::current().id());
+            tid_sent = true;
+        }
+        pending_force_idr = (pending_force_idr || decision.force_idr) && !delivered;
+        frame_counter = frame_counter.wrapping_add(1);
+
+        let elapsed = last_log.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            if gpu.settings.debug_logging {
+                println!(
+                    "[x11] DRI3 {}x{} Encoder: {} EncFPS: {:.2} Damaged/s: {:.2}",
+                    gpu.settings.width,
+                    gpu.settings.height,
+                    gpu.backend(),
+                    sent_frames as f64 / elapsed,
+                    damaged_frames as f64 / elapsed
+                );
+            }
+            sent_frames = 0;
+            damaged_frames = 0;
+            last_log = Instant::now();
+        }
+    }
+    Some(Ok(()))
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::prune_modifier;
+
+    const CCS_CC: u64 = 0x0100_0000_0000_0008;
+    const CCS: u64 = 0x0100_0000_0000_0006;
+    const Y_TILED: u64 = 0x0100_0000_0000_0002;
+
+    /// A compressed layout the server offered is dropped and the rest stays offered, so the
+    /// retry walks the server's list down to a single-plane layout.
+    #[test]
+    fn a_rejected_modifier_leaves_the_others() {
+        let mut mods = vec![CCS_CC, CCS, Y_TILED];
+        prune_modifier(&mut mods, CCS_CC);
+        assert_eq!(mods, vec![CCS, Y_TILED]);
+        prune_modifier(&mut mods, CCS);
+        assert_eq!(mods, vec![Y_TILED]);
+    }
+
+    /// A layout the list never named came from the driver's own choice, so the list is spent
+    /// and the next allocation is unconstrained rather than retried against the same list.
+    #[test]
+    fn a_choice_outside_the_list_spends_it() {
+        let mut mods = vec![CCS, Y_TILED];
+        prune_modifier(&mut mods, 0x00ff_ffff_ffff_ffff);
+        assert!(mods.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
+    use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
+    use crate::webcam::decode::{AvDecoder, Codec as DecCodec};
+
+    /// On a DRI3 server whose screen lives on the GPU: the server imports the pool, a blit of a
+    /// painted root decodes to the painted color, and a repaint reaches the next frame, which it
+    /// could not if the encoder read a stale buffer. Ignored by default; run with `DISPLAY` on
+    /// such a server (XLibre's Xvfb with `-glamor -dri`, an Xorg on a DRM driver) and a
+    /// hardware encoder on the same device:
+    /// `cargo test gpu_dri3 -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn gpu_dri3_zero_copy_encodes_the_painted_root() {
+        const FIRST: (u8, u8, u8) = (0x20, 0x40, 0xc0);
+        const SECOND: (u8, u8, u8) = (0xd0, 0x50, 0x18);
+        if !paint_root(FIRST) {
+            println!("no X root this host can paint (xsetroot, $DISPLAY); nothing to capture");
+            return;
+        }
+        let Some(mut gpu) = open(&settings(crate::encoders::codec::Codec::H264)) else {
+            println!("the DRI3 path declined this session on this host; nothing to capture");
+            return;
+        };
+        let mut dec = AvDecoder::new(DecCodec::H264).expect("avcodec h264");
+
+        let encode = |gpu: &mut GpuCapture, i: u64, key: bool| -> Vec<u8> {
+            let idx = gpu.grab(false).expect("blit into the pool");
+            let dmabuf = gpu.buffers[idx].dmabuf.clone();
+            gpu.enc().encode_dmabuf(&dmabuf, i, 25, key).expect("encode in place")
+        };
+
+        let pkt = encode(&mut gpu, 0, true);
+        assert_eq!(parse_video_type(pkt[1]), Some((crate::encoders::codec::Codec::H264, FRAME_KEY)));
+        let mean = decoded_mean(&mut dec, &pkt[VIDEO_HEADER_LEN..]);
+        let want = painted_ycbcr(FIRST);
+        for i in 0..3 {
+            assert!((mean[i] - want[i]).abs() <= 8.0, "plane {i}: captured {:.1}, painted {:.1}", mean[i], want[i]);
+        }
+
+        for i in 1..4u64 {
+            let pkt = encode(&mut gpu, i, false);
+            assert_eq!(parse_video_type(pkt[1]), Some((crate::encoders::codec::Codec::H264, FRAME_DELTA)));
+            let _ = decoded_mean(&mut dec, &pkt[VIDEO_HEADER_LEN..]);
+        }
+
+        assert!(paint_root(SECOND), "the root was painted once, so a repaint must work");
+        let pkt = encode(&mut gpu, 4, false);
+        let mean = decoded_mean(&mut dec, &pkt[VIDEO_HEADER_LEN..]);
+        let want = painted_ycbcr(SECOND);
+        for i in 0..3 {
+            assert!(
+                (mean[i] - want[i]).abs() <= 8.0,
+                "after repaint, plane {i}: captured {:.1}, painted {:.1}",
+                mean[i],
+                want[i]
+            );
+        }
+        println!(
+            "captured {}x{} through {} server-imported buffers on {} and encoded in place on {}",
+            gpu.settings.width,
+            gpu.settings.height,
+            POOL_N,
+            gpu.x.device,
+            gpu.backend()
+        );
+    }
+}
