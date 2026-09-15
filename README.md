@@ -76,7 +76,7 @@ pip install .
 
 ### Backend Selection
 
-### X11 GPU capture (NvFBC)
+### X11 GPU capture (NvFBC and DRI3)
 
 On an NVIDIA GPU whose session encodes on NVENC, X11 capture goes through **NvFBC**: the NVIDIA X
 driver composites each frame into a buffer it owns in video memory and hands back a CUDA device
@@ -92,6 +92,18 @@ streams through XShm instead: a codec NVENC has no engine for, software encoding
 not NVIDIA, a watermark (which is composited into host pixels), or a driver without NvFBC.
 `libnvidia-fbc.so.1` is loaded at run time and ships with the driver; containers get it under the
 `video` driver capability. There is nothing to turn on or off: what the driver offers decides.
+
+On any other X server whose screen lives on the GPU (XLibre's Xvfb started with `-glamor -dri`,
+an Xorg on a DRM driver), X11 capture goes through **DRI3**: pixelflux allocates a small pool of
+dmabufs through GBM on the render node the server draws with, hands each to the server as a pixmap
+(`PixmapFromBuffers`), and every frame is one `CopyArea` of the root into the next one, a GPU blit
+in glamor. The hardware encoder, NVENC or VA-API, imports the dmabuf in place through the same
+path the Wayland zero-copy capture uses, so no frame crosses to the CPU. The Damage extension says
+whether anything was drawn since the last frame, and the XFixes cursor is composited by the server
+through Render. It is declined, with one line saying why, for a codec no hardware engine serves,
+software encoding, a watermark, a server without DRI3 1.2, Damage or Render, a server drawing on a
+device other than the encode node, a buffer the server will not import, or a first frame the
+encoder cannot read; the session then streams through XShm.
 
 `pixelflux` supports both an X11 and a **Wayland** backend (the latter built on [Smithay](https://github.com/Smithay/smithay)), selected per capture by the `use_wayland` attribute on `CaptureSettings`:
 
@@ -647,7 +659,7 @@ session settled on rather than what was asked for.
 ## Features
 
 *   **Dual Backend (one Rust extension):**
-    *   **X11:** XShm capture via pure-Rust XCB, with XFixes cursor and watermark compositing.
+    *   **X11:** zero-copy capture through NvFBC on the NVIDIA X driver or through DRI3 on any server whose screen lives on the GPU, else XShm capture via pure-Rust XCB with XFixes cursor and watermark compositing.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
     *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, all through the linked FFmpeg; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call.
