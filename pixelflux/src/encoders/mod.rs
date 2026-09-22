@@ -324,7 +324,8 @@ mod tests {
         println!("asked for av1, landed on {}", settings.codec.display());
         assert_ne!(settings.codec, Codec::Jpeg, "this build encodes video in software");
         assert!(software_encoder(settings.codec).is_some());
-        assert!(encoder.is_some());
+        // H.264 comes back as the caller's own striped path rather than a full-frame session.
+        assert!(encoder.is_some() || settings.codec == Codec::H264);
     }
 
     /// A codec with no path on this host falls through the video codecs it does serve, the
@@ -589,8 +590,8 @@ pub enum FrameSource {
 /// 3. The software encoder of the codec, except JPEG and H.264, whose software path is the
 ///    striped one.
 /// 4. Where the codec has no path at all, the other video codecs this host serves, the encode
-///    node's hardware ones before the build's software ones, and JPEG only where none of them
-///    come up. `settings.codec` names what did.
+///    node's hardware ones before the build's software ones, then H.264's striped software
+///    path, and JPEG only past all of them. `settings.codec` names what came up.
 pub fn select_frame_encoder(
     settings: &mut RustCaptureSettings,
     source: FrameSource,
@@ -606,7 +607,10 @@ pub fn select_frame_encoder(
     }
     // A dmabuf source stops here, its readback path running the ladder again on host frames,
     // and H.264 has come up on the striped path the caller encodes itself.
-    if !matches!(source, FrameSource::Host { .. }) || requested == Codec::H264 {
+    let FrameSource::Host { rgba } = source else {
+        return None;
+    };
+    if requested == Codec::H264 {
         return None;
     }
     let hardware: Vec<Codec> = if settings.use_cpu || settings.encode_node_index == -1 {
@@ -621,6 +625,12 @@ pub fn select_frame_encoder(
             return Some(enc);
         }
     }
+    // No full-frame codec came up: H.264's software path, the striped one, is the last video
+    // rung, and JPEG the leg past it.
+    settings.codec = Codec::H264;
+    if software_encoder(Codec::H264).is_some() {
+        return software_fallback(settings, rgba, tag);
+    }
     eprintln!("[{tag}] No video encoder on this host. Encoding JPEG instead.");
     settings.codec = Codec::Jpeg;
     None
@@ -628,8 +638,8 @@ pub fn select_frame_encoder(
 
 /// The video codecs a capture falls through to where the one it asked for has no path on this
 /// host: those an engine on the encode node carries, named in `hardware`, before those the
-/// build encodes in software, each group newest first. H.264 joins through hardware alone, its
-/// software path being the striped one, which no other codec falls back to.
+/// build encodes in software, each group newest first. H.264 joins through hardware alone: its
+/// software path is the striped one, which the ladder reaches only past every full-frame rung.
 fn fallback_codecs(requested: Codec, hardware: &[Codec]) -> Vec<Codec> {
     let order: Vec<Codec> =
         Codec::VIDEO.iter().rev().copied().filter(|&codec| codec != requested).collect();
