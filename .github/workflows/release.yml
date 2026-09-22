@@ -73,6 +73,7 @@ jobs:
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > /dev/null 2>&1; then
             echo "${RELEASE_TAG} is already tagged"
           else
+            [ "${GITHUB_REF}" = refs/heads/main ] || { echo "::error::a new tag is cut from main; this run started from ${GITHUB_REF_NAME}"; exit 1; }
             gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
               -f ref="refs/tags/${RELEASE_TAG}" -f sha="${GITHUB_SHA}"
             echo "${RELEASE_TAG} now tags ${GITHUB_SHA}"
