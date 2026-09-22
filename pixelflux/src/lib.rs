@@ -1378,7 +1378,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                             } else {
                                 eprintln!(
                                     "[Wayland] readback HW encoder unrecoverable; demoting to software encoding ({}).",
-                                    encoders::software_library(Codec::H264)
+                                    encoders::software_library(settings.codec)
                                 );
                             }
                             // The broken session is released before its replacement is opened:

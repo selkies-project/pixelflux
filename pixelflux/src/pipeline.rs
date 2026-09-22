@@ -175,7 +175,8 @@ impl X11Pipeline {
     /// Build the context, choosing the full-frame encoder for the X11 host-BGRA path through
     /// the shared ladder (`select_frame_encoder`): the hardware backend the encode node's driver
     /// selects, then the codec's software encoder, or the striped software path for JPEG and
-    /// H.264. A codec no backend serves demotes the pipeline to JPEG.
+    /// H.264. A codec no backend serves falls through to the video codecs the host does serve,
+    /// JPEG last.
     pub fn new(mut settings: RustCaptureSettings) -> Self {
         let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "X11");
         let pipeline = Self {
@@ -218,7 +219,7 @@ impl X11Pipeline {
         if self.hw_rebuilt {
             eprintln!(
                 "[X11] HW encoder unrecoverable; demoting to software encoding ({}).",
-                crate::encoders::software_library(Codec::H264)
+                crate::encoders::software_library(self.settings.codec)
             );
             // The broken session is released before its replacement is built: these failures
             // are usually device memory pressure, and holding both at once is what would make
