@@ -8022,22 +8022,35 @@ fn probe_wayland_gpu(
 #[pyfunction]
 #[pyo3(signature = (encode_node_index = -2, auto_gpu = ""))]
 fn hardware_encoders(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> PyResult<Py<PyAny>> {
-    let node = match encode_node_index {
-        -1 => None,
-        index if index < -1 => {
-            Some(auto_render_node(auto_gpu).and_then(|picked| render_node_index(&picked)).unwrap_or(0))
-        }
-        index => Some(index),
-    };
-    let served = match node {
-        Some(node) => py.detach(|| encoders::hardware_encoders(node)),
-        None => Vec::new(),
-    };
     let d = pyo3::types::PyDict::new(py);
-    for (codec, backend) in served {
+    for (codec, backend, _) in probe_hardware(py, encode_node_index, auto_gpu) {
         d.set_item(codec.name(), backend)?;
     }
     Ok(d.into_any().unbind())
+}
+
+/// The video codecs the GPU behind an encode node encodes 4:4:4, by name: those of
+/// `hardware_encoders` whose engine takes a `video_fullcolor` session as 4:4:4 rather than
+/// 4:2:0, read from the same probe. Arguments as `hardware_encoders`.
+#[pyfunction]
+#[pyo3(signature = (encode_node_index = -2, auto_gpu = ""))]
+fn hardware_fullcolor(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> Vec<&'static str> {
+    probe_hardware(py, encode_node_index, auto_gpu)
+        .into_iter()
+        .filter(|&(_, _, fullcolor)| fullcolor)
+        .map(|(codec, ..)| codec.name())
+        .collect()
+}
+
+/// The hardware table of the node `encode_node_index` and `auto_gpu` resolve to, as a capture
+/// resolves them; empty for -1, software only.
+fn probe_hardware(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> encoders::HardwareEncoders {
+    let node = match encode_node_index {
+        -1 => return Vec::new(),
+        index if index < -1 => auto_render_node(auto_gpu).and_then(|picked| render_node_index(&picked)).unwrap_or(0),
+        index => index,
+    };
+    py.detach(|| encoders::hardware_encoders(node))
 }
 
 /// The running compositor's Wayland socket name (e.g. "wayland-1"), or None when no
@@ -8180,7 +8193,12 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
         }
     }
     m.add("SOFTWARE_ENCODERS", software)?;
+    // The codecs whose software encoder above takes a `video_fullcolor` session as 4:4:4.
+    let fullcolor: Vec<&str> =
+        Codec::VIDEO.into_iter().filter(|&codec| encoders::software_fullcolor(codec)).map(|codec| codec.name()).collect();
+    m.add("SOFTWARE_FULLCOLOR", fullcolor)?;
     m.add_function(wrap_pyfunction!(hardware_encoders, m)?)?;
+    m.add_function(wrap_pyfunction!(hardware_fullcolor, m)?)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;

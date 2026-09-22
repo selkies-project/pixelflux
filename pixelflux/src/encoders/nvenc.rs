@@ -740,7 +740,7 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// driver, no device, or a session that would not open, each of which a real session would
 /// fail on too. The CUDA and NVENC libraries stay loaded like a session's, since the driver
 /// does not promise to survive `libcuda` being unloaded after `cuInit`.
-pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String> {
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>, String> {
     let cuda = std::mem::ManuallyDrop::new(NvencEncoder::load_cuda()?);
     let nvenc_lib = std::mem::ManuallyDrop::new(NvencEncoder::load_nvenc()?);
     nvenc_negotiate(&nvenc_lib);
@@ -772,9 +772,9 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String>
     }
 }
 
-/// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes,
-/// and close it.
-unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) -> Result<Vec<Codec>, String> {
+/// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes
+/// and whether each in 4:4:4, and close it.
+unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) -> Result<Vec<(Codec, bool)>, String> {
     let mut function_list = NV_ENCODE_API_FUNCTION_LIST {
         version: sv(NvStruct::FunctionList),
         ..Default::default()
@@ -799,7 +799,12 @@ unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) 
     }
     let codecs = Codec::VIDEO
         .into_iter()
-        .filter(|&codec| codec_guid(codec).is_some_and(|guid| NvencEncoder::device_encodes(&function_list, session, &guid)))
+        .filter_map(|codec| {
+            let guid = codec_guid(codec).filter(|guid| NvencEncoder::device_encodes(&function_list, session, guid))?;
+            let fullcolor = codec.fullcolor()
+                && query_cap(&function_list, session, guid, NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE) == Some(1);
+            Some((codec, fullcolor))
+        })
         .collect();
     destroy_fn(session);
     Ok(codecs)

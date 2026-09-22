@@ -350,6 +350,17 @@ fn vaapi_profiles(codec: Codec) -> &'static [c_int] {
     }
 }
 
+/// The VA profile a 4:4:4 session of a codec opens under: `VAProfileHEVCMain444`, the
+/// `main444-8` the HEVC session asks for, and `VAProfileVP9Profile1`; the linked FFmpeg drives
+/// no 4:4:4 profile of the other codecs.
+fn vaapi_fullcolor_profiles(codec: Codec) -> &'static [c_int] {
+    match codec {
+        Codec::H265 => &[26],
+        Codec::Vp9 => &[20],
+        _ => &[],
+    }
+}
+
 /// The SVT-AV1 the linked FFmpeg carries, as `(major, minor)`, read from the library already in
 /// this process. `None` where nothing exports the symbol, which is every build without SVT-AV1.
 ///
@@ -380,7 +391,7 @@ fn svt_av1_version() -> Option<(u32, u32)> {
 /// the way a session opens it (a DRM device derived into a VA one) and released. An error
 /// names the step that failed: no such node, no VA driver on it, or a libva the probe cannot
 /// reach.
-pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String> {
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>, String> {
     set_log_level(false);
     let render_node = format!("/dev/dri/renderD{}", 128 + encode_node_index.max(0));
     let device_url = CString::new(render_node).unwrap();
@@ -414,8 +425,9 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Codec>, String>
     }
 }
 
-/// The codecs a VA device encodes, by its profile and entry-point lists.
-unsafe fn va_encode_codecs(device: *mut ff::AVBufferRef) -> Result<Vec<Codec>, String> {
+/// The codecs a VA device encodes, by its profile and entry-point lists, and whether each in
+/// 4:4:4, by the profile a 4:4:4 session opens under.
+unsafe fn va_encode_codecs(device: *mut ff::AVBufferRef) -> Result<Vec<(Codec, bool)>, String> {
     let lib = Library::new(LIBVA).map_err(|e| format!("{LIBVA} is unavailable to the encoder probe: {e}"))?;
     let symbol = |e: libloading::Error| format!("{LIBVA} lacks a query the encoder probe needs: {e}");
     let max_profiles: Symbol<VaMaxNum> = lib.get(b"vaMaxNumProfiles\0").map_err(symbol)?;
@@ -447,7 +459,8 @@ unsafe fn va_encode_codecs(device: *mut ff::AVBufferRef) -> Result<Vec<Codec>, S
             continue;
         }
         if vaapi_profiles(codec).iter().any(|p| profiles.contains(p) && encodes(*p)) {
-            served.push(codec);
+            let fullcolor = vaapi_fullcolor_profiles(codec).iter().any(|p| profiles.contains(p) && encodes(*p));
+            served.push((codec, fullcolor));
         }
     }
     Ok(served)

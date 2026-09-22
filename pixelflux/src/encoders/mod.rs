@@ -67,7 +67,9 @@ pub struct SoftwareEncoder {
 }
 
 /// The codecs a render node encodes in hardware, each with the backend's name.
-pub type HardwareEncoders = Vec<(Codec, &'static str)>;
+/// Each video codec an engine on a node encodes, the backend's name, and whether the engine
+/// takes a `video_fullcolor` session as 4:4:4 rather than 4:2:0.
+pub type HardwareEncoders = Vec<(Codec, &'static str, bool)>;
 
 /// The hardware backend that serves each video codec on an encode node, as the name a
 /// session logs it in lower case (`"nvenc"`, `"vaapi"` or `"tegra"`), probed once per node and
@@ -87,8 +89,8 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     }
     #[cfg(target_arch = "aarch64")]
     if tegra::available() {
-        let served: HardwareEncoders = tegra::served().into_iter().map(|c| (c, "tegra")).collect();
-        let names: Vec<&str> = served.iter().map(|(c, _)| c.display()).collect();
+        let served: HardwareEncoders = tegra::served().into_iter().map(|c| (c, "tegra", false)).collect();
+        let names: Vec<&str> = served.iter().map(|(c, ..)| c.display()).collect();
         println!("[pixelflux] Render node {node} encodes {} on tegra.", names.join(", "));
         probed.insert(node, served.clone());
         return served;
@@ -100,7 +102,7 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
         ("vaapi", avcodec::probe_codecs(node))
     };
     let served: HardwareEncoders = match codecs {
-        Ok(codecs) => codecs.into_iter().map(|codec| (codec, backend)).collect(),
+        Ok(codecs) => codecs.into_iter().map(|(codec, fullcolor)| (codec, backend, fullcolor)).collect(),
         Err(e) => {
             eprintln!("[pixelflux] No hardware encoder on render node {node} ({backend}): {e}");
             Vec::new()
@@ -111,14 +113,14 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
         // answer is the same whichever index was asked about. It is cached under the key all
         // the same, so a caller asking twice is answered from the same probe.
         let codecs = v4l2m2m::served();
-        let served: HardwareEncoders = codecs.iter().map(|&c| (c, "v4l2m2m")).collect();
+        let served: HardwareEncoders = codecs.iter().map(|&c| (c, "v4l2m2m", false)).collect();
         let names: Vec<&str> = codecs.iter().map(|c| c.display()).collect();
         println!("[pixelflux] A stateful V4L2 M2M encoder serves {}.", names.join(", "));
         probed.insert(node, served.clone());
         return served;
     }
     if !served.is_empty() {
-        let names: Vec<&str> = served.iter().map(|(codec, _)| codec.display()).collect();
+        let names: Vec<&str> = served.iter().map(|(codec, ..)| codec.display()).collect();
         println!("[pixelflux] Render node {node} encodes {} on {backend}.", names.join(", "));
     }
     probed.insert(node, served.clone());
@@ -349,6 +351,16 @@ mod tests {
         // An engine's codecs go most efficient first, whatever the build encodes in software.
         let engine = [Codec::H264, Codec::H265, Codec::Av1];
         assert_eq!(&fallback_codecs(Codec::Vp8, &engine)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
+    }
+
+    /// The software encoders that take a 4:4:4 session: x264 and x265, and libvpx for VP9 alone;
+    /// AV1 and VP8 encode 4:2:0 whatever is asked.
+    #[test]
+    fn software_fullcolor_follows_the_library() {
+        assert_eq!(software_fullcolor(Codec::H264), software_library(Codec::H264) == "x264");
+        assert_eq!(software_fullcolor(Codec::H265), software_library(Codec::H265) == "x265");
+        assert_eq!(software_fullcolor(Codec::Vp9), software_library(Codec::Vp9) == "libvpx");
+        assert!(!software_fullcolor(Codec::Av1) && !software_fullcolor(Codec::Vp8));
     }
 
     /// A child's fate is the finding: a fatal signal, and only that, reads as not surviving.
@@ -619,7 +631,7 @@ pub fn select_frame_encoder(
     let hardware: Vec<Codec> = if settings.use_cpu || settings.encode_node_index == -1 {
         Vec::new()
     } else {
-        hardware_encoders(settings.encode_node_index).into_iter().map(|(codec, _)| codec).collect()
+        hardware_encoders(settings.encode_node_index).into_iter().map(|(codec, ..)| codec).collect()
     };
     eprintln!("[{tag}] No {} path on this host; trying the video codecs it serves.", requested.display());
     for codec in fallback_codecs(requested, &hardware) {
@@ -994,8 +1006,8 @@ mod hardware_encoder_tests {
     #[ignore]
     fn gpu_hardware_encoders_serve_h264_once_probed() {
         let served = hardware_encoders(0);
-        assert!(served.iter().any(|(codec, _)| *codec == Codec::H264), "node 0 serves {served:?}");
-        assert!(served.iter().all(|(_, backend)| matches!(*backend, "nvenc" | "vaapi")));
+        assert!(served.iter().any(|(codec, ..)| *codec == Codec::H264), "node 0 serves {served:?}");
+        assert!(served.iter().all(|(_, backend, _)| matches!(*backend, "nvenc" | "vaapi")));
         assert_eq!(hardware_encoders(0), served);
     }
 }
