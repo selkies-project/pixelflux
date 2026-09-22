@@ -1363,10 +1363,10 @@ mod tests {
     /// on an Orin and on any board this does not know.
     #[test]
     fn every_codec_reported_is_one_a_session_can_be_opened_for() {
-        let nano = b"nvidia,p3450-0000+p3448-0000\0nvidia,jetson-nano\0nvidia,tegra210\0";
+        let nano = b"nvidia,p3449-0000-b00+p3448-0000-b00\0nvidia,jetson-nano\0nvidia,tegra210\0";
         let tx2 = b"nvidia,quill\0nvidia,tegra186\0";
-        let xavier = b"nvidia,p2972-0000\0nvidia,tegra194\0";
-        let orin = b"nvidia,p3737-0000+p3701-0000\0nvidia,tegra234\0nvidia,tegra23x\0";
+        let xavier = b"nvidia,galen\0nvidia,jetson-xavier\0nvidia,p2822-0000+p2888-0001\0nvidia,tegra194\0";
+        let orin = b"nvidia,p3737-0000+p3701-0000\0nvidia,p3701-0000\0nvidia,tegra234\0";
         let thor = b"nvidia,tegra264\0";
         for (board, av1) in [(&nano[..], false), (tx2, false), (xavier, false), (orin, true), (thor, true), (b"", true)] {
             let served = served_on(board);
