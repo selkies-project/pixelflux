@@ -207,6 +207,9 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
+          # A new tag is created at this commit rather than at the default branch's head by the
+          # time the wheels have built.
+          target_commitish: ${{ github.sha }}
           body: ${{ steps.notes.outputs.content }}
           prerelease: ${{ steps.kind.outputs.prerelease == 'true' }}
           make_latest: ${{ steps.kind.outputs.make_latest }}
