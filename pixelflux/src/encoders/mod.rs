@@ -329,10 +329,11 @@ mod tests {
     }
 
     /// A codec with no path on this host falls through the video codecs it does serve, the
-    /// encode node's hardware ones first, and never onto H.264's striped software path.
+    /// encode node's hardware ones first and most efficient first, the software ones by encode
+    /// time, and never onto H.264's striped software path.
     #[test]
     fn a_codec_without_a_path_falls_through_the_served_video_codecs() {
-        let software: Vec<Codec> = FALLBACK_ORDER
+        let software: Vec<Codec> = SOFTWARE_ORDER
             .iter()
             .copied()
             .filter(|&codec| {
@@ -345,6 +346,9 @@ mod tests {
         hardware_first.extend(software.iter().copied());
         assert_eq!(fallback_codecs(Codec::Av1, &[Codec::H264]), hardware_first);
         assert!(!fallback_codecs(Codec::Av1, &[Codec::Av1]).contains(&Codec::Av1));
+        // An engine's codecs go most efficient first, whatever the build encodes in software.
+        let engine = [Codec::H264, Codec::H265, Codec::Av1];
+        assert_eq!(&fallback_codecs(Codec::Vp8, &engine)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
     }
 
     /// A child's fate is the finding: a fatal signal, and only that, reads as not surviving.
@@ -635,21 +639,30 @@ pub fn select_frame_encoder(
     None
 }
 
+/// The video codecs by compression efficiency: the order a fallthrough tries the ones an engine
+/// on the encode node carries, where CPU is no constraint.
+const HARDWARE_ORDER: [Codec; 5] = [Codec::Av1, Codec::H265, Codec::Vp9, Codec::H264, Codec::Vp8];
+
 /// The video codecs by the measured time per frame of their software encoders, x264 to libvpx
-/// VP9: the order a fallthrough tries them in within each group.
-const FALLBACK_ORDER: [Codec; 5] = [Codec::H264, Codec::Av1, Codec::Vp8, Codec::H265, Codec::Vp9];
+/// VP9: the order a fallthrough tries the ones the build encodes in software.
+const SOFTWARE_ORDER: [Codec; 5] = [Codec::H264, Codec::Av1, Codec::Vp8, Codec::H265, Codec::Vp9];
 
 /// The video codecs a capture falls through to where the one it asked for has no path on this
-/// host: those an engine on the encode node carries, named in `hardware`, before those the
-/// build encodes in software, each group in `FALLBACK_ORDER`. H.264 joins through hardware
+/// host: those an engine on the encode node carries, named in `hardware`, in `HARDWARE_ORDER`,
+/// then those the build encodes in software, in `SOFTWARE_ORDER`. H.264 joins through hardware
 /// alone: its software path is the striped one, which the ladder reaches only past every
 /// full-frame rung.
 fn fallback_codecs(requested: Codec, hardware: &[Codec]) -> Vec<Codec> {
-    let order: Vec<Codec> =
-        FALLBACK_ORDER.iter().copied().filter(|&codec| codec != requested).collect();
-    let mut codecs: Vec<Codec> = order.iter().copied().filter(|codec| hardware.contains(codec)).collect();
-    codecs.extend(order.iter().copied().filter(|&codec| {
-        codec != Codec::H264 && !hardware.contains(&codec) && software_encoder(codec).is_some()
+    let mut codecs: Vec<Codec> = HARDWARE_ORDER
+        .iter()
+        .copied()
+        .filter(|&codec| codec != requested && hardware.contains(&codec))
+        .collect();
+    codecs.extend(SOFTWARE_ORDER.iter().copied().filter(|&codec| {
+        codec != requested
+            && codec != Codec::H264
+            && !hardware.contains(&codec)
+            && software_encoder(codec).is_some()
     }));
     codecs
 }
