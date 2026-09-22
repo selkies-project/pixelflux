@@ -195,19 +195,23 @@ fn avcodec_has_encoder(name: &str) -> bool {
 /// lacks or a register the kernel does not emulate, takes the child down and not a session.
 fn encodes_in_child(codec: Codec, enc: SoftwareEncoder) -> bool {
     survives_in_child(|| {
-        let settings = RustCaptureSettings { width: 256, height: 128, ..Default::default() };
-        let Ok(mut encoder) = AvcodecEncoder::open(
-            &settings, codec, Backend::Software, enc.library, enc.avcodec, Input::Host { rgba: false },
-        ) else {
-            return;
-        };
-        let frame = vec![0u8; 256 * 128 * 4];
-        for n in 0..64 {
-            let packet = encoder.encode_host(&frame, 256 * 4, n, settings.video_crf as u32, n == 0);
-            if !matches!(packet, Ok(p) if p.is_empty()) {
-                break;
+        // The child converts on a pool of its own: the parent's rayon workers do not exist in it.
+        let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else { return };
+        pool.install(|| {
+            let settings = RustCaptureSettings { width: 256, height: 128, ..Default::default() };
+            let Ok(mut encoder) = AvcodecEncoder::open(
+                &settings, codec, Backend::Software, enc.library, enc.avcodec, Input::Host { rgba: false },
+            ) else {
+                return;
+            };
+            let frame = vec![0u8; 256 * 128 * 4];
+            for n in 0..64 {
+                let packet = encoder.encode_host(&frame, 256 * 4, n, settings.video_crf as u32, n == 0);
+                if !matches!(packet, Ok(p) if p.is_empty()) {
+                    break;
+                }
             }
-        }
+        })
     })
 }
 
@@ -317,6 +321,8 @@ mod tests {
 
     #[test]
     fn software_encoders_follow_the_build() {
+        use rayon::prelude::*;
+        let _: u32 = (0..8u32).into_par_iter().sum();
         let h264 = software_encoder(Codec::H264).expect("H.264 is always served");
         assert_eq!(h264.library, if cfg!(feature = "gpl") { "x264" } else { "openh264" });
         assert_eq!(software_library(Codec::H264), h264.library);
