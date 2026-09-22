@@ -309,6 +309,44 @@ mod tests {
     /// The build always serves H.264 in software, JPEG never, and whatever the linked FFmpeg
     /// carries for the rest is reported by a library name with a libavcodec encoder behind it;
     /// a GPL-free build never names x265.
+    /// A session lands on the codec it asked for, or on the next video codec this host serves;
+    /// JPEG is the ladder's last leg, not its answer to one missing encoder.
+    #[test]
+    fn a_session_lands_on_a_video_codec_the_host_serves() {
+        let mut settings = RustCaptureSettings {
+            width: 256,
+            height: 128,
+            codec: Codec::Av1,
+            use_cpu: true,
+            ..Default::default()
+        };
+        let encoder = select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "test");
+        println!("asked for av1, landed on {}", settings.codec.display());
+        assert_ne!(settings.codec, Codec::Jpeg, "this build encodes video in software");
+        assert!(software_encoder(settings.codec).is_some());
+        assert!(encoder.is_some());
+    }
+
+    /// A codec with no path on this host falls through the video codecs it does serve, the
+    /// encode node's hardware ones first, and never onto H.264's striped software path.
+    #[test]
+    fn a_codec_without_a_path_falls_through_the_served_video_codecs() {
+        let software: Vec<Codec> = Codec::VIDEO
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&codec| {
+                codec != Codec::Av1 && codec != Codec::H264 && software_encoder(codec).is_some()
+            })
+            .collect();
+        assert_eq!(fallback_codecs(Codec::Av1, &[]), software);
+        assert!(!fallback_codecs(Codec::Av1, &[]).contains(&Codec::H264));
+        let mut hardware_first = vec![Codec::H264];
+        hardware_first.extend(software.iter().copied());
+        assert_eq!(fallback_codecs(Codec::Av1, &[Codec::H264]), hardware_first);
+        assert!(!fallback_codecs(Codec::Av1, &[Codec::Av1]).contains(&Codec::Av1));
+    }
+
     /// A child's fate is the finding: a fatal signal, and only that, reads as not surviving.
     #[test]
     fn a_child_survives_unless_a_signal_takes_it() {
@@ -549,18 +587,68 @@ pub enum FrameSource {
 /// 2. A dmabuf source stops here: software cannot read dmabufs, and the caller's readback path
 ///    then runs this ladder again with host frames.
 /// 3. The software encoder of the codec, except JPEG and H.264, whose software path is the
-///    striped one. A codec this build has no software encoder for demotes the session to
-///    JPEG, the one path every client decodes, rewriting `settings.codec`.
+///    striped one.
+/// 4. Where the codec has no path at all, the other video codecs this host serves, the encode
+///    node's hardware ones before the build's software ones, and JPEG only where none of them
+///    come up. `settings.codec` names what did.
 pub fn select_frame_encoder(
     settings: &mut RustCaptureSettings,
     source: FrameSource,
     prior: Option<FrameEncoder>,
     tag: &str,
 ) -> Option<FrameEncoder> {
-    let codec = settings.codec;
-    if !codec.is_video() {
+    let requested = settings.codec;
+    if !requested.is_video() {
         return None;
     }
+    if let Some(enc) = select_for_codec(settings, source, prior, tag) {
+        return Some(enc);
+    }
+    // A dmabuf source stops here, its readback path running the ladder again on host frames,
+    // and H.264 has come up on the striped path the caller encodes itself.
+    if !matches!(source, FrameSource::Host { .. }) || requested == Codec::H264 {
+        return None;
+    }
+    let hardware: Vec<Codec> = if settings.use_cpu || settings.encode_node_index == -1 {
+        Vec::new()
+    } else {
+        hardware_encoders(settings.encode_node_index).into_iter().map(|(codec, _)| codec).collect()
+    };
+    eprintln!("[{tag}] No {} path on this host; trying the video codecs it serves.", requested.display());
+    for codec in fallback_codecs(requested, &hardware) {
+        settings.codec = codec;
+        if let Some(enc) = select_for_codec(settings, source, None, tag) {
+            return Some(enc);
+        }
+    }
+    eprintln!("[{tag}] No video encoder on this host. Encoding JPEG instead.");
+    settings.codec = Codec::Jpeg;
+    None
+}
+
+/// The video codecs a capture falls through to where the one it asked for has no path on this
+/// host: those an engine on the encode node carries, named in `hardware`, before those the
+/// build encodes in software, each group newest first. H.264 joins through hardware alone, its
+/// software path being the striped one, which no other codec falls back to.
+fn fallback_codecs(requested: Codec, hardware: &[Codec]) -> Vec<Codec> {
+    let order: Vec<Codec> =
+        Codec::VIDEO.iter().rev().copied().filter(|&codec| codec != requested).collect();
+    let mut codecs: Vec<Codec> = order.iter().copied().filter(|codec| hardware.contains(codec)).collect();
+    codecs.extend(order.iter().copied().filter(|&codec| {
+        codec != Codec::H264 && !hardware.contains(&codec) && software_encoder(codec).is_some()
+    }));
+    codecs
+}
+
+/// The ladder for the one codec `settings` names; `None` where no backend of it opened, and for
+/// H.264 on host frames, whose software path the caller encodes itself.
+fn select_for_codec(
+    settings: &mut RustCaptureSettings,
+    source: FrameSource,
+    prior: Option<FrameEncoder>,
+    tag: &str,
+) -> Option<FrameEncoder> {
+    let codec = settings.codec;
     let software_forced = settings.use_cpu || settings.encode_node_index == -1;
     #[cfg(target_arch = "aarch64")]
     if let (false, Some(_), FrameSource::Host { rgba }) =
@@ -688,7 +776,7 @@ pub fn select_frame_encoder(
 }
 
 /// The codec's software encoder; `None` for H.264, whose software path is the striped one, and
-/// for JPEG, which a codec this build has no software encoder for is demoted to.
+/// where the build carries none for the codec, which the ladder then falls through on.
 fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) -> Option<FrameEncoder> {
     let codec = settings.codec;
     if codec == Codec::H264 {
@@ -701,8 +789,7 @@ fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) 
             Some(FrameEncoder::Avcodec(enc))
         }
         Err(e) => {
-            eprintln!("[{tag}] No {} encoder available: {e}. Encoding JPEG instead.", codec.display());
-            settings.codec = Codec::Jpeg;
+            eprintln!("[{tag}] No {} encoder available: {e}.", codec.display());
             None
         }
     }
