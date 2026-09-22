@@ -567,12 +567,29 @@ pub fn coded_fourcc(codec: Codec) -> Option<u32> {
     }
 }
 
-/// Every codec the vendor encoder can be set to. The board is its own authority on which of them
-/// it has an engine for and says so at `S_FMT`: a format it does not serve costs one refusal and
-/// a fall back to software that the session report names, where a codec withheld here would have
-/// no route back to hardware that does carry it.
+/// Every codec the vendor encoder can be set to, less AV1 on the generations whose engine has
+/// none. The node enumerates that format on a Tegra X1 all the same and refuses it only once a
+/// session asks, so the device tree's SoC name decides; the board stays the authority for the
+/// rest at `S_FMT`, where a refusal costs one attempt and the codec's software encoder, and a
+/// board this does not know keeps AV1, since a codec withheld here has no route back to hardware
+/// that does carry it.
 pub fn served() -> Vec<Codec> {
-    vec![Codec::H264, Codec::H265, Codec::Av1]
+    static COMPATIBLE: OnceLock<Vec<u8>> = OnceLock::new();
+    served_on(COMPATIBLE.get_or_init(|| std::fs::read("/proc/device-tree/compatible").unwrap_or_default()))
+}
+
+/// `served` for a board whose device tree `compatible` list, NUL-separated `nvidia,<name>`
+/// entries, is `compatible`: AV1 is withheld where it names a Tegra X1, X2 or Xavier SoC.
+fn served_on(compatible: &[u8]) -> Vec<Codec> {
+    let without_av1 = compatible
+        .split(|&b| b == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok()?.rsplit(',').next())
+        .any(|soc| ["tegra21", "tegra18", "tegra19"].iter().any(|generation| soc.starts_with(generation)));
+    let mut served = vec![Codec::H264, Codec::H265];
+    if !without_av1 {
+        served.push(Codec::Av1);
+    }
+    served
 }
 
 /// Whether this host has the Tegra encoder: the encoder library loads and an encoder node is
@@ -1341,15 +1358,25 @@ mod tests {
     }
 
     /// Every codec the backend reports is one it can open, so the ladder never picks a hardware
-    /// path that the session then refuses and logs as a failure.
+    /// path that the session then refuses and logs as a failure: AV1 is withheld on the
+    /// generations without the engine, whose node enumerates the format regardless, and kept
+    /// on an Orin and on any board this does not know.
     #[test]
     fn every_codec_reported_is_one_a_session_can_be_opened_for() {
-        let served = served();
-        assert!(!served.is_empty());
-        for codec in &served {
-            assert!(coded_fourcc(*codec).is_some(), "{} is reported but has no format", codec.display());
+        let nano = b"nvidia,p3450-0000+p3448-0000\0nvidia,jetson-nano\0nvidia,tegra210\0";
+        let tx2 = b"nvidia,quill\0nvidia,tegra186\0";
+        let xavier = b"nvidia,p2972-0000\0nvidia,tegra194\0";
+        let orin = b"nvidia,p3737-0000+p3701-0000\0nvidia,tegra234\0nvidia,tegra23x\0";
+        let thor = b"nvidia,tegra264\0";
+        for (board, av1) in [(&nano[..], false), (tx2, false), (xavier, false), (orin, true), (thor, true), (b"", true)] {
+            let served = served_on(board);
+            assert_eq!(served.contains(&Codec::Av1), av1, "{}", String::from_utf8_lossy(board));
+            assert!(served.contains(&Codec::H264) && served.contains(&Codec::H265));
+            for codec in &served {
+                assert!(coded_fourcc(*codec).is_some(), "{} is reported but has no format", codec.display());
+            }
         }
-        assert!(served.contains(&Codec::H264) && served.contains(&Codec::H265));
+        assert!(!served().is_empty());
     }
 
     /// The profile control is the codec's own: H.264's is a standard kernel CID and H.265's a

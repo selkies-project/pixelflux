@@ -485,7 +485,7 @@ pub enum FrameSource {
 ///    then runs this ladder again with host frames.
 /// 3. The software encoder of the codec, except JPEG and H.264, whose software path is the
 ///    striped one. A codec this build has no software encoder for demotes the session to
-///    H.264, rewriting `settings.codec`, so the stream comes up rather than staying black.
+///    JPEG, the one path every client decodes, rewriting `settings.codec`.
 pub fn select_frame_encoder(
     settings: &mut RustCaptureSettings,
     source: FrameSource,
@@ -502,25 +502,30 @@ pub fn select_frame_encoder(
         (software_forced, tegra::coded_fourcc(codec), source)
     {
         // Tegra publishes no render node driver to probe and carries no libnvidia-encode, so the
-        // vendor library is the only way to its encoder and this step comes before both.
+        // vendor library is the only way to its encoder and this step comes before both; a
+        // codec it does not serve, or refuses, goes straight to software, past the two backends
+        // the board lacks.
         if tegra::available() {
             drop(prior);
-            match tegra::TegraEncoder::new(codec, settings, rgba) {
-                Ok(enc) => {
-                    println!(
-                        "[{tag}] Encoder: TEGRA {} {} on the vendor V4L2 encoder.",
-                        codec.display(),
-                        chroma_name(enc.is_fullcolor())
-                    );
-                    return Some(FrameEncoder::Tegra(enc));
+            if tegra::served().contains(&codec) {
+                match tegra::TegraEncoder::new(codec, settings, rgba) {
+                    Ok(enc) => {
+                        println!(
+                            "[{tag}] Encoder: TEGRA {} {} on the vendor V4L2 encoder.",
+                            codec.display(),
+                            chroma_name(enc.is_fullcolor())
+                        );
+                        return Some(FrameEncoder::Tegra(enc));
+                    }
+                    Err(e) => {
+                        eprintln!("[{tag}] Failed to init the Tegra encoder: {e}");
+                        crate::report::encoder_reason(&format!("Tegra {} did not open: {e}", codec.display()));
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[{tag}] Failed to init the Tegra encoder: {e}");
-                    println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(codec));
-                    crate::report::encoder_reason(&format!("Tegra {} did not open: {e}", codec.display()));
-                }
+            } else {
+                crate::report::encoder_reason(&format!("the Tegra encoder has no {} engine", codec.display()));
             }
-            return None;
+            return software_fallback(settings, rgba, tag);
         }
     }
     if !software_forced {
@@ -614,6 +619,13 @@ pub fn select_frame_encoder(
     let FrameSource::Host { rgba } = source else {
         return None;
     };
+    software_fallback(settings, rgba, tag)
+}
+
+/// The codec's software encoder; `None` for H.264, whose software path is the striped one, and
+/// for JPEG, which a codec this build has no software encoder for is demoted to.
+fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) -> Option<FrameEncoder> {
+    let codec = settings.codec;
     if codec == Codec::H264 {
         println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(Codec::H264));
         return None;
@@ -624,12 +636,8 @@ pub fn select_frame_encoder(
             Some(FrameEncoder::Avcodec(enc))
         }
         Err(e) => {
-            eprintln!(
-                "[{tag}] No {} encoder available: {e}. Encoding H.264 ({}) instead.",
-                codec.display(),
-                software_library(Codec::H264)
-            );
-            settings.codec = Codec::H264;
+            eprintln!("[{tag}] No {} encoder available: {e}. Encoding JPEG instead.", codec.display());
+            settings.codec = Codec::Jpeg;
             None
         }
     }

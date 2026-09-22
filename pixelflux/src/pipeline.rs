@@ -175,7 +175,7 @@ impl X11Pipeline {
     /// Build the context, choosing the full-frame encoder for the X11 host-BGRA path through
     /// the shared ladder (`select_frame_encoder`): the hardware backend the encode node's driver
     /// selects, then the codec's software encoder, or the striped software path for JPEG and
-    /// H.264. A codec no backend serves demotes the pipeline to H.264.
+    /// H.264. A codec no backend serves demotes the pipeline to JPEG.
     pub fn new(mut settings: RustCaptureSettings) -> Self {
         let hw = encoders::select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "X11");
         let pipeline = Self {
