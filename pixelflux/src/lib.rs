@@ -8170,8 +8170,9 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ScreenCapture>()?;
     m.add_class::<webcam::VirtualCamera>()?;
     m.add_class::<webcam::VirtualCameraSettings>()?;
-    // The software H.264 encoder this build resolved to ("x264" | "openh264"): what a CPU
-    // H.264 session encodes with, so a consumer can pick rate-control defaults and name it.
+    // The software encoder of each video codec this build runs on this machine, by codec name:
+    // what a CPU session encodes with, so a consumer can pick rate-control defaults and name
+    // it, and a codec absent here has no software path on this host.
     let software = pyo3::types::PyDict::new(m.py());
     for codec in Codec::VIDEO {
         if let Some(enc) = encoders::software_encoder(codec) {

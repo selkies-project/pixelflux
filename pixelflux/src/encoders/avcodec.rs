@@ -613,10 +613,6 @@ impl AvcodecEncoder {
         if backend == Backend::Software && input == Input::Dmabuf {
             return Err("a software session takes host frames, not dmabufs".into());
         }
-        set_log_level(settings.debug_logging);
-        let width = settings.width;
-        let height = settings.height;
-        let fps = (settings.target_fps as i32).max(1);
         let (library, name) = match backend {
             Backend::Vaapi => ("vaapi", format!("{}_vaapi", vaapi_codec_name(codec))),
             Backend::Software => {
@@ -626,6 +622,23 @@ impl AvcodecEncoder {
                 (enc.library, enc.avcodec.to_string())
             }
         };
+        Self::open(settings, codec, backend, library, &name, input)
+    }
+
+    /// `new` on the libavcodec encoder `name` of `library`, resolved by the caller: the build's
+    /// probe opens a candidate here without consulting the table it is filling.
+    pub(super) fn open(
+        settings: &RustCaptureSettings,
+        codec: Codec,
+        backend: Backend,
+        library: &'static str,
+        name: &str,
+        input: Input,
+    ) -> Result<Self, String> {
+        set_log_level(settings.debug_logging);
+        let width = settings.width;
+        let height = settings.height;
+        let fps = (settings.target_fps as i32).max(1);
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
@@ -633,7 +646,7 @@ impl AvcodecEncoder {
             .clamp(1, 8) as i32;
 
         unsafe {
-            let cname = CString::new(name.clone()).unwrap();
+            let cname = CString::new(name).unwrap();
             let avcodec = ff::avcodec_find_encoder_by_name(cname.as_ptr());
             if avcodec.is_null() {
                 return Err(format!("{name} encoder not found in this FFmpeg"));

@@ -141,15 +141,17 @@ pub fn software_library(codec: Codec) -> &'static str {
     software_encoder(codec).map_or("none", |enc| enc.library)
 }
 
-/// The software encoder this build runs for `codec`, or `None` when the linked FFmpeg
-/// carries none of the encoders the codec is served by.
+/// The software encoder this build runs for `codec` on this machine, or `None` when the linked
+/// FFmpeg carries none of the encoders the codec is served by that run here.
 ///
 /// H.264 is fixed by the crate features: libx264 whenever `gpl` is on (it wins even if
 /// `openh264` is also enabled), Cisco OpenH264 for a GPL-free build; it is what the striped
 /// software path and the full-frame software fallback under NVENC/VA-API both encode with.
 /// The other codecs are probed once against the linked libavcodec: HEVC through x265 (GPL,
 /// so only with the `gpl` feature) or kvazaar, VP8 and VP9 through libvpx, AV1 through
-/// SVT-AV1. A build without `gpl` never picks x265 even from a system FFmpeg that has it,
+/// SVT-AV1, each opened on a frame in a forked child first, so an encoder that takes its
+/// process down on this machine is one the build does not carry here and the next candidate
+/// is tried. A build without `gpl` never picks x265 even from a system FFmpeg that has it,
 /// keeping the GPL-free posture the feature promises.
 pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
     static PROBED: OnceLock<[Option<SoftwareEncoder>; 5]> = OnceLock::new();
@@ -165,18 +167,18 @@ pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
         } else {
             &[SoftwareEncoder { library: "kvazaar", avcodec: "libkvazaar" }]
         };
-        let first_linked = |candidates: &[SoftwareEncoder]| {
-            candidates.iter().copied().find(|c| avcodec_has_encoder(c.avcodec))
+        let first_linked = |codec: Codec, candidates: &[SoftwareEncoder]| {
+            candidates.iter().copied().find(|c| avcodec_has_encoder(c.avcodec) && encodes_in_child(codec, *c))
         };
         [
             Some(SoftwareEncoder {
                 library: if cfg!(feature = "gpl") { "x264" } else { "openh264" },
                 avcodec: "",
             }),
-            first_linked(&[SoftwareEncoder { library: "libvpx", avcodec: "libvpx" }]),
-            first_linked(&[SoftwareEncoder { library: "libvpx", avcodec: "libvpx-vp9" }]),
-            first_linked(&[SoftwareEncoder { library: "svt-av1", avcodec: "libsvtav1" }]),
-            first_linked(h265),
+            first_linked(Codec::Vp8, &[SoftwareEncoder { library: "libvpx", avcodec: "libvpx" }]),
+            first_linked(Codec::Vp9, &[SoftwareEncoder { library: "libvpx", avcodec: "libvpx-vp9" }]),
+            first_linked(Codec::Av1, &[SoftwareEncoder { library: "svt-av1", avcodec: "libsvtav1" }]),
+            first_linked(Codec::H265, h265),
         ]
     });
     table[Codec::VIDEO.iter().position(|&c| c == codec).unwrap()]
@@ -186,6 +188,53 @@ pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
 fn avcodec_has_encoder(name: &str) -> bool {
     let Ok(name) = CString::new(name) else { return false };
     unsafe { !ffmpeg_sys_next::avcodec_find_encoder_by_name(name.as_ptr()).is_null() }
+}
+
+/// Whether opening `enc` for `codec` on a small frame and encoding one leaves a process alive,
+/// tried in a forked child: a library that faults on this machine, with an instruction the CPU
+/// lacks or a register the kernel does not emulate, takes the child down and not a session.
+fn encodes_in_child(codec: Codec, enc: SoftwareEncoder) -> bool {
+    survives_in_child(|| {
+        let settings = RustCaptureSettings { width: 256, height: 128, ..Default::default() };
+        let Ok(mut encoder) = AvcodecEncoder::open(
+            &settings, codec, Backend::Software, enc.library, enc.avcodec, Input::Host { rgba: false },
+        ) else {
+            return;
+        };
+        let frame = vec![0u8; 256 * 128 * 4];
+        for n in 0..64 {
+            let packet = encoder.encode_host(&frame, 256 * 4, n, settings.video_crf as u32, n == 0);
+            if !matches!(packet, Ok(p) if p.is_empty()) {
+                break;
+            }
+        }
+    })
+}
+
+/// Whether a forked child outlives `f`: a fatal signal in it is the finding, an exit is not, and
+/// neither reaches the caller. The child has a minute, and one that neither returns nor dies
+/// in it has stalled, which is as final. One a sandbox refuses to fork counts as alive.
+fn survives_in_child(f: impl FnOnce()) -> bool {
+    match unsafe { libc::fork() } {
+        0 => {
+            unsafe {
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
+                libc::alarm(60);
+            }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            unsafe { libc::_exit(0) }
+        }
+        pid if pid > 0 => {
+            let mut status = 0;
+            while unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return true;
+                }
+            }
+            !libc::WIFSIGNALED(status)
+        }
+        _ => true,
+    }
 }
 
 /// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
@@ -256,6 +305,16 @@ mod tests {
     /// The build always serves H.264 in software, JPEG never, and whatever the linked FFmpeg
     /// carries for the rest is reported by a library name with a libavcodec encoder behind it;
     /// a GPL-free build never names x265.
+    /// A child's fate is the finding: a fatal signal, and only that, reads as not surviving.
+    #[test]
+    fn a_child_survives_unless_a_signal_takes_it() {
+        assert!(survives_in_child(|| {}));
+        assert!(survives_in_child(|| unsafe { libc::_exit(3) }));
+        assert!(!survives_in_child(|| unsafe {
+            libc::raise(libc::SIGILL);
+        }));
+    }
+
     #[test]
     fn software_encoders_follow_the_build() {
         let h264 = software_encoder(Codec::H264).expect("H.264 is always served");
