@@ -332,7 +332,7 @@ mod tests {
 
     /// A codec with no path on this host falls through the video codecs it does serve, the
     /// encode node's hardware ones first and most efficient first, the software ones by encode
-    /// time, and never onto H.264's striped software path.
+    /// time, with software H.264 among them for a full-frame session alone.
     #[test]
     fn a_codec_without_a_path_falls_through_the_served_video_codecs() {
         let software: Vec<Codec> = SOFTWARE_ORDER
@@ -342,15 +342,15 @@ mod tests {
                 codec != Codec::Av1 && codec != Codec::H264 && software_encoder(codec).is_some()
             })
             .collect();
-        assert_eq!(fallback_codecs(Codec::Av1, &[]), software);
-        assert!(!fallback_codecs(Codec::Av1, &[]).contains(&Codec::H264));
-        let mut hardware_first = vec![Codec::H264];
-        hardware_first.extend(software.iter().copied());
-        assert_eq!(fallback_codecs(Codec::Av1, &[Codec::H264]), hardware_first);
-        assert!(!fallback_codecs(Codec::Av1, &[Codec::Av1]).contains(&Codec::Av1));
+        assert_eq!(fallback_codecs(Codec::Av1, &[], false), software);
+        let mut h264_first = vec![Codec::H264];
+        h264_first.extend(software.iter().copied());
+        assert_eq!(fallback_codecs(Codec::Av1, &[], true), h264_first, "one x264 session leads the software rungs");
+        assert_eq!(fallback_codecs(Codec::Av1, &[Codec::H264], false), h264_first, "an engine's H.264 leads either way");
+        assert!(!fallback_codecs(Codec::Av1, &[Codec::Av1], true).contains(&Codec::Av1));
         // An engine's codecs go most efficient first, whatever the build encodes in software.
         let engine = [Codec::H264, Codec::H265, Codec::Av1];
-        assert_eq!(&fallback_codecs(Codec::Vp8, &engine)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
+        assert_eq!(&fallback_codecs(Codec::Vp8, &engine, true)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
     }
 
     /// The software encoders that take a 4:4:4 session: x264 and x265, and libvpx for VP9 alone;
@@ -605,8 +605,9 @@ pub enum FrameSource {
 /// 3. The software encoder of the codec, except JPEG and H.264, whose software path is the
 ///    striped one.
 /// 4. Where the codec has no path at all, the other video codecs this host serves, the encode
-///    node's hardware ones before the build's software ones, then H.264's striped software
-///    path, and JPEG only past all of them. `settings.codec` names what came up.
+///    node's hardware ones before the build's software ones, software H.264 among the latter
+///    for a full-frame session, then the striped H.264 path, and JPEG only past all of them.
+///    `settings.codec` names what came up.
 pub fn select_frame_encoder(
     settings: &mut RustCaptureSettings,
     source: FrameSource,
@@ -634,10 +635,14 @@ pub fn select_frame_encoder(
         hardware_encoders(settings.encode_node_index).into_iter().map(|(codec, ..)| codec).collect()
     };
     eprintln!("[{tag}] No {} path on this host; trying the video codecs it serves.", requested.display());
-    for codec in fallback_codecs(requested, &hardware) {
+    for codec in fallback_codecs(requested, &hardware, settings.video_fullframe) {
         settings.codec = codec;
         if let Some(enc) = select_for_codec(settings, source, None, tag) {
             return Some(enc);
+        }
+        // Software H.264 is the caller's own path, one x264 session for a full-frame capture.
+        if codec == Codec::H264 && settings.video_fullframe && software_encoder(Codec::H264).is_some() {
+            return None;
         }
     }
     // No full-frame codec came up: H.264's software path, the striped one, is the last video
@@ -661,10 +666,10 @@ const SOFTWARE_ORDER: [Codec; 5] = [Codec::H264, Codec::Av1, Codec::Vp8, Codec::
 
 /// The video codecs a capture falls through to where the one it asked for has no path on this
 /// host: those an engine on the encode node carries, named in `hardware`, in `HARDWARE_ORDER`,
-/// then those the build encodes in software, in `SOFTWARE_ORDER`. H.264 joins through hardware
-/// alone: its software path is the striped one, which the ladder reaches only past every
-/// full-frame rung.
-fn fallback_codecs(requested: Codec, hardware: &[Codec]) -> Vec<Codec> {
+/// then those the build encodes in software, in `SOFTWARE_ORDER`. Software H.264 joins a
+/// full-frame session, where it is one x264 session; otherwise its software path is the
+/// striped one, which the ladder reaches only past every full-frame rung.
+fn fallback_codecs(requested: Codec, hardware: &[Codec], fullframe: bool) -> Vec<Codec> {
     let mut codecs: Vec<Codec> = HARDWARE_ORDER
         .iter()
         .copied()
@@ -672,7 +677,7 @@ fn fallback_codecs(requested: Codec, hardware: &[Codec]) -> Vec<Codec> {
         .collect();
     codecs.extend(SOFTWARE_ORDER.iter().copied().filter(|&codec| {
         codec != requested
-            && codec != Codec::H264
+            && (codec != Codec::H264 || fullframe)
             && !hardware.contains(&codec)
             && software_encoder(codec).is_some()
     }));
