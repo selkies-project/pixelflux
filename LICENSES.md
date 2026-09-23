@@ -40,7 +40,7 @@ contains it.
 | --- | --- | --- | --- | --- | --- |
 | libx264 (via `x264-sys`) | GPL-2.0-or-later | copyleft | GPL only | linked shared library (`NEEDED libx264.so.*`); auditwheel bundles it into the manylinux wheel, the musllinux wheel takes Alpine's package | Striped software H.264. The only GPL component of pixelflux itself; the `x264-sys` crate is MIT but has no purpose without libx264. |
 | Cisco OpenH264 2.6 (via `openh264-sys2`) | BSD-2-Clause | permissive | non-GPL only | compiled from the source vendored in the crate (needs a C++ toolchain and nasm) and linked statically; no binary download | Software H.264 without GPL. Cisco's royalty-covered binary module is irrelevant to a source build; the AVC patent pool applies to any H.264 encoder and is the deployer's concern. Pulls `libstdc++` in as the only C++ code. |
-| FFmpeg libavcodec, libavfilter, libavutil (via `ffmpeg-sys-next`), plus libswresample, libswscale and libavformat they depend on | LGPL-2.1-or-later as built for the non-GPL wheels (n8.1, `--enable-shared --disable-static --disable-programs`, no `--enable-gpl`; the libraries report "LGPL version 2.1 or later"); GPL-2.0-or-later as built for the GPL wheels (`--enable-gpl --enable-libx265`); whatever the system FFmpeg is when building from source | weak copyleft (non-GPL wheel), copyleft (GPL wheel) | both | linked shared libraries; the wheels bundle them, a source build links the system FFmpeg | the VA-API encoders (`h264_vaapi`, `hevc_vaapi`, `vp8_vaapi`, `vp9_vaapi`, `av1_vaapi`) and filters, and the software encoders below. A GPL-built system FFmpeg (Debian/Ubuntu, Alpine, conda-forge's `gpl_*` variant) makes the linked set GPL: see [Distribution notes](#distribution-notes). |
+| FFmpeg libavcodec, libavfilter, libavutil (via `ffmpeg-sys-next`), plus libswresample, libswscale, and libavformat they depend on | LGPL-2.1-or-later as built for the non-GPL wheels (n8.1, `--enable-shared --disable-static --disable-programs`, no `--enable-gpl`; the libraries report "LGPL version 2.1 or later"); GPL-2.0-or-later as built for the GPL wheels (`--enable-gpl --enable-libx265`); whatever the system FFmpeg is when building from source | weak copyleft (non-GPL wheel), copyleft (GPL wheel) | both | linked shared libraries; the wheels bundle them, a source build links the system FFmpeg | the VA-API encoders (`h264_vaapi`, `hevc_vaapi`, `vp8_vaapi`, `vp9_vaapi`, `av1_vaapi`) and filters, and the software encoders below. A GPL-built system FFmpeg (Debian/Ubuntu, Alpine, conda-forge's `gpl_*` variant) makes the linked set GPL: see [Distribution notes](#distribution-notes). |
 | x265 | GPL-2.0-or-later | copyleft | GPL only | linked by libavcodec (`libx265`); bundled into the GPL wheels | software H.265 (incl. 4:4:4) |
 | kvazaar | BSD-3-Clause | permissive | both | linked by libavcodec (`libkvazaar`); bundled into the wheels | software H.265 of a GPL-free build (4:2:0) |
 | libvpx | BSD-3-Clause | permissive | both | linked by libavcodec (`libvpx`, `libvpx-vp9`); bundled into the wheels | software VP8 and VP9 |
@@ -349,7 +349,7 @@ table below.
   OpenH264 and libjpeg-turbo compiled from vendored BSD/IJG source;
 - linked: FFmpeg libavcodec/libavfilter/libavutil (+ swresample, swscale,
   avformat) under LGPL-2.1-or-later when FFmpeg is built without
-  `--enable-gpl`, and through it kvazaar, libvpx, SVT-AV1 and dav1d (BSD),
+  `--enable-gpl`, and through it kvazaar, libvpx, SVT-AV1, and dav1d (BSD),
   libgbm, libpixman-1, libxkbcommon (MIT), the C and C++
   runtimes (glibc LGPL-2.1-or-later or musl MIT; libgcc_s/libstdc++ with the
   GCC runtime exception), and through FFmpeg libva/libdrm/libX11 (MIT);
@@ -375,7 +375,7 @@ The default build (`gpl` feature, what the published wheels and
   of kvazaar; the wheels' FFmpeg is built `--enable-gpl --enable-libx265`;
 - removes the OpenH264 crates and `safe_arch`/`wide` from the binary (they stay
   dev-dependencies for the tests);
-- the resulting binary is a combination of MPL-2.0, permissive and GPL code and
+- the resulting binary is a combination of MPL-2.0, permissive, and GPL code and
   is therefore distributed under the GPL-2.0-or-later terms as a whole
   (MPL-2.0 is GPL-compatible through its secondary-license clause). setup.py
   prints which configuration is being built.
@@ -383,7 +383,7 @@ The default build (`gpl` feature, what the published wheels and
 ## Distribution notes
 
 - manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): FFmpeg
-  n8.1, kvazaar, libvpx, SVT-AV1 and dav1d — plus x264 and x265 for the GPL
+  n8.1, kvazaar, libvpx, SVT-AV1, and dav1d — plus x264 and x265 for the GPL
   wheel — are built from source in the image; auditwheel bundles them
   (`libx264.so`, `libx265.so`, `libkvazaar.so`, `libvpx.so`, `libSvtAv1Enc.so`,
   `libdav1d.so`, `libavcodec`, `libavfilter`, `libavformat`, `libavutil`,

@@ -13,7 +13,7 @@ explanation. The code commenting should reflect the current state of the codebas
 to an LLM bot or developer. Write American English -- color, behavior, center, initialize, canceled -- except
 where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
-Empirical testing is possible for everything here, including implementation, auditing, validation and verification,
+Empirical testing is possible for everything here, including implementation, auditing, validation, and verification,
 and every change is validated before it is reported. `cargo test --lib` in both feature configurations is the floor;
 the `#[ignore]`d `gpu_` tests need an NVIDIA GPU (`cargo test gpu_ -- --ignored --nocapture --test-threads=1`,
 serially, since concurrent session builds fault in the driver), the `gpu_dmabuf_` ones a render node as well, and the
@@ -80,7 +80,7 @@ IDR instead; an H.264 session answers a loss covering the frame at its `frame_nu
 since FFmpeg's decoder derives the picture order past that gap wrongly and withholds every picture after it. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then NVENC on the NVIDIA
 driver, VA-API otherwise, then a stateful V4L2 memory-to-memory device, then the codec's software encoder, then
-a demotion to H.264), shared by X11, Wayland zero-copy and Wayland readback.
+a demotion to H.264), shared by X11, Wayland zero-copy, and Wayland readback.
 The V4L2 step comes after the render-node probes, since a machine carrying either backend never reaches it, and
 the boards it serves -- the Raspberry Pi's `bcm2835-codec`, RK356x's hantro, i.MX8M's VPU -- publish no driver
 for those probes to select. It is reached by asking for the interface (`V4L2_CAP_VIDEO_M2M` and the codec's
@@ -93,7 +93,7 @@ Only the picture type is codec-specific, because an H.265 NAL header is two byte
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
 the libavcodec session: VA-API for all five codecs (a 4:4:4 session tries the surface formats the
 driver allocates and its video processor renders, read through libva's `VAProfileNone`
-configuration, until one survives the surface pool, the convert and the codec open: Intel's iHD
+configuration, until one survives the surface pool, the convert, and the codec open: Intel's iHD
 allocates planar 444P but its VPP writes 4:4:4 only packed, as XYUV, and its HEVC 4:4:4 entry point
 takes only what the VPP writes), and the software HEVC (x265 with the `gpl` feature, else
 kvazaar), VP8/VP9 (libvpx) and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
@@ -149,7 +149,7 @@ xdg-desktop-portal RemoteDesktop/ScreenCast session whose PipeWire streams are i
 (`wayland/portal.rs` over the pure-Rust zbus client, `wayland/pwcapture.rs` over the run-time
 libpipewire binding shared with the webcam sink in `pipewire.rs`); keyboard and pointer over libei
 (`wayland/eiclient.rs`, the pure-Rust `reis` client) where the backend answers `ConnectToEIS`, since
-it carries keyboard, pointer and touch on one socket, else the virtual-keyboard and virtual-pointer
+it carries keyboard, pointer, and touch on one socket, else the virtual-keyboard and virtual-pointer
 protocols where the host offers them, else kernel uinput devices where `/dev/uinput` is writable, and
 the portal's own `Notify*` methods by keysym last. That order is measured rather than assumed: a
 socket write to the compositor runs about 4 us, a uinput write reaching its evdev node about 12 us,
