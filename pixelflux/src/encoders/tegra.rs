@@ -110,6 +110,10 @@ const NVBUF_FILTER_SMART: u32 = 4;
 
 const OUTPUT_BUFFERS: usize = 4;
 const CAPTURE_BUFFERS: usize = 4;
+/// How long the engine is given for an access unit it is expected to have. Its encode time is
+/// well inside this on every board, so a wait that runs out means the unit is not coming until
+/// more input does.
+const OUTPUT_WAIT_MS: i32 = 100;
 const ENCODER_NODES: [&str; 2] = ["/dev/v4l2-nvenc", "/dev/nvhost-msenc"];
 
 #[repr(C)]
@@ -654,6 +658,14 @@ pub struct TegraEncoder {
     staging_pitch: usize,
     capture: [(*mut c_void, usize); CAPTURE_BUFFERS],
     queued: usize,
+    /// Access units queued and not yet collected. The engine emits a frame once the next is
+    /// queued behind it, so one is expected only from `wait_from` in flight, learned from the
+    /// waits that ran out rather than assumed of a generation.
+    outstanding: usize,
+    wait_from: usize,
+    /// The newest frame of its own, whose unit is still inside, and the slot it was converted
+    /// into: a still screen repeats it to bring the unit out.
+    held: Option<(u64, usize)>,
     scratch: Vec<u8>,
     codec: Codec,
     omit_headers: bool,
@@ -708,6 +720,9 @@ impl TegraEncoder {
             staging_pitch: 0,
             capture: [(ptr::null_mut(), 0); CAPTURE_BUFFERS],
             queued: 0,
+            outstanding: 0,
+            wait_from: 1,
+            held: None,
             scratch: Vec::new(),
             codec,
             omit_headers: settings.omit_stripe_headers,
@@ -1175,7 +1190,28 @@ impl TegraEncoder {
             return Err("input buffer too small".into());
         }
         self.fill_staging(pixels, stride)?;
+        self.submit(frame_number, force_idr, false)
+    }
 
+    /// Bring the newest frame's access unit out on a still screen. With no next frame coming the
+    /// unit would stay inside, so the frame is queued again from its staging copy, under the
+    /// number of the tick that repeats it; the repeat's own unit is one more of the same picture.
+    pub fn push_held(&mut self, frame_number: u64) -> Result<Vec<u8>, String> {
+        if !self.holds_frame() {
+            return Ok(Vec::new());
+        }
+        self.submit(frame_number, false, true)
+    }
+
+    /// Whether a frame's unit is inside with room to repeat it.
+    pub fn holds_frame(&self) -> bool {
+        self.held.is_some() && self.outstanding < OUTPUT_BUFFERS - 1
+    }
+
+    /// Queue the staging frame and take what the engine has ready, waiting for it where a unit
+    /// is expected. A wait that runs out raises the number in flight one is expected from, so a
+    /// deeper engine costs one wait per depth rather than one per frame.
+    fn submit(&mut self, frame_number: u64, force_idr: bool, repeat: bool) -> Result<Vec<u8>, String> {
         let slot = if self.queued < OUTPUT_BUFFERS {
             self.queued
         } else {
@@ -1202,7 +1238,16 @@ impl TegraEncoder {
         buffer.timestamp = [frame_number as i64, 0];
         self.ioctl(VIDIOC_QBUF, &mut buffer, "QBUF output")?;
         self.queued = (self.queued + 1).min(OUTPUT_BUFFERS);
-
+        self.outstanding += 1;
+        if !repeat {
+            self.held = Some((frame_number, slot));
+        }
+        if self.outstanding >= self.wait_from {
+            let mut poll = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut poll, 1, OUTPUT_WAIT_MS) } != 1 {
+                self.wait_from = self.outstanding + 1;
+            }
+        }
         self.collect()
     }
 
@@ -1265,6 +1310,10 @@ impl TegraEncoder {
             }
             let index = buffer.index as usize;
             let length = planes[0].bytesused as usize;
+            self.outstanding = self.outstanding.saturating_sub(1);
+            if self.held.is_some_and(|(number, _)| number == buffer.timestamp[0] as u64) {
+                self.held = None;
+            }
             if length > 0 {
                 let (data, _) = self.capture[index];
                 let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };

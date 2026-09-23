@@ -529,6 +529,25 @@ impl FrameEncoder {
     }
 
     /// The frame the last delivered frame predicted from.
+    /// The access unit a still screen leaves inside an engine that emits a frame only once the
+    /// next is queued: empty from every other backend, whose units come with their frame.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    pub fn push_held(&mut self, frame_number: u64) -> Result<Vec<u8>, String> {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            FrameEncoder::Tegra(enc) => enc.push_held(frame_number),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    pub fn holds_frame(&self) -> bool {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            FrameEncoder::Tegra(enc) => enc.holds_frame(),
+            _ => false,
+        }
+    }
+
     pub fn last_reference(&self) -> reference::Reference {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_reference(),

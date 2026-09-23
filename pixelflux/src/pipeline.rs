@@ -380,11 +380,15 @@ impl X11Pipeline {
                 false,
                 requested,
             );
-            if d.send {
-                let fc = self.frame_counter as u64;
+            let fc = self.frame_counter as u64;
+            if d.send || self.hw.as_ref().unwrap().holds_frame() {
                 let force_idr = d.force_idr;
                 let enc = self.hw.as_mut().unwrap();
-                let res = enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr);
+                let res = if d.send {
+                    enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr)
+                } else {
+                    enc.push_held(fc)
+                };
                 match res {
                     Ok(data) if !data.is_empty() => {
                         self.hw_error_streak = 0;

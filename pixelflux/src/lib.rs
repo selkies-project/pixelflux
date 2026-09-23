@@ -1322,7 +1322,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 f.is_animated,
                 requested_idr,
             );
-            if decision.send {
+            if decision.send || encoder.holds_frame() {
                 let w = width as u32;
                 let force_idr = decision.force_idr;
                 // The readback rows go to the encoder as they are — BGRA from the pixman
@@ -1330,14 +1330,18 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 // converts on the GPU and a software one on its own threads, so no color
                 // conversion runs here.
                 let encode_start_ns = wayland::host::now_ns();
-                let outcome = encoder.encode_host(
-                    &f.buf,
-                    (w * 4) as usize,
-                    cfg.use_gpu,
-                    f.frame_id as u64,
-                    decision.target_qp,
-                    force_idr,
-                );
+                let outcome = if decision.send {
+                    encoder.encode_host(
+                        &f.buf,
+                        (w * 4) as usize,
+                        cfg.use_gpu,
+                        f.frame_id as u64,
+                        decision.target_qp,
+                        force_idr,
+                    )
+                } else {
+                    encoder.push_held(f.frame_id as u64)
+                };
                 match outcome {
                     Ok(data) => {
                         hw_error_streak = 0;
