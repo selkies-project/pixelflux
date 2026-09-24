@@ -504,6 +504,54 @@ pub enum Input {
     Host { rgba: bool },
 }
 
+/// Open a graph's `buffer` source for `width`x`height` frames of `format` at `fps`, over
+/// `hw_frames_ctx` when they are hardware frames, declared as the full-range pictures the session
+/// feeds it (`encode_through_graph` tags every frame so). A libavfilter that compares a frame's
+/// range with its source's (10 and later) takes the first frame of a source left unspecified as a
+/// change of properties and logs so on every session; one without the option compares nothing,
+/// and the declaration is skipped there.
+unsafe fn open_buffersrc(
+    graph: *mut ff::AVFilterGraph,
+    format: ff::AVPixelFormat,
+    hw_frames_ctx: *mut ff::AVBufferRef,
+    width: i32,
+    height: i32,
+    fps: i32,
+) -> Result<*mut ff::AVFilterContext, String> {
+    let ctx = ff::avfilter_graph_alloc_filter(graph, ff::avfilter_get_by_name(c"buffer".as_ptr()), c"in".as_ptr());
+    if ctx.is_null() {
+        return Err("Failed to alloc buffersrc".into());
+    }
+    let par = ff::av_buffersrc_parameters_alloc();
+    if par.is_null() {
+        return Err("Failed to alloc buffersrc parameters".into());
+    }
+    (*par).format = format as i32;
+    if !hw_frames_ctx.is_null() {
+        (*par).hw_frames_ctx = ff::av_buffer_ref(hw_frames_ctx);
+    }
+    (*par).width = width;
+    (*par).height = height;
+    (*par).time_base = ff::AVRational { num: 1, den: fps };
+    let ret = ff::av_buffersrc_parameters_set(ctx, par);
+    if !(*par).hw_frames_ctx.is_null() {
+        ff::av_buffer_unref(&mut (*par).hw_frames_ctx);
+    }
+    ff::av_free(par as *mut c_void);
+    if ret < 0 {
+        return Err(format!("Failed to set buffersrc parameters: {}", ff_err_str(ret)));
+    }
+    let ret = ff::av_opt_set(ctx as *mut c_void, c"range".as_ptr(), c"pc".as_ptr(), ff::AV_OPT_SEARCH_CHILDREN);
+    if ret < 0 && ret != ff::AVERROR_OPTION_NOT_FOUND {
+        return Err(format!("Failed to declare the buffersrc range: {}", ff_err_str(ret)));
+    }
+    let args = CString::new(format!("video_size={width}x{height}:time_base=1/{fps}:pixel_aspect=1/1")).unwrap();
+    if ff::avfilter_init_str(ctx, args.as_ptr()) < 0 {
+        return Err("Failed to init buffersrc".into());
+    }
+    Ok(ctx)
+}
+
 /// The VA-API half of a session: device and frame contexts, the upload/convert filter graph,
 /// and the reusable frames, all freed in dependency order by `Drop`.
 struct VaapiSession {
@@ -927,39 +975,13 @@ impl AvcodecEncoder {
         if graph.is_null() {
             return Err("Failed to alloc the filter graph".into());
         }
-        let buffersrc = ff::avfilter_get_by_name(c"buffer".as_ptr());
-        let buffersink = ff::avfilter_get_by_name(c"buffersink".as_ptr());
-        session.buffersrc_ctx = ff::avfilter_graph_alloc_filter(graph, buffersrc, c"in".as_ptr());
-
-        let par = ff::av_buffersrc_parameters_alloc();
-        if par.is_null() {
-            return Err("Failed to alloc buffersrc parameters".into());
-        }
-        if self.input == Input::Dmabuf {
-            (*par).format = ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME as i32;
-            (*par).hw_frames_ctx = ff::av_buffer_ref(session.drm_frames_ctx);
+        let (format, hw_frames_ctx) = if self.input == Input::Dmabuf {
+            (ff::AVPixelFormat::AV_PIX_FMT_DRM_PRIME, session.drm_frames_ctx)
         } else {
-            (*par).format = host_format as i32;
-        }
-        (*par).width = self.width;
-        (*par).height = self.height;
-        (*par).time_base = ff::AVRational { num: 1, den: self.fps };
-        let ret = ff::av_buffersrc_parameters_set(session.buffersrc_ctx, par);
-        if !(*par).hw_frames_ctx.is_null() {
-            ff::av_buffer_unref(&mut (*par).hw_frames_ctx);
-        }
-        ff::av_free(par as *mut c_void);
-        if ret < 0 {
-            return Err(format!("Failed to set buffersrc parameters: {}", ff_err_str(ret)));
-        }
-        let args = CString::new(format!(
-            "video_size={}x{}:time_base=1/{}:pixel_aspect=1/1",
-            self.width, self.height, self.fps
-        ))
-        .unwrap();
-        if ff::avfilter_init_str(session.buffersrc_ctx, args.as_ptr()) < 0 {
-            return Err("Failed to init buffersrc".into());
-        }
+            (host_format, ptr::null_mut())
+        };
+        session.buffersrc_ctx = open_buffersrc(graph, format, hw_frames_ctx, self.width, self.height, self.fps)?;
+        let buffersink = ff::avfilter_get_by_name(c"buffersink".as_ptr());
         if ff::avfilter_graph_create_filter(
             &mut session.buffersink_ctx,
             buffersink,
@@ -2276,6 +2298,89 @@ mod software_tests {
             let out = enc.encode_host(&frame(0), W * 4, 0, 25, true).unwrap();
             let mut dec = AvDecoder::new(codec).expect("decoder");
             assert!(decode_one(&mut dec, &out));
+        }
+    }
+
+    /// What libavfilter said about a frame whose properties differ from its source's, counted
+    /// off the format string the log callback is handed. The argument list's type is the
+    /// callback's own to name, since the bindings spell `va_list` differently per architecture.
+    static PROPERTY_CHANGES: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+    unsafe extern "C" fn count_property_changes<VaList>(
+        _: *mut c_void,
+        _: c_int,
+        fmt: *const std::ffi::c_char,
+        _: VaList,
+    ) {
+        let text = unsafe { std::ffi::CStr::from_ptr(fmt) }.to_string_lossy();
+        if text.contains("Changing video frame properties") {
+            *PROPERTY_CHANGES.lock().unwrap() += 1;
+        }
+    }
+
+    /// Feed one full-range BGRA frame through `buffer -> buffersink`, the source opened by
+    /// `open`, and count the property-change complaints libavfilter logged for it.
+    fn property_changes_for(open: impl FnOnce(*mut ff::AVFilterGraph) -> *mut ff::AVFilterContext) -> usize {
+        unsafe {
+            let mut graph = ff::avfilter_graph_alloc();
+            let src = open(graph);
+            let mut sink: *mut ff::AVFilterContext = ptr::null_mut();
+            assert!(
+                ff::avfilter_graph_create_filter(
+                    &mut sink,
+                    ff::avfilter_get_by_name(c"buffersink".as_ptr()),
+                    c"out".as_ptr(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    graph,
+                ) >= 0
+            );
+            assert!(ff::avfilter_link(src, 0, sink, 0) >= 0);
+            assert!(ff::avfilter_graph_config(graph, ptr::null_mut()) >= 0);
+            let frame = ff::av_frame_alloc();
+            (*frame).width = 64;
+            (*frame).height = 64;
+            (*frame).format = ff::AVPixelFormat::AV_PIX_FMT_BGRA as c_int;
+            assert!(ff::av_frame_get_buffer(frame, 0) >= 0);
+            (*frame).color_range = ff::AVColorRange::AVCOL_RANGE_JPEG;
+            *PROPERTY_CHANGES.lock().unwrap() = 0;
+            ff::av_log_set_callback(Some(count_property_changes));
+            let fed = ff::av_buffersrc_add_frame(src, frame);
+            let out = ff::av_frame_alloc();
+            while ff::av_buffersink_get_frame(sink, out) >= 0 {
+                ff::av_frame_unref(out);
+            }
+            ff::av_log_set_callback(Some(ff::av_log_default_callback));
+            assert!(fed >= 0, "the frame was not accepted: {}", ff_err_str(fed));
+            let mut frame = frame;
+            let mut out = out;
+            ff::av_frame_free(&mut frame);
+            ff::av_frame_free(&mut out);
+            ff::avfilter_graph_free(&mut graph);
+            *PROPERTY_CHANGES.lock().unwrap()
+        }
+    }
+
+    /// The source is opened at the range every frame carries. A libavfilter that compares the
+    /// two (10 and later; the option and the check are in 12, FFmpeg 9.0, as well) takes the
+    /// first frame of a source left unspecified as a change of properties and logs so, on every
+    /// session; the declared source gives it nothing to log. The undeclared source is the
+    /// control, proving the libavfilter under test compares at all; an older one compares
+    /// nothing and logs nothing either way.
+    #[test]
+    fn the_buffersrc_declares_the_range_its_frames_carry() {
+        let undeclared = property_changes_for(|graph| unsafe {
+            let ctx = ff::avfilter_graph_alloc_filter(graph, ff::avfilter_get_by_name(c"buffer".as_ptr()), c"in".as_ptr());
+            let args = c"video_size=64x64:pix_fmt=bgra:time_base=1/60:pixel_aspect=1/1";
+            assert!(ff::avfilter_init_str(ctx, args.as_ptr()) >= 0);
+            ctx
+        });
+        let declared = property_changes_for(|graph| unsafe {
+            open_buffersrc(graph, ff::AVPixelFormat::AV_PIX_FMT_BGRA, ptr::null_mut(), 64, 64, 60).unwrap()
+        });
+        assert_eq!(declared, 0, "the declared source still read the frame as a change of properties");
+        if unsafe { ff::avfilter_version() } >> 16 >= 10 {
+            assert_eq!(undeclared, 1, "this libavfilter did not complain about the undeclared source");
         }
     }
 }
