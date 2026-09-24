@@ -128,7 +128,10 @@ of a small budget, which keeps the sustained rate within a few percent of `targe
 ### Host capture (external compositors)
 
 Setting `wayland_host_display` to another compositor's socket captures **that** session instead
-of the built-in one, with input injected through the virtual keyboard/pointer protocols. Frames
+of the built-in one, with input injected over libei where the portal backend grants an EIS socket,
+else through the virtual keyboard and pointer protocols, else through kernel uinput devices where
+`/dev/uinput` is writable, and through the portal's own `Notify*` methods last (a socket write to
+the compositor lands in about 4 us, a uinput write in about 12 us, a portal call in about 2 ms). Frames
 are fetched with `ext-image-copy-capture-v1` when the host offers it (wlroots 0.19+, KWin 6.2+,
 COSMIC) and `zwlr-screencopy-v1` (v3) otherwise, so any wlroots-era or KDE compositor works;
 `PIXELFLUX_HOST_CAPTURE=zwlr` forces the fallback for triage. Both protocols share the same
