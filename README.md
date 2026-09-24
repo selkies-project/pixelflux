@@ -62,7 +62,7 @@ sudo apt-get install -y \
 
 **Option A: Install a prebuilt wheel**
 
-Every release on the [GitHub Releases page](https://github.com/selkies-project/pixelflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9–3.14), the pre-releases cut per commit included; take the one for your interpreter and platform:
+Every release on the [GitHub Releases page](https://github.com/selkies-project/pixelflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9 and newer), the pre-releases cut per commit included; take the one for your interpreter and platform:
 ```bash
 pip install ./pixelflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
@@ -326,7 +326,7 @@ def my_callback(frame):
 ### Zero-Copy Frames
 
 `memoryview(frame)` aliases the native encoder buffer with **no copy**, on **every supported
-Python version (3.9–3.14)**. The frame object owns its buffer and keeps it alive until every
+Python version (3.9 and newer)**. The frame object owns its buffer and keeps it alive until every
 consumer — including a transport that retained a slice during a partial write — has released its
 view, so the hand-off is memory-safe. (The old `deferred_free` / `OwnedFrame` / PEP 688 /
 Python-3.12-only path is gone; the native buffer protocol does this on all versions.) Hand the
@@ -731,7 +731,7 @@ session settled on rather than what was asked for.
     *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, all through the linked FFmpeg; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call. `pixelflux.SOFTWARE_FULLCOLOR` and `pixelflux.hardware_fullcolor(encode_node_index, auto_gpu)` name, of those, the codecs each side encodes 4:4:4 when `video_fullcolor` asks for it, so a caller knows the chroma a session will carry before it opens one.
     *   **Hardware:** NVIDIA NVENC (H.264, H.265, and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI color signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9, and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
-*   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
+*   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9 and newer).
 *   **Smart Bandwidth Management:**
     *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
     *   **Paint-Over:** Automatically improves quality for static regions.
