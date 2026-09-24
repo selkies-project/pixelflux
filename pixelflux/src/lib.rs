@@ -7450,16 +7450,16 @@ impl ScreenCapture {
         })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
-    /// Whether the app compositor grows screens on demand through KWin's
-    /// `zkde_screencast_unstable_v1` virtual outputs — the rung selkies probes
-    /// when the session serves no control socket. Proven by growing a
-    /// token-sized probe screen and giving it back: a stock KWin serves the
-    /// request but never registers the output. Once per session is enough.
-    fn app_screen_control_available(&self, py: Python<'_>, display: String) -> PyResult<bool> {
+    /// Whether the app compositor serves KWin's `zkde_screencast_unstable_v1`
+    /// virtual outputs -- the rung selkies offers a second display on when the
+    /// session serves no control socket. A registry read that touches no
+    /// screen: whether the compositor registers the screen it grows is proven
+    /// when a display asks for one (`add_app_screen` refuses one that does not).
+    fn app_screen_control_offered(&self, py: Python<'_>, display: String) -> PyResult<bool> {
         py.detach(move || {
             let path = crate::wayland::wlclient::socket_path(&display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::kdeclient::screen_control_available(&path)
+            crate::wayland::kdeclient::screen_control_offered(&path)
         })
         .map_err(pyo3::exceptions::PyRuntimeError::new_err)
     }
