@@ -341,7 +341,7 @@ mod tests {
         u32::from_ne_bytes(v[off..off + 4].try_into().unwrap())
     }
 
-    /// One key of an object pod: its id, value type and value payload.
+    /// One key of an object pod: its id, value type, and value payload.
     type PodKey = (u32, u32, Vec<u8>);
 
     /// Walk an object pod: (object type, param id, [keys]).

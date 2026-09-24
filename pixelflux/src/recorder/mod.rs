@@ -56,7 +56,7 @@ use crate::ThreadCommand;
 const QUEUE_CAP: usize = 256;
 
 /// What crosses into the writer: a video frame as its `Arc`-shared encoded payload, the byte
-/// offset where the Annex-B stream starts (past the wire header when present) and the
+/// offset where the Annex-B stream starts (past the wire header when present), and the
 /// wall-clock capture time; or an audio packet with its decode time on the 48 kHz clock.
 enum Tap {
     Video(Arc<Vec<u8>>, usize, u64),
@@ -127,7 +127,7 @@ impl RecordOptions {
     }
 }
 
-/// Live counters shared between the feeding side (delivery threads), the writer thread and
+/// Live counters shared between the feeding side (delivery threads), the writer thread, and
 /// the status surfaces.
 struct RecShared {
     start: Instant,
@@ -171,7 +171,7 @@ impl RecShared {
     }
 }
 
-/// Point-in-time view of the recorder, identical across the Python, env and REST surfaces.
+/// Point-in-time view of the recorder, identical across the Python, env, and REST surfaces.
 #[derive(Clone, Debug)]
 pub struct RecordingStatus {
     pub active: bool,

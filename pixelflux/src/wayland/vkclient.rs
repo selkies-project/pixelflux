@@ -9,7 +9,7 @@
 //! by Computer-Use actions and by selkies over the `type_text_wayland` ABI —
 //! reusing the seat's [`KeymapPolicy`] over a US base: base-reachable characters
 //! press their ordinary keycodes, everything else is overlay-bound. The client
-//! is PERSISTENT per socket: the connection, virtual-keyboard device and its
+//! is PERSISTENT per socket: the connection, virtual-keyboard device, and its
 //! uploaded keymap live across calls, so a flush re-uploads (and settles) only
 //! when the accumulated keymap actually changed, and key events ride the
 //! protocol's ordering in one batch with a single closing round-trip. Any
@@ -191,7 +191,7 @@ fn flush_keysyms(
         }
         // The protocol requires a keymap before the first key event even when
         // the whole text resolves in the base; after that, only a changed
-        // keymap costs an upload, its compositor-side compile and the settle.
+        // keymap costs an upload, its compositor-side compile, and the settle.
         let generation = KEYMAP_GENERATION.load(Ordering::Relaxed);
         if typer.uploaded_generation != generation {
             upload_keymap(&typer.vk, &mut typer.queue, &policy.keymap_text())?;

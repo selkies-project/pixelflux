@@ -160,7 +160,7 @@ impl<'a> BitReader<'a> {
 ///
 /// Walks every field ahead of `pic_width_in_mbs_minus1` — including the high-profile
 /// chroma/bit-depth/scaling-list block — and applies the frame-cropping rectangle with the
-/// chroma-format-dependent crop units, so 4:2:0, 4:2:2 and 4:4:4 streams from any of the
+/// chroma-format-dependent crop units, so 4:2:0, 4:2:2, and 4:4:4 streams from any of the
 /// project's encoders all report their true display size.
 pub fn parse_sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
     if sps_nal.len() < 4 || sps_nal[0] & 0x1f != 7 {
@@ -274,7 +274,7 @@ fn mk_full_box(fourcc: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec
     mk_box(fourcc, &p)
 }
 
-/// The unity transformation matrix `mvhd` and `tkhd` carry: 0x00010000, 0x00010000 and
+/// The unity transformation matrix `mvhd` and `tkhd` carry: 0x00010000, 0x00010000, and
 /// 0x40000000 on the diagonal (16.16 fixed point for the first two, 2.30 for the last).
 const MATRIX_IDENTITY: [u8; 36] = {
     let mut m = [0u8; 36];
@@ -435,7 +435,7 @@ fn trak(track_id: u32, timescale: u32, handler: &[u8; 4], media_header: Vec<u8>,
     mk_box(b"trak", &[tkhd, mdia].concat())
 }
 
-/// A `trex` whose fragments state their own durations, sizes and flags unless
+/// A `trex` whose fragments state their own durations, sizes, and flags unless
 /// `default_duration` is set, which the audio track's fixed packet length is.
 fn trex(track_id: u32, default_duration: u32) -> Vec<u8> {
     let mut trex_p = Vec::new();
@@ -574,7 +574,7 @@ impl<W: Write> FragmentWriter<W> {
         // sample flags: sync = "depends on nothing"; non-sync also sets the non-sync bit.
         let sample_flags: u32 = if s.sync { 0x0200_0000 } else { 0x0101_0000 };
         // trun payload in field order: sample_count, a data_offset placeholder patched in below,
-        // then this sample's duration, size and flags — exactly the fields its flags select
+        // then this sample's duration, size, and flags — exactly the fields its flags select
         // (data-offset | sample-duration | sample-size | sample-flags).
         let mut trun_p = Vec::new();
         trun_p.extend_from_slice(&1u32.to_be_bytes());
@@ -778,7 +778,7 @@ impl H264SampleBuilder {
         let (width, height) = parse_sps_dimensions(sps)?;
 
         // avcC header in field order: configurationVersion, AVCProfileIndication,
-        // profile_compatibility and AVCLevelIndication taken straight from the SPS,
+        // profile_compatibility, and AVCLevelIndication taken straight from the SPS,
         // lengthSizeMinusOne = 3 (the 4-byte NAL lengths this muxer writes), and
         // numOfSequenceParameterSets = 1. The SPS then the PPS follow, each length-prefixed.
         let mut avcc_p = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];

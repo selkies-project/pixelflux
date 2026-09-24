@@ -153,7 +153,7 @@ impl Codec {
     /// The quantizer, in this codec's own domain, that a session quality index (`video_crf`,
     /// on the H.26x QP scale) selects.
     ///
-    /// H.26x takes the index as its QP. The VP8, VP9 and AV1 quantizer indices come from
+    /// H.26x takes the index as its QP. The VP8, VP9, and AV1 quantizer indices come from
     /// tables measured on the software encoders: each point is the quantizer whose SSIM
     /// matches libx264's (ultrafast, zerolatency, four threads) at the same index on a
     /// scrolling text desktop, every encoder at the settings pixelflux gives it — VP8 at
@@ -478,7 +478,7 @@ pub fn h264_frame_type(au: &[u8]) -> u8 {
     if intra { FRAME_INTRA } else { FRAME_DELTA }
 }
 
-/// Wire frame kind of one encoded H.265 access unit: an IRAP picture (BLA, IDR or CRA,
+/// Wire frame kind of one encoded H.265 access unit: an IRAP picture (BLA, IDR, or CRA,
 /// which every backend here emits as an IDR with its parameter sets) is a key, anything
 /// else a delta.
 pub fn h265_frame_type(au: &[u8]) -> u8 {

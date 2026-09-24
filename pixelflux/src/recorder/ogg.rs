@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read};
 
-/// What `OpusHead` declares; `mapping` holds the stream count, coupled count and channel
+/// What `OpusHead` declares; `mapping` holds the stream count, coupled count, and channel
 /// table for channel mapping family 1 and is empty for family 0.
 pub struct OpusHead {
     pub channels: u8,

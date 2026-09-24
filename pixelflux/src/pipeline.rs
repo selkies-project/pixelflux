@@ -705,7 +705,7 @@ mod tests {
         assert!(totals.encode_ns >= 1_000_000 && totals.pipeline_ns >= 2_000_000);
     }
 
-    /// On a host with a hardware encoder the report names it, the GPU it runs on and the node.
+    /// On a host with a hardware encoder the report names it, the GPU it runs on, and the node.
     #[test]
     #[ignore]
     fn gpu_x11_pipeline_reports_the_hardware_session() {

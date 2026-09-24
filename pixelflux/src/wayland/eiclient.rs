@@ -7,7 +7,7 @@
 //! libei (EIS) input injection for the portal host-capture rung.
 //!
 //! GNOME and KDE hand a RemoteDesktop session an EIS socket through
-//! `ConnectToEIS`; this drives keyboard, pointer and touch over that socket
+//! `ConnectToEIS`; this drives keyboard, pointer, and touch over that socket
 //! instead of the portal's `Notify*` D-Bus methods. It is the lower-latency
 //! channel — one socket write per event, no bus round trip — and the one the
 //! backends develop, so it is preferred wherever the portal offers it. The
@@ -17,7 +17,7 @@
 //! never answers `ConnectToEIS` keeps the `Notify*` path (`portal.rs`).
 //!
 //! All socket I/O runs on one thread: it completes the handshake, binds the
-//! seat's capabilities, tracks the devices the server creates and emits queued
+//! seat's capabilities, tracks the devices the server creates, and emits queued
 //! events, waking from a pipe the moment an event is queued so injection does
 //! not wait on a poll tick. Keyboard keys arrive as xkb keycodes under selkies'
 //! managed keymap; the compositor's own keymap (delivered over EIS) is
@@ -555,7 +555,7 @@ mod tests {
 
     /// The injector, run against a minimal in-process EIS server, emits the protocol a
     /// compositor expects: it binds the seat, starts emulating before the first event, and
-    /// sends absolute motion, buttons, keys and discrete scroll with the values handed to it,
+    /// sends absolute motion, buttons, keys, and discrete scroll with the values handed to it,
     /// each committed by a frame.
     #[test]
     fn injector_emits_the_expected_eis_protocol() {

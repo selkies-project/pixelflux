@@ -351,7 +351,7 @@ pub fn pod_frac(v: &mut Vec<u8>, num: u32, den: u32) {
 }
 
 /// A choice cell over fixed-size values of `child_ty`: `values` holds the default first, then
-/// the alternatives (Enum), the bounds (Range) or the flag words (Flags), each `child_size` bytes.
+/// the alternatives (Enum), the bounds (Range), or the flag words (Flags), each `child_size` bytes.
 fn pod_choice(v: &mut Vec<u8>, choice: u32, child_ty: u32, child_size: u32, values: &[u8]) {
     let mut body = Vec::new();
     push_u32(&mut body, choice);
@@ -413,7 +413,7 @@ pub fn object(ty: u32, id: u32, props: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
 
 // --- SPA pod reading --------------------------------------------------------------------------
 
-/// One property of an object pod: its key, flags and value cell.
+/// One property of an object pod: its key, flags, and value cell.
 #[derive(Clone, Copy, Debug)]
 pub struct PodProp<'a> {
     pub key: u32,

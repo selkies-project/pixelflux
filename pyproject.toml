@@ -54,7 +54,7 @@ before-all = """
     # * libva, whose headers decide which VA-API encoders FFmpeg compiles at all:
     #   AV1 encode entered the interface in 2.20, and the images ship older, so
     #   without this the wheel has every VA-API encoder but that one.
-    # * kvazaar, libvpx, SVT-AV1 and dav1d (BSD), the software H.265, VP8/VP9
+    # * kvazaar, libvpx, SVT-AV1, and dav1d (BSD), the software H.265, VP8/VP9,
     #   and AV1 encoders and the AV1 decoder of the virtual camera, all reached
     #   through FFmpeg.
     # * FFmpeg n8.1 wrapping those: LGPL for the non-GPL wheel, --enable-gpl

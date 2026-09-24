@@ -3,7 +3,7 @@
 //! The device is a fixed-function camera: one raw pixel format at one size. Whatever the client
 //! camera delivers (any size, full- or limited-range luma) is fitted into that: the frame is scaled
 //! to fit with black bars when its size differs, full-range (JPEG) samples are compressed into the
-//! limited range every V4L2 consumer assumes, and the planes are emitted as I420, NV12 or YUYV.
+//! limited range every V4L2 consumer assumes, and the planes are emitted as I420, NV12, or YUYV.
 //! The common path — a frame already at the device size, limited range, I420 device — is a plain
 //! plane copy straight into the ring slot.
 

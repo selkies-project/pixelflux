@@ -31,7 +31,7 @@ __device__ __forceinline__ void chroma8(float r, float g, float b, unsigned char
     *cr = clamp8(128.0f + (r - y) * (224.0f / 255.0f) / (2.0f * (1.0f - 0.2126f)));
 }
 
-// A pixel's B, G and R, from either byte order.
+// A pixel's B, G, and R, from either byte order.
 __device__ __forceinline__ void unpack(const unsigned char* px, int swap_rb, float* r, float* g, float* b)
 {
     *b = px[swap_rb ? 2 : 0];

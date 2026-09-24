@@ -23,7 +23,7 @@ pub mod wlclient;
 pub mod dcclient;
 /// Output-management client scaling a nested app compositor's screens.
 pub mod outclient;
-/// KDE client growing, removing and arranging a nested KWin session's screens.
+/// KDE client growing, removing, and arranging a nested KWin session's screens.
 pub mod kdeclient;
 /// Generated bindings for the KDE output protocols vendored under `protocols/`.
 pub mod kdeproto;
@@ -39,6 +39,6 @@ pub mod pwcapture;
 /// libei (EIS) input injection over a portal session's `ConnectToEIS` socket.
 pub mod eiclient;
 
-/// An enabled screen as clients see it: name, layout position and the size of
+/// An enabled screen as clients see it: name, layout position, and the size of
 /// the mode it currently holds.
 pub type AppScreen = (String, i32, i32, i32, i32);

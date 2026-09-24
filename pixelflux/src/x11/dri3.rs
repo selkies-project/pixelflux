@@ -30,7 +30,7 @@
 //!
 //! Everything that can be checked is checked before a frame is delivered, and the path is
 //! declined otherwise: a codec no hardware engine serves, software encoding, a server without
-//! DRI3 1.2, Damage or Render, a server drawing on a device other than the encode node, a buffer
+//! DRI3 1.2, Damage, or Render, a server drawing on a device other than the encode node, a buffer
 //! the server will not import, or a first frame the encoder cannot read. A watermark is not among
 //! them: it is composited by the server through Render, as the cursor is. The capture then runs the XShm path with nothing half-built.
 
@@ -342,7 +342,7 @@ impl XScreen {
 
 impl GpuCapture {
     /// One buffer of the pool: a single-plane allocation the server and the encoder both
-    /// describe with one fd, stride and offset. A modifier that spreads the buffer over
+    /// describe with one fd, stride, and offset. A modifier that spreads the buffer over
     /// auxiliary planes (a compressed layout) is dropped from the server's list and the
     /// allocation retried, down to the driver's own choice.
     fn alloc_bo(&mut self, w: u16, h: u16) -> Result<BufferObject<()>, String> {
@@ -757,7 +757,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
 ///
 /// Each iteration paces to the live target rate, applies the cross-thread controls on the thread
 /// that owns the sessions, follows the root geometry, asks the server whether anything was drawn,
-/// and only then blits, waits and encodes through the same send / quality / key-frame policy every
+/// and only then blits, waits, and encodes through the same send / quality / key-frame policy every
 /// full-frame encoder obeys.
 pub fn run_capture<F>(
     settings: RustCaptureSettings,

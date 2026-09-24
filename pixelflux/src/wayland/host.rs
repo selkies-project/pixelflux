@@ -873,7 +873,7 @@ struct HostKeyboardState {
 impl HostKeyboardState {
     fn set_keymap(&mut self, text: &str) -> Option<SerializedMods> {
         let keymap = crate::wayland::keymap::compile_keymap(text)?;
-        // Latched, locked and the locked layout live in the xkb state rather than the
+        // Latched, locked, and the locked layout live in the xkb state rather than the
         // pressed set, so they are read off the outgoing state and seeded back once the
         // held keys are replayed; without this a keymap swap drops CapsLock and a locked
         // group, and the modifiers() that follows clears them on the host.
@@ -965,7 +965,7 @@ pub struct HostSession {
 
 impl HostSession {
     /// Connect to `display`, bring up input devices, enumerate the host's
-    /// outputs and spawn one capture thread per output (idle until
+    /// outputs, and spawn one capture thread per output (idle until
     /// [`start_capture`]) plus the layout-control thread. `gbm_path` (this
     /// process's render node) enables the zero-copy path; `frame_wake` is told the
     /// output index every time a capture thread queues a frame.
@@ -1229,7 +1229,7 @@ impl HostSession {
 
     /// The host's answer to the layout request `epoch` (as returned by [`start_capture`]):
     /// `Some(true)` once the host said it applied the request, `Some(false)` once it said it
-    /// did not (refusal, no layout management at all — KWin — or no answer within
+    /// did not (refusal, no layout management at all — KWin —, or no answer within
     /// `LAYOUT_DEADLINE`), `None` while still unanswered. Never blocks. Which of the two it
     /// is settles nothing on its own, since a host may acknowledge a mode it did not take:
     /// the caller polls for either answer, then compares [`current_output_size`] with what

@@ -442,7 +442,7 @@ fn dyn_addr(base: usize, v: u64) -> usize {
 /// both the lazy-PLT and `-fno-plt` relocation forms because NVIDIA ships the latter.
 ///
 /// 1. **Parse `.dynamic`**: iterate the `Elf64Dyn` entries until `DT_NULL`, recording the dynamic
-///    symbol table, string table, PLT relocation table (`DT_JMPREL`/`DT_PLTRELSZ`) and general
+///    symbol table, string table, PLT relocation table (`DT_JMPREL`/`DT_PLTRELSZ`), and general
 ///    relocation table (`DT_RELA`/`DT_RELASZ`). Table addresses are resolved through `dyn_addr` to
 ///    handle the glibc-absolute vs musl-relative pointer conventions.
 /// 2. **Sanity-gate the tables**: bail if the symbol or string table is missing, and — via the

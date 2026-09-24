@@ -8,7 +8,7 @@
 
 This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
 
-It encodes JPEG, H.264, H.265, VP8, VP9, and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264, H.265 and AV1 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written, or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
+It encodes JPEG, H.264, H.265, VP8, VP9, and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264, H.265, and AV1 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so is the X11 path on an NVIDIA GPU whose session encodes on NVENC: NvFBC has the driver composite the X screen straight into video memory and that buffer is registered with the encoder in place, so a frame is never read, written, or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
 
 ## Installation
 
@@ -148,7 +148,7 @@ owns the portal's buffers: a dmabuf frame is imported by the encoder where it li
 offers the modifiers the encoder's display imports) and a memfd frame is read in place, cursor
 metadata delivers the host's own cursor sprite to the cursor callback, and the stream is asked
 for at most the capture's frame rate. Portal input takes the lower-latency **libei** channel where
-the backend answers `ConnectToEIS` — one socket for keyboard, pointer and touch, and the path the
+the backend answers `ConnectToEIS` — one socket for keyboard, pointer, and touch, and the path the
 GNOME and KDE backends develop — and the portal's own `Notify*` methods otherwise. A successful
 `ConnectToEIS` makes the session refuse `Notify*`, so libei is taken only once its handshake binds a
 device; keys resolve against the compositor's own keymap that libei delivers, with a raw-keycode
@@ -345,7 +345,7 @@ See `example/screen_to_browser.py` for a complete queue-based usage.
 
 ### What a Capture Runs On
 
-Which path a capture took is decided by the hardware, the driver and the display server rather
+Which path a capture took is decided by the hardware, the driver, and the display server rather
 than by a setting, so the capture says what it settled on instead of leaving it in the log.
 `capture.stream_info()` returns a dict, `None` before a start and after a stop:
 
@@ -414,7 +414,7 @@ ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -prese
 ## Virtual Camera
 
 `VirtualCamera` turns a client's webcam uplink into a V4L2 capture device for applications. Encoded frames of any
-browser codec — H.264, VP8, VP9, AV1, HEVC (WebCodecs or a WebRTC media track) and MJPEG (the canvas fallback) — are
+browser codec — H.264, VP8, VP9, AV1, HEVC (WebCodecs or a WebRTC media track), and MJPEG (the canvas fallback) — are
 pushed in; a worker thread decodes them (libavcodec, TurboJPEG), fits them into the device's fixed format (raw
 I420 by default, NV12, or YUYV; or MJPEG, a compressed device that carries an MJPEG uplink's frames as received,
 decoding nothing, and re-encodes only frames that must be fitted), and publishes every frame to the configured sinks at once:
@@ -619,7 +619,7 @@ so no frame is converted on a CPU core.
 *   **Selection:** the ladder consults this backend before it probes render nodes, because a
     Jetson has no render node to probe. `hardware_encoders()` reports every codec the vendor
     encoder takes a capture format for there, and a session logs its backend as `TEGRA`.
-*   **Codecs:** H.264, H.265 and AV1, 4:2:0, Main profile. The capture queue is set to the
+*   **Codecs:** H.264, H.265, and AV1, 4:2:0, Main profile. The capture queue is set to the
     session's codec and the rest of the path is the same whichever it is. The board decides what
     it actually has an engine for: one it does not serve refuses the format, and the session
     falls back to software with the refusal in `stream_info`. The VIC does the color conversion,
@@ -633,7 +633,7 @@ so no frame is converted on a CPU core.
     actually spends is the copy of the captured frame into the staging surface (2.8 ms at
     1080p, 9.6 ms at 4K) and the VIC conversion (1.7 ms and 5.9 ms).
 *   **Measured on an AGX Orin** (L4T R36.4.3, twelve Cortex-A78AE cores), isolated encode path
-    over 200 frames: 0.05 cores at 1080p30, 0.10 at 1080p60, 0.20 at 1080p120 and 0.15 at 4K30,
+    over 200 frames: 0.05 cores at 1080p30, 0.10 at 1080p60, 0.20 at 1080p120, and 0.15 at 4K30,
     against 0.49 cores for the striped software encoder in a live session at 1080p30. 4K60 is
     not reachable on that board either: the VIC conversion alone is 12 ms a frame there and the
     path holds 46 fps. The conversion is pinned to the VIC rather than left at the API's
@@ -704,7 +704,7 @@ encoder asks the device which 4:4:4 surface formats it allocates and which of th
 processor renders, since every frame reaches the codec through the `scale_vaapi` convert (Intel's
 iHD allocates planar `444P` but renders 4:4:4 only as packed `XYUV`, so it encodes from `vuyx`),
 and tries each format on both lists in turn, planar `yuv444p` ahead of packed `vuyx`, until one
-survives the whole bring-up: the surface pool, the convert's output pad and the codec open. A
+survives the whole bring-up: the surface pool, the convert's output pad, and the codec open. A
 driver can still report a surface its encoder entry point does not take, and that shows only at
 one of those steps, so a format refused there hands over to the next rather than failing the
 session. The session builds the surface pool and the convert around the format that survived,
@@ -729,7 +729,7 @@ session settled on rather than what was asked for.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
     *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, all through the linked FFmpeg; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call. `pixelflux.SOFTWARE_FULLCOLOR` and `pixelflux.hardware_fullcolor(encode_node_index, auto_gpu)` name, of those, the codecs each side encodes 4:4:4 when `video_fullcolor` asks for it, so a caller knows the chroma a session will carry before it opens one.
-    *   **Hardware:** NVIDIA NVENC (H.264, H.265 and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI color signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9, and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
+    *   **Hardware:** NVIDIA NVENC (H.264, H.265, and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI color signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9, and AV1, VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9–3.14).
 *   **Smart Bandwidth Management:**

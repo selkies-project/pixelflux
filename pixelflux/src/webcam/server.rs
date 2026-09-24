@@ -114,7 +114,7 @@ impl Server {
 }
 
 impl Drop for Server {
-    /// Stop accepting, close every client (the interposer sees EOF and reports `ENODEV`) and remove
+    /// Stop accepting, close every client (the interposer sees EOF and reports `ENODEV`), and remove
     /// the socket file.
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);

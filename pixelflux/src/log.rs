@@ -1,8 +1,8 @@
 //! The verbosity switch behind every backend's tagged line.
 //!
 //! What an operator reads back from a user is printed plainly: one line per
-//! capture start, encoder choice, zero-copy or readback decision and fallback,
-//! tagged `[X11]`, `[Wayland]`, `[HostCapture]` or `[pixelflux]` on stdout,
+//! capture start, encoder choice, zero-copy or readback decision, and fallback,
+//! tagged `[X11]`, `[Wayland]`, `[HostCapture]`, or `[pixelflux]` on stdout,
 //! with warnings and errors on stderr. The mechanics behind those lines (each
 //! dmabuf import, the CUDA device enumeration, the per-second rate counters,
 //! an in-place reconfigure) go through `debug!` and print only once the

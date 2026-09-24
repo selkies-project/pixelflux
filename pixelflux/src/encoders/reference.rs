@@ -181,7 +181,7 @@ mod tests {
         for id in 1..6u16 {
             w.record(id, false);
         }
-        // The window holds 3, 4 and 5; frame 2 has left it, and everything held predicts
+        // The window holds 3, 4, and 5; frame 2 has left it, and everything held predicts
         // through it.
         assert_eq!(w.invalidate(2), Invalidation::KeyFrame);
         assert!(!w.has_reference());
@@ -227,7 +227,7 @@ mod tests {
         // Frame 16 carries frame_num 0 again; a loss that leaves it out cannot be predicted past.
         assert_eq!(w.invalidate(17), Invalidation::Forget(17));
         assert_eq!(w.record(18, false), Reference::Frame(16));
-        assert_eq!(w.invalidate(15), Invalidation::KeyFrame, "15, 16 and 18 go, and 16 is the wrap");
+        assert_eq!(w.invalidate(15), Invalidation::KeyFrame, "15, 16, and 18 go, and 16 is the wrap");
         assert!(!w.has_reference());
         assert_eq!(w.record(19, true), Reference::None);
         assert_eq!(w.record(20, false), Reference::Frame(19));

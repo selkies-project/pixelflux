@@ -12,7 +12,7 @@
 //! PCIe. NvFBC removes both. The capture subsystem lives in the NVIDIA X driver, composites each
 //! frame into a buffer it owns in video memory, and hands back a `CUdeviceptr` — which is
 //! registered with NVENC **in place**, exactly as a Wayland dmabuf is, so a frame is never read,
-//! written or copied by the CPU between the screen and the bitstream.
+//! written, or copied by the CPU between the screen and the bitstream.
 //!
 //! Three properties follow from that, and the module is built around keeping all three:
 //!
@@ -330,7 +330,7 @@ struct GrabbedFrame {
 ///
 /// The handle owns an OpenGL and a CUDA context that the driver binds to the thread that created
 /// it, and the captured device pointer belongs to whichever CUDA context was current at setup —
-/// which is why the whole object is built, used and dropped on one thread, with NVENC's own
+/// which is why the whole object is built, used, and dropped on one thread, with NVENC's own
 /// primary context pushed current. Sharing that context is what makes the capture zero-copy: the
 /// pointer the driver hands back is one NVENC can register directly.
 struct NvfbcSession {
@@ -566,7 +566,7 @@ enum Recovery {
     /// The capture session is gone but the client handle is live: create the session again.
     Session,
     /// The X server the handle talks to is gone. The API has no way back from this other than a
-    /// new handle, so the old one is destroyed (which may leak the X, GLX and GL resources it can
+    /// new handle, so the old one is destroyed (which may leak the X, GLX, and GL resources it can
     /// no longer reach) and the capture rebuilt around a fresh one.
     Handle,
     /// Nothing this path can do; the caller stops.
@@ -791,7 +791,7 @@ const GEOMETRY_POLL_FRAMES: i32 = 30;
 /// 1. **Paces** to the live target frame rate, which is re-read every tick, so a rate change
 ///    applies immediately and the loop never runs ahead of the session's contract.
 /// 2. **Applies the cross-thread controls** on the thread that owns the sessions: a requested key
-///    frame, a rate change, live tunables, a cursor toggle or a region change (the last two are
+///    frame, a rate change, live tunables, a cursor toggle, or a region change (the last two are
 ///    session parameters, so they restart the capture session in place).
 /// 3. **Grabs** the next frame, which returns immediately when one is already waiting and
 ///    otherwise waits for one until the frame deadline.
@@ -1025,7 +1025,7 @@ where
     Some(Ok(()))
 }
 
-/// Restart the capture session at a new region, size or cursor mode, and bring NVENC to the same
+/// Restart the capture session at a new region, size, or cursor mode, and bring NVENC to the same
 /// geometry. The device pointer the driver returns afterwards is a new one, which the encoder's
 /// registration follows on the next frame.
 fn restart_session(
@@ -1052,7 +1052,7 @@ fn restart_session(
 /// Replace the client handle and the capture session on it, for the one failure the API offers no
 /// other way back from: the X server the handle was opened on is gone.
 ///
-/// The encoder, its CUDA context and the frames already delivered all survive; only the driver
+/// The encoder, its CUDA context, and the frames already delivered all survive; only the driver
 /// objects are rebuilt, in the order that keeps the encoder from holding a registration of memory
 /// the outgoing session owns.
 fn rebuild_handle(
@@ -1502,7 +1502,7 @@ mod gpu_tests {
         }
     }
 
-    /// The same screen, same codec and same GPU through the general XShm path, for the comparison
+    /// The same screen, same codec, and same GPU through the general XShm path, for the comparison
     /// the zero-copy path exists to win: the X server blits the root into a shared-memory surface
     /// and the encoder uploads that surface across PCIe, where NvFBC hands the encoder a buffer
     /// the driver already composited in video memory.

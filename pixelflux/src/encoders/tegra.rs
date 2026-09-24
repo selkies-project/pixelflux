@@ -560,7 +560,7 @@ fn load_surfaces() -> Result<Surfaces, String> {
 }
 
 /// The capture-queue format for a codec the vendor encoder can be set to, or `None` for one it
-/// has no format for. The queues, controls and surface formats are the same whichever of these
+/// has no format for. The queues, controls, and surface formats are the same whichever of these
 /// the capture queue carries, so the codec is a parameter rather than a second backend.
 pub fn coded_fourcc(codec: Codec) -> Option<u32> {
     match codec {
@@ -583,7 +583,7 @@ pub fn served() -> Vec<Codec> {
 }
 
 /// `served` for a board whose device tree `compatible` list, NUL-separated `nvidia,<name>`
-/// entries, is `compatible`: AV1 is withheld where it names a Tegra X1, X2 or Xavier SoC.
+/// entries, is `compatible`: AV1 is withheld where it names a Tegra X1, X2, or Xavier SoC.
 fn served_on(compatible: &[u8]) -> Vec<Codec> {
     let without_av1 = compatible
         .split(|&b| b == 0)
@@ -743,7 +743,7 @@ impl TegraEncoder {
         Ok(())
     }
 
-    /// One surface out of `NvBufSurfaceAllocate`, its batch marked as carrying a frame and its
+    /// One surface out of `NvBufSurfaceAllocate`, its batch marked as carrying a frame, and its
     /// first plane taken. The caller's field is written only once the surface is one `Drop` can
     /// destroy, so an allocation the library refused leaves nothing behind to free.
     fn allocate_surface(
@@ -767,7 +767,7 @@ impl TegraEncoder {
         Ok((surf, SurfacePlane { desc: plane.buffer_desc, pitch: plane.pitch as usize, height: plane.height }))
     }
 
-    /// Where the staging plane is mapped, or `None` if the batch, its plane or the mapping is
+    /// Where the staging plane is mapped, or `None` if the batch, its plane, or the mapping is
     /// absent. Read after `NvBufSurfaceMap`, which is what fills it in.
     fn mapped_plane(surf: *mut NvSurf) -> Option<*mut c_void> {
         let batch = unsafe { surf.as_ref() }?;

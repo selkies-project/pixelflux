@@ -65,7 +65,7 @@ as the default: that it is exposed is not proof it works, and a reviewer has to 
 The codec of a capture is `CaptureSettings.codec` (`jpeg`, `h264`, `h265`, `vp8`, `vp9`, `av1`), the
 `encoders::Codec` enum in Rust: it carries the wire id (the high nibble of a `0x04` frame's type byte, the
 low nibble being the frame kind), the per-codec quantizer domain the shared `video_crf` index maps onto, the
-level ladders and the bitstream reads that label frames. A session advertises its stream's level from the
+level ladders, and the bitstream reads that label frames. A session advertises its stream's level from the
 shared ladder at the current geometry (`codec.rs`), the lowest a decoder is asked to accept, so a hardware
 decoder that gates on the level — older Apple and Intel parts refuse a level above their ceiling even for a
 picture they could hold — takes the stream; NVENC re-declares it with a forced IDR on each in-place resize, and
@@ -87,7 +87,7 @@ for those probes to select. It is reached by asking for the interface (`V4L2_CAP
 fourcc on the capture queue) rather than by naming a board, so a device nobody here has is served on the same
 path, and the size is checked before the node is opened because a refusal afterwards leaves a session that
 produces nothing. Both backends take the codec as
-a parameter rather than carrying a second copy of the interface: the queues, controls and surface formats are
+a parameter rather than carrying a second copy of the interface: the queues, controls, and surface formats are
 the same whichever coded format the capture queue is set to, so a device that advertises H.265 serves it there.
 Only the picture type is codec-specific, because an H.265 NAL header is two bytes where H.264's is one. `encoders/nvenc.rs`
 is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
@@ -96,7 +96,7 @@ driver allocates and its video processor renders, read through libva's `VAProfil
 configuration, until one survives the surface pool, the convert, and the codec open: Intel's iHD
 allocates planar 444P but its VPP writes 4:4:4 only packed, as XYUV, and its HEVC 4:4:4 entry point
 takes only what the VPP writes), and the software HEVC (x265 with the `gpl` feature, else
-kvazaar), VP8/VP9 (libvpx) and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
+kvazaar), VP8/VP9 (libvpx), and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
 (`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`), never assumed. Software H.264 is
 resolved at build time, never by a setting: the default `gpl` feature makes libx264 the encoder behind every
 CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
@@ -116,18 +116,18 @@ the center of each 2x2 block, which NVENC's own conversion does not: it weights 
 of a block 3:1 (its matrix follows what the session declares, measured on Volta and Pascal, so
 only the siting is at stake). A 4:2:0 session therefore converts with `ChromaConvert`, a PTX
 kernel the driver JIT-compiles (`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) that reads
-the packed surface, a pitch-linear dmabuf import or a texture over an array-typed one and writes
+the packed surface, a pitch-linear dmabuf import, or a texture over an array-typed one and writes
 the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
 driver that refuses the kernel.
 `AvDecoder::color_tags` reads what a stream declares, and the unit tests hold each
 encoder to it; the sequence headers travel with every IDR so a client joining or resynchronizing on any key
 frame can decode, which `encoders/v4l2m2m.rs` keeps true itself for the devices whose drivers will not
 (`REPEAT_SEQ_HEADER` is asked for and the parameter sets are put back where it is refused), since neither
-FFmpeg's nor GStreamer's M2M encoder guarantees it. Encoder settings are chosen by measured latency first, frame rate second, quality third and
+FFmpeg's nor GStreamer's M2M encoder guarantees it. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
 ultrafast with wavefront threads) and NVENC at preset P3 with two-pass quarter-resolution rate control
-(`gpu_bench_tuning` measures the alternatives); the VP8, VP9 and AV1 quantizer tables in `codec.rs` were
+(`gpu_bench_tuning` measures the alternatives); the VP8, VP9, and AV1 quantizer tables in `codec.rs` were
 measured at those settings and must be re-measured whenever they change (`encoders::codec` documents the
 method). VP9 carries 4:4:4 as profile 1 at the same limited range as its 4:2:0, so the decoder hint the
 client sends for it stays true. The CBR
@@ -136,7 +136,7 @@ it that forces macroblock skips on a VBV underflow, which freezes rows of a scre
 budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test both configurations (`cargo test --lib` and
 `cargo test --lib --no-default-features --features openh264`, the latter against an FFmpeg carrying
 `libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
-wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d and, for the GPL wheel, x264 and x265
+wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d, and, for the GPL wheel, x264 and x265
 from source ahead of FFmpeg.
 The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver pre-release
 the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the manifest
@@ -172,7 +172,7 @@ imports each dmabuf in place through the same `encode_dmabuf` the Wayland zero-c
 the general XShm path otherwise. Each zero-copy backend is declined -- with one line saying why --
 for a codec its engine does not serve, software encoding, a server or device that does not qualify
 (DRI3 also asks that the server draw on the encode node and that the encoder read the first frame),
-and NvFBC for a non-NVIDIA encode node, a watermark or a driver without it; DRI3 composites a
+and NvFBC for a non-NVIDIA encode node, a watermark, or a driver without it; DRI3 composites a
 watermark through Render as it does the cursor, so that one costs it no readback. There is no
 setting either way: the server's and the driver's own answers decide, and a host without NvFBC
 pays about 7 ms once per capture start to find that out.
@@ -199,17 +199,17 @@ Selkies V4L2 interposer (`ring.rs`/`server.rs`; the layout is mirrored byte-for-
 `selkies/addons/v4l2-interposer/v4l2_interposer.c` and checked by selkies' `tests/unit/test_webcam_abi.py`), a
 v4l2loopback output device (`v4l2out.rs`), and a PipeWire `Video/Source` node (`pipewire.rs`, `libpipewire-0.3`
 loaded at run time, pods built by hand — never add a build-time PipeWire dependency). `cargo test --lib webcam`
-covers the ring, decoders (including an OpenH264→avcodec round trip) and pod layouts; the device-level and browser
+covers the ring, decoders (including an OpenH264→avcodec round trip), and pod layouts; the device-level and browser
 checks live in selkies (`tests/integration/test_webcam_device.py`, `tests/e2e/test_webcam.py`).
 
 Licensing is part of the build matrix: `LICENSES.md` inventories every crate and native library of the default
 (`gpl`, libx264) and `PIXELFLUX_ENABLE_GPL=0` (`openh264`) builds, `scripts/check-licenses.py` and
-`pixelflux/deny.toml` gate both (the `Licenses` workflow runs them), and a new crate that links, loads or vendors
+`pixelflux/deny.toml` gate both (the `Licenses` workflow runs them), and a new crate that links, loads, or vendors
 native code has to be described in the script's `NATIVE` table and in `LICENSES.md` before the check passes.
 Copyleft stays confined to the `gpl` feature.
 
 Logging follows one rule on every backend, because the combined selkies log is what a remote user pastes
-back: a plain `println!` tagged `[X11]`, `[Wayland]`, `[HostCapture]` or `[pixelflux]` for what an operator
+back: a plain `println!` tagged `[X11]`, `[Wayland]`, `[HostCapture]`, or `[pixelflux]` for what an operator
 reads (the encoder chosen and the GPU it runs on, the zero-copy or readback decision and why, each fallback,
 the `Stream settings active` line that names the mode), `eprintln!` for warnings and errors, and
 `crate::log::debug!` (`src/log.rs`) for everything behind those lines — device enumeration, each dmabuf
@@ -221,10 +221,10 @@ one `Stream settings active` builder (`log_stream_settings`) serves every path. 
 wait on (`Stream settings active`, `Socket listening on:`, `Configuring Output`, `[Wayland] Output`) are
 contracts; a change to one changes the test with it.
 
-What those lines tell an operator, a caller reads as values (`src/report.rs`, `ScreenCapture.stream_info` and
+What those lines tell an operator, a caller reads as values (`src/report.rs`, `ScreenCapture.stream_info`, and
 `stream_stats`), which is what selkies shows a user who will never see the log. Each decision is recorded where
 it is made and logged, into the report bound to the deciding thread (`report::enter`), so a new capture path, a
-new fallback or a new reason a path is declined records itself beside its log line, and the counters stay one
+new fallback, or a new reason a path is declined records itself beside its log line, and the counters stay one
 tally per delivered frame, never a callback into Python.
 
 Update this file when certain details change.

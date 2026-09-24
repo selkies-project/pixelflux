@@ -193,7 +193,7 @@ fn scaled_hotspot(sprite: &CappedSprite, hot_x: i32, hot_y: i32) -> (i32, i32) {
 }
 
 /// Cache wrapper for sprite jobs, keyed by `(sprite hash, cap)` so a repeat of a sprite already
-/// delivered under the same cap is a plain clone of its PNG; a miss decodes the sprite, caps it
+/// delivered under the same cap is a plain clone of its PNG; a miss decodes the sprite, caps it,
 /// and encodes it once. Keying on the cap keeps a live `SetSizeCap` from serving stale sizes.
 fn capped_job(
     cache: &mut HashMap<(u64, i32), CappedSprite>,

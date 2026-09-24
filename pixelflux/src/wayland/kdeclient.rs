@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! KDE session-screen client: grows, removes and arranges the screens of a
+//! KDE session-screen client: grows, removes, and arranges the screens of a
 //! nested KWin session, in-process.
 //!
 //! KWin serves no control socket; its interface for a screen that exists on

@@ -6,8 +6,8 @@
 
 Resolves the crate graph of a build configuration with ``cargo metadata``
 (normal dependencies only, the ones compiled into the extension), classifies
-every crate's SPDX license expression as permissive, weak copyleft or
-copyleft, and overlays the native libraries the ``-sys`` crates link, load or
+every crate's SPDX license expression as permissive, weak copyleft, or
+copyleft, and overlays the native libraries the ``-sys`` crates link, load, or
 vendor, which crate metadata cannot see (``x264-sys`` is an MIT binding to the
 GPL-2.0-or-later libx264). It fails when a copyleft component appears in a
 build configuration that is not allowed to carry it, when a crate has no
@@ -168,7 +168,7 @@ def classify_expression(expression: str) -> int:
     return rank
 
 
-# Native libraries behind the crates that bind, vendor or load them. `rank` is
+# Native libraries behind the crates that bind, vendor, or load them. `rank` is
 # the license category of the native code, `how` the way it reaches the
 # extension. Every crate named like a native binding (-sys, _sys, -ffi) has to
 # be described here, so a new binding fails the check until it is inventoried.
@@ -228,7 +228,7 @@ NATIVE: Dict[str, Dict[str, object]] = {
                      note="Python binding"),
     "nvcodec-sys": dict(
         library="NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture "
-                "(libnvidia-fbc.so.1) and CUDA driver (libcuda.so.1)",
+                "(libnvidia-fbc.so.1), and CUDA driver (libcuda.so.1)",
         license="proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings "
                 "are declarations generated from the CUDA toolkit headers",
         rank=PERMISSIVE,

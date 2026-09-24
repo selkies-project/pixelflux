@@ -3,7 +3,7 @@
 pixelflux itself is licensed under the [Mozilla Public License 2.0](LICENSE).
 This file inventories what a built `pixelflux` extension contains or loads, per
 build configuration, and the license of each piece. It is enforced by
-`scripts/check-licenses.py`, `pixelflux/deny.toml` and the `Licenses` workflow
+`scripts/check-licenses.py`, `pixelflux/deny.toml`, and the `Licenses` workflow
 (see [How this is enforced](#how-this-is-enforced)).
 
 Categories used below:
@@ -26,7 +26,7 @@ may be under any license) and is grouped with the permissive licenses here.
 
 Both configurations share everything else: JPEG, the VP8/VP9 (libvpx) and AV1
 (SVT-AV1) software encoders reached through FFmpeg, NVENC, VA-API, capture,
-compositor and virtual camera. A build with neither feature does not compile;
+compositor, and virtual camera. A build with neither feature does not compile;
 a build whose FFmpeg carries x265 but not the `gpl` feature never selects it.
 
 ## Native libraries and vendored code
@@ -77,7 +77,7 @@ The crate graph was resolved with `cargo metadata` (normal dependencies only,
 Linux targets) for both configurations: 240 crates in the default (GPL) build,
 243 in the non-GPL build, 244 distinct crates in total. Every one of them has a
 permissive license (MPL-2.0 for `pixelflux` itself); no crate is GPL, LGPL,
-AGPL or unlicensed. The only differences between the two sets:
+AGPL, or unlicensed. The only differences between the two sets:
 
 | Crate | License | Build | Why |
 | --- | --- | --- | --- |
@@ -218,7 +218,7 @@ table below.
 | num-integer | 0.1.47 | MIT OR Apache-2.0 | permissive | both |  |
 | num-rational | 0.4.2 | MIT OR Apache-2.0 | permissive | both |  |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | permissive | both |  |
-| nvcodec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture (libnvidia-fbc.so.1) and CUDA driver (libcuda.so.1): proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings are declarations generated from the CUDA toolkit headers (permissive) |
+| nvcodec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture (libnvidia-fbc.so.1), and CUDA driver (libcuda.so.1): proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings are declarations generated from the CUDA toolkit headers (permissive) |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | permissive | both |  |
 | openh264 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only |  |
 | openh264-sys2 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only | Cisco OpenH264 2.6 (vendored source): BSD-2-Clause (permissive) |
@@ -389,7 +389,7 @@ The default build (`gpl` feature, what the published wheels and
   `libdav1d.so`, `libavcodec`, `libavfilter`, `libavformat`, `libavutil`,
   `libswresample`, `libswscale`) into `pixelflux.libs/` and leaves libva,
   libdrm, libgbm, libEGL, libxkbcommon, libpixman-1, libX11/libxcb, zlib,
-  liblzma and the GCC runtime to the host (`repair-wheel-command` excludes).
+  liblzma, and the GCC runtime to the host (`repair-wheel-command` excludes).
   The non-GPL wheel's FFmpeg reports `LGPL version 2.1 or later` and its
   configuration contains no `--enable-gpl`; the GPL wheel's is built
   `--enable-gpl --enable-libx265`.
@@ -407,7 +407,7 @@ The default build (`gpl` feature, what the published wheels and
   metadata --locked` (no build, normal dependencies only), classifies every
   crate's SPDX expression, overlays the native libraries behind the binding
   crates (the `NATIVE` table in the script, the source of the component table
-  above) and fails when a copyleft component appears in a configuration not
+  above), and fails when a copyleft component appears in a configuration not
   listed for it in `ALLOWED_COPYLEFT` (`x264-sys` → `gpl` only), when a crate
   has no usable license metadata, or when a crate named like a native binding
   (`-sys`, `_sys`, `-ffi`) is not described in `NATIVE`. Run it from the
@@ -425,7 +425,7 @@ The default build (`gpl` feature, what the published wheels and
   section and needs `--no-default-features --features openh264` spelled out.
 - `.github/workflows/licenses.yml` runs the script and both cargo-deny
   invocations on every push and pull request.
-- Adding a dependency that links, loads or vendors native code means adding it
+- Adding a dependency that links, loads, or vendors native code means adding it
   to `NATIVE` in the script and to the table above; adding a copyleft
   dependency means an `ALLOWED_COPYLEFT` entry, a `deny.toml` clarification
   and exception, and a row here. To exercise the gate itself, save the GPL

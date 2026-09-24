@@ -417,7 +417,7 @@ pub struct WindowMeta {
     pub output: AtomicU32,
     /// Set once the first commit has picked the window's output. The choice cannot key off
     /// xdg's `initial_configure_sent`: a client that negotiates xdg-decoration (every
-    /// wlroots-based nested compositor, GTK and Qt) is answered with a configure before it
+    /// wlroots-based nested compositor, GTK, and Qt) is answered with a configure before it
     /// ever commits, which would leave every window on the pointer's output.
     pub placed: AtomicBool,
     /// Set while the window is mapped outside every output, tagged to the output it will

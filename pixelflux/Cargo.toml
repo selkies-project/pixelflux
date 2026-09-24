@@ -15,7 +15,7 @@ wayland-server = { version = "0.31.10", features = ["dlopen"] }
 wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
 wayland-client = "0.31"
 # The generated KDE output bindings (src/wayland/kdeproto.rs) build from the
-# XMLs vendored under protocols/, so the scanner, the backend it references and
+# XMLs vendored under protocols/, so the scanner, the backend it references, and
 # the bitflags its enums expand to are direct deps.
 wayland-scanner = "0.31"
 wayland-backend = "0.3"

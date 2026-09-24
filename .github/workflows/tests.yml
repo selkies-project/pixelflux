@@ -51,6 +51,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: cargo test
-        # Tests needing a GPU, a render node or an encoder device mark themselves
+        # Tests needing a GPU, a render node, or an encoder device mark themselves
         # ignored, which is what a runner carrying none of them runs.
         run: cargo test --manifest-path pixelflux/Cargo.toml

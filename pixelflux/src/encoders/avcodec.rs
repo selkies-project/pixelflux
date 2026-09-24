@@ -8,7 +8,7 @@
 //! video codec, and the software HEVC / VP8 / VP9 / AV1 encoders the linked FFmpeg carries.
 //!
 //! One session type serves both. The codec context, packet drain, wire framing, the
-//! rate-control re-open with its QP hysteresis and the keyframe policy are shared; only how
+//! rate-control re-open with its QP hysteresis, and the keyframe policy are shared; only how
 //! pixels reach the codec differs. A hardware session lands them on a VA surface — a Wayland
 //! dmabuf mapped in place, or a packed host frame uploaded — and runs VA-VPP (`scale_vaapi`)
 //! to convert to the surface format on the GPU, so no colorspace conversion happens on the
@@ -75,7 +75,7 @@ unsafe extern "C" fn release_borrowed(_opaque: *mut c_void, _data: *mut u8) {}
 
 /// Mirrors FFmpeg's `libavutil/hwcontext_drm.h` ABI so a Wayland dmabuf can be handed to the
 /// `hwmap` filter without a copy. FFmpeg reinterprets these bytes directly, so every field,
-/// order and `#[repr(C)]` layout must stay bit-identical to the C definitions.
+/// order, and `#[repr(C)]` layout must stay bit-identical to the C definitions.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct AVDRMObjectDescriptor {
@@ -190,7 +190,7 @@ struct VaapiDeviceContext {
 }
 
 /// The VA display a derived VA-API device was opened on, or None where the reference, its
-/// device context or the display itself is null.
+/// device context, or the display itself is null.
 unsafe fn va_display(device: *mut ff::AVBufferRef) -> Option<*mut c_void> {
     if device.is_null() {
         return None;
@@ -236,7 +236,7 @@ type VaQueryConfigEntrypoints = unsafe extern "C" fn(*mut c_void, c_int, *mut c_
 /// every frame reaches the codec through `scale_vaapi` and a driver converts into fewer
 /// formats than it allocates (Intel's iHD allocates planar 444P but its VPP renders 4:4:4
 /// only packed, as XYUV). This answers only the driver half: the surface pool, the VA-VPP
-/// output pad and `avcodec_open2` each still have to accept the format, so the caller tries
+/// output pad, and `avcodec_open2` each still have to accept the format, so the caller tries
 /// them in turn.
 unsafe fn fullcolor_sw_formats(device: *mut ff::AVBufferRef) -> Vec<ff::AVPixelFormat> {
     let allocated = constrained_sw_formats(device, ptr::null());
@@ -337,7 +337,7 @@ fn preferred_fullcolor_formats(
 
 /// The VA profiles libavcodec's `*_vaapi` encoder opens an 8-bit 4:2:0 session under, the
 /// session every hardware codec here comes up as before a 4:4:4 request is negotiated:
-/// `VAProfileH264ConstrainedBaseline`, `Main` and `High`; `VAProfileHEVCMain`;
+/// `VAProfileH264ConstrainedBaseline`, `Main`, and `High`; `VAProfileHEVCMain`;
 /// `VAProfileVP8Version0_3`; `VAProfileVP9Profile0`; `VAProfileAV1Profile0`.
 fn vaapi_profiles(codec: Codec) -> &'static [c_int] {
     match codec {
@@ -516,7 +516,7 @@ struct VaapiSession {
     buffersink_ctx: *mut ff::AVFilterContext,
     filtered_frame: *mut ff::AVFrame,
     /// Whether the codec is opened on the low-power (VDENC) entry point. It is tried first: recent
-    /// Intel generations expose it as the only one for HEVC, VP9 and AV1, and it is the shorter
+    /// Intel generations expose it as the only one for HEVC, VP9, and AV1, and it is the shorter
     /// path where both exist. A driver without it refuses the open and the default one follows.
     low_power: bool,
 }
@@ -547,7 +547,7 @@ impl Drop for VaapiSession {
 /// One libavcodec encoder session, hardware or software, for one capture.
 ///
 /// `current_qp` / `qp_hysteresis_counter` drive the constant-quantizer hysteresis of
-/// `update_qp`; `cbr_mode`, `current_bitrate_kbps`, `current_vbv_mult` and `current_kf_s`
+/// `update_qp`; `cbr_mode`, `current_bitrate_kbps`, `current_vbv_mult`, and `current_kf_s`
 /// cache the live rate-control state so `reconfigure_rate` re-opens the codec only when a
 /// value actually changes. `sw_format` is the format frames reach the codec in: the surface
 /// format a hardware session negotiated, or the planar format a software one converts into.
@@ -610,9 +610,9 @@ impl AvcodecEncoder {
     ///
     /// A hardware session opens the DRM render node the settings select (`renderD128` when
     /// none is), derives the VA-API device, negotiates the surface format, opens the codec
-    /// (retrying on the low-power entry point when the default one refuses) and builds the
+    /// (retrying on the low-power entry point when the default one refuses), and builds the
     /// upload/convert filter graph. A software session resolves the build's encoder for the
-    /// codec, opens it on a planar frame and allocates that frame. Every failure unwinds
+    /// codec, opens it on a planar frame, and allocates that frame. Every failure unwinds
     /// what was built so far and names the layer that refused, so the caller can fall back.
     pub fn new(
         settings: &RustCaptureSettings,
@@ -741,7 +741,7 @@ impl AvcodecEncoder {
     }
 
     /// Whether this session negotiated 4:4:4 chroma. The request alone does not settle it —
-    /// the driver, the FFmpeg build and the codec all have to carry it — so callers describing
+    /// the driver, the FFmpeg build, and the codec all have to carry it — so callers describing
     /// the active colorspace ask the encoder rather than the settings.
     pub fn is_fullcolor(&self) -> bool {
         !matches!(
@@ -768,7 +768,7 @@ impl AvcodecEncoder {
         declared_colorspace(self.codec)
     }
 
-    /// Open the VA-API device, surface pool and filter graph, then the codec.
+    /// Open the VA-API device, surface pool, and filter graph, then the codec.
     /// Stand the VA-API session up, trying each 4:4:4 surface format the driver carries until
     /// one survives the whole bring-up.
     ///
@@ -1794,7 +1794,7 @@ mod tests {
 
     /// Four colors whose 2x2 average is gray, tiled: a decoded block's chroma comes out
     /// neutral only where the session sited chroma at the center of the block, and saturated
-    /// wherever it kept one pixel, row or column of it — the color a browser then shows along
+    /// wherever it kept one pixel, row, or column of it — the color a browser then shows along
     /// the glyph edges of subpixel-antialiased text. Every session this host can open is
     /// measured, since a hardware one runs the driver's own downsampler and a unit test cannot
     /// pin that.

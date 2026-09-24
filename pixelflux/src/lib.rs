@@ -135,7 +135,7 @@ use smithay::{
     wayland::selection::primary_selection::PrimarySelectionState,
 };
 
-/// Encoder backends and the codec identities, wire framing and rate-control policy they share.
+/// Encoder backends and the codec identities, wire framing, and rate-control policy they share.
 pub mod encoders;
 /// The debug switch behind every backend's tagged line.
 pub mod log;
@@ -498,7 +498,7 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             let name: String = settings.getattr("codec")?.extract()?;
             Codec::parse(&name).ok_or_else(|| {
                 PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "unknown codec '{name}': expected jpeg, h264, h265, vp8, vp9 or av1"
+                    "unknown codec '{name}': expected jpeg, h264, h265, vp8, vp9, or av1"
                 ))
             })?
         },
@@ -1146,7 +1146,7 @@ pub(crate) const SCROLL_V120_PER_UNIT: f64 = 12.0;
 
 /// Shared capture stats: whichever thread owns the encoders counts frames/stripes and
 /// composes `desc` + `n_stripes` (the encoder half of the 1 s debug log line); the calloop
-/// log loads, prints and resets the counters.
+/// log loads, prints, and resets the counters.
 pub struct WlEncodeStats {
     frames: AtomicU32,
     stripes: AtomicU32,
@@ -3434,7 +3434,7 @@ fn render_node_tick(
                 |_, _| wp_presentation_feedback::Kind::empty(),
             );
         }
-        // Panels, backgrounds and other layer-shell surfaces are composited from the
+        // Panels, backgrounds, and other layer-shell surfaces are composited from the
         // layer map rather than the space, so they need the callback separately: one
         // that never arrives leaves a client which draws on frame callbacks showing
         // whatever it painted first, for as long as the session lasts.
@@ -4227,7 +4227,7 @@ const DEFAULT_VIEW_ID: u32 = 1;
 
 /// Add a view: a display over a rectangle of `owner`'s output.
 ///
-/// A view renders and encodes on its own -- its own damage tracker, frame buffer and
+/// A view renders and encodes on its own -- its own damage tracker, frame buffer, and
 /// capture -- but publishes no `wl_output`, so the session sees one screen however many
 /// displays the client is shown. That is what a window drag needs: the pointer grab it
 /// runs under stays inside one surface across the whole desk, where separate screens
@@ -4430,7 +4430,7 @@ fn gpu_exposed() -> bool {
 ///    calloop thread, because the dmabuf and its EGL context are calloop-affine; every readback
 ///    flavor (striped software H.264/JPEG, Pixman, or a cross-GPU hardware encoder) builds its
 ///    encoders on that display's dedicated encode thread instead. A shared timer (paced at the
-///    fastest active capture) renders each capturing output — its windows, popups and layers made
+///    fastest active capture) renders each capturing output — its windows, popups, and layers made
 ///    output-local, the cursor only on the pointer's output — applies the shared paint-over /
 ///    recovery-IDR policy per display, and delivers each display's encoded stripes through its own
 ///    frame callback. The zero-copy encode waits the GL render fence first, so a hardware encoder
@@ -5580,7 +5580,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 //
                 // Slowly, though: at a viewing rate the clients draw at a viewing rate
                 // too, and every frame they hand over is one that nothing renders,
-                // encodes or looks at. Unblocking them is the whole purpose here, and
+                // encodes, or looks at. Unblocking them is the whole purpose here, and
                 // that costs a callback every so often rather than sixty a second.
                 state.last_idle_service_at = Some(Instant::now());
                 send_idle_frame_callbacks(state);
@@ -6187,7 +6187,7 @@ impl WaylandBackend {
     }
 
     /// Lifecycle of `display_id`'s capture as `(state, last_error)`: `state` is `"running"`
-    /// (pipeline live), `"failed"` (start left no live pipeline) or `"idle"` (never started
+    /// (pipeline live), `"failed"` (start left no live pipeline), or `"idle"` (never started
     /// / stopped clean); `last_error` is the reason a start failed, or a caveat a live
     /// capture came up with (host connect refused -> local compositing, a hardware encoder
     /// that fell back to CPU, a refused resize). Read straight from the recorded outcome, so
@@ -7059,7 +7059,7 @@ impl ScreenCapture {
     /// `dmabuf`, `readback`), `zero_copy` and the `capture_reason` a faster path was declined
     /// for, `encoder` (`NVENC`, `VAAPI`, or the software library), `hardware` and the
     /// `encoder_reason` it is not, `codec`, `fullcolor`, `striped`, and for a hardware session
-    /// its `gpu`, kernel `driver` and `encode_node`. A Wayland capture adds how its compositor
+    /// its `gpu`, kernel `driver`, and `encode_node`. A Wayland capture adds how its compositor
     /// renders: `renderer` (`gl`, `pixman`), `render_node`, `render_gpu`, `renderer_reason`.
     /// The first read of a VA-API session brings a GL context up once to name its GPU, so a
     /// caller with an event loop reads this off it.
@@ -7675,7 +7675,7 @@ impl ScreenCapture {
         wayland_backend_running(py)
             .map_or(Ok(None), |be| be.bind(py).borrow().get_realized_geometry(py, display_id))
     }
-    /// Lifecycle of this capture as `(state, last_error)`: `state` is `"running"`, `"failed"`
+    /// Lifecycle of this capture as `(state, last_error)`: `state` is `"running"`, `"failed"`,
     /// or `"idle"`; `last_error` gives the reason a start failed, or a caveat a live capture
     /// came up with (encoder fell back to CPU, host connect refused, a refused resize). The
     /// Wayland outcome is recorded by the compositor thread; the X11 outcome is the capture
@@ -8168,7 +8168,7 @@ fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
 }
 
 /// `gil_used = true`: the module has not been audited for free-threaded Python. The
-/// detached compositor, capture, encode and delivery threads attach to the interpreter
+/// detached compositor, capture, encode, and delivery threads attach to the interpreter
 /// and several native encoder sessions (NVENC/CUDA, VA-API) assume the GIL serializes
 /// their Python-facing access; until that is proven safe the interpreter re-enables the
 /// GIL for this module on a free-threaded build rather than silently defaulting to the

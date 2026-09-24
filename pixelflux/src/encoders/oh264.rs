@@ -56,7 +56,7 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 ///
 /// Holds the live `Encoder`, the fixed dimensions, and the reusable I420 plane buffers
 /// (`y_buf` / `u_buf` / `v_buf`) that each frame's RGB-to-YUV conversion writes into before
-/// hand-off. `threads`, `slices` and `csc_bands` are the parallelism policy fixed at open: a lone
+/// hand-off. `threads`, `slices`, and `csc_bands` are the parallelism policy fixed at open: a lone
 /// full-frame instance encodes with several threads over four slices and converts color in four
 /// bands, while a stripe of the striped path is single-threaded and single-slice, its parallelism
 /// coming from the stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
@@ -90,7 +90,7 @@ pub struct Openh264Encoder {
 
 impl Openh264Encoder {
     /// Build a full-frame OpenH264 encoder from the capture settings (their width, height,
-    /// CRF and bitrate), or `None` on init failure: `new_stripe` with the whole-frame policy.
+    /// CRF, and bitrate), or `None` on init failure: `new_stripe` with the whole-frame policy.
     pub fn new(settings: &RustCaptureSettings) -> Option<Self> {
         Self::new_stripe(
             settings,
@@ -106,7 +106,7 @@ impl Openh264Encoder {
     /// `None` on init failure. Like the NVENC/VAAPI encoders, this one self-prepends the wire
     /// header on the buffer it returns.
     ///
-    /// `width` x `height` is the stripe's geometry, `crf` its constant quantizer and `bitrate_kbps`
+    /// `width` x `height` is the stripe's geometry, `crf` its constant quantizer, and `bitrate_kbps`
     /// its own CBR budget — the per-stripe share `stripe_rate_control` hands out, since every stripe
     /// runs its own rate control. `fullframe` selects the parallelism policy: a lone full-frame
     /// stripe encodes with `fullframe_threads` threads over four fixed slices (client decoders
@@ -125,7 +125,7 @@ impl Openh264Encoder {
     ///
     /// 3. **Base config** (shared by both rate modes): screen-content real-time usage, low
     ///    complexity, an effectively infinite intra period, a VUI declaring the conversion
-    ///    (BT.709 primaries, transfer and matrix at limited range; without it a WebRTC receiver
+    ///    (BT.709 primaries, transfer, and matrix at limited range; without it a WebRTC receiver
     ///    infers the range from the SDP profile and can display the picture visibly darker), and
     ///    the thread count. Frame skip is **enabled** so the rate controller can actually hold
     ///    the target bitrate — skip-less bitrate control is only approximate. A skipped frame is not encoded
@@ -899,7 +899,7 @@ mod slice_tests {
 
     /// One stripe of the striped path is a single-slice stream (SPS + PPS + one IDR slice:
     /// three slices fewer than a four-slice full-frame IDR) whose wire header stamps the
-    /// caller's y-start, frame number and the stripe geometry — exactly what the x264 stripes
+    /// caller's y-start, frame number, and the stripe geometry — exactly what the x264 stripes
     /// send, so the client's per-stripe decoders cannot tell the builds apart.
     #[test]
     fn stripe_instance_is_single_slice_and_stamps_y_start() {

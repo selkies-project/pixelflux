@@ -44,7 +44,7 @@ pub enum ScaleOutcome {
     Unsupported,
 }
 
-/// An announced head with its name, enabled state, layout position and scale.
+/// An announced head with its name, enabled state, layout position, and scale.
 struct Head {
     head: ZwlrOutputHeadV1,
     name: Option<String>,
@@ -53,7 +53,7 @@ struct Head {
     scale: f64,
 }
 
-/// An enabled screen as a plan sees it: its head, logical position, current mode
+/// An enabled screen as a plan sees it: its head, logical position, current mode,
 /// and scale.
 #[derive(Clone)]
 struct Screen {

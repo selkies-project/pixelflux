@@ -285,7 +285,7 @@ pub fn write_color(nal: &[u8], signal: ColorSignal) -> Result<Vec<u8>, String> {
         w.bit(0);
         write_signal(&mut w, signal);
         // The rest of a VUI this stream never had: chroma location, timing, both HRDs, picture
-        // structure and bitstream restriction, each absent.
+        // structure, and bitstream restriction, each absent.
         for _ in 0..6 {
             w.bit(0);
         }

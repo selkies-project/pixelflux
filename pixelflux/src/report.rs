@@ -85,7 +85,7 @@ impl StreamReport {
         }
     }
 
-    /// Count one delivered frame: its bytes over every stripe, the time its encode took and
+    /// Count one delivered frame: its bytes over every stripe, the time its encode took, and
     /// the time from capture to the end of the encode.
     pub fn tally(&self, stripes: &[EncodedStripe]) {
         let Some(first) = stripes.first() else { return };

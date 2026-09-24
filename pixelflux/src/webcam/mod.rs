@@ -3,7 +3,7 @@
 //! The client encodes its camera (H.264/VP8/… over the WebRTC media track or WebCodecs over the
 //! WebSocket, MJPEG as the last-resort canvas path) and Selkies hands each encoded frame to
 //! [`VirtualCamera::push`], which returns at once. A worker thread decodes, fits the picture into the
-//! device's fixed raw format and publishes it to every sink at once:
+//! device's fixed raw format, and publishes it to every sink at once:
 //!
 //! - the shared-memory ring served over a Unix socket to the Selkies V4L2 interposer
 //!   (`LD_PRELOAD`, no privileges, no kernel module), see [`ring`] and [`server`];
@@ -56,7 +56,7 @@ pub struct VirtualCameraSettings {
     pub fps_num: u32,
     #[pyo3(get, set)]
     pub fps_den: u32,
-    /// Raw device pixel format: "I420", "NV12" or "YUYV".
+    /// Raw device pixel format: "I420", "NV12", or "YUYV".
     #[pyo3(get, set)]
     /// Device pixel format: "I420" (the default; the browsers' preference), "NV12", "YUYV",
     /// or "MJPEG" — a compressed device that carries an MJPEG uplink's frames as received
@@ -523,11 +523,11 @@ impl VirtualCamera {
     }
 
     /// Hand one encoded frame to the decoder. `data` is any buffer-protocol object; the encoded
-    /// payload starts at `offset`. `rotation` (clockwise degrees: 0, 90, 180 or 270) and `flip`
+    /// payload starts at `offset`. `rotation` (clockwise degrees: 0, 90, 180, or 270) and `flip`
     /// (a horizontal mirror applied after the rotation) carry the frame's upright transform when
     /// the client's encoder left it as metadata instead of baking it into the pixels; the decoded
     /// picture is oriented before it is fitted. Returns a bit set (`KEYFRAME_WANTED`) the caller
-    /// relays to the client. Raises when the camera is not running, the codec id is unknown or the
+    /// relays to the client. Raises when the camera is not running, the codec id is unknown, or the
     /// rotation is not a quarter turn.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (data, codec, keyframe = false, offset = 0, rotation = 0, flip = false))]
@@ -535,7 +535,7 @@ impl VirtualCamera {
     fn push(&self, py: Python<'_>, data: PyBuffer<u8>, codec: u32, keyframe: bool, offset: usize, rotation: u32, flip: bool) -> PyResult<u32> {
         let codec = Codec::from_id(codec).ok_or_else(|| PyValueError::new_err(format!("unknown codec id {}", codec)))?;
         if !rotation.is_multiple_of(90) || rotation >= 360 {
-            return Err(PyValueError::new_err("rotation must be 0, 90, 180 or 270"));
+            return Err(PyValueError::new_err("rotation must be 0, 90, 180, or 270"));
         }
         let orientation = Orientation { quarter_turns: (rotation / 90) as u8, hflip: flip };
         if !data.is_c_contiguous() {
@@ -564,7 +564,7 @@ impl VirtualCamera {
         Ok(running.keyframe_wanted.swap(false, Ordering::Relaxed) as u32)
     }
 
-    /// Stop the decoder thread, close every interposer client and remove the socket.
+    /// Stop the decoder thread, close every interposer client, and remove the socket.
     fn stop(&self, py: Python<'_>) {
         let running = self.running.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut r) = running {

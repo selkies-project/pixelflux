@@ -238,7 +238,7 @@ fn enum_format_pods(cfg: &StreamConfig) -> Vec<Vec<u8>> {
 
 /// Buffers and metadata asked for once the format is fixated: dmabuf or memfd blocks per the
 /// modifier's presence, three to eight buffers so one can be held retained while another is
-/// in flight and the compositor still has one to fill, plus header, damage and cursor metas.
+/// in flight and the compositor still has one to fill, plus header, damage, and cursor metas.
 fn negotiated_params(n: &Negotiated, dmabuf: bool) -> Vec<Vec<u8>> {
     let data_type = 1i32 << if dmabuf { SPA_DATA_DMABUF } else { SPA_DATA_MEMFD };
     let buffers = object(SPA_TYPE_OBJECT_PARAM_BUFFERS, SPA_PARAM_BUFFERS, |p| {
@@ -273,7 +273,7 @@ fn meta(ty: u32, size: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     })
 }
 
-/// The fixated `Format` param: pixel format, size and whether a modifier (dmabuf) was agreed.
+/// The fixated `Format` param: pixel format, size, and whether a modifier (dmabuf) was agreed.
 fn parse_format(pod: &[u8]) -> Option<Negotiated> {
     let (ty, _, props) = object_props(pod)?;
     if ty != SPA_TYPE_OBJECT_FORMAT {
@@ -789,7 +789,7 @@ mod tests {
         }
     }
 
-    /// A fixated format the compositor sends back parses into geometry, fourcc and the
+    /// A fixated format the compositor sends back parses into geometry, fourcc, and the
     /// dmabuf decision, and the buffer params answer with the matching data type.
     #[test]
     fn fixated_format_parses_and_selects_buffer_type() {

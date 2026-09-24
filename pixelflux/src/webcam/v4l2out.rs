@@ -2,7 +2,7 @@
 //!
 //! Where the host (or a privileged container) carries the v4l2loopback module, a real `/dev/videoN`
 //! is the zero-configuration path for consumers — no preload, no socket — exactly as `/dev/uinput`
-//! is for the gamepads. The device is opened for output, set to the ring's raw format and fed one
+//! is for the gamepads. The device is opened for output, set to the ring's raw format, and fed one
 //! `write()` per published frame. It is a best-effort mirror of the ring: an error disables the
 //! sink and is reported once, never failing the camera.
 

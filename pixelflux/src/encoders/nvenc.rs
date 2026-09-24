@@ -7,14 +7,14 @@
 //! NVENC hardware H.264 / HEVC / AV1 encoder: CUDA-bound sessions that encode packed BGRA or
 //! RGBA frames from the X11 host and Wayland readback paths, or Wayland dmabufs in place.
 //!
-//! The module dynamically loads `libcuda`, `libnvidia-encode` and `libEGL` at runtime, negotiates
+//! The module dynamically loads `libcuda`, `libnvidia-encode`, and `libEGL` at runtime, negotiates
 //! the NVENC API version against the installed driver (set-once per process), and stamps every
 //! NVENCAPI struct with the exact `NV_ENC_*_VER` word the negotiated SDK defines, so one binary
 //! drives drivers from NVENC 10.0 (~R445) through 13.0. Frames reach the GPU two ways: a
 //! zero-copy dmabuf import (EGLImage → CUDA, the mapped plane registered with NVENC in place as
 //! pitch-linear memory or as a CUDA array), and a pinned host→device upload of packed BGRA / RGBA.
 //! Color is converted on the GPU either way. The codec is a session parameter: the same rate
-//! control, GOP, VUI and latency posture is programmed into whichever of the three codec
+//! control, GOP, VUI, and latency posture is programmed into whichever of the three codec
 //! configurations the device offers, and a codec the device lacks (AV1 before Ada) is refused at
 //! open so the caller falls back. Sessions reconfigure resolution and rate control in place, so a
 //! resize or bitrate change costs a few milliseconds instead of a full rebuild.
@@ -93,7 +93,7 @@ const CU_AD_FORMAT_U8: u32 = 1;
 const CU_TRSF_READ_AS_INTEGER: u32 = 1;
 
 /// A CUDA frame mapped from an EGLImage: the `cuGraphicsResourceGetMappedEglFrame` result
-/// describing the imported dmabuf's plane pointers, geometry, pitch and pixel format.
+/// describing the imported dmabuf's plane pointers, geometry, pitch, and pixel format.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CUeglFrame {
@@ -137,7 +137,7 @@ struct EglFunctions {
 }
 
 /// Dynamically loaded CUDA driver-API entry points (from `libcuda`) for context, device,
-/// memory, host-pin and EGL-interop calls. `_lib` keeps the library resident for the pointers' life.
+/// memory, host-pin, and EGL-interop calls. `_lib` keeps the library resident for the pointers' life.
 struct CudaFunctions {
     _lib: Library,
     cuInit: unsafe extern "C" fn(flags: u32) -> CUresult,
@@ -275,7 +275,7 @@ impl NvStruct {
     /// The revision lands in bits 16-23 of the version word and the flag in bit 31; every other bit
     /// is fixed, which is exactly why matching just these two on `api` reproduces each SDK's word.
     /// The values are transcribed verbatim from `nvEncodeAPI.h` at the FFmpeg nv-codec-headers tags
-    /// n10.0.26.2, n11.0.10.3, n11.1.5.3, n12.0.16.1, n12.1.14.0, n12.2.72.0 and n13.0.19.0, so they
+    /// n10.0.26.2, n11.0.10.3, n11.1.5.3, n12.0.16.1, n12.1.14.0, n12.2.72.0, and n13.0.19.0, so they
     /// are ground truth rather than anything derived that could drift. Structs whose layout is stable
     /// across those SDKs return a constant pair; the rest match on `api`. 10.0 is the negotiation
     /// floor, so the oldest match arm also covers anything below it.
@@ -380,7 +380,7 @@ fn neg_api() -> u32 {
 ///    above the cap. Each probe stamps an `NV_ENCODE_API_FUNCTION_LIST` with that version's word and
 ///    calls `create_instance`.
 /// 3. **Require the whole encode path**, not just a success code: the session opener plus
-///    `nvEncInitializeEncoder`, `nvEncGetEncodePresetConfigEx`, `nvEncEncodePicture` and
+///    `nvEncInitializeEncoder`, `nvEncGetEncodePresetConfigEx`, `nvEncEncodePicture`, and
 ///    `nvEncLockBitstream` must all be non-null, because a driver can accept the function-list word
 ///    yet leave newer entry points null. The first fully-populated version wins.
 /// 4. **Fall back** to `pinned` if nothing qualifies. Stored in `NVENC_NEG_VER`, set-once.
@@ -642,7 +642,7 @@ fn cbr_bps(settings: &RustCaptureSettings) -> u32 {
     (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000)
 }
 
-/// The VBV of a CBR session at `bps`, from the session's frame rate, key-frame interval and
+/// The VBV of a CBR session at `bps`, from the session's frame rate, key-frame interval, and
 /// explicit multiplier.
 fn cbr_vbv(settings: &RustCaptureSettings, bps: u32) -> u32 {
     crate::encoders::vbv_bits(
@@ -736,7 +736,7 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// from a bare session's GUID list the way a real session reads it (`device_encodes`): the
 /// driver is negotiated, the device bound by the render node's PCI bus id (the first CUDA
 /// device where the node names none), and the session opened on its primary context with no
-/// input buffers, EGL or encoder initialization. An error names the step that failed: no
+/// input buffers, EGL, or encoder initialization. An error names the step that failed: no
 /// driver, no device, or a session that would not open, each of which a real session would
 /// fail on too. The CUDA and NVENC libraries stay loaded like a session's, since the driver
 /// does not promise to survive `libcuda` being unloaded after `cuInit`.
@@ -811,7 +811,7 @@ unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) 
 }
 
 /// `sliceMode = 3`: `sliceModeData` is the number of slices in the picture, which the driver
-/// divides evenly; the other modes count macroblocks, bytes or rows and drift with geometry.
+/// divides evenly; the other modes count macroblocks, bytes, or rows and drift with geometry.
 const SLICE_MODE_COUNT: u32 = 3;
 
 /// Slices per H.264 and HEVC frame, the count the VA-API (`slices = 4`) and OpenH264
@@ -821,7 +821,7 @@ const SLICE_MODE_COUNT: u32 = 3;
 /// for as 1x1 in `configure_codec`.
 const SLICES_PER_FRAME: u32 = 4;
 
-/// Output bitstream buffers per session: one, because `submit_frame` locks, copies and unlocks
+/// Output bitstream buffers per session: one, because `submit_frame` locks, copies, and unlocks
 /// each frame's bitstream before it returns, so no second buffer is ever outstanding (the lock
 /// blocks; a `doNotWait` lock on Linux answers an unfinished encode with an empty bitstream
 /// rather than `NV_ENC_ERR_LOCK_BUSY`). The ring stays, so a pipelined depth is one constant
@@ -829,7 +829,7 @@ const SLICES_PER_FRAME: u32 = 4;
 const BITSTREAM_BUFFERS: usize = 1;
 
 /// The encoder-side quality knobs of a session: the preset, the rate-control passes of a CBR
-/// session and adaptive quantization. Production sessions take the default, which the tuning
+/// session, and adaptive quantization. Production sessions take the default, which the tuning
 /// bench (`gpu_bench_tuning`) measures against the alternatives: P3 encodes a 1080p H.264
 /// frame in 3.7 ms where P4 takes 5.2 ms on a V100, for 0.001 of SSIM at the same bitrate,
 /// and the presets above P4 buy nothing; a single pass saves half a millisecond but overshoots
@@ -910,7 +910,7 @@ struct ChromaConvert {
 }
 
 impl ChromaConvert {
-    /// JIT the module, allocate the `width`x`height` NV12 surface and register it with the
+    /// JIT the module, allocate the `width`x`height` NV12 surface, and register it with the
     /// session. `None` where any step refuses: the session then encodes the packed RGB itself,
     /// which sites chroma at the left of each block but converts with the matrix the session
     /// declares all the same.
@@ -1504,7 +1504,7 @@ impl NvencEncoder {
         Self::new_tuned(settings, egl_display, NvencTuning::default())
     }
 
-    /// `new` with the preset, rate-control passes and adaptive quantization named, for the
+    /// `new` with the preset, rate-control passes, and adaptive quantization named, for the
     /// tuning bench; production sessions take `NvencTuning::default`.
     pub(crate) fn new_tuned(
         settings: &RustCaptureSettings,
@@ -2148,17 +2148,17 @@ impl NvencEncoder {
     /// Follow a capture restart on the live session, folding in the current rate / QP / fps,
     /// without tearing it down.
     ///
-    /// The NVENC session, CUDA context and bitstream buffers survive, so a restart costs a few
+    /// The NVENC session, CUDA context, and bitstream buffers survive, so a restart costs a few
     /// milliseconds instead of a full rebuild. Flow:
     ///
     /// 1. **Reject the unchangeable**: a different encode device or codec, a chroma-format flip
     ///    (4:4:4), an RC-mode flip, dimensions of zero or beyond the init-time `maxEncode`
     ///    headroom, or a level whose decoded picture buffer is smaller than the one the session
     ///    declared (the driver refuses to change it) all return `Err` so the caller rebuilds.
-    /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface and
+    /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface, and
     ///    the dmabuf imports stay as they are, so the restart costs no IDR and no reset. Only the
     ///    pinned hosts are dropped -- the restart recreates the source buffers, often at the same
-    ///    addresses -- and the rate, frame rate and wire framing the restart carries are folded
+    ///    addresses -- and the rate, frame rate, and wire framing the restart carries are folded
     ///    in, as `reconfigure_rate` does. Returns `Ok(false)`.
     /// 3. **Release geometry-dependent state** under the pushed CUDA context: unmap / unregister /
     ///    free the packed input surface, every cached dmabuf import (with the NVENC registration a
@@ -2496,7 +2496,7 @@ impl NvencEncoder {
     /// Apply a runtime rate-control / frame-rate change to the live session, and report whether
     /// the session carries it afterwards.
     ///
-    /// In CBR mode the target bitrate, max bitrate, VBV and its initial delay are updated (the VBV
+    /// In CBR mode the target bitrate, max bitrate, VBV, and its initial delay are updated (the VBV
     /// is ignored outside CBR); the target fps is updated in either mode. The session is
     /// reconfigured only when one of these actually changed — no RC reset, and a forced IDR only
     /// where a target past the declared level's bitrate ceiling raises the level, which the
@@ -3146,7 +3146,7 @@ impl NvencEncoder {
     /// first time and reusing that registration for every later frame from the same buffer.
     ///
     /// A capture source hands back one buffer for as long as its geometry holds, so the register
-    /// and map cost is paid once per session rather than per frame; a pointer, pitch or geometry
+    /// and map cost is paid once per session rather than per frame; a pointer, pitch, or geometry
     /// that changes releases the old registration and builds a new one.
     unsafe fn register_external_input(
         &mut self,
@@ -3410,7 +3410,7 @@ mod gpu_tests {
     }
 
     /// Test helper: one CBR bench row. Encodes `seq` on `enc`, its first frame as the warm-up key
-    /// frame, and prints the achieved rate at `fps`, the smallest and largest frame and the luma
+    /// frame, and prints the achieved rate at `fps`, the smallest and largest frame, and the luma
     /// PSNR of every decoded frame against its source.
     fn cbr_row(label: &str, enc: &mut NvencEncoder, codec: Codec, seq: &[&Vec<u8>], w: usize, h: usize, fps: usize) {
         use crate::webcam::decode::AvDecoder;
@@ -3603,7 +3603,7 @@ mod gpu_tests {
     /// A frame a client lost is left out of the device's predictions: the next frame predicts
     /// from the newest frame before it and names it, a decoder that never saw the lost frames
     /// decodes it as one that saw everything does, the stream declares the decoded picture
-    /// buffer the level admits and an in-place resize redeclares it. A device that cannot
+    /// buffer the level admits, and an in-place resize redeclares it. A device that cannot
     /// invalidate a reference tracks none and says so. Ignored by default.
     #[test]
     #[ignore]
@@ -3846,8 +3846,8 @@ mod gpu_tests {
                             .map(rbsp)
                             .expect("an SPS on the key frame");
                         // After the two-byte NAL header and the byte holding the VPS id, the
-                        // sub-layer count and the nesting flag, profile_tier_level opens with
-                        // general_profile_space (2), general_tier_flag (1) and
+                        // sub-layer count, and the nesting flag, profile_tier_level opens with
+                        // general_profile_space (2), general_tier_flag (1), and
                         // general_profile_idc (5); general_level_idc follows the 32
                         // compatibility flags and the 48 constraint bits.
                         assert_eq!((sps[3] >> 5) & 1, 1, "general_tier_flag at {w}x{h}");
@@ -3908,10 +3908,10 @@ mod gpu_tests {
     /// for H.264 and HEVC at 1080p, on three kinds of content: the alternating gradient frames
     /// the other benches use, where every frame is a scene cut; a steady desktop-like sequence
     /// with one moving block; and that sequence entered through one cut. Each row varies the VBV
-    /// (one frame or one and a half), the initial delay (a full buffer or the driver's default)
+    /// (one frame or one and a half), the initial delay (a full buffer or the driver's default),
     /// and the slice count (`SLICES_PER_FRAME` or one), and prints the achieved rate, the
     /// largest and smallest frame, the luma PSNR of the decoded picture against the source (mean
-    /// and worst frame) and the wall time per frame. `NVENC_BENCH_KBPS` and `NVENC_BENCH_FPS`
+    /// and worst frame), and the wall time per frame. `NVENC_BENCH_KBPS` and `NVENC_BENCH_FPS`
     /// move the target from 8000 kbit/s at 60 fps. Ignored by default.
     #[test]
     #[ignore]
@@ -4658,7 +4658,7 @@ mod gpu_tests {
     }
 
     /// Assert decoded region means sit within `tol` of the limited-range values of the painted
-    /// colors — a wrong pitch, byte order or stale buffer lands far outside this.
+    /// colors — a wrong pitch, byte order, or stale buffer lands far outside this.
     fn assert_painted(label: &str, block: [f64; 3], bg: [f64; 3], tol: f64) {
         let (eb, eg) = (painted_ycbcr(FG), painted_ycbcr(BG));
         for i in 0..3 {
@@ -4831,7 +4831,7 @@ mod gpu_tests {
         pass(&mut enc, &mut dec, "hardware");
     }
 
-    /// On a real GPU: per-frame wall time of every NVENC preset, rate-control pass mode and
+    /// On a real GPU: per-frame wall time of every NVENC preset, rate-control pass mode, and
     /// adaptive quantization, 1080p CBR on both codecs. Prints all; ignored by default.
     #[test]
     #[ignore]
@@ -5019,7 +5019,7 @@ mod gpu_tests {
     static EMPTY_SUCCESSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     /// Test helper: upload one frame synchronously, submit it, wait for its bitstream with
-    /// `strategy` and unlock it; the wait in microseconds and the not-ready answers seen.
+    /// `strategy`, and unlock it; the wait in microseconds and the not-ready answers seen.
     unsafe fn lock_round_trip(enc: &mut NvencEncoder, pixels: &[u8], frame_number: u64, strategy: LockWait) -> (f64, u64) {
         let _ = (enc.cuda.cuCtxPushCurrent_v2)(enc.cuda_context);
         let copy = CUDA_MEMCPY2D {
@@ -5340,7 +5340,7 @@ mod decision_tests {
         assert_ne!(a, DmaBufIdentity::probe(fd, 0x1234, 1280, 720));
     }
 
-    /// Test helper: a mapped `CUeglFrame` of one plane with the given kind, geometry and pitch,
+    /// Test helper: a mapped `CUeglFrame` of one plane with the given kind, geometry, and pitch,
     /// its first plane at `plane` (a device pointer for the pitch kind, an array handle for the
     /// array kind) in four 8-bit channels.
     fn egl_frame(frame_type: u32, w: u32, h: u32, pitch: u32, plane: usize) -> CUeglFrame {

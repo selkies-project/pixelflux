@@ -14,7 +14,7 @@
 //! Wayland compositor owned by this process when one is registered, otherwise the X server named
 //! by `DISPLAY` (XTEST injection on a private connection, no active capture required).
 //!
-//! The same server also exposes the built-in MP4 recorder at `/record_start`, `/record_stop`
+//! The same server also exposes the built-in MP4 recorder at `/record_start`, `/record_stop`,
 //! and `/record_status`, so a headless script can drive a session and record it over plain HTTP.
 
 use std::collections::HashMap;
@@ -750,7 +750,7 @@ struct RecordStartRequest {
 }
 
 /// Handle the recorder REST endpoints sharing the CU server: `record_start`,
-/// `record_stop` and `record_status`, all one JSON round-trip into the same recorder
+/// `record_stop`, and `record_status`, all one JSON round-trip into the same recorder
 /// implementation the Python API and env vars use. Returns `None` for any other URL.
 fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
     let reply = match url {

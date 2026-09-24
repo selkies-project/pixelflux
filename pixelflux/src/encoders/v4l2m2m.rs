@@ -56,7 +56,7 @@ const V4L2_PIX_FMT_VP8: u32 = 0x3038_5056;
 const V4L2_PIX_FMT_VP9: u32 = 0x3039_5056;
 
 /// The capture-queue format for a codec the kernel's interface names, or `None` for one it does
-/// not. The queues, the controls and the input format are the same whichever of these a node
+/// not. The queues, the controls, and the input format are the same whichever of these a node
 /// carries, so the codec is a parameter rather than a second backend.
 pub fn coded_fourcc(codec: Codec) -> Option<u32> {
     match codec {

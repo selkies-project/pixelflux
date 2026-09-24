@@ -233,7 +233,7 @@ impl H264EncoderWrapper {
     ///      budget the content cannot meet overshoots instead, as NVENC and libvpx do.
     ///    - **CRF** (default): constant-quality with `f_rf_constant = crf`.
     /// 4. **Color**: I444 at full range or I420 at limited range, a VUI declaring that range
-    ///    with the BT.709 primaries, transfer and matrix the sRGB source and the conversion
+    ///    with the BT.709 primaries, transfer, and matrix the sRGB source and the conversion
     ///    carry, and the matching `high444` / `baseline` profile.
     /// 5. **Coding tools**: CABAC and the 8x8 transform are disabled, matching the low-latency
     ///    baseline profile — CAVLC entropy coding with no 8x8 DCT — for minimal encode cost.

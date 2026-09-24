@@ -37,7 +37,7 @@ pub mod software;
 pub mod sps;
 /// Hardware H.264 through a generic stateful V4L2 M2M encoder: boards whose encoder sits
 /// behind the kernel's own interface rather than a vendor library or a render node, such as
-/// a Raspberry Pi 4, RK356x or i.MX8M. Built everywhere, since the interface is the kernel's.
+/// a Raspberry Pi 4, RK356x, or i.MX8M. Built everywhere, since the interface is the kernel's.
 pub mod v4l2m2m;
 
 pub use codec::*;
@@ -72,7 +72,7 @@ pub struct SoftwareEncoder {
 pub type HardwareEncoders = Vec<(Codec, &'static str, bool)>;
 
 /// The hardware backend that serves each video codec on an encode node, as the name a
-/// session logs it in lower case (`"nvenc"`, `"vaapi"` or `"tegra"`), probed once per node and
+/// session logs it in lower case (`"nvenc"`, `"vaapi"`, or `"tegra"`), probed once per node and
 /// remembered for the life of the process: the ladder picks the backend by the node's
 /// driver exactly as `select_frame_encoder` does, and that backend lists the codecs its
 /// device has an engine for (`nvenc::probe_codecs`, `avcodec::probe_codecs`). A node whose
@@ -128,7 +128,7 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
 }
 
 /// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264
-/// (High 4:4:4, full range), x265 and libvpx's VP9 (profile 1) do; OpenH264, kvazaar, VP8 and
+/// (High 4:4:4, full range), x265, and libvpx's VP9 (profile 1) do; OpenH264, kvazaar, VP8, and
 /// SVT-AV1 encode such a request 4:2:0.
 pub fn software_fullcolor(codec: Codec) -> bool {
     match software_encoder(codec) {
@@ -611,7 +611,7 @@ pub enum FrameSource {
 }
 
 /// Choose and build the full-frame encoder of a session, or `None` when the striped software
-/// path serves it. One ladder for X11, Wayland zero-copy and Wayland readback, so the three
+/// path serves it. One ladder for X11, Wayland zero-copy, and Wayland readback, so the three
 /// cannot pick differently for the same settings:
 ///
 /// 1. Unless software encoding is forced (`use_cpu`, or encode node `-1`), the hardware
@@ -862,7 +862,7 @@ fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) 
 /// The fixture the chroma-siting checks of every backend share.
 #[cfg(test)]
 pub(crate) mod chroma_siting {
-    /// Four colors averaging to gray, of which no pixel, row pair or column pair does: the
+    /// Four colors averaging to gray, of which no pixel, row pair, or column pair does: the
     /// chroma of a block comes out neutral only where all four were averaged. A 4:2:0 convert
     /// that keeps one pixel of the block, or one row or column of it, leaves the saturation
     /// subpixel-antialiased text carries on its glyph edges in the picture as visible color.

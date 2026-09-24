@@ -67,7 +67,7 @@ const PACED_INPUT_MAX_FRACTION: f64 = 1.25;
 /// frames whether it runs a hair faster or slower than the timer, or jitters around it: a timer
 /// that resumed exactly a period after the frame would render just ahead of a move landing a
 /// little late, which then could not pull and waited a period. When the input stops, the timer
-/// renders after the grace and carries on from there. A faster client, a slower one and a
+/// renders after the grace and carries on from there. A faster client, a slower one, and a
 /// host's frames leave the timer its period as before.
 #[derive(Debug, Default)]
 pub struct FramePace {
