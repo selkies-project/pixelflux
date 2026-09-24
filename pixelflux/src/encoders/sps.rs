@@ -339,8 +339,9 @@ mod dpb {
         }
     }
 
-    /// `(log2_max_frame_num, max_num_ref_frames)` of the first SPS in an Annex-B H.264 stream.
-    fn h264_sps(stream: &[u8]) -> Option<(u32, u32)> {
+    /// `(log2_max_frame_num, max_num_ref_frames, chroma_format_idc)` of the first SPS in an
+    /// Annex-B H.264 stream.
+    fn h264_sps(stream: &[u8]) -> Option<(u32, u32, u32)> {
         let nal = crate::encoders::codec::annexb_nals(stream).find(|n| n[0] & 0x1f == 7)?;
         let mut rbsp = Vec::with_capacity(nal.len());
         let mut zeros = 0;
@@ -356,8 +357,9 @@ mod dpb {
         let profile = r.bits(8);
         r.bits(16);
         r.ue();
+        let mut chroma = 1;
         if matches!(profile, 100 | 110 | 122 | 244 | 44 | 83 | 86 | 118 | 128 | 138 | 139 | 134 | 135) {
-            let chroma = r.ue();
+            chroma = r.ue();
             if chroma == 3 {
                 r.bits(1);
             }
@@ -395,25 +397,31 @@ mod dpb {
             }
             _ => {}
         }
-        Some((log2_max_frame_num, r.ue()))
+        Some((log2_max_frame_num, r.ue(), chroma))
     }
 
     /// How many values `frame_num` takes before it wraps, from the first SPS of an Annex-B
     /// H.264 stream.
     pub fn h264_frame_num_range(stream: &[u8]) -> Option<u32> {
-        h264_sps(stream).map(|(log2, _)| 1 << log2)
+        h264_sps(stream).map(|(log2, _, _)| 1 << log2)
     }
 
     /// `max_num_ref_frames` of the first SPS in an Annex-B H.264 stream.
     #[cfg(test)]
     pub fn h264_max_num_ref_frames(stream: &[u8]) -> Option<u32> {
-        h264_sps(stream).map(|(_, refs)| refs)
+        h264_sps(stream).map(|(_, refs, _)| refs)
+    }
+
+    /// `chroma_format_idc` of the first SPS in an Annex-B H.264 stream: 3 for 4:4:4.
+    #[cfg(test)]
+    pub fn h264_chroma_format_idc(stream: &[u8]) -> Option<u32> {
+        h264_sps(stream).map(|(_, _, chroma)| chroma)
     }
 }
 
 pub use dpb::h264_frame_num_range;
 #[cfg(test)]
-pub use dpb::h264_max_num_ref_frames;
+pub use dpb::{h264_chroma_format_idc, h264_max_num_ref_frames};
 
 #[cfg(test)]
 mod tests {

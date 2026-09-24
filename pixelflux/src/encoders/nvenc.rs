@@ -2140,6 +2140,11 @@ impl NvencEncoder {
         self.codec
     }
 
+    /// Every NVENC session converts to and declares limited range.
+    pub fn is_full_range(&self) -> bool {
+        false
+    }
+
     /// Whether the session negotiated 4:4:4 chroma.
     pub fn is_fullcolor(&self) -> bool {
         self.fullcolor
@@ -3384,7 +3389,7 @@ mod gpu_tests {
     /// Test helper: luma PSNR of one decoded access unit against the BGRA frame it encodes, the
     /// source taken through the limited-range BT.709 luma the session converts with.
     fn luma_psnr(
-        dec: &mut crate::webcam::decode::AvDecoder,
+        dec: &mut crate::webcam::decode::VideoDecoder,
         pkt: &[u8],
         src: &[u8],
         w: usize,
@@ -3413,7 +3418,7 @@ mod gpu_tests {
     /// frame, and prints the achieved rate at `fps`, the smallest and largest frame, and the luma
     /// PSNR of every decoded frame against its source.
     fn cbr_row(label: &str, enc: &mut NvencEncoder, codec: Codec, seq: &[&Vec<u8>], w: usize, h: usize, fps: usize) {
-        use crate::webcam::decode::AvDecoder;
+        use crate::webcam::decode::VideoDecoder;
         let n = seq.len() - 1;
         let first = enc.encode_cpu_packed(seq[0], w * 4, false, 0, 25, true).expect("warm-up");
         let mut pkts: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -3425,7 +3430,7 @@ mod gpu_tests {
         });
         let sizes: Vec<usize> = pkts.iter().map(|p| p.len().saturating_sub(VIDEO_HEADER_LEN)).collect();
         let bytes: usize = sizes.iter().sum();
-        let mut dec = AvDecoder::new(codec).expect("decoder");
+        let mut dec = VideoDecoder::new(codec).expect("decoder");
         luma_psnr(&mut dec, &first, seq[0], w, h);
         let psnr: Vec<f64> =
             pkts.iter().enumerate().map(|(i, p)| luma_psnr(&mut dec, p, seq[1 + i], w, h)).collect();
@@ -3552,7 +3557,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_codec_sessions_encode_and_decode() {
         use crate::encoders::codec::{av1_is_key, h264_frame_type, h265_frame_type, parse_video_type, FRAME_DELTA, FRAME_KEY};
-        use crate::webcam::decode::{AvDecoder, Decoder};
+        use crate::webcam::decode::{VideoDecoder, Decoder};
         let (w, h) = (1280usize, 720usize);
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
@@ -3566,7 +3571,7 @@ mod gpu_tests {
                 }
             };
             assert_eq!(enc.codec(), codec);
-            let mut dec = AvDecoder::new(codec).expect("decoder");
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
             for i in 0..6u64 {
                 let src = frame(w, h, 10 + i as u8);
                 let pkt = enc.encode_cpu_argb(&src, w * 4, i, 25, i == 0).expect("encode");
@@ -3586,7 +3591,7 @@ mod gpu_tests {
             }
             let key = enc.encode_cpu_argb(&frame(w, h, 99), w * 4, 6, 25, true).expect("forced key");
             assert_eq!(parse_video_type(key[1]), Some((codec, FRAME_KEY)));
-            let mut fresh = AvDecoder::new(codec).expect("decoder");
+            let mut fresh = VideoDecoder::new(codec).expect("decoder");
             assert!(fresh.decode(&key[10..]).expect("decode"), "{codec:?}: a forced key frame must decode alone");
 
             let mut full = s.clone();
@@ -3610,7 +3615,7 @@ mod gpu_tests {
     fn gpu_predicts_past_a_lost_frame() {
         use crate::encoders::reference::Reference;
         use crate::encoders::sps::h264_max_num_ref_frames;
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (w, h) = (1280usize, 720usize);
         let apart = |a: &crate::webcam::convert::I420View<'_>, b: &crate::webcam::convert::I420View<'_>| {
             a.y.chunks(a.y_stride)
@@ -3658,7 +3663,7 @@ mod gpu_tests {
             let (out, reference) = encode(&mut enc, 9, w, h);
             assert_eq!(reference, Reference::Frame(8), "{codec:?}");
             frames.push(out);
-            let (mut whole, mut lossy) = (AvDecoder::new(codec).unwrap(), AvDecoder::new(codec).unwrap());
+            let (mut whole, mut lossy) = (VideoDecoder::new(codec).unwrap(), VideoDecoder::new(codec).unwrap());
             for (i, f) in frames.iter().enumerate() {
                 assert!(whole.decode(f).expect("decode"), "{codec:?} frame {i}");
                 if !(5..8).contains(&i) {
@@ -3691,7 +3696,7 @@ mod gpu_tests {
     fn gpu_answers_a_loss_at_the_frame_num_wrap_with_a_key_frame() {
         use crate::encoders::reference::Reference;
         use crate::encoders::sps::h264_frame_num_range;
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (w, h) = (1280usize, 720usize);
         let mut s = settings(w as i32, h as i32, 60.0);
         s.omit_stripe_headers = true;
@@ -3716,7 +3721,7 @@ mod gpu_tests {
         assert!(enc.invalidate_reference(range as u16), "the wrap frame is reported lost");
         let (out, reference) = encode(&mut enc, range + 1);
         assert_eq!(reference, Reference::None, "the loss at the wrap costs the key frame");
-        let mut lossy = AvDecoder::new(Codec::H264).unwrap();
+        let mut lossy = VideoDecoder::new(Codec::H264).unwrap();
         for f in &frames[..range] {
             assert!(lossy.decode(f).expect("decode"));
         }
@@ -4170,7 +4175,7 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_dmabuf_chroma_is_sited_at_the_block_center() {
-        use crate::webcam::decode::{AvDecoder, Codec, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Codec, Decoder as _};
         let (w, h) = (256u32, 256u32);
         let s = settings(w as i32, h as i32, 60.0);
         let (gbm, mut renderer) = gpu_render();
@@ -4179,7 +4184,7 @@ mod gpu_tests {
         let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
         assert!(enc.csc.is_some(), "this GPU took no chroma convert");
         let pkt = enc.encode(&dmabuf, 0, 20, true).expect("dmabuf encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture");
         let v = dec.frame().expect("decoded frame");
         let (mut su, mut sv) = (0.0f64, 0.0f64);
@@ -4283,30 +4288,45 @@ mod gpu_tests {
     /// color when the matrix the VUI declares is inverted, which is what a client does with
     /// every frame. 4:2:0 comes through the kernel and 4:4:4 through NVENC's own conversion, so
     /// this is what holds both to the declared matrix — the siting check cannot see a wrong one,
-    /// its tile being neutral whichever matrix converts it. Ignored by default.
+    /// its tile being neutral whichever matrix converts it. No software decoder reads 4:4:4
+    /// H.264, so that stream is held to what its SPS declares and the 4:4:4 picture is read
+    /// back from the HEVC session, which converts the same way. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_chart_decodes_to_the_color_that_was_painted() {
         use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::encoders::sps::{h264_chroma_format_idc, read_color};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (w, h) = (256usize, 128usize);
-        for fullcolor in [false, true] {
+        for (codec, fullcolor) in [(Codec::H264, false), (Codec::H264, true), (Codec::H265, true)] {
             let st = RustCaptureSettings {
+                codec,
                 video_fullcolor: fullcolor,
                 ..settings(w as i32, h as i32, 60.0)
             };
             let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
             if fullcolor && !enc.is_fullcolor() {
-                println!("[chart] this GPU carries no 4:4:4 H.264");
+                println!("[chart] this GPU carries no 4:4:4 {codec:?}");
                 continue;
             }
             assert_eq!(enc.csc.is_some(), !fullcolor, "the convert follows the chroma format");
-            let pkt = enc.encode_cpu_packed(&chart_bgra(w, h), w * 4, false, 0, 20, true).expect("encode");
-            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
-            assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
-            let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
-            println!("[chart] NVENC 4:4:4 {fullcolor}: worst |dRGB| {worst:.1}");
-            assert!(worst <= 8.0, "the session paints {worst:.1} off the chart");
+            let check = |enc: &mut NvencEncoder, bgra: &[u8], w: usize, frame: u64, what: &str| {
+                let pkt = enc.encode_cpu_packed(bgra, w * 4, false, frame, 20, true).expect("encode");
+                let stream = &pkt[VIDEO_HEADER_LEN..];
+                if codec == Codec::H264 && fullcolor {
+                    assert_eq!(h264_chroma_format_idc(stream), Some(3), "the SPS declares 4:4:4");
+                    let sps = crate::encoders::codec::annexb_nals(stream).find(|n| n[0] & 0x1f == 7).expect("an SPS");
+                    assert_eq!(read_color(sps).map(|s| (s.matrix, s.full_range)), Some((1, false)), "the SPS declares BT.709 limited");
+                    println!("[chart] NVENC H264 4:4:4{what}: the SPS declares 4:4:4 BT.709");
+                    return;
+                }
+                let mut dec = VideoDecoder::new(codec).expect("decoder");
+                assert!(dec.decode(stream).expect("decode"), "no picture");
+                let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
+                println!("[chart] NVENC {codec:?} 4:4:4 {fullcolor}{what}: worst |dRGB| {worst:.1}");
+                assert!(worst <= 8.0, "the session paints {worst:.1} off the chart{what}");
+            };
+            check(&mut enc, &chart_bgra(w, h), w, 0, "");
 
             // A resize rebuilds the convert's surface around the new geometry, so the chart is
             // read back again at a size the session was not opened for.
@@ -4314,12 +4334,7 @@ mod gpu_tests {
             let grown = RustCaptureSettings { width: w2 as i32, height: h2 as i32, ..st };
             assert!(enc.reconfigure_resolution(&grown).expect("resize"), "the resize was taken");
             assert_eq!(enc.csc.is_some(), !fullcolor, "the convert followed the resize");
-            let pkt = enc.encode_cpu_packed(&chart_bgra(w2, h2), w2 * 4, false, 1, 20, true).expect("encode");
-            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
-            assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
-            let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
-            println!("[chart] NVENC 4:4:4 {fullcolor} after a resize to {w2}x{h2}: worst |dRGB| {worst:.1}");
-            assert!(worst <= 8.0, "the resized session paints {worst:.1} off the chart");
+            check(&mut enc, &chart_bgra(w2, h2), w2, 1, " after a resize");
         }
     }
 
@@ -4333,7 +4348,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_hardware_conversion_matches_the_declared_matrix() {
         use crate::encoders::chroma_siting::{chart_bgra, chart_error, chroma, BT601, BT709};
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (w, h) = (256usize, 256usize);
         let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
         let st = settings(w as i32, h as i32, 60.0);
@@ -4342,7 +4357,7 @@ mod gpu_tests {
         assert!(enc.csc.is_none(), "the session was asked for NVENC's own conversion");
 
         let pkt = enc.encode_cpu_packed(&chart_bgra(w, h), w * 4, false, 0, 20, true).expect("encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
         let worst = chart_error(&dec.frame().expect("decoded frame"), BT709);
         println!("[csc] NVENC's own conversion: chart worst |dRGB| {worst:.1}");
@@ -4371,7 +4386,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_external_pointer_is_encoded_where_it_lies() {
         use crate::encoders::chroma_siting::{ycbcr, BT709};
-        use crate::webcam::decode::AvDecoder;
+        use crate::webcam::decode::VideoDecoder;
         let (w, h) = (256usize, 128usize);
         let st = settings(w as i32, h as i32, 60.0);
         let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
@@ -4393,7 +4408,7 @@ mod gpu_tests {
         let pkt = enc
             .encode_cuda_pitch(external, external_pitch, false, 0, 20, true)
             .expect("external encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         let (mean, _) = decoded_means(&mut dec, &pkt, (0, 0, w as i32, h as i32));
         let want = ycbcr(paint.map(f64::from), BT709);
         println!("[external] decoded {mean:?} against the painted {want:?}");
@@ -4460,10 +4475,10 @@ mod gpu_tests {
 
     /// Encode one key frame of `bgra` and return the mean chroma of the decoded picture.
     fn encode_and_measure(enc: &mut NvencEncoder, bgra: &[u8]) -> (f64, f64) {
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let w = enc.width() as usize;
         let pkt = enc.encode_cpu_packed(bgra, w * 4, false, 0, 20, true).expect("packed encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
         let v = dec.frame().expect("decoded frame");
         let (mut su, mut sv) = (0.0f64, 0.0f64);
@@ -4629,9 +4644,9 @@ mod gpu_tests {
     }
 
     /// Test helper: decode one H.264 access unit (the bytes behind the 10-byte wire header)
-    /// with the crate's avcodec decoder and return the mean Y/Cb/Cr inside `rect` and outside it.
+    /// with the crate's H.264 decoder and return the mean Y/Cb/Cr inside `rect` and outside it.
     fn decoded_means(
-        dec: &mut crate::webcam::decode::AvDecoder,
+        dec: &mut crate::webcam::decode::VideoDecoder,
         pkt: &[u8],
         rect: (i32, i32, i32, i32),
     ) -> ([f64; 3], [f64; 3]) {
@@ -4701,7 +4716,7 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_dmabuf_direct_and_copy_paths_decode_to_the_paint() {
-        use crate::webcam::decode::{AvDecoder, Codec};
+        use crate::webcam::decode::{VideoDecoder, Codec};
         let (w, h) = (1920u32, 1080u32);
         let s = settings(w as i32, h as i32, 60.0);
         let (gbm, mut renderer) = gpu_render();
@@ -4710,7 +4725,7 @@ mod gpu_tests {
         let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
 
         let run = |enc: &mut NvencEncoder, label: &str| -> Vec<Vec<u8>> {
-            let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+            let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
             let mut out = Vec::new();
             for i in 0..6u64 {
                 let (seed, (_, dmabuf)) = &bufs[(i % 2) as usize];
@@ -4767,7 +4782,7 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_packed_bgra_and_rgba_inputs_agree() {
-        use crate::webcam::decode::{AvDecoder, Codec};
+        use crate::webcam::decode::{VideoDecoder, Codec};
         let (w, h) = (1280u32, 720u32);
         let s = settings(w as i32, h as i32, 60.0);
         let rect = block_rect(w, h, 3);
@@ -4792,12 +4807,12 @@ mod gpu_tests {
         let bgra = paint(false);
         let rgba = paint(true);
         let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
-        let mut dec = AvDecoder::new(Codec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         let stride = (w * 4) as usize;
         // Byte order reaches the chroma convert as its own argument and the hardware conversion
         // as the packed surface's registered format, so both mechanisms are driven here: the
         // second pass is the path a GPU whose driver refuses the kernel takes.
-        let pass = |enc: &mut NvencEncoder, dec: &mut AvDecoder, tag: &str| {
+        let pass = |enc: &mut NvencEncoder, dec: &mut VideoDecoder, tag: &str| {
             for (i, (buf, is_rgba)) in [(&bgra, false), (&rgba, true), (&bgra, false), (&rgba, true)]
                 .into_iter()
                 .enumerate()

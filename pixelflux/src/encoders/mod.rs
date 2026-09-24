@@ -8,11 +8,12 @@
 //! rate-control policy, which software encoder a build resolves each codec to, and which
 //! hardware encoder a render node serves each with.
 
-/// libavcodec-backed encoders: VA-API hardware sessions on a DRM render node, and the
-/// software HEVC / VP8 / VP9 / AV1 encoders the linked FFmpeg carries.
-pub mod avcodec;
+/// The bit writer the packed headers of the VA-API session are written with.
+pub mod bits;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
+/// Software HEVC: x265 with the `gpl` feature, kvazaar without it.
+pub mod hevc;
 /// Tegra hardware video encoding through the vendor V4L2 encoder, loaded at runtime: the only path to a
 /// Jetson's encoder, which carries no `libnvidia-encode` and no render node driver. Built for
 /// `aarch64` alone — the vendor libraries and the encoder behind them exist on no other
@@ -29,12 +30,20 @@ pub mod oh264;
 /// PNG watermark overlay composited onto frames before encoding.
 pub mod overlay;
 pub mod reference;
+/// What the full-frame software sessions share: planar input, quantizer, rate settings.
+pub mod session;
 /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
 /// change detection.
 pub mod software;
 /// The colour an H.264 stream declares: read from a sequence parameter set, and written into
 /// one for a device that converts without saying what it converted with.
 pub mod sps;
+/// Software AV1 through SVT-AV1.
+pub mod svtav1;
+/// VA-API hardware sessions on a DRM render node, driven through libva directly.
+pub mod vaapi;
+/// Software VP8 and VP9 through libvpx.
+pub mod vpx;
 /// Hardware H.264 through a generic stateful V4L2 M2M encoder: boards whose encoder sits
 /// behind the kernel's own interface rather than a vendor library or a render node, such as
 /// a Raspberry Pi 4, RK356x, or i.MX8M. Built everywhere, since the interface is the kernel's.
@@ -43,10 +52,9 @@ pub mod v4l2m2m;
 pub use codec::*;
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 
-use avcodec::{AvcodecEncoder, Backend, Input};
 use nvenc::NvencEncoder;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
@@ -57,13 +65,11 @@ compile_error!(
     "pixelflux needs a software H.264 encoder: enable the `gpl` feature (libx264, the default) or `openh264`."
 );
 
-/// A software encoder the build can run for one codec: the library's name as reported to
-/// Python and the logs, and the libavcodec encoder that reaches it (empty for H.264, whose
-/// software encoders are linked directly).
+/// A software encoder the build runs for one codec: the library's name as reported to Python
+/// and the logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SoftwareEncoder {
     pub library: &'static str,
-    pub avcodec: &'static str,
 }
 
 /// The codecs a render node encodes in hardware, each with the backend's name.
@@ -75,7 +81,7 @@ pub type HardwareEncoders = Vec<(Codec, &'static str, bool)>;
 /// session logs it in lower case (`"nvenc"`, `"vaapi"`, or `"tegra"`), probed once per node and
 /// remembered for the life of the process: the ladder picks the backend by the node's
 /// driver exactly as `select_frame_encoder` does, and that backend lists the codecs its
-/// device has an engine for (`nvenc::probe_codecs`, `avcodec::probe_codecs`). A node whose
+/// device has an engine for (`nvenc::probe_codecs`, `vaapi::probe_codecs`). A node whose
 /// backend cannot be brought up serves nothing, said once in the log, so a caller offers
 /// the codec only where a session would come up on hardware rather than demote. What a
 /// session is then refused for (a size past the engine's maximum, a 4:4:4 the engine lacks)
@@ -99,7 +105,7 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     let (backend, codecs) = if crate::driver_selects_nvenc(&driver) {
         ("nvenc", nvenc::probe_codecs(node))
     } else {
-        ("vaapi", avcodec::probe_codecs(node))
+        ("vaapi", vaapi::probe_codecs(node))
     };
     let served: HardwareEncoders = match codecs {
         Ok(codecs) => codecs.into_iter().map(|(codec, fullcolor)| (codec, backend, fullcolor)).collect(),
@@ -137,78 +143,48 @@ pub fn software_fullcolor(codec: Codec) -> bool {
     }
 }
 
-/// The name of the software encoder this build runs for `codec`, for logs; `"none"` where the
-/// linked FFmpeg carries none.
+/// The name of the software encoder this build runs for `codec`, for logs; `"none"` for JPEG,
+/// which is striped stills.
 pub fn software_library(codec: Codec) -> &'static str {
     software_encoder(codec).map_or("none", |enc| enc.library)
 }
 
-/// The software encoder this build runs for `codec` on this machine, or `None` when the linked
-/// FFmpeg carries none of the encoders the codec is served by that run here.
+/// The software encoder this build runs for `codec` on this machine, or `None` for JPEG and for
+/// a codec whose encoder does not run here.
 ///
-/// H.264 is fixed by the crate features: libx264 whenever `gpl` is on (it wins even if
-/// `openh264` is also enabled), Cisco OpenH264 for a GPL-free build; it is what the striped
-/// software path and the full-frame software fallback under NVENC/VA-API both encode with.
-/// The other codecs are probed once against the linked libavcodec: HEVC through x265 (GPL,
-/// so only with the `gpl` feature) or kvazaar, VP8 and VP9 through libvpx, AV1 through
-/// SVT-AV1, each opened on a frame in a forked child first, so an encoder that takes its
-/// process down on this machine is one the build does not carry here and the next candidate
-/// is tried. A build without `gpl` never picks x265 even from a system FFmpeg that has it,
-/// keeping the GPL-free posture the feature promises.
+/// Every one is fixed by the crate features: libx264 and x265 whenever `gpl` is on (it wins
+/// even if `openh264` is also enabled), Cisco OpenH264 and kvazaar for a GPL-free build; libvpx
+/// serves VP8 and VP9 and SVT-AV1 serves AV1 in both. H.264 is what the striped software
+/// path and the full-frame software fallback under NVENC/VA-API both encode with. Each
+/// full-frame encoder is opened on a frame in a forked child once, so one that takes its
+/// process down on this machine is one the build does not carry here.
 pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
-    static PROBED: OnceLock<[Option<SoftwareEncoder>; 5]> = OnceLock::new();
-    if codec == Codec::Jpeg {
-        return None;
-    }
-    let table = PROBED.get_or_init(|| {
-        let h265: &[SoftwareEncoder] = if cfg!(feature = "gpl") {
-            &[
-                SoftwareEncoder { library: "x265", avcodec: "libx265" },
-                SoftwareEncoder { library: "kvazaar", avcodec: "libkvazaar" },
-            ]
-        } else {
-            &[SoftwareEncoder { library: "kvazaar", avcodec: "libkvazaar" }]
-        };
-        let first_linked = |codec: Codec, candidates: &[SoftwareEncoder]| {
-            candidates.iter().copied().find(|c| avcodec_has_encoder(c.avcodec) && encodes_in_child(codec, *c))
-        };
-        [
-            Some(SoftwareEncoder {
-                library: if cfg!(feature = "gpl") { "x264" } else { "openh264" },
-                avcodec: "",
-            }),
-            first_linked(Codec::Vp8, &[SoftwareEncoder { library: "libvpx", avcodec: "libvpx" }]),
-            first_linked(Codec::Vp9, &[SoftwareEncoder { library: "libvpx", avcodec: "libvpx-vp9" }]),
-            first_linked(Codec::Av1, &[SoftwareEncoder { library: "svt-av1", avcodec: "libsvtav1" }]),
-            first_linked(Codec::H265, h265),
-        ]
-    });
-    table[Codec::VIDEO.iter().position(|&c| c == codec).unwrap()]
+    static ENCODES: OnceLock<[bool; 5]> = OnceLock::new();
+    let library = match codec {
+        Codec::Jpeg => return None,
+        Codec::H264 => if cfg!(feature = "gpl") { "x264" } else { "openh264" },
+        Codec::H265 => if cfg!(feature = "gpl") { "x265" } else { "kvazaar" },
+        Codec::Vp8 | Codec::Vp9 => "libvpx",
+        Codec::Av1 => "svt-av1",
+    };
+    let encodes = ENCODES.get_or_init(|| Codec::VIDEO.map(|c| c == Codec::H264 || encodes_in_child(c)));
+    encodes[Codec::VIDEO.iter().position(|&c| c == codec).unwrap()].then_some(SoftwareEncoder { library })
 }
 
-/// Whether the linked libavcodec registers an encoder of this name.
-fn avcodec_has_encoder(name: &str) -> bool {
-    let Ok(name) = CString::new(name) else { return false };
-    unsafe { !ffmpeg_sys_next::avcodec_find_encoder_by_name(name.as_ptr()).is_null() }
-}
-
-/// Whether opening `enc` for `codec` on a small frame and encoding one leaves a process alive,
-/// tried in a forked child: a library that faults on this machine, with an instruction the CPU
-/// lacks or a register the kernel does not emulate, takes the child down and not a session.
-fn encodes_in_child(codec: Codec, enc: SoftwareEncoder) -> bool {
+/// Whether opening `codec`'s software session on a small frame and encoding one leaves a
+/// process alive, tried in a forked child: a library that faults on this machine, with an
+/// instruction the CPU lacks or a register the kernel does not emulate, takes the child down
+/// and not a session.
+fn encodes_in_child(codec: Codec) -> bool {
     survives_in_child(|| {
         // The child converts on a pool of its own: the parent's rayon workers do not exist in it.
         let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else { return };
         pool.install(|| {
             let settings = RustCaptureSettings { width: 256, height: 128, ..Default::default() };
-            let Ok(mut encoder) = AvcodecEncoder::open(
-                &settings, codec, Backend::Software, enc.library, enc.avcodec, Input::Host { rgba: false },
-            ) else {
-                return;
-            };
+            let Ok(mut session) = software_session(&settings, codec, false) else { return };
             let frame = vec![0u8; 256 * 128 * 4];
             for n in 0..64 {
-                let packet = encoder.encode_host(&frame, 256 * 4, n, settings.video_crf as u32, n == 0);
+                let packet = session.encode_host(&frame, 256 * 4, false, n, settings.video_crf as u32, n == 0);
                 if !matches!(packet, Ok(p) if p.is_empty()) {
                     break;
                 }
@@ -245,7 +221,7 @@ fn survives_in_child(f: impl FnOnce()) -> bool {
 
 /// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
 /// quality drop under sustained motion) must be requested before a fixed-QP encoder commits
-/// it. Moving the quantizer costs a codec re-open (the libavcodec encoders) or a full encoder
+/// it. Moving the quantizer costs a codec re-open (kvazaar, SVT-AV1) or a full encoder
 /// rebuild (OpenH264), and either forces a key frame, so acting on every transient increase —
 /// and then reversing it as motion settles — would make the picture pulse. Quality
 /// *increases* (a lower QP, e.g. a paint-over refresh) apply at once and never wait. Shared so
@@ -308,9 +284,6 @@ pub fn colorspace_desc(fullcolor: bool, full_range: bool) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The build always serves H.264 in software, JPEG never, and whatever the linked FFmpeg
-    /// carries for the rest is reported by a library name with a libavcodec encoder behind it;
-    /// a GPL-free build never names x265.
     /// A session lands on the codec it asked for, or on the next video codec this host serves;
     /// JPEG is the ladder's last leg, not its answer to one missing encoder.
     #[test]
@@ -373,6 +346,8 @@ mod tests {
         }));
     }
 
+    /// The build serves every video codec in software, JPEG never, and the GPL-free build
+    /// names neither x264 nor x265.
     #[test]
     fn software_encoders_follow_the_build() {
         use rayon::prelude::*;
@@ -381,20 +356,15 @@ mod tests {
         assert_eq!(h264.library, if cfg!(feature = "gpl") { "x264" } else { "openh264" });
         assert_eq!(software_library(Codec::H264), h264.library);
         assert_eq!(software_library(Codec::Jpeg), "none");
-        assert!(h264.avcodec.is_empty());
         assert_eq!(software_encoder(Codec::Jpeg), None);
-        for codec in [Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1] {
-            if let Some(enc) = software_encoder(codec) {
-                assert!(avcodec_has_encoder(enc.avcodec), "{codec:?}: {}", enc.avcodec);
-                assert!(!enc.library.is_empty());
-                if !cfg!(feature = "gpl") {
-                    assert_ne!(enc.library, "x265");
-                }
-            }
-        }
+        assert_eq!(software_library(Codec::H265), if cfg!(feature = "gpl") { "x265" } else { "kvazaar" });
+        assert_eq!(software_library(Codec::Vp8), "libvpx");
+        assert_eq!(software_library(Codec::Vp9), "libvpx");
+        assert_eq!(software_library(Codec::Av1), "svt-av1");
         assert_eq!(software_fullcolor(Codec::H264), cfg!(feature = "gpl"));
-        assert!(!software_fullcolor(Codec::Vp8));
-        assert_eq!(software_fullcolor(Codec::Vp9), software_encoder(Codec::Vp9).is_some());
+        assert_eq!(software_fullcolor(Codec::H265), cfg!(feature = "gpl"));
+        assert!(!software_fullcolor(Codec::Vp8) && !software_fullcolor(Codec::Av1));
+        assert!(software_fullcolor(Codec::Vp9));
     }
 
     /// A session's range is the session's to report, not something read off whether its
@@ -427,7 +397,14 @@ mod tests {
 #[allow(clippy::large_enum_variant)]
 pub enum FrameEncoder {
     Nvenc(NvencEncoder),
-    Avcodec(AvcodecEncoder),
+    /// A VA-API session on a render node, hardware.
+    Vaapi(vaapi::VaapiEncoder),
+    /// libvpx VP8 or VP9, software.
+    Vpx(vpx::VpxEncoder),
+    /// x265 or kvazaar, software.
+    Hevc(hevc::HevcEncoder),
+    /// SVT-AV1, software.
+    Av1(svtav1::SvtAv1Encoder),
     /// Tegra's encoder, reached through the vendor V4L2 library.
     #[cfg(target_arch = "aarch64")]
     Tegra(tegra::TegraEncoder),
@@ -435,35 +412,41 @@ pub enum FrameEncoder {
     V4l2m2m(v4l2m2m::V4l2M2mEncoder),
 }
 
+/// Apply one expression to the session behind whichever variant `self` is.
+macro_rules! each {
+    ($self:expr, $enc:ident => $e:expr) => {
+        match $self {
+            FrameEncoder::Nvenc($enc) => $e,
+            FrameEncoder::Vaapi($enc) => $e,
+            FrameEncoder::Vpx($enc) => $e,
+            FrameEncoder::Hevc($enc) => $e,
+            FrameEncoder::Av1($enc) => $e,
+            #[cfg(target_arch = "aarch64")]
+            FrameEncoder::Tegra($enc) => $e,
+            FrameEncoder::V4l2m2m($enc) => $e,
+        }
+    };
+}
+
 impl FrameEncoder {
     /// The codec the session emits.
     pub fn codec(&self) -> Codec {
-        match self {
-            FrameEncoder::Nvenc(enc) => enc.codec(),
-            FrameEncoder::Avcodec(enc) => enc.codec(),
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(enc) => enc.codec(),
-            FrameEncoder::V4l2m2m(enc) => enc.codec(),
-        }
+        each!(self, enc => enc.codec())
     }
 
-    /// Whether the session encodes on a GPU.
+    /// Whether the session encodes on a GPU or a hardware engine.
     pub fn is_hardware(&self) -> bool {
-        match self {
-            FrameEncoder::Nvenc(_) => true,
-            FrameEncoder::Avcodec(enc) => enc.backend() == Backend::Vaapi,
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(_) => true,
-            FrameEncoder::V4l2m2m(_) => true,
-        }
+        !matches!(self, FrameEncoder::Vpx(_) | FrameEncoder::Hevc(_) | FrameEncoder::Av1(_))
     }
 
     /// The backend as the logs name it: `NVENC`, `VAAPI`, or the software library.
     pub fn backend_name(&self) -> &'static str {
         match self {
             FrameEncoder::Nvenc(_) => "NVENC",
-            FrameEncoder::Avcodec(enc) if enc.backend() == Backend::Vaapi => "VAAPI",
-            FrameEncoder::Avcodec(enc) => enc.library(),
+            FrameEncoder::Vaapi(_) => "VAAPI",
+            FrameEncoder::Vpx(enc) => enc.library(),
+            FrameEncoder::Hevc(enc) => enc.library(),
+            FrameEncoder::Av1(enc) => enc.library(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => "TEGRA",
             FrameEncoder::V4l2m2m(_) => "V4L2M2M",
@@ -472,25 +455,13 @@ impl FrameEncoder {
 
     /// Whether the session negotiated 4:4:4 chroma.
     pub fn is_fullcolor(&self) -> bool {
-        match self {
-            FrameEncoder::Nvenc(enc) => enc.is_fullcolor(),
-            FrameEncoder::Avcodec(enc) => enc.is_fullcolor(),
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(enc) => enc.is_fullcolor(),
-            FrameEncoder::V4l2m2m(enc) => enc.is_fullcolor(),
-        }
+        each!(self, enc => enc.is_fullcolor())
     }
 
     /// Whether the session signals full range: a software 4:4:4 of x264's kind, and the V4L2
     /// M2M sessions whose firmware converts at full range and offers no way to ask for another.
     pub fn is_full_range(&self) -> bool {
-        match self {
-            FrameEncoder::Nvenc(_) => false,
-            FrameEncoder::Avcodec(enc) => enc.is_full_range(),
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(_) => false,
-            FrameEncoder::V4l2m2m(enc) => enc.is_full_range(),
-        }
+        each!(self, enc => enc.is_full_range())
     }
 
     /// Apply a live bitrate / VBV / frame-rate change. `Err` means the session lost its codec
@@ -501,7 +472,10 @@ impl FrameEncoder {
                 enc.reconfigure_rate(settings);
                 Ok(())
             }
-            FrameEncoder::Avcodec(enc) => enc.reconfigure_rate(settings),
+            FrameEncoder::Vaapi(enc) => enc.reconfigure_rate(settings),
+            FrameEncoder::Vpx(enc) => enc.reconfigure_rate(settings),
+            FrameEncoder::Hevc(enc) => enc.reconfigure_rate(settings),
+            FrameEncoder::Av1(enc) => enc.reconfigure_rate(settings),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.reconfigure_rate(settings),
             FrameEncoder::V4l2m2m(enc) => enc.reconfigure_rate(settings),
@@ -521,11 +495,40 @@ impl FrameEncoder {
     ) -> Result<Vec<u8>, String> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode_cpu_packed(pixels, stride, rgba, frame_number, qp, force_idr),
-            FrameEncoder::Avcodec(enc) => enc.encode_host(pixels, stride, frame_number, qp, force_idr),
+            FrameEncoder::Vaapi(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
+            FrameEncoder::Vpx(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
+            FrameEncoder::Hevc(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
+            FrameEncoder::Av1(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
             FrameEncoder::V4l2m2m(enc) => enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr),
         }
+    }
+
+    /// The data one call returned, cut at the units it carries, each with its own frame's id and
+    /// reference: whole and labelled `encoded` from a session that hands back the frame it
+    /// encoded, one unit per earlier frame from one that hands them back late (Tegra), so what a
+    /// consumer reports lost is the unit it dropped and nothing else.
+    pub fn delivered_units(&self, data: Vec<u8>, encoded: u16) -> Vec<(Vec<u8>, u16, reference::Reference)> {
+        #[cfg(target_arch = "aarch64")]
+        if let FrameEncoder::Tegra(enc) = self {
+            match enc.delivered_units() {
+                [] => {}
+                &[(id, reference, _)] => return vec![(data, id, reference)],
+                units => {
+                    let mut start = 0;
+                    return units
+                        .iter()
+                        .map(|&(id, reference, end)| {
+                            let unit = data[start..end].to_vec();
+                            start = end;
+                            (unit, id, reference)
+                        })
+                        .collect();
+                }
+            }
+        }
+        vec![(data, encoded, self.last_reference())]
     }
 
     /// The frame the last delivered frame predicted from.
@@ -549,26 +552,14 @@ impl FrameEncoder {
     }
 
     pub fn last_reference(&self) -> reference::Reference {
-        match self {
-            FrameEncoder::Nvenc(enc) => enc.last_reference(),
-            FrameEncoder::Avcodec(_) => reference::Reference::Untracked,
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(_) => reference::Reference::Untracked,
-            FrameEncoder::V4l2m2m(_) => reference::Reference::Untracked,
-        }
+        each!(self, enc => enc.last_reference())
     }
 
     /// Leave frame `frame_id` and every frame after it out of the predictions, so the next
     /// frame decodes for a client that lost it. False when the session cannot, and the caller
     /// codes a key frame instead.
     pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
-        match self {
-            FrameEncoder::Nvenc(enc) => enc.invalidate_reference(frame_id),
-            FrameEncoder::Avcodec(_) => false,
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(_) => false,
-            FrameEncoder::V4l2m2m(_) => false,
-        }
+        each!(self, enc => enc.invalidate_reference(frame_id))
     }
 
     /// Encode one Wayland dmabuf in place (a zero-copy session).
@@ -581,12 +572,20 @@ impl FrameEncoder {
     ) -> Result<Vec<u8>, String> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.encode(dmabuf, frame_number, qp, force_idr),
-            FrameEncoder::Avcodec(enc) => enc.encode_dmabuf(dmabuf, frame_number, qp, force_idr),
-            #[cfg(target_arch = "aarch64")]
-            FrameEncoder::Tegra(_) => Err("the Tegra session takes host frames".into()),
-            FrameEncoder::V4l2m2m(_) => Err("the V4L2 M2M session takes host frames".into()),
+            FrameEncoder::Vaapi(enc) => enc.encode_dmabuf(dmabuf, frame_number, qp, force_idr),
+            _ => Err(format!("the {} session takes host frames", self.backend_name())),
         }
     }
+}
+
+/// The full-frame software session of `codec` on host frames in the byte order `rgba` names.
+pub fn software_session(settings: &RustCaptureSettings, codec: Codec, rgba: bool) -> Result<FrameEncoder, String> {
+    Ok(match codec {
+        Codec::Vp8 | Codec::Vp9 => FrameEncoder::Vpx(vpx::VpxEncoder::new(settings, codec, rgba)?),
+        Codec::H265 => FrameEncoder::Hevc(hevc::HevcEncoder::new(settings, rgba)?),
+        Codec::Av1 => FrameEncoder::Av1(svtav1::SvtAv1Encoder::new(settings, rgba)?),
+        Codec::H264 | Codec::Jpeg => return Err(format!("{} takes the striped path", codec.display())),
+    })
 }
 
 /// The chroma sampling of a session as the logs name it.
@@ -788,20 +787,20 @@ fn select_for_codec(
             // alive, and a window resize would then demote a working hardware path.
             drop(prior);
             let input = match source {
-                FrameSource::Dmabuf { .. } => Input::Dmabuf,
-                FrameSource::Host { rgba } => Input::Host { rgba },
+                FrameSource::Dmabuf { .. } => vaapi::Input::Dmabuf,
+                FrameSource::Host { rgba } => vaapi::Input::Host { rgba },
             };
-            match AvcodecEncoder::new(settings, codec, Backend::Vaapi, input) {
+            match vaapi::VaapiEncoder::new(settings, codec, input) {
                 Ok(enc) => {
                     println!(
                         "[{tag}] Encoder: VAAPI {} {} on {} surfaces (render node {node}, {} driver).",
                         codec.display(),
                         chroma_name(enc.is_fullcolor()),
-                        enc.sw_format_name(),
+                        enc.surface_format_name(),
                         driver_name(&driver)
                     );
                     crate::report::hardware_encoder("", driver_name(&driver), node);
-                    return Some(FrameEncoder::Avcodec(enc));
+                    return Some(FrameEncoder::Vaapi(enc));
                 }
                 Err(e) => {
                     eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display());
@@ -846,10 +845,13 @@ fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) 
         println!("[{tag}] Encoder: software {} ({}).", codec.display(), software_library(Codec::H264));
         return None;
     }
-    match AvcodecEncoder::new(settings, codec, Backend::Software, Input::Host { rgba }) {
+    let session = software_encoder(codec)
+        .ok_or_else(|| format!("the {} encoder does not run on this machine", codec.display()))
+        .and_then(|_| software_session(settings, codec, rgba));
+    match session {
         Ok(enc) => {
-            println!("[{tag}] Encoder: software {} ({}).", codec.display(), enc.library());
-            Some(FrameEncoder::Avcodec(enc))
+            println!("[{tag}] Encoder: software {} ({}).", codec.display(), enc.backend_name());
+            Some(enc)
         }
         Err(e) => {
             eprintln!("[{tag}] No {} encoder available: {e}.", codec.display());
@@ -858,6 +860,489 @@ fn software_fallback(settings: &mut RustCaptureSettings, rgba: bool, tag: &str) 
     }
 }
 
+
+#[cfg(test)]
+mod software_tests {
+    //! The full-frame software sessions, driven end to end through the one ladder step that
+    //! builds them: every frame they emit is wire-framed for its codec and decodes back to the
+    //! picture that went in, key frames come on request and are self-contained, the quantizer
+    //! and the CBR target reach the encoder, a live rate or quality change keeps the stream
+    //! decodable, and each stream declares the matrix it was converted with.
+    use super::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, WIRE_VIDEO};
+    use super::*;
+    use crate::webcam::convert::I420View;
+    use crate::webcam::decode::{ColorTags, Decoder, VideoDecoder};
+    use std::cell::Cell;
+    use std::sync::{Mutex, MutexGuard};
+
+    const W: usize = 320;
+    const H: usize = 240;
+
+    /// The video codecs the software ladder serves whole-frame.
+    const SOFTWARE: [Codec; 4] = [Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1];
+
+    /// One AV1 session at a time across the suite: SVT-AV1 before 2.x faults while a second
+    /// session is live, and the whole life of the session is the unsafe window. Every other
+    /// codec stays parallel, and a thread already holding the turn keeps it, since one check
+    /// holds two sessions at once.
+    static ONE_AV1: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        static AV1_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// The AV1 turn, held for as long as the session it was taken for.
+    pub(super) struct Turn {
+        _guard: Option<MutexGuard<'static, ()>>,
+        counted: bool,
+    }
+
+    impl Drop for Turn {
+        fn drop(&mut self) {
+            if self.counted {
+                AV1_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            }
+        }
+    }
+
+    /// Take the turn for `codec`, which is a no-op for anything but AV1.
+    pub(super) fn turn(codec: Codec) -> Turn {
+        let counted = codec == Codec::Av1;
+        let first = counted
+            && AV1_DEPTH.with(|depth| {
+                let held = depth.get();
+                depth.set(held + 1);
+                held == 0
+            });
+        Turn { _guard: first.then(|| ONE_AV1.lock().unwrap_or_else(|e| e.into_inner())), counted }
+    }
+
+    /// A software session holding the AV1 turn for as long as it lives.
+    pub(super) struct Session {
+        encoder: FrameEncoder,
+        _turn: Turn,
+    }
+
+    impl std::ops::Deref for Session {
+        type Target = FrameEncoder;
+        fn deref(&self) -> &FrameEncoder {
+            &self.encoder
+        }
+    }
+
+    impl std::ops::DerefMut for Session {
+        fn deref_mut(&mut self) -> &mut FrameEncoder {
+            &mut self.encoder
+        }
+    }
+
+    pub(super) fn settings(codec: Codec) -> RustCaptureSettings {
+        RustCaptureSettings {
+            width: W as i32,
+            height: H as i32,
+            target_fps: 30.0,
+            codec,
+            video_crf: 25,
+            use_cpu: true,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn session(codec: Codec, s: &RustCaptureSettings, rgba: bool) -> Session {
+        let _turn = turn(codec);
+        let encoder = software_session(s, codec, rgba).unwrap_or_else(|e| panic!("{codec:?} software session: {e}"));
+        Session { encoder, _turn }
+    }
+
+    /// Frames a fresh session takes before its first packet, zero where one frame in is one
+    /// picture out. The wire ids and the latency budget both assume zero; SVT-AV1 gives that
+    /// only from 2.3.0, where its packet call became blocking for low delay, and before it
+    /// fills two frames that it neither reports nor lets a caller shorten.
+    fn pipeline_depth(codec: Codec) -> usize {
+        let s = settings(codec);
+        let mut enc = session(codec, &s, false);
+        for t in 0..8usize {
+            let out = enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0).unwrap_or_default();
+            if !out.is_empty() {
+                return t;
+            }
+        }
+        panic!("{codec:?}: no packet after eight frames");
+    }
+
+    /// The software codecs whose encoder answers each frame with that frame's own picture,
+    /// which is what the checks below read a frame id back from. One that pipelines is named
+    /// rather than skipped silently, since the delay is the session's latency as well as the
+    /// test's.
+    fn lockstep_codecs() -> Vec<Codec> {
+        SOFTWARE
+            .into_iter()
+            .filter(|&codec| {
+                let depth = pipeline_depth(codec);
+                if depth > 0 {
+                    println!("[pipeline] {codec:?}: {depth} frames deep, frame-id checks skipped");
+                }
+                depth == 0
+            })
+            .collect()
+    }
+
+    /// A desktop-like BGRA frame: a diagonal gradient with a grid of dark glyph cells and a
+    /// bright block that moves with `t`, so inter frames carry real motion.
+    pub(super) fn frame(t: usize) -> Vec<u8> {
+        let mut f = vec![0u8; W * H * 4];
+        let (bx, by) = ((t * 9) % (W - 40), (t * 5) % (H - 30));
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * W + x) * 4;
+                let g = ((x * 255) / W) as u8;
+                let cell = (x / 8 + y / 12) % 3 == 0 && x % 8 < 6 && y % 12 < 9;
+                let (b, gr, r) = if x >= bx && x < bx + 40 && y >= by && y < by + 30 {
+                    (40, 220, 250)
+                } else if cell {
+                    (30, 30, 30)
+                } else {
+                    (g, 200 - g / 2, 120)
+                };
+                f[i] = b;
+                f[i + 1] = gr;
+                f[i + 2] = r;
+                f[i + 3] = 255;
+            }
+        }
+        f
+    }
+
+    /// Incompressible content, so rate control has to spend its whole budget.
+    fn noise(t: usize) -> Vec<u8> {
+        let mut f = vec![255u8; W * H * 4];
+        let mut s = (t as u32).wrapping_mul(2654435761).wrapping_add(7);
+        for px in f.as_chunks_mut::<4>().0 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            px[0] = (s >> 24) as u8;
+            px[1] = (s >> 16) as u8;
+            px[2] = (s >> 8) as u8;
+        }
+        f
+    }
+
+    /// Luma PSNR of a decoded frame against the BGRA source it came from, with the source's
+    /// luma derived by the BT.709 limited-range formula the encoder's conversion uses.
+    fn luma_psnr(decoded: &I420View<'_>, bgra: &[u8]) -> f64 {
+        assert_eq!((decoded.width, decoded.height), (W, H));
+        let mut mse = 0f64;
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * W + x) * 4;
+                let (b, g, r) = (bgra[i] as f64, bgra[i + 1] as f64, bgra[i + 2] as f64);
+                let luma = 16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * b) * 219.0 / 255.0;
+                let d = decoded.y[y * decoded.y_stride + x] as f64 - luma;
+                mse += d * d;
+            }
+        }
+        mse /= (W * H) as f64;
+        if mse <= 0.0 { 99.0 } else { 10.0 * (255.0 * 255.0 / mse).log10() }
+    }
+
+    fn decode_one(dec: &mut VideoDecoder, packet: &[u8]) -> bool {
+        dec.decode(&packet[VIDEO_HEADER_LEN..]).unwrap_or_else(|e| panic!("decode: {e:?}"))
+    }
+
+    /// Every codec's frames carry its own wire id and kind, decode back to the source picture,
+    /// and a key frame forced mid-stream starts a fresh decoder on its own.
+    #[test]
+    fn software_frames_decode_back_to_the_source() {
+        for codec in lockstep_codecs() {
+            let s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            for t in 0..6usize {
+                let src = frame(t);
+                let out = enc
+                    .encode_host(&src, W * 4, false, t as u64, 25, t == 0)
+                    .unwrap_or_else(|e| panic!("{codec:?} encode {t}: {e}"));
+                assert!(out.len() > VIDEO_HEADER_LEN, "{codec:?} frame {t} is empty");
+                assert_eq!(out[0], WIRE_VIDEO);
+                let kind = if t == 0 { FRAME_KEY } else { FRAME_DELTA };
+                assert_eq!(parse_video_type(out[1]), Some((codec, kind)), "{codec:?} frame {t}");
+                assert_eq!(u16::from_be_bytes([out[2], out[3]]) as usize, t);
+                assert_eq!(&out[4..10], &[0, 0, (W >> 8) as u8, W as u8, (H >> 8) as u8, H as u8]);
+                assert!(decode_one(&mut dec, &out), "{codec:?} frame {t} decoded nothing");
+                let psnr = luma_psnr(&dec.frame().unwrap(), &src);
+                assert!(psnr > 28.0, "{codec:?} frame {t}: luma PSNR {psnr:.1} dB");
+            }
+            let src = frame(6);
+            let key = enc.encode_host(&src, W * 4, false, 6, 25, true).expect("forced key");
+            assert_eq!(parse_video_type(key[1]), Some((codec, FRAME_KEY)), "{codec:?} forced key");
+            let mut fresh = VideoDecoder::new(codec).expect("decoder");
+            assert!(decode_one(&mut fresh, &key), "{codec:?}: a forced key frame must decode alone");
+            assert!(luma_psnr(&fresh.frame().unwrap(), &src) > 28.0);
+            let next = enc.encode_host(&frame(7), W * 4, false, 7, 25, false).expect("delta after key");
+            assert_eq!(parse_video_type(next[1]), Some((codec, FRAME_DELTA)));
+            assert!(decode_one(&mut fresh, &next));
+        }
+    }
+
+    /// A key frame asked for mid-stream comes back as one on every codec, through whatever
+    /// pipeline the encoder keeps, carrying the id of the frame it was asked for, and a fresh
+    /// decoder starts on it. SVT-AV1 before 2.0 re-opens for it and hands it back two frames
+    /// later, as kvazaar does.
+    #[test]
+    fn a_key_frame_asked_for_mid_stream_starts_a_fresh_decoder() {
+        for codec in SOFTWARE {
+            let s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            for t in 0..6usize {
+                enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0)
+                    .unwrap_or_else(|e| panic!("{codec:?} encode {t}: {e}"));
+            }
+            let mut out = enc.encode_host(&frame(6), W * 4, false, 6, 25, true).expect("forced key");
+            let mut t = 7usize;
+            while out.get(1).and_then(|&kind| parse_video_type(kind)) != Some((codec, FRAME_KEY)) {
+                assert!(t < 22, "{codec:?}: no key frame came back within fifteen frames of the request");
+                out = enc.encode_host(&frame(t), W * 4, false, t as u64, 25, false).expect("delta");
+                t += 1;
+            }
+            assert_eq!(u16::from_be_bytes([out[2], out[3]]), 6, "{codec:?}: the key frame carries the id it was asked for");
+            let mut fresh = VideoDecoder::new(codec).expect("decoder");
+            assert!(decode_one(&mut fresh, &out), "{codec:?}: the key frame must decode alone");
+            assert!(luma_psnr(&fresh.frame().unwrap(), &frame(6)) > 28.0, "{codec:?}");
+        }
+    }
+
+    /// A session whose library keeps its references to itself says so instead of pretending:
+    /// it names no reference on any frame and refuses the request, which is what leaves the
+    /// caller a key frame to code. x265, kvazaar, and SVT-AV1 offer nothing to steer; libvpx
+    /// does, and its sessions track every frame.
+    #[test]
+    fn a_session_that_cannot_invalidate_names_no_reference() {
+        use super::reference::Reference;
+        for codec in [Codec::H265, Codec::Av1] {
+            let s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            for t in 0..4usize {
+                enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0)
+                    .unwrap_or_else(|e| panic!("{codec:?} encode {t}: {e}"));
+                assert_eq!(enc.last_reference(), Reference::Untracked, "{codec:?} frame {t}");
+            }
+            assert!(!enc.invalidate_reference(2), "{codec:?}: the refusal is what asks for the key frame");
+        }
+        for codec in [Codec::Vp8, Codec::Vp9] {
+            let s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            enc.encode_host(&frame(0), W * 4, false, 0, 25, true).unwrap();
+            assert_eq!(enc.last_reference(), Reference::None, "{codec:?}");
+            enc.encode_host(&frame(1), W * 4, false, 1, 25, false).unwrap();
+            assert_eq!(enc.last_reference(), Reference::Frame(0), "{codec:?}");
+            assert!(enc.invalidate_reference(1), "{codec:?}");
+        }
+    }
+
+    /// The byte order a session is built for reaches the conversion: a red picture handed as
+    /// B,G,R,A and as R,G,B,A decodes to the same red on both.
+    #[test]
+    fn host_byte_order_is_honored() {
+        for codec in lockstep_codecs() {
+            let s = settings(codec);
+            let mut means = Vec::new();
+            for rgba in [false, true] {
+                let mut px = [0u8; 4];
+                if rgba { px[0] = 220 } else { px[2] = 220 }
+                px[3] = 255;
+                let src: Vec<u8> = px.repeat(W * H);
+                let mut enc = session(codec, &s, rgba);
+                let out = enc.encode_host(&src, W * 4, rgba, 0, 20, true).expect("encode");
+                let mut dec = VideoDecoder::new(codec).expect("decoder");
+                assert!(decode_one(&mut dec, &out));
+                let f = dec.frame().unwrap();
+                let cw = f.chroma_width();
+                let ch = f.chroma_height();
+                let v: f64 = (0..ch).flat_map(|y| (0..cw).map(move |x| (x, y))).map(|(x, y)| f.v[y * f.uv_stride + x] as f64).sum::<f64>() / (cw * ch) as f64;
+                means.push(v);
+            }
+            assert!(means[0] > 180.0, "{codec:?}: red must land high in V, got {:.0}", means[0]);
+            assert!((means[0] - means[1]).abs() < 6.0, "{codec:?}: BGRA {:.0} vs RGBA {:.0}", means[0], means[1]);
+        }
+    }
+
+    /// A higher session quality index (a coarser quantizer) shrinks the stream, and CBR holds a
+    /// noise stream near its bitrate target.
+    #[test]
+    fn quantizer_and_bitrate_reach_the_encoder() {
+        for codec in SOFTWARE {
+            let run = |crf: i32| -> usize {
+                let mut s = settings(codec);
+                s.video_crf = crf;
+                let mut enc = session(codec, &s, false);
+                (0..12usize)
+                    .map(|t| enc.encode_host(&frame(t), W * 4, false, t as u64, crf as u32, t == 0).unwrap().len())
+                    .sum()
+            };
+            let (fine, coarse) = (run(15), run(45));
+            assert!(coarse * 2 < fine, "{codec:?}: crf 45 = {coarse} bytes vs crf 15 = {fine}");
+
+            const KBPS: i32 = 800;
+            let mut s = settings(codec);
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = KBPS;
+            let mut enc = session(codec, &s, false);
+            let mut bytes = 0usize;
+            for t in 0..90usize {
+                let out = enc.encode_host(&noise(t), W * 4, false, t as u64, 25, t == 0).unwrap();
+                // A constant-rate encoder is free to answer a frame with nothing -- SVT-AV1
+                // drops one rather than overshoot its buffer -- and that frame carries no
+                // payload to count rather than a negative one.
+                if t >= 30 && out.len() > VIDEO_HEADER_LEN {
+                    bytes += out.len() - VIDEO_HEADER_LEN;
+                }
+            }
+            let kbps = bytes as f64 * 8.0 * 30.0 / 60.0 / 1000.0;
+            println!("{codec:?} CBR {KBPS} kbps on noise: {kbps:.0} kbps");
+            assert!(kbps > KBPS as f64 * 0.5 && kbps < KBPS as f64 * 1.6, "{codec:?}: {kbps:.0} kbps");
+        }
+    }
+
+    /// A quality increase applies at once and keeps the stream decodable, a decrease waits out
+    /// the hysteresis where a change costs a re-open, and a frame-rate change keeps the stream
+    /// decodable too. A library that takes the change live spends no key frame on it (libvpx,
+    /// x265); one that has to re-open starts the fresh encoder with one (kvazaar, SVT-AV1).
+    #[test]
+    fn live_quality_and_rate_changes_keep_the_stream_decodable() {
+        for codec in lockstep_codecs() {
+            let mut s = settings(codec);
+            s.video_crf = 40;
+            let mut enc = session(codec, &s, false);
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            let coarse = enc.encode_host(&frame(0), W * 4, false, 0, 40, true).unwrap();
+            assert!(decode_one(&mut dec, &coarse));
+            let fine = enc.encode_host(&frame(1), W * 4, false, 1, 15, false).unwrap();
+            let live = matches!(enc.backend_name(), "libvpx" | "x265");
+            let kind = if live { FRAME_DELTA } else { FRAME_KEY };
+            assert_eq!(parse_video_type(fine[1]), Some((codec, kind)), "{codec:?}: a quality change {}", if live { "is live" } else { "re-opens with a key frame" });
+            assert!(decode_one(&mut dec, &fine));
+            let held = enc.encode_host(&frame(2), W * 4, false, 2, 40, false).unwrap();
+            assert_eq!(parse_video_type(held[1]), Some((codec, FRAME_DELTA)), "{codec:?}: a single decrease waits out the hysteresis");
+            assert!(decode_one(&mut dec, &held));
+            s.target_fps = 15.0;
+            enc.reconfigure_rate(&s).expect("rate reconfigure");
+            let after = enc.encode_host(&frame(3), W * 4, false, 3, 15, false).unwrap();
+            let kind = if enc.backend_name() == "libvpx" { FRAME_DELTA } else { FRAME_KEY };
+            assert_eq!(parse_video_type(after[1]), Some((codec, kind)), "{codec:?}: a frame-rate change");
+            assert!(decode_one(&mut dec, &after));
+            assert!(luma_psnr(&dec.frame().unwrap(), &frame(3)) > 28.0);
+        }
+    }
+
+    /// Every session declares the BT.709 matrix it converts with, at limited range for 4:2:0
+    /// and full range for the x265 4:4:4 one, like x264. VP8 reads back as BT.470BG whatever it
+    /// is handed: its keyframe header holds one color-space bit and BT.601 is its only defined
+    /// value, so the transports carry the real matrix for that codec themselves.
+    #[test]
+    fn sessions_declare_the_matrix_they_convert_with() {
+        for codec in lockstep_codecs() {
+            let mut s = settings(codec);
+            let mut enc = session(codec, &s, false);
+            let out = enc.encode_host(&frame(0), W * 4, false, 0, 25, true).expect("encode");
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            assert!(decode_one(&mut dec, &out));
+            let want = if codec == Codec::Vp8 { ColorTags::BT470BG_LIMITED } else { ColorTags::BT709_LIMITED };
+            assert_eq!(dec.color_tags(), Some(want), "{codec:?}");
+            if software_fullcolor(codec) {
+                s.video_fullcolor = true;
+                let mut enc = session(codec, &s, false);
+                assert!(enc.is_fullcolor(), "{codec:?} carries the 4:4:4 request");
+                let out = enc.encode_host(&frame(0), W * 4, false, 0, 25, true).expect("encode");
+                let mut dec = VideoDecoder::new(codec).expect("decoder");
+                assert!(decode_one(&mut dec, &out));
+                let want = if codec == Codec::Vp9 { ColorTags::BT709_LIMITED } else { ColorTags::BT709_FULL };
+                assert_eq!(dec.color_tags(), Some(want), "{codec:?} 4:4:4");
+            }
+        }
+    }
+
+    /// 4:4:4 is carried only where the software encoder does (x265, VP9), never quietly
+    /// elsewhere.
+    #[test]
+    fn fullcolor_follows_the_software_encoder() {
+        for codec in lockstep_codecs() {
+            let mut s = settings(codec);
+            s.video_fullcolor = true;
+            let mut enc = session(codec, &s, false);
+            assert_eq!(enc.is_fullcolor(), software_fullcolor(codec), "{codec:?}");
+            let out = enc.encode_host(&frame(0), W * 4, false, 0, 25, true).unwrap();
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            assert!(decode_one(&mut dec, &out));
+        }
+    }
+
+    /// Four colors whose 2x2 average is gray, tiled: a decoded block's chroma comes out
+    /// neutral only where the session sited chroma at the center of the block, and saturated
+    /// wherever it kept one pixel, row, or column of it — the color a browser then shows along
+    /// the glyph edges of subpixel-antialiased text.
+    #[test]
+    fn decoded_chroma_is_neutral_on_a_tile_that_averages_to_gray() {
+        const N: usize = 128;
+        let bgra = chroma_siting::bgra(N, N);
+        let settings = RustCaptureSettings { width: N as i32, height: N as i32, target_fps: 30.0, video_crf: 20, ..Default::default() };
+        for codec in SOFTWARE {
+            let mut enc = session(codec, &settings, false);
+            let out = drain_first(&mut enc, &bgra, N * 4, 20);
+            assert!(!out.is_empty(), "{codec:?} encoded nothing");
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            assert!(dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false), "{codec:?} decoded nothing");
+            let worst = chroma_siting::worst(&dec.frame().expect("frame"));
+            println!("[chroma-siting] {codec:?}: worst |C-128| {worst:.1}");
+            assert!(worst <= 8.0, "{codec:?} sites chroma {worst:.1} off neutral");
+        }
+    }
+
+    /// The eight-patch chart, encoded and decoded, comes back as the color that was painted
+    /// when a receiver inverts the matrix the session declares — the check a client's
+    /// presentation path performs on every frame. A convert or a declaration that name
+    /// different matrices leaves the neutrals exact and the saturated patches tens of levels
+    /// out, which is what the browsers show as washed-out or shifted color.
+    #[test]
+    fn the_chart_decodes_to_the_color_that_was_painted() {
+        const N: usize = 256;
+        let bgra = chroma_siting::chart_bgra(N, N / 2);
+        let settings = RustCaptureSettings { width: N as i32, height: (N / 2) as i32, target_fps: 30.0, video_crf: 20, ..Default::default() };
+        for codec in SOFTWARE {
+            let mut enc = session(codec, &settings, false);
+            let out = drain_first(&mut enc, &bgra, N * 4, 20);
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            assert!(dec.decode(&out[VIDEO_HEADER_LEN..]).unwrap_or(false), "{codec:?}");
+            let declared = codec != Codec::Vp8;
+            let (k, other, other_name) = if declared {
+                (chroma_siting::BT709, chroma_siting::BT601, "BT.601")
+            } else {
+                (chroma_siting::BT601, chroma_siting::BT709, "BT.709")
+            };
+            let frame = dec.frame().expect("frame");
+            let worst = chroma_siting::chart_error(&frame, k);
+            let under_other = chroma_siting::chart_error(&frame, other);
+            println!("[chart] {codec:?}: worst |dRGB| {worst:.1} against the declared matrix, {under_other:.1} against {other_name}");
+            assert!(
+                worst <= 12.0,
+                "{codec:?} paints {worst:.1} off the chart against the matrix it declares, and {under_other:.1} against {other_name}: {}",
+                if under_other < worst { "it converted with that one and declared the other" } else { "neither matrix explains it" }
+            );
+        }
+    }
+
+    /// The first packet of a fresh session, feeding `bgra` until one arrives: an encoder that
+    /// pipelines answers the opening frames with nothing.
+    pub(super) fn drain_first(enc: &mut FrameEncoder, bgra: &[u8], stride: usize, qp: u32) -> Vec<u8> {
+        for t in 0..8u64 {
+            let out = enc.encode_host(bgra, stride, false, t, qp, t == 0).unwrap_or_else(|e| panic!("encode: {e}"));
+            if !out.is_empty() {
+                return out;
+            }
+        }
+        Vec::new()
+    }
+}
 
 /// The fixture the chroma-siting checks of every backend share.
 #[cfg(test)]

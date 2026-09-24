@@ -1369,7 +1369,7 @@ pub(crate) mod gpu_test_support {
     use std::time::Duration;
 
     use crate::encoders::codec::Codec;
-    use crate::webcam::decode::{AvDecoder, Decoder};
+    use crate::webcam::decode::{VideoDecoder, Decoder};
     use crate::RustCaptureSettings;
 
     /// Full-frame capture settings for `codec` at CRF 25, streaming every frame.
@@ -1409,7 +1409,7 @@ pub(crate) mod gpu_test_support {
     }
 
     /// Mean Y/Cb/Cr of a decoded picture.
-    pub(crate) fn decoded_mean(dec: &mut AvDecoder, payload: &[u8]) -> [f64; 3] {
+    pub(crate) fn decoded_mean(dec: &mut VideoDecoder, payload: &[u8]) -> [f64; 3] {
         assert!(dec.decode(payload).expect("decode"), "no picture from this access unit");
         let v = dec.frame().expect("decoded frame");
         let mut acc = [0f64; 3];

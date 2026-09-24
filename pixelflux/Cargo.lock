@@ -313,6 +313,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.73.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "787ef8ef523575546b106a58213d6e6b06198a05c2f757258c68a74273670cfa"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex 2.0.1",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -477,6 +494,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "codec-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen 0.73.2",
+ "pkg-config",
 ]
 
 [[package]]
@@ -758,20 +783,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
-]
-
-[[package]]
-name = "ffmpeg-sys-next"
-version = "9.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b939bf79dd5949412a4b81cfe21a07f48ea21b47fcbb5f57816c8c2de5ae30b"
-dependencies = [
- "bindgen",
- "cc",
- "libc",
- "num_cpus",
- "pkg-config",
- "vcpkg",
 ]
 
 [[package]]
@@ -1393,16 +1404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num_cpus"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
-dependencies = [
- "hermit-abi 0.5.3",
- "libc",
-]
-
-[[package]]
 name = "nvcodec-sys"
 version = "0.1.0"
 
@@ -1486,8 +1487,8 @@ dependencies = [
  "bitflags",
  "calloop",
  "cfg-if",
+ "codec-sys",
  "crossbeam-channel",
- "ffmpeg-sys-next",
  "gbm",
  "image",
  "libc",
@@ -1504,6 +1505,7 @@ dependencies = [
  "smithay",
  "tiny_http",
  "turbojpeg",
+ "va-sys",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
@@ -2443,10 +2445,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "vcpkg"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+name = "va-sys"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.9.0",
+]
 
 [[package]]
 name = "version-compare"
@@ -2859,7 +2862,7 @@ version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b694bc460acd21d48a05977f57025a93e2a4d4a10feffde9f0c66925d6e72ff4"
 dependencies = [
- "bindgen",
+ "bindgen 0.72.1",
  "system-deps",
 ]
 

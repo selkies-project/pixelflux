@@ -2,13 +2,10 @@
 //!
 //! A host session takes its input from the kernel, so a uinput keyboard and
 //! pointer reach it whatever display server it runs: no compositor protocol to
-//! advertise, no portal on the bus, and no consent dialog to answer. That puts
-//! it on the host-capture input ladder below libei and the virtual keyboard and
-//! pointer protocols, which a compositor may not offer, and above the portal's
-//! own methods (a socket write to the compositor lands in about 4 us, a uinput
-//! write in about 12 us, a portal call in about 2 ms); it is taken only where
-//! `/dev/uinput` is writable — a bare-metal host rather than an unprivileged
-//! container.
+//! advertise, no portal on the bus, and no consent dialog to answer. That makes
+//! it the first rung of the host-capture input ladder, ahead of libei and the
+//! portal, and it is taken only where `/dev/uinput` is writable — a bare-metal
+//! host rather than an unprivileged container.
 //!
 //! The pointer carries a normalized absolute axis rather than the layout's own
 //! pixels: a uinput device fixes its axis range when the kernel creates it,

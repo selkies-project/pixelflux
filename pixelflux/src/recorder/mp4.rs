@@ -6,10 +6,9 @@
 
 //! Pure-Rust fragmented-MP4 (fMP4) muxer for the built-in recorder.
 //!
-//! Hand-rolled rather than pulled in as a dependency for two reasons: `ffmpeg-sys-next`'s
-//! `avformat` feature would add libavformat as a hard runtime dependency of every build, and the
-//! pure-Rust mp4 crates only write moov-trailing progressive files, which lose everything on a
-//! crash. Fragmented MP4 needs no trailer and no seeking — each `moof`+`mdat` pair is
+//! Hand-rolled rather than pulled in as a dependency for two reasons: libavformat would be a
+//! hard runtime dependency of every build, and the pure-Rust mp4 crates only write
+//! moov-trailing progressive files, which lose everything on a crash. Fragmented MP4 needs no trailer and no seeking — each `moof`+`mdat` pair is
 //! self-contained — so a file truncated by a crash or SIGKILL stays playable up to the last
 //! fragment, and the writer works on any `Write` sink.
 //!

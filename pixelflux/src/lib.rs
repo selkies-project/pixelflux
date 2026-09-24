@@ -18,8 +18,8 @@
 //! (a headless [Smithay](https://github.com/Smithay/smithay) compositor) — and a shared
 //! encoding layer that dispatches to software (striped JPEG, H.264 through the build's
 //! software encoder — libx264 with the `gpl` feature, OpenH264 without — and the other
-//! codecs through the software encoders the linked FFmpeg carries) or hardware (NVENC,
-//! VA-API) encoders based on the available GPU and operator settings.
+//! codecs through the software encoders the build links: x265 or kvazaar, libvpx, SVT-AV1) or
+//! hardware (NVENC, VA-API) encoders based on the available GPU and operator settings.
 //!
 //! ## Crate structure
 //!
@@ -166,7 +166,6 @@ pub mod nvgpufilter;
 
 pub mod webcam;
 
-pub use encoders::avcodec;
 pub use encoders::nvenc;
 pub use encoders::software::StripeState;
 
@@ -1347,19 +1346,22 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                         hw_error_streak = 0;
                         hw_rebuilt = false;
                         if !data.is_empty() {
-                            out.push(EncodedStripe {
-                                data: Arc::new(data),
-                                codec: settings.codec,
-                                stripe_y_start: 0,
-                                stripe_height: height,
-                                frame_id: f.frame_id as i32,
-                                timing: FrameTiming {
-                                    capture_ns: f.captured_ns,
-                                    encode_start_ns,
-                                    encode_end_ns: wayland::host::now_ns(),
-                                },
-                                reference: encoder.last_reference(),
-                            });
+                            let encode_end_ns = wayland::host::now_ns();
+                            for (data, id, reference) in encoder.delivered_units(data, f.frame_id) {
+                                out.push(EncodedStripe {
+                                    data: Arc::new(data),
+                                    codec: settings.codec,
+                                    stripe_y_start: 0,
+                                    stripe_height: height,
+                                    frame_id: id as i32,
+                                    timing: FrameTiming {
+                                        capture_ns: f.captured_ns,
+                                        encode_start_ns,
+                                        encode_end_ns,
+                                    },
+                                    reference,
+                                });
+                            }
                         }
                     }
                     Err(e) => {

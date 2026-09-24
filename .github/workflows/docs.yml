@@ -31,20 +31,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             build-essential pkg-config nasm clang libclang-dev \
-            libx264-dev \
-            libudev-dev libva-dev libdrm-dev libgbm-dev \
+            libx264-dev libx265-dev libvpx-dev libsvtav1enc-dev libdav1d-dev libde265-dev \
+            libudev-dev libdrm-dev libgbm-dev \
             libwayland-dev libxkbcommon-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev
-
-      - name: Install FFmpeg 8.1
-        run: |
-          curl -L -o /tmp/miniforge.sh \
-            "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-          bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-          source "$HOME/miniforge3/etc/profile.d/conda.sh"
-          conda create -y -n pixelflux-docs -c conda-forge "ffmpeg=8.1"
-          conda activate pixelflux-docs
-          echo "PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
 
       - name: Build docs
         run: cargo doc --no-deps

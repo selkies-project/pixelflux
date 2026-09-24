@@ -11,7 +11,7 @@ Categories used below:
 | Category | Meaning | Licenses |
 | --- | --- | --- |
 | copyleft | the whole combined binary must be distributed under the license's terms | GPL-2.0-or-later (libx264) |
-| weak copyleft | the library itself stays under its license and must remain replaceable (dynamic linking is fine) | LGPL-2.1-or-later (FFmpeg, glibc, libudev) |
+| weak copyleft | the library itself stays under its license and must remain replaceable (dynamic linking is fine) | LGPL-2.1-or-later (glibc, libudev), LGPL-3.0-or-later (libde265) |
 | permissive | attribution only | MIT, BSD, Apache-2.0, ISC, Zlib, BSL-1.0, Unlicense, WTFPL, ... |
 
 MPL-2.0 is file-level copyleft (modified MPL files stay MPL, the larger work
@@ -21,13 +21,13 @@ may be under any license) and is grouped with the permissive licenses here.
 
 | Configuration | How it is selected | Software H.264 encoder | Software H.265 encoder | Cargo features |
 | --- | --- | --- | --- | --- |
-| default (GPL) | `pip install pixelflux` / the published wheels | libx264 (GPL-2.0-or-later) | x265 (GPL-2.0-or-later), through FFmpeg | `gpl` (default) |
-| non-GPL | `PIXELFLUX_ENABLE_GPL=0 pip install .` | Cisco OpenH264 (BSD-2-Clause, compiled from vendored source) | kvazaar (BSD-3-Clause), through FFmpeg | `--no-default-features --features openh264` |
+| default (GPL) | `pip install pixelflux` / the published wheels | libx264 (GPL-2.0-or-later) | x265 (GPL-2.0-or-later) | `gpl` (default) |
+| non-GPL | `PIXELFLUX_ENABLE_GPL=0 pip install .` | Cisco OpenH264 (BSD-2-Clause, compiled from vendored source) | kvazaar (BSD-3-Clause) | `--no-default-features --features openh264` |
 
 Both configurations share everything else: JPEG, the VP8/VP9 (libvpx) and AV1
-(SVT-AV1) software encoders reached through FFmpeg, NVENC, VA-API, capture,
-compositor, and virtual camera. A build with neither feature does not compile;
-a build whose FFmpeg carries x265 but not the `gpl` feature never selects it.
+(SVT-AV1) software encoders, the virtual camera's decoders (OpenH264, libvpx,
+dav1d, libde265, libjpeg-turbo), NVENC, VA-API, capture, and compositor. A build
+with neither feature does not compile.
 
 ## Native libraries and vendored code
 
@@ -39,15 +39,15 @@ contains it.
 | Component | License | Category | Build | How used | Notes |
 | --- | --- | --- | --- | --- | --- |
 | libx264 (via `x264-sys`) | GPL-2.0-or-later | copyleft | GPL only | linked shared library (`NEEDED libx264.so.*`); auditwheel bundles it into the manylinux wheel, the musllinux wheel takes Alpine's package | Striped software H.264. The only GPL component of pixelflux itself; the `x264-sys` crate is MIT but has no purpose without libx264. |
-| Cisco OpenH264 2.6 (via `openh264-sys2`) | BSD-2-Clause | permissive | non-GPL only | compiled from the source vendored in the crate (needs a C++ toolchain and nasm) and linked statically; no binary download | Software H.264 without GPL. Cisco's royalty-covered binary module is irrelevant to a source build; the AVC patent pool applies to any H.264 encoder and is the deployer's concern. Pulls `libstdc++` in as the only C++ code. |
-| FFmpeg libavcodec, libavfilter, libavutil (via `ffmpeg-sys-next`), plus libswresample, libswscale, and libavformat they depend on | LGPL-2.1-or-later as built for the non-GPL wheels (n8.1, `--enable-shared --disable-static --disable-programs`, no `--enable-gpl`; the libraries report "LGPL version 2.1 or later"); GPL-2.0-or-later as built for the GPL wheels (`--enable-gpl --enable-libx265`); whatever the system FFmpeg is when building from source | weak copyleft (non-GPL wheel), copyleft (GPL wheel) | both | linked shared libraries; the wheels bundle them, a source build links the system FFmpeg | the VA-API encoders (`h264_vaapi`, `hevc_vaapi`, `vp8_vaapi`, `vp9_vaapi`, `av1_vaapi`) and filters, and the software encoders below. A GPL-built system FFmpeg (Debian/Ubuntu, Alpine, conda-forge's `gpl_*` variant) makes the linked set GPL: see [Distribution notes](#distribution-notes). |
-| x265 | GPL-2.0-or-later | copyleft | GPL only | linked by libavcodec (`libx265`); bundled into the GPL wheels | software H.265 (incl. 4:4:4) |
-| kvazaar | BSD-3-Clause | permissive | both | linked by libavcodec (`libkvazaar`); bundled into the wheels | software H.265 of a GPL-free build (4:2:0) |
-| libvpx | BSD-3-Clause | permissive | both | linked by libavcodec (`libvpx`, `libvpx-vp9`); bundled into the wheels | software VP8 and VP9 |
-| SVT-AV1 | BSD-3-Clause-Clear (with the Alliance for Open Media patent license) | permissive | both | linked by libavcodec (`libsvtav1`); bundled into the wheels | software AV1 |
-| dav1d | BSD-2-Clause | permissive | both | linked by libavcodec (`libdav1d`); bundled into the wheels | the virtual camera's AV1 decoder |
-| libva, libva-drm, libva-x11 | MIT | permissive | both | linked by libavutil/libavcodec; pixelflux also opens libva at run time (`libloading`) to query the video processor's surface formats; excluded from the wheel (`auditwheel --exclude`), the host's copy is used. The wheel images build libva 2.20.0 from source for its headers alone, since AV1 encode entered the interface there and the images ship 2.13 | VA-API |
-| libdrm | MIT | permissive | both | linked by libavutil; excluded from the wheel. `drm-sys`/`drm-ffi` only carry bindings and issue the ioctls themselves, no libdrm symbol is linked by pixelflux | DRM/KMS |
+| Cisco OpenH264 2.6 (via `openh264-sys2`) | BSD-2-Clause | permissive | both | compiled from the source vendored in the crate (needs a C++ toolchain and nasm) and linked statically; no binary download | Its decoder is the virtual camera's H.264 decoder in every build; its encoder is the software H.264 of the non-GPL build. Cisco's royalty-covered binary module is irrelevant to a source build; the AVC patent pool applies to any H.264 codec and is the deployer's concern. Pulls `libstdc++` in as the only C++ code. |
+| x265 (via `codec-sys`, feature `x265`) | GPL-2.0-or-later | copyleft | GPL only | linked shared library (`NEEDED libx265.so.*`), bound at build time from its headers; bundled into the GPL wheels | software H.265 (incl. 4:4:4) |
+| kvazaar (via `codec-sys`, feature `kvazaar`) | BSD-3-Clause | permissive | non-GPL only | linked shared library, bound at build time from its headers; bundled into the non-GPL wheels | software H.265 of a GPL-free build (4:2:0) |
+| libvpx (via `codec-sys`) | BSD-3-Clause | permissive | both | linked shared library, bound at build time from its headers; bundled into the wheels | software VP8 and VP9 encoders, and the virtual camera's VP8 and VP9 decoders |
+| SVT-AV1 (via `codec-sys`) | BSD-3-Clause-Clear (with the Alliance for Open Media patent license) | permissive | both | linked shared library, bound at build time from its headers; bundled into the wheels | software AV1 |
+| dav1d (via `codec-sys`) | BSD-2-Clause | permissive | both | linked shared library, bound at build time from its headers; bundled into the wheels | the virtual camera's AV1 decoder |
+| libde265 (via `codec-sys`) | LGPL-3.0-or-later | weak copyleft | both | linked shared library, bound at build time from its headers; bundled into the wheels, replaceable | the virtual camera's HEVC decoder |
+| libva, libva-drm (via `va-sys`) | MIT | permissive | both | `dlopen("libva.so.2")` and `dlopen("libva-drm.so.2")` at run time, never linked; not in the wheel, the host's copy serves the driver it was built for. The bindings are generated from the libva 2.24 headers vendored under `pixelflux/va-sys/headers/` (MIT) | VA-API encoders and video processor |
+| libdrm | MIT | permissive | both (headers only) | `drm-sys` carries bindings generated from its headers and `drm-ffi` issues the ioctls itself; no libdrm symbol is linked | DRM/KMS |
 | libgbm (Mesa) | MIT | permissive | both | linked shared library (`gbm-sys`); excluded from the wheel | GPU buffer allocation |
 | libpixman-1 | MIT | permissive | both | linked shared library (`pixman-sys`); excluded from the wheel | software renderer of the compositor |
 | libxkbcommon | MIT | permissive | both | linked shared library (`xkbcommon` crate); excluded from the wheel | keymaps |
@@ -74,23 +74,21 @@ contains it.
 ## Rust crates
 
 The crate graph was resolved with `cargo metadata` (normal dependencies only,
-Linux targets) for both configurations: 240 crates in the default (GPL) build,
-243 in the non-GPL build, 244 distinct crates in total. Every one of them has a
+Linux targets) for both configurations: 246 crates in the default (GPL) build,
+245 in the non-GPL build, 246 distinct crates in total. Every one of them has a
 permissive license (MPL-2.0 for `pixelflux` itself); no crate is GPL, LGPL,
-AGPL, or unlicensed. The only differences between the two sets:
+AGPL, or unlicensed. The only difference between the two sets:
 
 | Crate | License | Build | Why |
 | --- | --- | --- | --- |
-| `x264-sys` 0.2.3 | MIT (links libx264, GPL-2.0-or-later) | GPL only | `gpl` feature |
-| `openh264` 0.9.7, `openh264-sys2` 0.9.7 | BSD-2-Clause (vendors OpenH264, BSD-2-Clause) | non-GPL only | `openh264` feature; dev-dependencies in every build so the encoder is still tested |
-| `safe_arch` 1.1.0, `wide` 1.6.0 | Zlib OR Apache-2.0 OR MIT | non-GPL only | dependencies of `openh264` |
+| `x264-sys` 0.2.3 | MIT (links libx264, GPL-2.0-or-later) | GPL only | `gpl` feature; the OpenH264 crates stay in both builds, since their decoder is the virtual camera's H.264 decoder |
 
-License expressions as published by the crates (count of the 244):
-MIT OR Apache-2.0 (and spellings of it) 129, MIT 67, MIT OR Apache-2.0 OR Zlib (and spellings of it) 12, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT 6, BSD-2-Clause 5, BSD-3-Clause 4, Unlicense OR MIT 4, Apache-2.0 3, BSD-3-Clause OR Apache-2.0 3, BSD-2-Clause OR Apache-2.0 OR MIT 2, ISC 2, and one each of (MIT OR Apache-2.0) AND Unicode-3.0 (`unicode-ident`), 0BSD OR MIT OR Apache-2.0 (`adler2`), Apache-2.0 OR MIT OR Unlicense (`atomic_float`), BSL-1.0 (`xxhash-rust`), CC0-1.0 OR Apache-2.0 (`imgref`), MPL-2.0 (`pixelflux`), WTFPL (`ffmpeg-sys-next`). `scripts/check-licenses.py --markdown` regenerates the full
+License expressions as published by the crates (count of the 246):
+MIT OR Apache-2.0 (and spellings of it) 131, MIT 68, MIT OR Apache-2.0 OR Zlib (and spellings of it) 11, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT 6, BSD-2-Clause 5, BSD-3-Clause 4, Unlicense OR MIT 4, Apache-2.0 3, BSD-3-Clause OR Apache-2.0 3, BSD-2-Clause OR Apache-2.0 OR MIT 2, ISC 2, and one each of (MIT OR Apache-2.0) AND Unicode-3.0 (`unicode-ident`), 0BSD OR MIT OR Apache-2.0 (`adler2`), Apache-2.0 OR MIT OR Unlicense (`atomic_float`), BSL-1.0 (`xxhash-rust`), CC0-1.0 OR Apache-2.0 (`imgref`), MPL-2.0 (`pixelflux`), Zlib (`zlib-rs`). `scripts/check-licenses.py --markdown` regenerates the full
 table below.
 
 <details>
-<summary>All 244 crates (Build: both, GPL only, non-GPL only)</summary>
+<summary>All 246 crates (Build: both, GPL only, non-GPL only)</summary>
 
 | Crate | Version | License (SPDX) | Category | Build | Native library / note |
 | --- | --- | --- | --- | --- | --- |
@@ -133,6 +131,7 @@ table below.
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 | permissive | both |  |
 | cgmath | 0.18.0 | Apache-2.0 | permissive | both |  |
 | chunked_transfer | 1.5.0 | MIT OR Apache-2.0 | permissive | both |  |
+| codec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | libvpx, SVT-AV1, dav1d, and libde265 on every wheel; x265 (GPL-2.0-or-later) on the GPL wheel, kvazaar on the non-GPL one (BSD-3-Clause (libvpx, kvazaar; SVT-AV1 with the Alliance for Open Media patent license), BSD-2-Clause (dav1d), LGPL-3.0-or-later (libde265), weak copyleft) |
 | color_quant | 1.1.0 | MIT | permissive | both |  |
 | concurrent-queue | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | permissive | both |  |
@@ -147,9 +146,9 @@ table below.
 | dlib | 0.5.3 | MIT | permissive | both |  |
 | downcast-rs | 1.2.1 | MIT/Apache-2.0 | permissive | both |  |
 | drm | 0.14.1 | MIT | permissive | both |  |
-| drm-ffi | 0.9.1 | MIT | permissive | both | Linux DRM ioctls (no library): MIT (permissive) |
+| drm-ffi | 0.9.1 | MIT | permissive | both | Linux DRM ioctls (no library) (MIT, permissive) |
 | drm-fourcc | 2.2.0 | MIT | permissive | both |  |
-| drm-sys | 0.8.1 | MIT | permissive | both | libdrm headers (bindings only): MIT (permissive) |
+| drm-sys | 0.8.1 | MIT | permissive | both | libdrm headers (bindings only) (MIT, permissive) |
 | either | 1.18.0 | MIT OR Apache-2.0 | permissive | both |  |
 | endi | 1.1.1 | MIT | permissive | both |  |
 | enumflags2 | 0.7.12 | MIT OR Apache-2.0 | permissive | both |  |
@@ -164,13 +163,12 @@ table below.
 | fastrand | 2.5.0 | Apache-2.0 OR MIT | permissive | both |  |
 | fax | 0.2.7 | MIT | permissive | both |  |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | permissive | both |  |
-| ffmpeg-sys-next | 9.0.0 | WTFPL | permissive | both | FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, libswscale, libavformat they pull in), and through libavcodec the codec libraries it wraps: kvazaar, libvpx, SVT-AV1, dav1d (BSD) on every wheel, x265 (GPL-2.0-or-later) on the GPL wheel: LGPL-2.1-or-later (weak copyleft) |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-io | 0.3.34 | MIT OR Apache-2.0 | permissive | both |  |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT | permissive | both |  |
 | gbm | 0.18.0 | MIT | permissive | both |  |
-| gbm-sys | 0.4.0 | MIT | permissive | both | libgbm (Mesa): MIT (permissive) |
+| gbm-sys | 0.4.0 | MIT | permissive | both | libgbm (Mesa) (MIT, permissive) |
 | gcd | 2.3.0 | MIT/Apache-2.0 | permissive | both |  |
 | generic-array | 0.14.7 | MIT | permissive | both |  |
 | gethostname | 1.1.0 | Apache-2.0 | permissive | both |  |
@@ -187,19 +185,19 @@ table below.
 | imgref | 1.12.3 | CC0-1.0 OR Apache-2.0 | permissive | both |  |
 | indexmap | 2.14.2 | Apache-2.0 OR MIT | permissive | both |  |
 | input | 0.10.0 | MIT | permissive | both |  |
-| input-sys | 1.19.0 | MIT | permissive | both | libinput: MIT (permissive) |
+| input-sys | 1.19.0 | MIT | permissive | both | libinput (MIT, permissive) |
 | io-lifetimes | 1.0.11 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
 | itertools | 0.14.0 | MIT OR Apache-2.0 | permissive | both |  |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | permissive | both |  |
 | lebe | 0.5.3 | BSD-3-Clause | permissive | both |  |
 | libc | 0.2.189 | MIT OR Apache-2.0 | permissive | both | C runtime (glibc, or musl on musllinux wheels) (LGPL-2.1-or-later (glibc), MIT (musl), weak copyleft) |
-| libloading | 0.8.9 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary), and on aarch64 the Jetson Linux libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/libnvbufsurftransform.so (proprietary): MIT and proprietary driver libraries (permissive) |
-| libloading | 0.9.0 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary), and on aarch64 the Jetson Linux libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/libnvbufsurftransform.so (proprietary): MIT and proprietary driver libraries (permissive) |
+| libloading | 0.8.9 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 and libva-drm.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary), and on aarch64 the Jetson Linux libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/libnvbufsurftransform.so (proprietary) (MIT and proprietary driver libraries, permissive) |
+| libloading | 0.9.0 | ISC | permissive | both | libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), libwayland-server.so.0 (MIT), libva.so.2 and libva-drm.so.2 (MIT), libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 (proprietary), and on aarch64 the Jetson Linux libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/libnvbufsurftransform.so (proprietary) (MIT and proprietary driver libraries, permissive) |
 | libm | 0.2.16 | MIT | permissive | both |  |
-| libudev-sys | 0.1.4 | MIT | permissive | both | libudev (systemd): LGPL-2.1-or-later (weak copyleft) |
-| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
-| linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
-| linux-raw-sys | 0.9.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs): Linux-syscall-note (permissive) |
+| libudev-sys | 0.1.4 | MIT | permissive | both | libudev (systemd) (LGPL-2.1-or-later, weak copyleft) |
+| linux-raw-sys | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs) (Linux-syscall-note, permissive) |
+| linux-raw-sys | 0.4.15 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs) (Linux-syscall-note, permissive) |
+| linux-raw-sys | 0.9.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both | Linux kernel ABI (syscall numbers and structs) (Linux-syscall-note, permissive) |
 | log | 0.4.34 | MIT OR Apache-2.0 | permissive | both |  |
 | loop9 | 0.1.5 | MIT | permissive | both |  |
 | maybe-rayon | 0.1.1 | MIT | permissive | both |  |
@@ -207,6 +205,7 @@ table below.
 | memmap2 | 0.9.11 | MIT OR Apache-2.0 | permissive | both |  |
 | memoffset | 0.9.1 | MIT | permissive | both |  |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | permissive | both |  |
+| miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | permissive | both |  |
 | moxcms | 0.8.1 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
 | new_debug_unreachable | 1.0.6 | MIT | permissive | both |  |
 | no_std_io2 | 0.9.4 | Apache-2.0 OR MIT | permissive | both |  |
@@ -218,10 +217,10 @@ table below.
 | num-integer | 0.1.47 | MIT OR Apache-2.0 | permissive | both |  |
 | num-rational | 0.4.2 | MIT OR Apache-2.0 | permissive | both |  |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | permissive | both |  |
-| nvcodec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture (libnvidia-fbc.so.1), and CUDA driver (libcuda.so.1): proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings are declarations generated from the CUDA toolkit headers (permissive) |
+| nvcodec-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | NVIDIA NVENC (libnvidia-encode.so.1), framebuffer capture (libnvidia-fbc.so.1), and CUDA driver (libcuda.so.1) (proprietary driver libraries; nvEncodeAPI.h is MIT, the CUDA bindings are declarations generated from the CUDA toolkit headers, permissive) |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | permissive | both |  |
-| openh264 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only |  |
-| openh264-sys2 | 0.9.8 | BSD-2-Clause | permissive | non-GPL only | Cisco OpenH264 2.6 (vendored source): BSD-2-Clause (permissive) |
+| openh264 | 0.9.8 | BSD-2-Clause | permissive | both |  |
+| openh264-sys2 | 0.9.8 | BSD-2-Clause | permissive | both | Cisco OpenH264 2.6 (vendored source) (BSD-2-Clause, permissive) |
 | ordered-stream | 0.2.0 | MIT OR Apache-2.0 | permissive | both |  |
 | parking | 2.2.1 | Apache-2.0 OR MIT | permissive | both |  |
 | paste | 1.0.15 | MIT OR Apache-2.0 | permissive | both |  |
@@ -230,7 +229,7 @@ table below.
 | piper | 0.2.5 | MIT OR Apache-2.0 | permissive | both |  |
 | pixelflux | 2.1.0 | MPL-2.0 | permissive (file-level copyleft) | both | repository LICENSE; Cargo.toml has no license field |
 | pixman | 0.2.1 | MIT | permissive | both |  |
-| pixman-sys | 0.1.0 | MIT | permissive | both | libpixman-1: MIT (permissive) |
+| pixman-sys | 0.1.0 | MIT | permissive | both | libpixman-1 (MIT, permissive) |
 | png | 0.18.1 | MIT OR Apache-2.0 | permissive | both |  |
 | polling | 3.11.0 | Apache-2.0 OR MIT | permissive | both |  |
 | ppv-lite86 | 0.2.21 | MIT OR Apache-2.0 | permissive | both |  |
@@ -242,7 +241,7 @@ table below.
 | pulp-wasm-simd-flag | 0.1.1 | MIT | permissive | both |  |
 | pxfm | 0.1.30 | BSD-3-Clause OR Apache-2.0 | permissive | both |  |
 | pyo3 | 0.29.2 | MIT OR Apache-2.0 | permissive | both |  |
-| pyo3-ffi | 0.29.2 | MIT OR Apache-2.0 | permissive | both | libpython (CPython): PSF-2.0 (permissive) |
+| pyo3-ffi | 0.29.2 | MIT OR Apache-2.0 | permissive | both | libpython (CPython) (PSF-2.0, permissive) |
 | pyo3-macros | 0.29.2 | MIT OR Apache-2.0 | permissive | both |  |
 | pyo3-macros-backend | 0.29.2 | MIT OR Apache-2.0 | permissive | both |  |
 | qoi | 0.4.1 | MIT/Apache-2.0 | permissive | both |  |
@@ -258,11 +257,11 @@ table below.
 | rayon | 1.12.0 | MIT OR Apache-2.0 | permissive | both |  |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 | permissive | both |  |
 | reborrow | 0.5.5 | MIT | permissive | both |  |
-| reis | 0.7.1 | MIT | permissive | both | pure-Rust libei/libeis; host-capture input over a portal EIS socket |
+| reis | 0.7.1 | MIT | permissive | both |  |
 | rgb | 0.8.53 | MIT | permissive | both |  |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
 | rustix | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | permissive | both |  |
-| safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
+| safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT | permissive | both |  |
 | scoped-tls | 1.0.1 | MIT/Apache-2.0 | permissive | both |  |
 | serde | 1.0.229 | MIT OR Apache-2.0 | permissive | both |  |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | permissive | both |  |
@@ -293,12 +292,13 @@ table below.
 | tracing-attributes | 0.1.31 | MIT | permissive | both |  |
 | tracing-core | 0.1.36 | MIT | permissive | both |  |
 | turbojpeg | 1.5.1 | Unlicense OR MIT | permissive | both |  |
-| turbojpeg-sys | 1.2.0 | Unlicense OR MIT | permissive | both | libjpeg-turbo 3.1 (vendored source): IJG AND BSD-3-Clause AND Zlib (permissive) |
+| turbojpeg-sys | 1.2.0 | Unlicense OR MIT | permissive | both | libjpeg-turbo 3.1 (vendored source) (IJG AND BSD-3-Clause AND Zlib, permissive) |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | permissive | both |  |
 | udev | 0.9.3 | MIT | permissive | both |  |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | permissive | both |  |
 | uuid | 1.26.1 | Apache-2.0 OR MIT | permissive | both |  |
 | v_frame | 0.3.9 | BSD-2-Clause | permissive | both |  |
+| va-sys | 0.1.0 | MIT OR Apache-2.0 | permissive | both | libva (libva.so.2, libva-drm.so.2) (MIT, permissive) |
 | wasm-bindgen | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
 | wasm-bindgen-macro | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
 | wasm-bindgen-macro-support | 0.2.128 | MIT OR Apache-2.0 | permissive | both |  |
@@ -311,15 +311,15 @@ table below.
 | wayland-protocols-wlr | 0.3.12 | MIT | permissive | both |  |
 | wayland-scanner | 0.31.11 | MIT | permissive | both |  |
 | wayland-server | 0.31.14 | MIT | permissive | both |  |
-| wayland-sys | 0.31.11 | MIT | permissive | both | libwayland-server: MIT (permissive) |
+| wayland-sys | 0.31.11 | MIT | permissive | both | libwayland-server (MIT, permissive) |
 | weezl | 0.1.12 | MIT OR Apache-2.0 | permissive | both |  |
-| wide | 1.7.0 | Zlib OR Apache-2.0 OR MIT | permissive | non-GPL only |  |
+| wide | 1.7.0 | Zlib OR Apache-2.0 OR MIT | permissive | both |  |
 | winnow | 1.0.4 | MIT | permissive | both |  |
 | x11rb | 0.14.0 | MIT OR Apache-2.0 | permissive | both |  |
 | x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | permissive | both |  |
-| x264-sys | 0.2.3 | MIT | permissive | GPL only | libx264: GPL-2.0-or-later (copyleft) |
+| x264-sys | 0.2.3 | MIT | permissive | GPL only | libx264 (GPL-2.0-or-later, copyleft) |
 | xcursor | 0.3.11 | MIT | permissive | both |  |
-| xkbcommon | 0.9.0 | MIT | permissive | both | libxkbcommon: MIT (permissive) |
+| xkbcommon | 0.9.0 | MIT | permissive | both | libxkbcommon (MIT, permissive) |
 | xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | xxhash-rust | 0.8.18 | BSL-1.0 | permissive | both |  |
 | y4m | 0.8.0 | MIT | permissive | both |  |
@@ -330,11 +330,10 @@ table below.
 | zcheapstr | 1.1.0 | MIT | permissive | both |  |
 | zerocopy | 0.8.57 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
 | zerocopy-derive | 0.8.57 | BSD-2-Clause OR Apache-2.0 OR MIT | permissive | both |  |
+| zlib-rs | 0.6.7 | Zlib | permissive | both |  |
 | zmij | 1.0.23 | MIT | permissive | both |  |
 | zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
-| zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zune-inflate | 0.2.54 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
-| zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | permissive | both |  |
 | zvariant | 5.15.0 | MIT | permissive | both |  |
 | zvariant_derive | 5.15.0 | MIT | permissive | both |  |
@@ -347,22 +346,16 @@ table below.
 
 - the 243 crates above, all permissive (pixelflux itself MPL-2.0), with
   OpenH264 and libjpeg-turbo compiled from vendored BSD/IJG source;
-- linked: FFmpeg libavcodec/libavfilter/libavutil (+ swresample, swscale,
-  avformat) under LGPL-2.1-or-later when FFmpeg is built without
-  `--enable-gpl`, and through it kvazaar, libvpx, SVT-AV1, and dav1d (BSD),
-  libgbm, libpixman-1, libxkbcommon (MIT), the C and C++
-  runtimes (glibc LGPL-2.1-or-later or musl MIT; libgcc_s/libstdc++ with the
-  GCC runtime exception), and through FFmpeg libva/libdrm/libX11 (MIT);
+- linked: kvazaar, libvpx, SVT-AV1, and dav1d (BSD), libde265
+  (LGPL-3.0-or-later), libgbm, libpixman-1, libxkbcommon (MIT), and the C
+  and C++ runtimes (glibc LGPL-2.1-or-later or musl MIT; libgcc_s/libstdc++
+  with the GCC runtime exception);
 - loaded at run time only when present: libwayland-server, libEGL,
-  libpipewire-0.3 (MIT), libva (MIT, the copy libavutil already links, for
-  the VA-API surface probe), and the NVIDIA driver's libcuda/libnvidia-encode
-  (proprietary, never shipped);
-- no GPL code. The build is only as GPL-free as the FFmpeg it links: the
-  project's non-GPL wheel recipe builds FFmpeg n8.1 without `--enable-gpl`,
-  a source build against a distribution FFmpeg that was configured with
-  `--enable-gpl` (Debian, Ubuntu, Alpine, conda-forge's `gpl_*` builds of `ffmpeg`, which is the default variant)
-  links a GPL libavcodec even though pixelflux contains no x264 code, and a
-  build without the `gpl` feature never selects that FFmpeg's `libx265`.
+  libpipewire-0.3, libva, and libva-drm (MIT), and the NVIDIA driver's
+  libcuda/libnvidia-encode/libnvidia-fbc (proprietary, never shipped);
+- no GPL code, whichever distribution's codec libraries a source build links:
+  every library the build binds is BSD or LGPL, and a build without the `gpl`
+  feature never links x265.
 
 ## What the GPL build adds
 
@@ -371,10 +364,10 @@ The default build (`gpl` feature, what the published wheels and
 
 - adds `x264-sys` and links libx264 (GPL-2.0-or-later); the manylinux wheels
   bundle `libx264.so`;
-- selects x265 (GPL-2.0-or-later) through FFmpeg for software H.265, in place
-  of kvazaar; the wheels' FFmpeg is built `--enable-gpl --enable-libx265`;
-- removes the OpenH264 crates and `safe_arch`/`wide` from the binary (they stay
-  dev-dependencies for the tests);
+- links x265 (GPL-2.0-or-later) for software H.265 in place of kvazaar
+  (`codec-sys`'s `x265` feature); the GPL wheels bundle `libx265.so`;
+- keeps the OpenH264 crates for the virtual camera's decoder; their encoder
+  goes unused;
 - the resulting binary is a combination of MPL-2.0, permissive, and GPL code and
   is therefore distributed under the GPL-2.0-or-later terms as a whole
   (MPL-2.0 is GPL-compatible through its secondary-license clause). setup.py
@@ -382,24 +375,20 @@ The default build (`gpl` feature, what the published wheels and
 
 ## Distribution notes
 
-- manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): FFmpeg
-  n8.1, kvazaar, libvpx, SVT-AV1, and dav1d — plus x264 and x265 for the GPL
-  wheel — are built from source in the image; auditwheel bundles them
-  (`libx264.so`, `libx265.so`, `libkvazaar.so`, `libvpx.so`, `libSvtAv1Enc.so`,
-  `libdav1d.so`, `libavcodec`, `libavfilter`, `libavformat`, `libavutil`,
-  `libswresample`, `libswscale`) into `pixelflux.libs/` and leaves libva,
-  libdrm, libgbm, libEGL, libxkbcommon, libpixman-1, libX11/libxcb, zlib,
-  liblzma, and the GCC runtime to the host (`repair-wheel-command` excludes).
-  The non-GPL wheel's FFmpeg reports `LGPL version 2.1 or later` and its
-  configuration contains no `--enable-gpl`; the GPL wheel's is built
-  `--enable-gpl --enable-libx265`.
+- manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): kvazaar,
+  libvpx, SVT-AV1, dav1d, and libde265 — plus x264 and x265 for the GPL wheel —
+  are built from source in the image; auditwheel bundles them (`libx264.so`,
+  `libx265.so`, `libkvazaar.so`, `libvpx.so`, `libSvtAv1Enc.so`,
+  `libdav1d.so`, `libde265.so`) into `pixelflux.libs/` and leaves libgbm,
+  libEGL, libxkbcommon, libpixman-1, libX11/libxcb, zlib, liblzma, and the GCC
+  runtime to the host (`repair-wheel-command` excludes). libva is never
+  linked, so the host's own copy serves the driver it was built for.
 - The wheels carry pixelflux's own LICENSE only. The statically linked OpenH264
   (BSD-2-Clause) and libjpeg-turbo (IJG/BSD-3-Clause/Zlib) and the bundled
-  libx264/FFmpeg notices are not included in the wheel; this file is the
+  codec libraries' notices are not included in the wheel; this file is the
   inventory, their license texts live in the upstream sources named above.
-- selkies' AppImage pairs pixelflux with conda-forge's `ffmpeg=*=*lgpl*`
-  variant; its container images install the distribution `ffmpeg` and `x264`
-  packages.
+- selkies' container images install the distribution `x264` package for the
+  wheel's libx264; its AppImage takes pixelflux's wheel as it is.
 
 ## How this is enforced
 
@@ -438,4 +427,3 @@ The default build (`gpl` feature, what the published wheels and
 
 - `pixelflux/Cargo.toml` has no `license = "MPL-2.0"` field (the script and
   `deny.toml` carry the clarification); adding it lets every tool see it.
-- The musllinux wheels bundle Alpine's GPL FFmpeg build (above).

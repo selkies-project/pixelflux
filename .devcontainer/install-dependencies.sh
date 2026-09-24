@@ -7,14 +7,16 @@
 set -euxo pipefail
 
 sudo apt-get update
-# System C libraries the crate links against (x264-sys -> libx264, x11rb -> libxcb
-# + shm + xfixes, VA-API, GBM/DRM, Wayland/xkb) plus the build toolchain (nasm is
-# needed to build the vendored OpenH264 and libjpeg-turbo sources, which are
-# statically linked and need no system copy).
+# System C libraries the crate links against (x264-sys -> libx264, codec-sys -> the
+# software codec libraries it binds from their headers, x11rb -> libxcb + shm +
+# xfixes, GBM/DRM, Wayland/xkb) plus the build toolchain (nasm is needed to build
+# the vendored OpenH264 and libjpeg-turbo sources, which are statically linked and
+# need no system copy). The VA-API session opens libva at run time, so only its
+# runtime package is needed.
 sudo apt-get install -y \
   build-essential pkg-config nasm clang libclang-dev curl ca-certificates \
-  libx264-dev \
-  libva-dev libdrm-dev libgbm-dev \
+  libx264-dev libx265-dev libvpx-dev libsvtav1enc-dev libdav1d-dev libde265-dev \
+  libva2 libdrm-dev libgbm-dev \
   libwayland-dev libxkbcommon-dev \
   libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
   python3-dev python3-pip
@@ -28,19 +30,6 @@ if ! command -v cargo >/dev/null 2>&1; then
   # shellcheck source=/dev/null
   source "$HOME/.cargo/env"
 fi
-
-# FFmpeg 8.1 is REQUIRED by ffmpeg-sys-next =8.1.0 (the VA-API encoder path) and is not
-# in the Ubuntu archive, so pull it from conda-forge (Miniforge), matching the repo's
-# build environment, and point pkg-config at it for the build.
-if [ ! -d "$HOME/miniforge3" ]; then
-  curl -L -o /tmp/miniforge.sh \
-    "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
-  bash /tmp/miniforge.sh -b -p "$HOME/miniforge3"
-fi
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda create -y -n pixelflux -c conda-forge "ffmpeg=8.1"
-conda activate pixelflux
-export PKG_CONFIG_PATH="$CONDA_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 
 # Build and install the extension from source.
 pip3 install --upgrade pip setuptools-rust

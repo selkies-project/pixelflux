@@ -602,14 +602,13 @@ mod tests {
     /// The stream declares the matrix its input was converted with: BT.709 at limited range.
     #[test]
     fn declares_the_conversion_matrix() {
-        use crate::webcam::decode::{AvDecoder, Decoder};
-        use ffmpeg_sys_next::{AVColorRange::AVCOL_RANGE_MPEG, AVColorSpace::AVCOL_SPC_BT709};
+        use crate::webcam::decode::{ColorTags, Decoder, VideoDecoder};
         let s = RustCaptureSettings { width: 128, height: 96, target_fps: 30.0, ..Default::default() };
         let mut enc = Openh264Encoder::new(&s).expect("openh264 init");
         let idr = enc.encode_host_argb(&busy_frame(128, 96, 0), 128 * 4, 0, true, false).expect("encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
         assert!(dec.decode(&idr[VIDEO_HEADER_LEN..]).expect("decode"));
-        assert_eq!(dec.color_tags(), Some((AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)));
+        assert_eq!(dec.color_tags(), Some(ColorTags::BT709_LIMITED));
     }
 
     /// The color chart, handed to the encoder as host ARGB, decodes back to the color that was
@@ -618,7 +617,7 @@ mod tests {
     #[test]
     fn paints_the_chart_it_converts() {
         use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
-        use crate::webcam::decode::{AvDecoder, Decoder};
+        use crate::webcam::decode::{VideoDecoder, Decoder};
         let (w, h) = (256usize, 128usize);
         let s = RustCaptureSettings {
             width: w as i32,
@@ -631,7 +630,7 @@ mod tests {
         let idr = enc
             .encode_host_argb(&chart_bgra(w, h), w * 4, 0, true, false)
             .expect("encode");
-        let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
         assert!(dec.decode(&idr[VIDEO_HEADER_LEN..]).expect("decode"));
         let worst = chart_error(&dec.frame().expect("frame"), BT709);
         println!("[chart] OpenH264: worst |dRGB| {worst:.1}");

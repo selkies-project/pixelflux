@@ -451,7 +451,10 @@ impl GpuCapture {
         self.settings.height = h as i32;
         let in_place = match self.encoder.as_mut() {
             Some(FrameEncoder::Nvenc(enc)) => enc.reconfigure_resolution(&self.settings).map(|_| ()),
-            Some(FrameEncoder::Avcodec(_)) => Err("a VA-API session is rebuilt at a new size".to_string()),
+            Some(FrameEncoder::Vaapi(_)) => Err("a VA-API session is rebuilt at a new size".to_string()),
+            Some(FrameEncoder::Vpx(_) | FrameEncoder::Hevc(_) | FrameEncoder::Av1(_)) => {
+                Err("a software session takes host frames".to_string())
+            }
             // Neither a Tegra nor a V4L2 M2M session reaches this path: both take host frames,
             // so `open` below declines the zero-copy capture before one is built. The arms exist
             // because the variants do, saying what would happen rather than panicking.
@@ -1026,7 +1029,7 @@ mod gpu_tests {
     use super::*;
     use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
     use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
-    use crate::webcam::decode::{AvDecoder, Codec as DecCodec, Decoder};
+    use crate::webcam::decode::{VideoDecoder, Codec as DecCodec, Decoder};
 
     /// The watermark is composited by the server, so it reaches the frame without the CPU
     /// touching a pixel, and a translucent one blends as the readback paths blend it: Render's
@@ -1055,7 +1058,7 @@ mod gpu_tests {
         let idx = gpu.grab(false).expect("blit and composite");
         let dmabuf = gpu.buffers[idx].dmabuf.clone();
         let pkt = gpu.enc().encode_dmabuf(&dmabuf, 0, 25, true).expect("encode in place");
-        let mut dec = AvDecoder::new(DecCodec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
         assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
         let v = dec.frame().expect("decoded frame");
         // Straight-alpha source over the painted screen, which is what both paths must produce.
@@ -1103,7 +1106,7 @@ mod gpu_tests {
             println!("the DRI3 path declined this session on this host; nothing to capture");
             return;
         };
-        let mut dec = AvDecoder::new(DecCodec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
 
         let encode = |gpu: &mut GpuCapture, i: u64, key: bool| -> Vec<u8> {
             let idx = gpu.grab(false).expect("blit into the pool");
