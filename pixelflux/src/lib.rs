@@ -6381,6 +6381,10 @@ fn wait_socket_name(timeout: Duration) -> Option<String> {
 /// applied when the backend is created, which is deferred to capture start so the real
 /// render node (not a placeholder) reaches the compositor.
 static PENDING_CURSOR_CALLBACK: Mutex<Option<Py<PyAny>>> = Mutex::new(None);
+/// Every capture's own cursor callback, the latest registration last: the process-wide slots
+/// carry the latest one's, so a capture withdrawing its own (a second display leaving) hands
+/// the cursor back to the capture registered before it.
+static CURSOR_REGISTRATIONS: Mutex<Vec<(u64, Py<PyAny>)>> = Mutex::new(Vec::new());
 /// Interpreter-teardown gate, set by the atexit sweep: the detached compositor and delivery
 /// threads must never attach to a finalizing interpreter (aborts the process pre-3.13).
 /// Cleared by a fresh capture start (only a live interpreter can start one).
@@ -7598,9 +7602,18 @@ impl ScreenCapture {
     /// registration), and the Wayland backend takes it directly — or stashes it in
     /// `PENDING_CURSOR_CALLBACK`, applied by `ensure_wayland_backend` at creation; the
     /// backend slot lock is held across the check so a concurrent creation cannot miss the
-    /// stash. Both slots are process-wide and outlive the capture that set them, so `None`
-    /// withdraws the callback and releases whatever it holds.
+    /// stash. Both slots are process-wide and outlive the capture that set them, so they carry
+    /// the latest live registration (`CURSOR_REGISTRATIONS`): `None` withdraws this capture's
+    /// own, releasing what it holds and restoring the one registered before it.
     fn set_cursor_callback(&self, py: Python<'_>, callback: Option<Py<PyAny>>) -> PyResult<()> {
+        let callback = {
+            let mut regs = CURSOR_REGISTRATIONS.lock().unwrap();
+            regs.retain(|(id, _)| *id != self.id);
+            if let Some(cb) = callback {
+                regs.push((self.id, cb));
+            }
+            regs.last().map(|(_, cb)| cb.clone_ref(py))
+        };
         crate::x11::cursor::set_callback(callback.as_ref().map(|c| c.clone_ref(py)));
         let slot = WAYLAND_BACKEND.get_or_init(|| Mutex::new(None));
         let g = slot.lock().unwrap();
@@ -7613,8 +7626,9 @@ impl ScreenCapture {
         }
     }
 
-    /// Withdraw the cursor callback, releasing what it holds. Present only where
-    /// the slots can be emptied, so a consumer can probe for it by name.
+    /// Withdraw this capture's cursor callback, releasing what it holds; another capture's
+    /// registration takes the slots back. Present only where the slots can be emptied, so a
+    /// consumer can probe for it by name.
     fn clear_cursor_callback(&self, py: Python<'_>) -> PyResult<()> {
         self.set_cursor_callback(py, None)
     }
