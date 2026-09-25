@@ -48,7 +48,7 @@ jobs:
             libinput-dev libudev-dev libxkbcommon-dev libpixman-1-dev libva-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: cargo test
         # Tests needing a GPU, a render node, or an encoder device mark themselves
