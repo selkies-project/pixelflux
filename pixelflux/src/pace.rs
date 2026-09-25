@@ -69,6 +69,12 @@ const PACED_INPUT_MAX_FRACTION: f64 = 1.25;
 /// little late, which then could not pull and waited a period. When the input stops, the timer
 /// renders after the grace and carries on from there. A faster client, a slower one, and a
 /// host's frames leave the timer its period as before.
+///
+/// Damage the X server reports at the cadence earns the same grace: it is an application
+/// presenting on the server's vblank, which runs on a clock of its own (a framebuffer server's
+/// fake vblank fires on a millisecond timer, so its frames land up to a millisecond either side
+/// of the period). Without the grace a timer tick taken just ahead of such a frame captures the
+/// one before it again, and the frame it missed is published late or never.
 #[derive(Debug, Default)]
 pub struct FramePace {
     /// Last tick this capture actually rendered.
@@ -81,6 +87,9 @@ pub struct FramePace {
     /// Where the timer was held off to by a tick that rendered nothing (host capture with no
     /// fresh frame), so it neither spins nor counts against the next frame.
     deferred_until: Option<Instant>,
+    /// The last damage frame, and the running average of the spacing between damage frames.
+    last_damage: Option<Instant>,
+    damage_spacing: Option<Duration>,
 }
 
 impl FramePace {
@@ -120,9 +129,22 @@ impl FramePace {
             };
             self.borrow_budget = Some((left, now));
         }
-        self.last_paced = trigger == TickTrigger::Input && input_paced;
+        let damage_paced = trigger == TickTrigger::Damage && self.damage_paced(period, now);
+        self.last_paced = (trigger == TickTrigger::Input && input_paced) || damage_paced;
         self.last_tick = Some(now);
         self.deferred_until = None;
+    }
+
+    /// Fold a damage frame at `now` into the spacing of damage frames, and say whether that
+    /// spacing sits at the cadence of `period`.
+    fn damage_paced(&mut self, period: Duration, now: Instant) -> bool {
+        if let Some(prev) = self.last_damage {
+            let dt = now.saturating_duration_since(prev).min(period * 4);
+            self.damage_spacing =
+                Some(self.damage_spacing.map_or(dt, |avg| avg.mul_f64(0.875) + dt.mul_f64(0.125)));
+        }
+        self.last_damage = Some(now);
+        Self::input_paced(self.damage_spacing, period)
     }
 
     /// How long after the last frame the timer's own tick renders again.
@@ -292,6 +314,39 @@ mod pacing_tests {
         assert_eq!(pace.next_due(PERIOD, at(base, 32)), at(base, 57), "a paced one adds the grace");
         pace.ticked(TickTrigger::HostFrame, PERIOD, at(base, 57), true);
         assert_eq!(pace.next_due(PERIOD, at(base, 57)), at(base, 77), "a host frame never does");
+    }
+
+    #[test]
+    fn damage_at_the_cadence_renders_every_frame_through_vblank_jitter() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        // An application presenting on a 20 ms vblank that fires on a millisecond grid, so its
+        // frames land 19, 20, or 21 ms apart: each is published as it lands, and no timer
+        // tick falls between two of them once the spacing reads as paced.
+        let steps = [21, 19, 20, 21, 21, 19, 20, 19, 21, 20];
+        let mut t = 0u64;
+        pace.ticked(TickTrigger::Damage, PERIOD, at(base, t), false);
+        for (i, step) in steps.iter().cycle().take(60).enumerate() {
+            t += step;
+            let now = at(base, t);
+            if i >= 2 {
+                assert!(pace.next_due(PERIOD, now) > now, "no timer frame slipped in ahead of frame {i}");
+            }
+            assert!(pace.due(TickTrigger::Damage, PERIOD, now), "frame {i} renders as it lands");
+            pace.ticked(TickTrigger::Damage, PERIOD, now, false);
+        }
+        assert_eq!(pace.next_due(PERIOD, at(base, t)), at(base, t + 25), "once it stops, the timer resumes after the grace");
+    }
+
+    #[test]
+    fn damage_off_the_cadence_leaves_the_timer_its_period() {
+        let base = Instant::now();
+        let mut pace = FramePace::default();
+        // A pointer sprite moving at 125 Hz against a 20 ms period.
+        for i in 0..40 {
+            pace.ticked(TickTrigger::Damage, PERIOD, at(base, 8 * i), false);
+        }
+        assert_eq!(pace.next_due(PERIOD, at(base, 312)), at(base, 332));
     }
 
     #[test]
