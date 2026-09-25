@@ -101,7 +101,8 @@ impl Ring {
         let slot_size = page_align(format.sizeimage.max(1) as usize);
         let total = DATA_OFFSET as usize + n_slots as usize * slot_size;
         let name = c"selkies-webcam-staging";
-        let raw: RawFd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+        let raw: RawFd =
+            unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -110,6 +111,13 @@ impl Ring {
             return Err(io::Error::last_os_error());
         }
         let map = unsafe { MmapMut::map_mut(&fd)? };
+        // Sealed once this writer's own mapping exists, so the read-only contract each peer
+        // receives the descriptor under is the kernel's: no peer maps it writable or resizes it
+        // (future-write sealing needs Linux 5.1; an older kernel keeps the size seals alone).
+        let size_seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, size_seals | libc::F_SEAL_FUTURE_WRITE) } != 0 {
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, size_seals) };
+        }
         let mut ring = Ring {
             fd,
             map,
@@ -249,6 +257,31 @@ pub fn page_align(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that receives the descriptor maps it read-only and nothing else: a writable map
+    /// or a resize is the kernel's to refuse, while this writer's own mapping keeps working.
+    #[test]
+    fn peers_cannot_write_or_resize_the_ring() {
+        let f = RingFormat::raw(V4L2_PIX_FMT_YUV420, 64, 48, 30, 1).unwrap();
+        let mut ring = Ring::new(f, 3).unwrap();
+        let fd = ring.fd();
+        let len = DATA_OFFSET as usize + ring.n_slots() as usize * ring.slot_size();
+        let map = |prot| unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_SHARED, fd, 0) };
+        let ro = map(libc::PROT_READ);
+        assert_ne!(ro, libc::MAP_FAILED, "a read-only map is what peers get");
+        unsafe { libc::munmap(ro, len) };
+        let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
+        assert!(seals & libc::F_SEAL_SHRINK != 0 && seals & libc::F_SEAL_GROW != 0, "seals {seals:#x}");
+        assert_ne!(unsafe { libc::ftruncate(fd, 4096) }, 0, "the size is sealed");
+        if seals & libc::F_SEAL_FUTURE_WRITE != 0 {
+            assert_eq!(map(libc::PROT_READ | libc::PROT_WRITE), libc::MAP_FAILED, "no writable map");
+        }
+        assert!(ring.publish(1, |dst| {
+            dst[0] = 7;
+            1
+        }));
+        assert_eq!(ring.latest_frame().unwrap()[0], 7, "the writer's own mapping still writes");
+    }
 
     #[test]
     fn header_and_config_layout() {

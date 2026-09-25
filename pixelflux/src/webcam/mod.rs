@@ -85,7 +85,7 @@ impl VirtualCameraSettings {
     #[new]
     fn new() -> Self {
         VirtualCameraSettings {
-            socket_path: "/tmp/selkies_webcam0.sock".into(),
+            socket_path: format!("{}/selkies_webcam0.sock", crate::webcam::socket_dir()),
             width: 1280,
             height: 720,
             fps_num: 30,
@@ -98,6 +98,13 @@ impl VirtualCameraSettings {
             pipewire_node_name: "selkies-webcam".into(),
         }
     }
+}
+
+/// Where the camera socket lives unless a caller names one: the session's private runtime
+/// directory, where no other account can take the name first, else `/tmp`. The v4l2
+/// interposer looks in the same place.
+pub fn socket_dir() -> String {
+    std::env::var("XDG_RUNTIME_DIR").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| "/tmp".into())
 }
 
 fn parse_pixel_format(name: &str) -> Option<u32> {

@@ -42,12 +42,26 @@ pub struct Server {
 
 impl Server {
     /// Bind `path` (replacing a stale socket file) and start serving `config` + `ring_fd`.
+    ///
+    /// A file there that another account owns is refused: in a shared directory it is that
+    /// account's listener, and every camera client of this session would reach it.
     pub fn bind(path: &str, config: [u8; CONFIG_SIZE], ring_fd: RawFd) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
         if let Some(dir) = std::path::Path::new(path).parent()
             && !dir.as_os_str().is_empty() {
                 std::fs::create_dir_all(dir)?;
             }
-        let _ = std::fs::remove_file(path);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.uid() != unsafe { libc::geteuid() } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{path} belongs to uid {}, not this session", meta.uid()),
+                ));
+            }
+            Ok(_) => std::fs::remove_file(path)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let listener = UnixListener::bind(path)?;
         listener.set_nonblocking(true)?;
         let wake_raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };

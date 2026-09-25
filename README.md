@@ -439,7 +439,7 @@ decoding nothing, and re-encodes only frames that must be fitted), and publishes
 from pixelflux import VirtualCamera, VirtualCameraSettings
 
 settings = VirtualCameraSettings()
-settings.socket_path = "/tmp/selkies_webcam0.sock"   # what the interposer connects to
+settings.socket_path = "/run/user/1000/selkies_webcam0.sock"   # what the interposer connects to (default: $XDG_RUNTIME_DIR, else /tmp)
 settings.width, settings.height = 1280, 720          # frames are scaled and letterboxed to fit
 settings.pixel_format = "I420"                       # "I420", "NV12", "YUYV" or "MJPEG" (an MJPEG uplink passes through)
 settings.device_path = "auto"                        # "", "auto", or a /dev/videoN to mirror into
