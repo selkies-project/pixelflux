@@ -7204,6 +7204,7 @@ impl ScreenCapture {
                     c.fps_milli.store((fps.max(1.0) * 1000.0) as u64, Ordering::Relaxed);
                     c.rate_dirty.store(true, Ordering::Release);
                 }
+                py.detach(crate::x11::follow_frame_rate);
             }
             2 => wayland_update_rate(py, did, None, None, Some(fps)),
             _ => {}

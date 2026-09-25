@@ -40,7 +40,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::damage::{ConnectionExt as DamageExt, Damage, ReportLevel};
 use x11rb::protocol::shm::ConnectionExt as ShmExt;
 use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
-use x11rb::protocol::xproto::{ConnectionExt as XprotoExt, ImageFormat, Window};
+use x11rb::protocol::xproto::{Atom, AtomEnum, ConnectionExt as XprotoExt, ImageFormat, PropMode, Window};
+use x11rb::wrapper::ConnectionExt as WrapperExt;
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
@@ -878,6 +879,81 @@ where
     }
 }
 
+/// The rate the X server's fake vblank runs at while this process captures it: the fastest live
+/// capture's frame rate (1 to 1000, what the server takes), published as the root window's
+/// `_FAKE_SCREEN_FPS` (CARDINAL) and deleted when the last capture ends. The Selkies Xvfb paces the
+/// clients that wait on Present by it, keeping the rate it started at as a floor, so a vsynced
+/// application presents as fast as it is streamed; any other server holds it as inert data.
+struct VblankRate {
+    captures: Vec<Arc<Controls>>,
+    published: u32,
+    conn: Option<(RustConnection, Window, Atom)>,
+}
+
+static VBLANK_RATE: Mutex<VblankRate> =
+    Mutex::new(VblankRate { captures: Vec::new(), published: 0, conn: None });
+
+impl VblankRate {
+    fn publish(&mut self) {
+        let want = self
+            .captures
+            .iter()
+            .map(|c| ((c.fps_milli.load(Ordering::Relaxed) + 500) / 1000).clamp(1, 1000) as u32)
+            .max()
+            .unwrap_or(0);
+        if want == self.published {
+            return;
+        }
+        if self.conn.is_none() {
+            self.conn = x11rb::connect(None).ok().and_then(|(conn, screen)| {
+                let root = conn.setup().roots[screen].root;
+                let atom = conn.intern_atom(false, b"_FAKE_SCREEN_FPS").ok()?.reply().ok()?.atom;
+                Some((conn, root, atom))
+            });
+        }
+        let sent = self.conn.as_ref().is_some_and(|(conn, root, atom)| {
+            let queued = if want > 0 {
+                conn.change_property32(PropMode::REPLACE, *root, *atom, AtomEnum::CARDINAL, &[want])
+                    .is_ok()
+            } else {
+                conn.delete_property(*root, *atom).is_ok()
+            };
+            // A round trip, not a flush: a server may drop what is still queued when a client
+            // closes, and the connection closes right after the last capture's delete.
+            queued && conn.get_input_focus().ok().and_then(|c| c.reply().ok()).is_some()
+        });
+        self.published = if sent { want } else { 0 };
+        if !sent || want == 0 {
+            self.conn = None;
+        }
+    }
+}
+
+/// A running capture's place in [`VblankRate`], given up when the capture ends.
+struct VblankClaim(Arc<Controls>);
+
+impl VblankClaim {
+    fn new(controls: &Arc<Controls>) -> Self {
+        let mut rate = VBLANK_RATE.lock().unwrap();
+        rate.captures.push(controls.clone());
+        rate.publish();
+        Self(controls.clone())
+    }
+}
+
+impl Drop for VblankClaim {
+    fn drop(&mut self) {
+        let mut rate = VBLANK_RATE.lock().unwrap();
+        rate.captures.retain(|c| !Arc::ptr_eq(c, &self.0));
+        rate.publish();
+    }
+}
+
+/// Republish [`VblankRate`] after a running capture's frame rate changed.
+pub fn follow_frame_rate() {
+    VBLANK_RATE.lock().unwrap().publish();
+}
+
 /// Capture an X11 display until `stop` is set, on the best path this session can run.
 ///
 /// [`nvfbc::run_capture`] is tried first: where the NVIDIA driver offers framebuffer capture and
@@ -887,7 +963,8 @@ where
 /// allocated and the hardware session reads them in place. Each reports that it cannot serve the
 /// session — a codec its engine has no support for, software encoding, a watermark that has to be
 /// blended into host pixels, a server or device that does not qualify — and the capture then runs
-/// on the general XShm path below, which every X server supports.
+/// on the general XShm path below, which every X server supports. Whichever path runs, the
+/// capture's frame rate paces the server's fake vblank for as long as it does ([`VblankRate`]).
 ///
 /// Blocking; intended to run on a dedicated thread.
 pub fn run_capture<F>(
@@ -900,6 +977,7 @@ where
     F: FnMut(Vec<EncodedStripe>) + Send + 'static,
 {
     let _report = crate::report::enter(&controls.report);
+    let _vblank = VblankClaim::new(&controls);
     if let Some(result) = nvfbc::run_capture(
         settings.clone(),
         controls.clone(),
@@ -1635,5 +1713,47 @@ mod damage_tests {
         assert_eq!(pulled, TickTrigger::Damage, "the repaint is what asked for the frame");
         assert!(waited < PERIOD.mul_f64(0.9), "the repaint was published after {waited:?}");
         println!("repaint at 0.6 of a period published after {:.0}ms", waited.as_secs_f64() * 1000.0);
+    }
+}
+
+#[cfg(test)]
+mod vblank_tests {
+    //! Needs an X server of its own: `DISPLAY=:N cargo test x11_vblank -- --ignored`.
+
+    use super::*;
+
+    fn capture_at(fps: f64) -> Arc<Controls> {
+        Arc::new(Controls::new(&RustCaptureSettings { target_fps: fps, ..Default::default() }))
+    }
+
+    fn published() -> Option<u32> {
+        let (conn, screen) = x11rb::connect(None).expect("connect");
+        let root = conn.setup().roots[screen].root;
+        let atom = conn.intern_atom(false, b"_FAKE_SCREEN_FPS").expect("intern").reply().expect("atom").atom;
+        let reply = conn
+            .get_property(false, root, atom, AtomEnum::CARDINAL, 0, 1)
+            .expect("get_property")
+            .reply()
+            .expect("reply");
+        reply.value32().and_then(|mut v| v.next())
+    }
+
+    /// The fastest running capture sets the rate, a change of rate follows, and the last capture to
+    /// end takes the property away.
+    #[test]
+    #[ignore]
+    fn x11_vblank_rate_follows_the_fastest_capture() {
+        let fast = capture_at(144.0);
+        let slow = capture_at(90.0);
+        let fast_claim = VblankClaim::new(&fast);
+        let slow_claim = VblankClaim::new(&slow);
+        assert_eq!(published(), Some(144));
+        drop(fast_claim);
+        assert_eq!(published(), Some(90));
+        slow.fps_milli.store(119_600, Ordering::Relaxed);
+        follow_frame_rate();
+        assert_eq!(published(), Some(120));
+        drop(slow_claim);
+        assert_eq!(published(), None);
     }
 }

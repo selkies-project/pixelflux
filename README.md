@@ -107,6 +107,12 @@ than the encode node, a buffer the server will not import, or a first frame the 
 read; the session then streams through XShm. A watermark is not a reason: the server composites it
 through Render like the cursor, so it costs no readback here.
 
+Whichever path runs, an X11 capture publishes its frame rate on the root window as
+`_FAKE_SCREEN_FPS` (CARDINAL), the fastest running capture's, and deletes it when the last one ends.
+A server that fakes its vblank reads it: the Selkies build of XLibre's Xvfb runs the vblank at that
+rate, never below the one it started with, so an application that waits on Present for vsync
+presents as fast as it is streamed. Any other server keeps the property as inert data.
+
 `pixelflux` supports both an X11 and a **Wayland** backend (the latter built on [Smithay](https://github.com/Smithay/smithay)), selected per capture by the `use_wayland` attribute on `CaptureSettings`:
 
 - `settings.use_wayland = True` — force the Wayland backend
