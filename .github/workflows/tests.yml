@@ -38,14 +38,15 @@ jobs:
 
       - name: Native libraries
         # The distro's development packages, which is what a test build needs;
-        # the source-built FFmpeg of the wheels is a release concern, not one
-        # the tests share.
+        # the source-built codec libraries of the wheels are a release concern,
+        # not one the tests share.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake nasm libclang-dev python3-dev libavcodec-dev libavfilter-dev \
-            libavutil-dev libx264-dev libgbm-dev libdrm-dev libwayland-dev \
-            libinput-dev libudev-dev libxkbcommon-dev libpixman-1-dev libva-dev
+            cmake nasm libclang-dev python3-dev libx264-dev libx265-dev \
+            libvpx-dev libsvtav1enc-dev libdav1d-dev libde265-dev \
+            libgbm-dev libdrm-dev libwayland-dev libinput-dev libudev-dev \
+            libxkbcommon-dev libpixman-1-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable

@@ -32,11 +32,18 @@ rayon = "1.10"
 # GPL-2.0+ libx264 (the default `gpl` feature) or BSD-licensed Cisco OpenH264 (the
 # `openh264` feature, used when `gpl` is off; setup.py selects it for
 # PIXELFLUX_ENABLE_GPL=0). OpenH264 builds its vendored C source (C toolchain + nasm),
-# no runtime download; openh264-sys2 carries the raw set_option calls (live bitrate,
-# slice layout) the safe wrapper does not expose.
+# no runtime download; openh264-sys2 carries the raw calls (live bitrate, slice layout,
+# the decoder interface) the safe wrapper does not expose. Its decoder is the virtual
+# camera's H.264 decoder in every build.
 x264-sys = { version = "0.2.2", optional = true }
-openh264 = { version = "0.9", optional = true }
-openh264-sys2 = { version = "0.9", optional = true }
+openh264 = "0.9"
+openh264-sys2 = "0.9"
+# The software codec libraries, bound at build time from the headers of the copies that are
+# linked: libvpx (VP8/VP9), SVT-AV1, and the virtual camera's dav1d and libde265 decoders;
+# x265 and kvazaar are the features below.
+codec-sys = { path = "codec-sys", features = ["vpx", "svtav1", "dav1d", "de265"] }
+# VA-API types from the bundled libva headers; the library itself is loaded at run time.
+va-sys = { path = "va-sys" }
 libc = "0.2"
 # fast_mode enables YuvConversionMode::Fast: empirically 1.23x faster than libyuv ARGBToI420
 # on x86-64-v3 (AVX2) at <=1 LSB error vs a float BT.709 reference (accuracy preserved).
@@ -51,14 +58,6 @@ xcursor = "0.3.1"
 # report that the screen changed. Pure-Rust XCB; links the system libxcb.
 x11rb = { version = "0.14", features = ["shm", "xfixes", "xtest", "randr", "damage", "dri3", "render"] }
 image = "=0.25.10"
-# The crate's build.rs probes the FFmpeg found via pkg-config and emits
-# per-version cfgs; one crate version supports FFmpeg 3.0 UP TO the release it
-# is named after (8.1.0 = "at most 8.1", not "exactly 8.1"). The VAAPI encoder
-# here uses 5.1-era API only, so any system FFmpeg 6.x-8.1 builds; bump the
-# crate when targeting a newer FFmpeg release. Only avcodec+avfilter are used
-# (avutil is implicit), so the default avformat/avdevice/swscale/swresample
-# components — and their dev packages — are not required.
-ffmpeg-sys-next = { version = "9.0", default-features = false, features = ["avcodec", "avfilter"] }
 base64 = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -73,18 +72,12 @@ features = ["cuda"]
 
 [features]
 default = ["gpl"]
-## GPL-licensed components: libx264 (GPL-2.0+) as the software H.264 encoder. Wins over
-## `openh264` whenever both are enabled.
-gpl = ["dep:x264-sys"]
-## BSD-licensed Cisco OpenH264 as the software H.264 encoder of a build without `gpl`;
-## the crate fails to compile with neither feature (no software H.264 at all).
-openh264 = ["dep:openh264", "dep:openh264-sys2"]
-
-# The OpenH264 crates are dev-dependencies as well, so the OpenH264 encoder and the
-# webcam H.264 round trip are always built and tested, whichever encoder the build ships.
-[dev-dependencies]
-openh264 = "0.9"
-openh264-sys2 = "0.9"
+## GPL-licensed components: libx264 (GPL-2.0+) as the software H.264 encoder and x265
+## (GPL-2.0+) as the software HEVC encoder. Wins over `openh264` whenever both are enabled.
+gpl = ["dep:x264-sys", "codec-sys/x265"]
+## BSD-licensed Cisco OpenH264 as the software H.264 encoder and kvazaar as the software
+## HEVC encoder of a build without `gpl`; the crate fails to compile with neither feature.
+openh264 = ["codec-sys/kvazaar"]
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay"

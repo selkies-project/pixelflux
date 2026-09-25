@@ -323,10 +323,10 @@ impl X11Pipeline {
     }
 
     /// Apply a runtime rate-control / framerate change: the CBR target bitrate + VBV (kbps /
-    /// kb; ignored unless CBR is active) and the target fps. NVENC reconfigures its live session
-    /// immediately; a libavcodec session re-opens its codec context to apply the new rate; the
-    /// striped software path picks the new values up on the next `process()` (encode_cpu reads
-    /// the updated settings and reconfigures each stripe's encoder).
+    /// kb; ignored unless CBR is active) and the target fps. NVENC, libvpx, and x265 reconfigure
+    /// their live session; a VA-API session starts a new sequence; kvazaar and SVT-AV1 re-open;
+    /// the striped software path picks the new values up on the next `process()` (encode_cpu
+    /// reads the updated settings and reconfigures each stripe's encoder).
     pub fn update_rate(&mut self, bitrate_kbps: i32, vbv_multiplier: f64, fps: f64) {
         self.settings.video_bitrate_kbps = bitrate_kbps;
         self.settings.video_vbv_multiplier = vbv_multiplier;
@@ -393,15 +393,19 @@ impl X11Pipeline {
                     Ok(data) if !data.is_empty() => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
-                        vec![EncodedStripe {
-                            data: Arc::new(data),
-                            codec: self.settings.codec,
-                            stripe_y_start: 0,
-                            stripe_height: height,
-                            frame_id: self.frame_counter as i32,
-                            timing: Default::default(),
-                            reference: enc.last_reference(),
-                        }]
+                        let codec = self.settings.codec;
+                        enc.delivered_units(data, self.frame_counter)
+                            .into_iter()
+                            .map(|(data, id, reference)| EncodedStripe {
+                                data: Arc::new(data),
+                                codec,
+                                stripe_y_start: 0,
+                                stripe_height: height,
+                                frame_id: id as i32,
+                                timing: Default::default(),
+                                reference,
+                            })
+                            .collect()
                     }
                     Ok(_) => {
                         self.hw_error_streak = 0;

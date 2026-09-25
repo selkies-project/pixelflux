@@ -1246,7 +1246,7 @@ mod gpu_tests {
     use super::*;
     use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
     use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
-    use crate::webcam::decode::{AvDecoder, Codec as DecCodec};
+    use crate::webcam::decode::{VideoDecoder, Codec as DecCodec};
 
     /// Thread CPU time, for the per-frame CPU cost of the path independent of GPU waiting.
     fn thread_cpu() -> Duration {
@@ -1354,7 +1354,7 @@ mod gpu_tests {
             println!("the NvFBC path declined this session on this host; nothing to capture");
             return;
         };
-        let mut dec = AvDecoder::new(DecCodec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(DecCodec::H264).expect("avcodec h264");
         let mut pointers = Vec::new();
 
         let encode = |gpu: &mut GpuCapture, i: u64, key: bool, pointers: &mut Vec<CUdeviceptr>| -> Vec<u8> {

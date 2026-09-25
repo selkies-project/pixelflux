@@ -5,8 +5,8 @@
 //! the node is `/dev/nvhost-msenc` on JetPack 4 and `/dev/v4l2-nvenc` on JetPack 6, and that
 //! JetPack 6 node is a `/dev/null` placeholder whose `open` the vendor `libnvv4l2.so` intercepts.
 //! The library is therefore loaded at runtime, the way `nvenc.rs` loads `libcuda` and
-//! `avcodec.rs` loads `libva`, and the encoder is driven with ordinary V4L2 ioctls. Nothing is
-//! added to the build.
+//! `vaapi` loads `libva`, and the encoder is driven with ordinary V4L2 ioctls. Nothing is added
+//! to the build.
 //!
 //! One host frame becomes one access unit like this:
 //!
@@ -24,6 +24,7 @@
 //! The ioctl numbers and structure layouts were read off a target's headers rather than written
 //! from memory, and `abi_matches` checks the sizes those numbers encode.
 
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::mem::size_of;
 use std::sync::OnceLock;
@@ -32,10 +33,10 @@ use std::ptr;
 use libloading::{Library, Symbol};
 
 use super::codec::{
-    av1_is_key, frame_type_from_key, h264_frame_type, h265_frame_type, push_video_header, Codec,
-    VIDEO_HEADER_LEN,
+    av1_is_key, frame_type_from_key, h264_dpb_frames, h264_frame_type, h265_dpb_frames,
+    h265_frame_type, push_video_header, Codec, FRAME_KEY, VIDEO_HEADER_LEN,
 };
-use super::reference::Reference;
+use super::reference::{Reference, ReferenceWindow};
 use crate::RustCaptureSettings;
 
 const V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE: u32 = 9;
@@ -66,6 +67,9 @@ const CID_BITRATE_MODE: u32 = 0x0099_09ce;
 const CID_H264_PROFILE: u32 = 0x0099_0a6b;
 const CID_H265_PROFILE: u32 = 0x0099_0b01;
 const CID_IDR_INTERVAL: u32 = 0x0099_0b02;
+/// `V4L2_CID_MPEG_VIDEO_GOP_SIZE`: the encoder's own intra interval, which inserts a key frame
+/// on its own whatever the IDR interval says.
+const CID_GOP_SIZE: u32 = 0x0099_09cb;
 const CID_VBV_SIZE: u32 = 0x0099_0b13;
 const CID_INSERT_SPS_PPS_AT_IDR: u32 = 0x0099_0b17;
 /// AV1 carries no parameter sets; its sequence header rides the frame under its own control.
@@ -75,6 +79,18 @@ const CID_INSERT_VUI: u32 = 0x0099_0b22;
 const CID_MAX_PERFORMANCE: u32 = 0x0099_0b2a;
 const CID_POC_TYPE: u32 = 0x0099_0b33;
 const CID_FORCE_IDR_FRAME: u32 = 0x0099_0b37;
+/// External reference-picture-set control (`V4L2_CID_MPEG_BASE` + 532, 541, and 542): the
+/// session names, with each frame, which pictures the encoder may predict from.
+const CID_NUM_REFERENCE_FRAMES: u32 = 0x0099_0b14;
+const CID_INPUT_METADATA: u32 = 0x0099_0b1d;
+const CID_EXTERNAL_RPS: u32 = 0x0099_0b1e;
+/// `V4L2_ENC_INPUT_RPS_PARAM_FLAG`.
+const INPUT_METADATA_RPS: u32 = 1 << 2;
+/// `V4L2_MAX_REF_FRAMES`, the length of the reference list a frame carries.
+const RPS_LIST_LEN: usize = 8;
+/// The widest picture order count LSB H.265 allows: H.265 names its references by POC, and the
+/// encoder's own default wraps within the few frames a loss spans far sooner.
+const H265_POC_LSB_BITS: u32 = 16;
 
 /// Every encoder control belongs to this class; the driver ignores a request that
 /// arrives without it, silently, which is how a profile and a VUI went missing.
@@ -395,6 +411,76 @@ fn abi_matches() -> Result<(), String> {
     Ok(())
 }
 
+/// Sizes and offsets of the external-RPS structures on one L4T release: R36 grew reserved and
+/// per-codec fields, moving every size and `config_store` while the fields written here kept
+/// their offsets. Read off `v4l2_nv_extensions.h` on a Nano at R32.6.1 and an AGX Orin at
+/// R36.4.3; R35 was measured on no board and keeps the key frame per loss.
+struct RpsLayout {
+    /// `v4l2_enc_enable_ext_rps_ctr`.
+    enable: usize,
+    /// `v4l2_enc_num_ref_frames`, which the count is passed in: this control takes a pointer too.
+    num_ref: usize,
+    /// `v4l2_enc_frame_prop`, one entry of `RPSList`.
+    prop: usize,
+    /// `v4l2_enc_frame_ext_rps_ctrl_params`.
+    params: usize,
+    /// `v4l2_ctrl_videoenc_input_metadata`.
+    metadata: usize,
+    /// `config_store` in that structure: the index of the output buffer the frame is queued on.
+    config_store: usize,
+}
+
+const RPS_R32: RpsLayout = RpsLayout { enable: 12, num_ref: 4, prop: 8, params: 84, metadata: 56, config_store: 48 };
+const RPS_R36: RpsLayout = RpsLayout { enable: 28, num_ref: 20, prop: 24, params: 232, metadata: 72, config_store: 56 };
+
+/// The layout for the release `/etc/nv_tegra_release` names; the surface library an image ships
+/// says nothing about it.
+fn rps_layout() -> Option<&'static RpsLayout> {
+    static LAYOUT: OnceLock<Option<&'static RpsLayout>> = OnceLock::new();
+    *LAYOUT.get_or_init(|| {
+        let release = std::fs::read_to_string("/etc/nv_tegra_release").ok()?;
+        rps_layout_for(&release)
+    })
+}
+
+fn rps_layout_for(release: &str) -> Option<&'static RpsLayout> {
+    // "# R36 (release), REVISION: 4.3, ..."
+    let major = release.trim_start_matches(['#', ' ']).split([' ', '(']).next()?;
+    match major {
+        "R32" => Some(&RPS_R32),
+        "R36" => Some(&RPS_R36),
+        _ => None,
+    }
+}
+
+/// A zeroed vendor structure with the fields this backend sets written at their offsets.
+struct Fields(Vec<u8>);
+
+impl Fields {
+    fn new(size: usize) -> Self {
+        Self(vec![0; size])
+    }
+
+    fn u8(&mut self, at: usize, value: u8) -> &mut Self {
+        self.0[at] = value;
+        self
+    }
+
+    fn u32(&mut self, at: usize, value: u32) -> &mut Self {
+        self.0[at..at + 4].copy_from_slice(&value.to_ne_bytes());
+        self
+    }
+
+    fn ptr(&mut self, at: usize, value: *const u8) -> &mut Self {
+        self.0[at..at + 8].copy_from_slice(&(value as u64).to_ne_bytes());
+        self
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.0.as_ptr()
+    }
+}
+
 type V4l2Open = unsafe extern "C" fn(*const c_char, c_int) -> c_int;
 type V4l2Ioctl = unsafe extern "C" fn(c_int, u64, *mut c_void) -> c_int;
 type V4l2Close = unsafe extern "C" fn(c_int) -> c_int;
@@ -671,6 +757,24 @@ pub struct TegraEncoder {
     omit_headers: bool,
     bitrate_bps: u32,
     fps: f64,
+    /// The references the decoder holds, where the encoder takes the reference set from the
+    /// session (`rps`); None where it chooses its own and a lost frame costs a key frame.
+    references: Option<ReferenceWindow>,
+    rps: Option<&'static RpsLayout>,
+    /// How many frames the encoder may predict from, which is what the window holds.
+    dpb: u32,
+    /// What each frame in flight predicted from, by frame number, in the order queued: the
+    /// encoder hands a unit back one or two frames after the one that produced it.
+    in_flight: VecDeque<(u64, Reference)>,
+    /// The units the last call handed back, in order, as `delivered_units` describes them.
+    units: Vec<(u16, Reference, usize)>,
+    last_reference: Reference,
+    /// Frames between the key frames the session asks for itself, and how many since the last.
+    keyframe_every: u64,
+    since_key: u64,
+    /// Set when the encoder coded a key frame nobody asked for: its references and the window's
+    /// no longer agree, and the next frame is a key frame to make them agree again.
+    resync: bool,
 }
 
 impl TegraEncoder {
@@ -728,6 +832,20 @@ impl TegraEncoder {
             omit_headers: settings.omit_stripe_headers,
             bitrate_bps,
             fps,
+            references: None,
+            rps: None,
+            // The level the encoder picks admits no more than this: at 3840x2160 a set of eight
+            // fails the session (`BlockSide error 0x4`) where level 5.1's five do not.
+            dpb: match codec {
+                Codec::H265 => h265_dpb_frames(153, width as u32, height as u32),
+                _ => h264_dpb_frames(51, width as u32, height as u32),
+            },
+            in_flight: VecDeque::new(),
+            units: Vec::new(),
+            last_reference: Reference::Untracked,
+            keyframe_every: 0,
+            since_key: 0,
+            resync: false,
         };
         if let Err(e) = me.setup(settings, fps, bitrate_bps, rgba, coded) {
             return Err(format!("{opened}: {e}"));
@@ -973,6 +1091,154 @@ impl TegraEncoder {
         self.ioctl(VIDIOC_S_EXT_CTRLS, &mut controls, what)
     }
 
+    /// Set a compound control, whose value the driver reads through the pointer in the union.
+    fn set_pointer_control(&self, id: u32, value: *const u8, what: &str) -> Result<(), String> {
+        let mut control = ExtControl { id, size: 0, reserved2: 0, value: value as i64 };
+        let mut controls = ExtControls {
+            which: V4L2_CTRL_CLASS_MPEG,
+            count: 1,
+            error_idx: 0,
+            request_fd: 0,
+            reserved: 0,
+            _pad: 0,
+            controls: &mut control,
+        };
+        self.ioctl(VIDIOC_S_EXT_CTRLS, &mut controls, what)
+    }
+
+    /// Take the reference set into the session's hands, so a frame a client lost is left out of
+    /// it instead of answered with a key frame. Before the buffers are requested, which is what
+    /// the vendor's `enableExternalRPS` checks; once on, a frame queued without its set fails the
+    /// session (`BlockSide error 0x4`, then `EINVAL` on the next `QBUF`), so `rps` is set only
+    /// here and every queued frame carries one.
+    ///
+    /// H.265 only: under an external set the vendor's H.264 encoder codes pictures its own
+    /// decoder does not reconstruct where content repeats within the search range, at any list
+    /// order, reference count, POC type, or preset, as NVIDIA's own sample shows, so an H.264
+    /// session keeps the key frame per loss. AV1 carries different metadata altogether.
+    fn enable_external_rps(&mut self) {
+        let (at, bits) = match self.codec {
+            Codec::H265 => (8, H265_POC_LSB_BITS),
+            _ => return,
+        };
+        let Some(layout) = rps_layout() else {
+            crate::log::debug!("[pixelflux] Tegra: no external RPS layout known for this L4T release");
+            return;
+        };
+        let mut enable = Fields::new(layout.enable);
+        enable.u8(0, 1).u32(at, bits);
+        if let Err(e) = self.set_pointer_control(CID_EXTERNAL_RPS, enable.as_ptr(), "external RPS") {
+            crate::log::debug!("[pixelflux] Tegra: {e}; a lost frame costs a key frame");
+            return;
+        }
+        // The count follows the enable and is a compound control too: passed inline, the driver
+        // reads the number as an address and dies inside the vendor library. Refused, the
+        // encoder keeps its default of one, and the window holds what the encoder does.
+        let mut count = Fields::new(layout.num_ref);
+        count.u32(0, self.dpb);
+        if let Err(e) = self.set_pointer_control(CID_NUM_REFERENCE_FRAMES, count.as_ptr(), "reference frames") {
+            eprintln!("[pixelflux] Tegra: {e}; predicting from one reference frame");
+            self.dpb = 1;
+        }
+        self.rps = Some(layout);
+        self.references = Some(ReferenceWindow::new(self.dpb));
+    }
+
+    /// Name the references the frame about to be queued on `slot` may predict from, and note
+    /// what that makes it predict from. An empty set is a key frame — the first, one asked for,
+    /// one the window needs because nothing it holds is left, and the periodic one the interval
+    /// no longer inserts.
+    fn queue_references(&mut self, layout: &RpsLayout, slot: usize, frame_number: u64, force_idr: bool) -> Result<(), String> {
+        let references = self.references.as_ref().ok_or("the reference window is missing")?;
+        let key = force_idr
+            || self.resync
+            || self.since_key >= self.keyframe_every
+            || !references.has_reference();
+        let held: Vec<u64> = if key { Vec::new() } else { references.held().filter(|f| !f.2).map(|f| f.1).collect() };
+        let held = &held[held.len().saturating_sub(RPS_LIST_LEN)..];
+
+        // The encoder's own ids are the window's timestamps, which do not wrap the way the frame
+        // number on the wire does.
+        let mut params = Fields::new(layout.params);
+        params
+            .u32(0, references.next_pts() as u32)
+            .u8(4, 1)
+            .u32(8, self.dpb)
+            .u32(12, held.len() as u32)
+            .u32(16, held.last().map_or(0, |&pts| pts as u32));
+        for (i, &pts) in held.iter().enumerate() {
+            params.u32(20 + i * layout.prop, pts as u32);
+        }
+        let mut metadata = Fields::new(layout.metadata);
+        metadata
+            .u32(0, INPUT_METADATA_RPS)
+            .ptr(32, params.as_ptr())
+            .u32(layout.config_store, slot as u32);
+        self.set_pointer_control(CID_INPUT_METADATA, metadata.as_ptr(), "frame references")?;
+
+        let reference = self.references.as_mut().map_or(Reference::Untracked, |w| w.record(frame_number as u16, key));
+        // A unit comes back one or two frames later; one the encoder never returns must not pin
+        // the rest of the queue behind it.
+        if self.in_flight.len() >= OUTPUT_BUFFERS + CAPTURE_BUFFERS {
+            self.in_flight.pop_front();
+        }
+        self.in_flight.push_back((frame_number, reference));
+        if key {
+            self.since_key = 1;
+            self.resync = false;
+        } else {
+            self.since_key += 1;
+        }
+        Ok(())
+    }
+
+    /// What the unit carrying frame `number` predicted from, where the session names references.
+    fn reference_of(&mut self, number: u64) -> Reference {
+        while let Some((queued, reference)) = self.in_flight.pop_front() {
+            if queued == number {
+                return reference;
+            }
+        }
+        Reference::Untracked
+    }
+
+    /// A key frame the session did not ask for means the encoder dropped references the window
+    /// still lists, so the next frame is a key frame to make them agree again.
+    fn note_key_frame(&mut self, reference: Reference) {
+        if self.references.is_some() && reference != Reference::None {
+            eprintln!("[pixelflux] Tegra: the encoder coded a key frame the session did not ask for; resynchronizing its references");
+            self.resync = true;
+        }
+    }
+
+    /// The frame the first unit the last call handed back predicted from; `Untracked` where the
+    /// session names no references or the call handed back nothing.
+    pub fn last_reference(&self) -> Reference {
+        self.last_reference
+    }
+
+    /// The units the last call handed back: each one's frame number, what it predicted from, and
+    /// where it ends in the data. A unit comes back a frame or two after the frame that produced
+    /// it, several at once after a stall, so a consumer that drops one reports it lost by that
+    /// unit's own frame number; named otherwise, the lost frame stays a reference.
+    pub fn delivered_units(&self) -> &[(u16, Reference, usize)] {
+        &self.units
+    }
+
+    /// Leave frame `frame_id` and every frame after it out of the predictions. The encoder
+    /// learns of it with the next frame's reference set, which the window now leaves it out of,
+    /// or which is empty, making that frame a key frame. False where the session does not name
+    /// references, and the caller codes a key frame instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
+        match &mut self.references {
+            Some(references) => {
+                references.invalidate(frame_id);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn format(&self, type_: u32, pixelformat: u32, planes: u8, sizeimage: u32) -> Format {
         let mut plane_fmt = [PlaneFormat::default(); 8];
         plane_fmt[0].sizeimage = sizeimage;
@@ -1050,7 +1316,17 @@ impl TegraEncoder {
         if self.codec == Codec::H264 {
             let _ = self.set_control(CID_POC_TYPE, 2, "picture order count type");
         }
-        self.set_control(CID_IDR_INTERVAL, keyframe, "IDR interval")?;
+        // With the reference set the session's, so is every key frame: one the encoder inserts
+        // on an interval of its own, IDR or GOP, is coded against the set it was handed, and the
+        // frames after it decode as noise until the window learns of it. Both intervals are
+        // parked and the session asks for each key frame with an empty set.
+        self.keyframe_every = keyframe as u64;
+        self.enable_external_rps();
+        let idr_interval = if self.rps.is_some() { i32::MAX as i64 } else { keyframe };
+        self.set_control(CID_IDR_INTERVAL, idr_interval, "IDR interval")?;
+        if self.rps.is_some() {
+            self.set_control(CID_GOP_SIZE, i32::MAX as i64, "GOP size")?;
+        }
         self.set_control(CID_VBV_SIZE, vbv, "VBV size")?;
 
         let mut request = RequestBuffers {
@@ -1156,6 +1432,11 @@ impl TegraEncoder {
         false
     }
 
+    /// The NV12 the VIC converts into is limited range.
+    pub fn is_full_range(&self) -> bool {
+        false
+    }
+
     /// Apply a live bitrate change. The control is writable while streaming on this path, unlike
     /// the same change through the vendor GStreamer element, which the driver accepts and ignores.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
@@ -1219,7 +1500,9 @@ impl TegraEncoder {
         };
         self.convert_to_nv12(slot)?;
 
-        if force_idr {
+        if let Some(layout) = self.rps {
+            self.queue_references(layout, slot, frame_number, force_idr)?;
+        } else if force_idr {
             self.set_control(CID_FORCE_IDR_FRAME, 1, "force IDR")?;
         }
         let mut planes = [Plane::default(); 2];
@@ -1236,6 +1519,12 @@ impl TegraEncoder {
         );
         buffer.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
         buffer.timestamp = [frame_number as i64, 0];
+        // The references were stored under the slot's index (`config_store`), and the buffer
+        // names that store in `reserved2`, as the vendor's own encoder does. Left zero, every
+        // frame reads store 0, and the first one queued elsewhere fails the session.
+        if self.rps.is_some() {
+            buffer.reserved2 = slot as u32;
+        }
         self.ioctl(VIDIOC_QBUF, &mut buffer, "QBUF output")?;
         self.queued = (self.queued + 1).min(OUTPUT_BUFFERS);
         self.outstanding += 1;
@@ -1285,6 +1574,8 @@ impl TegraEncoder {
     /// Take the access units the encoder has ready.
     fn collect(&mut self) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
+        self.last_reference = Reference::Untracked;
+        self.units.clear();
         loop {
             let mut planes = [Plane::default(); 1];
             let mut buffer = self.buffer(
@@ -1317,6 +1608,15 @@ impl TegraEncoder {
             if length > 0 {
                 let (data, _) = self.capture[index];
                 let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+                let number = buffer.timestamp[0] as u64;
+                let reference = self.reference_of(number);
+                let frame_type = self.frame_type(bytes);
+                if frame_type == FRAME_KEY {
+                    self.note_key_frame(reference);
+                }
+                if self.units.is_empty() {
+                    self.last_reference = reference;
+                }
                 if self.omit_headers {
                     out.extend_from_slice(bytes);
                 } else {
@@ -1324,15 +1624,16 @@ impl TegraEncoder {
                     push_video_header(
                         &mut out,
                         self.codec,
-                        self.frame_type(bytes),
-                        buffer.timestamp[0] as u16,
+                        frame_type,
+                        number as u16,
                         0,
                         self.width as u16,
                         self.height as u16,
-                        Reference::Untracked,
+                        reference,
                     );
                     out.extend_from_slice(bytes);
                 }
+                self.units.push((number as u16, reference, out.len()));
             }
             self.ioctl(VIDIOC_QBUF, &mut buffer, "QBUF capture")?;
         }
@@ -1436,5 +1737,304 @@ mod tests {
         assert_ne!(CID_H264_PROFILE, CID_H265_PROFILE);
         assert_eq!(CID_H265_PROFILE, 0x0099_0900 + 513, "V4L2_CID_MPEG_BASE + 513");
         assert_eq!(CID_H264_PROFILE, 0x0099_0900 + 363, "V4L2_CID_MPEG_VIDEO_H264_PROFILE");
+    }
+
+    /// The external-RPS layout follows the release the host runs, and only the two measured:
+    /// JetPack 5 lays the structures out in a way no board here has shown.
+    #[test]
+    fn the_reference_set_is_laid_out_for_the_release_measured() {
+        let orin = "# R36 (release), REVISION: 4.3, GCID: 38968081, BOARD: generic, EABI: aarch64";
+        let nano = "# R32 (release), REVISION: 6.1, GCID: 27863751, BOARD: t210ref, EABI: aarch64";
+        assert_eq!(rps_layout_for(orin).map(|l| l.metadata), Some(72));
+        assert_eq!(rps_layout_for(nano).map(|l| l.metadata), Some(56));
+        assert!(rps_layout_for("# R35 (release), REVISION: 6.0").is_none(), "JetPack 5 was never measured");
+        assert!(rps_layout_for("").is_none());
+        assert_eq!(CID_INPUT_METADATA, 0x0099_0900 + 541);
+        assert_eq!(CID_EXTERNAL_RPS, 0x0099_0900 + 542);
+        assert_eq!(CID_NUM_REFERENCE_FRAMES, 0x0099_0900 + 532);
+        for layout in [&RPS_R32, &RPS_R36] {
+            assert!(20 + RPS_LIST_LEN * layout.prop <= layout.params, "the list fits its structure");
+            assert!(layout.config_store + 4 <= layout.metadata);
+            assert!(layout.config_store >= 40, "past the pointers the metadata leads with");
+            assert!(8 + 4 <= layout.enable, "both counts fit the enable structure");
+        }
+    }
+
+    /// Test helper: a `w×h` BGRA frame of hashed noise with a block moved `step` places along
+    /// its top rows, so every frame predicts from the one before and differs from it.
+    fn moving(w: usize, h: usize, step: u64) -> Vec<u8> {
+        let mut f = vec![0u8; w * h * 4];
+        for (i, px) in f.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = ((i as u32).wrapping_mul(2654435761) >> 24) as u8;
+            *px = [v, v ^ 10, 10, 255];
+        }
+        let x0 = (step as usize * 64) % (w - 256);
+        for row in 0..256.min(h) {
+            let dst = (row * w + x0) * 4;
+            f[dst..dst + 256 * 4].fill(200);
+        }
+        f
+    }
+
+    /// Test helper: a session with the unit headers left off, so each unit decodes as it comes;
+    /// None where this host has no Tegra encoder.
+    fn session(codec: Codec, w: usize, h: usize, keyframe_s: f64) -> Option<TegraEncoder> {
+        let s = RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            codec,
+            target_fps: 30.0,
+            keyframe_interval_s: keyframe_s,
+            omit_stripe_headers: true,
+            ..Default::default()
+        };
+        match TegraEncoder::new(codec, &s, false) {
+            Ok(enc) => Some(enc),
+            Err(e) => {
+                println!("no Tegra {codec:?} session: {e}");
+                None
+            }
+        }
+    }
+
+    /// Test helper: encode frame `i` and wait for its own unit, so each call answers for that
+    /// frame alone although the encoder hands units back a frame or two late.
+    fn encode_one(enc: &mut TegraEncoder, i: u64, w: usize, h: usize, key: bool) -> (Vec<u8>, Reference) {
+        encode_frame(enc, &moving(w, h, i), w, i, key)
+    }
+
+    /// Test helper: `encode_one` for a frame of the caller's. Waits by the units handed back,
+    /// which a session names whether or not it names references.
+    fn encode_frame(enc: &mut TegraEncoder, pixels: &[u8], w: usize, i: u64, key: bool) -> (Vec<u8>, Reference) {
+        let mut out = enc.encode_host(pixels, w * 4, false, i, 25, key).expect("encode");
+        let mut came = enc.units.iter().any(|u| u.0 == i as u16);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !came {
+            assert!(std::time::Instant::now() < deadline, "frame {i} never came back");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            out.extend(enc.collect().expect("collect"));
+            came = enc.units.iter().any(|u| u.0 == i as u16);
+        }
+        (out, enc.last_reference())
+    }
+
+    /// Test helper: whether a unit carries the parameter sets a client starts on — the SPS, and
+    /// for H.265 the VPS ahead of it.
+    fn carries_parameter_sets(codec: Codec, unit: &[u8]) -> bool {
+        match codec {
+            Codec::H265 => {
+                let types: Vec<u8> = unit.windows(4)
+                    .filter(|w| w[..3] == [0, 0, 1])
+                    .map(|w| (w[3] >> 1) & 0x3f)
+                    .collect();
+                types.contains(&32) && types.contains(&33)
+            }
+            _ => crate::encoders::sps::h264_frame_num_range(unit).is_some(),
+        }
+    }
+
+    /// A frame a client lost is left out of the encoder's predictions: the next frame predicts
+    /// from the newest frame before it and names it, and a decoder that never saw the lost
+    /// frames shows the frames after them exactly as one that saw everything. A key frame the
+    /// window asks for carries the parameter sets a client starts on. Ignored by default.
+    #[test]
+    #[ignore]
+    fn tegra_predicts_past_a_lost_frame() {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        for codec in [Codec::H264, Codec::H265] {
+            let Some(mut enc) = session(codec, w, h, 10.0) else { continue };
+            let (first, reference) = encode_one(&mut enc, 0, w, h, true);
+            if reference == Reference::Untracked {
+                println!("{codec:?}: this encoder takes no reference set, so nothing is tracked");
+                assert!(!enc.invalidate_reference(0));
+                continue;
+            }
+            assert_eq!(reference, Reference::None);
+            let mut frames = vec![first];
+            for i in 1..8u64 {
+                let (out, reference) = encode_one(&mut enc, i, w, h, false);
+                assert_eq!(reference, Reference::Frame(i as u16 - 1), "{codec:?} frame {i}");
+                frames.push(out);
+            }
+            assert!(enc.invalidate_reference(5));
+            let (out, reference) = encode_one(&mut enc, 8, w, h, false);
+            assert_eq!(reference, Reference::Frame(4), "{codec:?}: frame 8 predicts past the lost 5-7");
+            frames.push(out);
+            let (out, reference) = encode_one(&mut enc, 9, w, h, false);
+            assert_eq!(reference, Reference::Frame(8), "{codec:?}");
+            frames.push(out);
+
+            let (mut whole, mut lossy) = (VideoDecoder::new(codec).unwrap(), VideoDecoder::new(codec).unwrap());
+            for (i, f) in frames.iter().enumerate() {
+                assert!(whole.decode(f).expect("decode"), "{codec:?} frame {i}");
+                if !(5..8).contains(&i) {
+                    assert!(lossy.decode(f).expect("decode without 5-7"), "{codec:?} frame {i}");
+                }
+            }
+            let (a, b) = (whole.frame().unwrap(), lossy.frame().unwrap());
+            let differ = a.y.chunks(a.y_stride)
+                .zip(b.y.chunks(b.y_stride))
+                .take(a.height)
+                .filter(|(ra, rb)| ra[..a.width] != rb[..a.width])
+                .count();
+            assert_eq!(differ, 0, "{codec:?}: frame 9 without frames 5-7 differs from the complete decode in {differ} rows");
+
+            // Frame 1 has left the window, and everything held predicts through it: a key frame,
+            // asked for with an empty set, which a client that saw nothing before it starts on.
+            let mut i = 10u64;
+            for _ in 0..enc.dpb + 2 {
+                encode_one(&mut enc, i, w, h, false);
+                i += 1;
+            }
+            assert!(enc.invalidate_reference(1));
+            let (key, reference) = encode_one(&mut enc, i, w, h, false);
+            assert_eq!(reference, Reference::None, "{codec:?}: a loss out of the window costs a key frame");
+            assert_eq!(enc.frame_type(&key), FRAME_KEY, "{codec:?}");
+            assert!(carries_parameter_sets(codec, &key), "{codec:?}: the key frame the session asked for carries its parameter sets");
+            let mut fresh = VideoDecoder::new(codec).unwrap();
+            assert!(fresh.decode(&key).expect("decode"), "{codec:?}: a client starts on it alone");
+            assert_eq!(encode_one(&mut enc, i + 1, w, h, false).1, Reference::Frame(i as u16), "{codec:?}");
+            assert!(!enc.resync, "{codec:?}: the encoder coded no key frame the session did not ask for");
+        }
+    }
+
+    /// With the reference set the session's, so is every key frame: the periodic one comes when
+    /// the interval says, at no other frame, and the encoder inserts none of its own. Ignored by
+    /// default.
+    #[test]
+    #[ignore]
+    fn tegra_codes_the_key_frames_the_session_asks_for_and_no_other() {
+        let (w, h) = (1280usize, 720usize);
+        for codec in [Codec::H264, Codec::H265] {
+            let Some(mut enc) = session(codec, w, h, 1.0) else { continue };
+            if encode_one(&mut enc, 0, w, h, true).1 == Reference::Untracked {
+                println!("{codec:?}: this encoder takes no reference set, so nothing is tracked");
+                continue;
+            }
+            for i in 1..95u64 {
+                let (out, reference) = encode_one(&mut enc, i, w, h, false);
+                let key = enc.frame_type(&out) == FRAME_KEY;
+                assert_eq!(key, i % 30 == 0, "{codec:?} frame {i}: a key frame every second at 30 fps, and only then");
+                assert_eq!(reference == Reference::None, key, "{codec:?} frame {i}: the header says what the bitstream is");
+                assert!(!enc.resync, "{codec:?} frame {i}: the encoder coded a key frame nobody asked for");
+            }
+            // Asked for between two periodic ones, and the count restarts there.
+            let (out, reference) = encode_one(&mut enc, 95, w, h, true);
+            assert_eq!((enc.frame_type(&out), reference), (FRAME_KEY, Reference::None), "{codec:?}");
+            for i in 96..125u64 {
+                assert_ne!(encode_one(&mut enc, i, w, h, false).1, Reference::None, "{codec:?} frame {i}");
+            }
+            assert_eq!(encode_one(&mut enc, 125, w, h, false).1, Reference::None, "{codec:?}: thirty frames after the one asked for");
+        }
+    }
+
+    /// Test helper: a flat blue `w×h` BGRA frame with a red bar 160 wide moved 12 pixels a step,
+    /// the motion a desktop has: slow enough that every frame predicts the bar from the last.
+    fn bar_scene(w: usize, h: usize, step: u64) -> (Vec<u8>, usize) {
+        let mut f = [0x78u8, 0x28, 0x1e, 255].repeat(w * h);
+        let x0 = (step as usize * 12) % (w - 160);
+        for row in 0..h {
+            for px in f[(row * w + x0) * 4..(row * w + x0 + 160) * 4].chunks_mut(4) {
+                px.copy_from_slice(&[0x28, 0x3c, 0xdc, 255]);
+            }
+        }
+        (f, x0 + 80)
+    }
+
+    /// Every frame decodes to what was encoded, not only to what another decoder makes of it:
+    /// a frame predicted from a reference other than the one its bitstream names drifts where
+    /// the picture moves, and comparing two decodes of one stream cannot see that, since both
+    /// drift alike. The bar's luma is held to the key frame's across a loss. Ignored by default.
+    #[test]
+    #[ignore]
+    fn tegra_decodes_what_it_encoded() {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        for codec in [Codec::H264, Codec::H265] {
+            let Some(mut enc) = session(codec, w, h, 10.0) else { continue };
+            if enc.references.is_none() {
+                println!("{codec:?}: this session takes no reference set, so a loss costs a key frame");
+                continue;
+            }
+            let mut dec = VideoDecoder::new(codec).unwrap();
+            let mut first = None;
+            let mut worst = 0u8;
+            for i in 0..90u64 {
+                // Frame 39 is lost, and the client's report reaches the session before frame 41.
+                if i == 41 {
+                    assert!(enc.invalidate_reference(39), "{codec:?}");
+                }
+                let (pixels, bar) = bar_scene(w, h, i);
+                let (out, _) = encode_frame(&mut enc, &pixels, w, i, i == 0);
+                if i == 39 || i == 40 {
+                    continue; // 39 lost by the client, and 40, which predicts from it, held back
+                }
+                assert!(dec.decode(&out).expect("decode"), "{codec:?} frame {i}");
+                let f = dec.frame().unwrap();
+                let luma = f.y[(h / 2) * f.y_stride + bar];
+                if std::env::var_os("TEGRA_TRACE").is_some() {
+                    print!("{i}:{luma} ");
+                }
+                let first = *first.get_or_insert(luma);
+                worst = worst.max(luma.abs_diff(first));
+                assert!(luma.abs_diff(first) <= 6, "{codec:?} frame {i}: the bar reads {luma}, the key frame {first}");
+            }
+            println!("{codec:?}: the bar held within {worst} of the key frame's luma");
+        }
+    }
+
+    /// Content that repeats a few frames apart lets motion search reach past the newest
+    /// reference, and a picture predicted from a reference its decoder resolves differently
+    /// drifts from the source there. A bar moving over a strip that cycles through four noise
+    /// images is held to the source's luma, with the session's reference set where it names one
+    /// and without it for H.264, whose external set the vendor encoder mis-codes (19.9 off the
+    /// source where this holds it under 8). Ignored by default.
+    #[test]
+    #[ignore]
+    fn tegra_decodes_repeating_content_as_encoded() {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        let noise: Vec<Vec<u8>> = (0..4u32)
+            .map(|k| {
+                (0..w * 240)
+                    .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k * 77777) >> 24) as u8)
+                    .collect()
+            })
+            .collect();
+        for codec in [Codec::H264, Codec::H265] {
+            let Some(mut enc) = session(codec, w, h, 10.0) else { continue };
+            let mut dec = VideoDecoder::new(codec).unwrap();
+            let mut worst = 0f64;
+            for i in 0..60u64 {
+                let (mut pixels, _) = bar_scene(w, h, i);
+                let strip = &noise[i as usize % 4];
+                for row in 0..240 {
+                    for x in 0..w {
+                        let v = strip[row * w + x];
+                        let at = ((h - 240 + row) * w + x) * 4;
+                        pixels[at..at + 3].copy_from_slice(&[v, v, v]);
+                    }
+                }
+                let (out, _) = encode_frame(&mut enc, &pixels, w, i, i == 0);
+                assert!(dec.decode(&out).expect("decode"), "{codec:?} frame {i}");
+                if i < 8 {
+                    continue;
+                }
+                // Gray v is luma 16 + 219 v / 255 in the limited range the session declares; the
+                // rows at the strip's edges are left to the quantizer.
+                let f = dec.frame().unwrap();
+                let mut off = 0f64;
+                for row in 8..232 {
+                    let decoded = &f.y[(h - 240 + row) * f.y_stride..][..w];
+                    for (x, &y) in decoded.iter().enumerate() {
+                        off += (y as f64 - (16.0 + 219.0 * strip[row * w + x] as f64 / 255.0)).abs();
+                    }
+                }
+                worst = worst.max(off / (224 * w) as f64);
+            }
+            println!("{codec:?}: the repeating strip held within {worst:.2} of the source's luma");
+            assert!(worst < 8.0, "{codec:?}: the repeating strip drifted {worst:.2} from the source");
+        }
     }
 }

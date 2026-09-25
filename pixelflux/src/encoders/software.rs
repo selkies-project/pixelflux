@@ -45,7 +45,7 @@ pub const MAX_STRIPE_CAPACITY: usize = 64;
 /// **Why the band split exists.** Color conversion is a non-trivial slice of per-frame CPU. The
 /// striped path already parallelizes it for free — each stripe converts on its own rayon worker —
 /// but a single full-frame consumer (the whole-frame x264 stripe, a full-frame OpenH264
-/// instance, a libavcodec session) would otherwise convert its entire image on one thread and
+/// instance, a whole-frame session of another codec) would otherwise convert its entire image on one thread and
 /// stall the frame there. Splitting into horizontal bands hands that lone conversion the same
 /// multi-threading the striped path enjoys. The cut is horizontal because YUV planes are
 /// row-major, so a horizontal boundary yields contiguous, non-overlapping plane sub-slices with no
@@ -1814,10 +1814,10 @@ mod qp_bound_sweep {
     #[cfg(feature = "gpl")]
     #[test]
     fn x264_declares_the_conversion_matrix() {
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
-        use ffmpeg_sys_next::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
-        use ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_BT709;
-        for (i444, want) in [(false, (AVCOL_SPC_BT709, AVCOL_RANGE_MPEG)), (true, (AVCOL_SPC_BT709, AVCOL_RANGE_JPEG))] {
+        use crate::encoders::codec::annexb_nals;
+        use crate::encoders::sps::read_color;
+        use crate::webcam::decode::{ColorTags, Decoder as _, VideoDecoder};
+        for (i444, want) in [(false, ColorTags::BT709_LIMITED), (true, ColorTags::BT709_FULL)] {
             let (w, h) = (128usize, 96usize);
             let mut enc = H264EncoderWrapper::new(w as i32, h as i32, 25, i444, 30.0, 1, false, 0, 0, 0, 0)
                 .expect("x264 init");
@@ -1827,9 +1827,14 @@ mod qp_bound_sweep {
             let v = vec![160u8; cw * ch];
             let mut out = Vec::new();
             assert!(enc.encode_with_headers(&y, &u, &v, w as i32, cw as i32, cw as i32, 0, 0, true, true, &mut out));
-            let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
-            assert!(dec.decode(&out).expect("decode"), "i444={i444}");
-            assert_eq!(dec.color_tags(), Some(want), "i444={i444}");
+            let sps = annexb_nals(&out).find(|n| n[0] & 0x1f == 7).expect("an SPS");
+            let declared = read_color(sps).map(|s| ColorTags { matrix: s.matrix, full_range: s.full_range });
+            assert_eq!(declared, Some(want), "i444={i444}");
+            if !i444 {
+                let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
+                assert!(dec.decode(&out).expect("decode"));
+                assert_eq!(dec.color_tags(), Some(want));
+            }
         }
     }
 
@@ -1840,7 +1845,7 @@ mod qp_bound_sweep {
     #[test]
     fn x264_paints_the_chart_it_converts() {
         use crate::encoders::chroma_siting::{chart_bgra, chart_error, BT709};
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         use super::convert_to_yuv_mt;
         let (w, h) = (256usize, 128usize);
         let bgra = chart_bgra(w, h);
@@ -1851,7 +1856,7 @@ mod qp_bound_sweep {
             .expect("x264 init");
         let mut out = Vec::new();
         assert!(enc.encode_with_headers(&y, &u, &v, w as i32, (w / 2) as i32, (w / 2) as i32, 0, 0, true, true, &mut out));
-        let mut dec = AvDecoder::new(Codec::H264).expect("decoder");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
         assert!(dec.decode(&out).expect("decode"));
         let worst = chart_error(&dec.frame().expect("frame"), BT709);
         println!("[chart] x264: worst |dRGB| {worst:.1}");
@@ -1868,7 +1873,7 @@ mod qp_bound_sweep {
         use crate::encoders::codec::{h264_frame_type, FRAME_DELTA, FRAME_KEY};
         use crate::encoders::reference::{Reference, REFERENCE_FRAMES};
         use crate::encoders::sps::h264_max_num_ref_frames;
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
         let mut enc = H264EncoderWrapper::new(W as i32, H as i32, 20, false, 60.0, 4, false, 0, 0, 0, 0)
             .expect("x264 init");
@@ -1895,7 +1900,7 @@ mod qp_bound_sweep {
         let (out, reference) = encode(&mut enc, 9);
         assert_eq!(reference, Reference::Frame(8));
         frames.push(out);
-        let (mut whole, mut lossy) = (AvDecoder::new(Codec::H264).unwrap(), AvDecoder::new(Codec::H264).unwrap());
+        let (mut whole, mut lossy) = (VideoDecoder::new(Codec::H264).unwrap(), VideoDecoder::new(Codec::H264).unwrap());
         for (i, f) in frames.iter().enumerate() {
             assert!(whole.decode(f).expect("decode"), "frame {i}");
             if !(5..8).contains(&i) {
@@ -1930,7 +1935,7 @@ mod qp_bound_sweep {
         use crate::encoders::codec::{h264_frame_type, FRAME_KEY};
         use crate::encoders::reference::Reference;
         use crate::encoders::sps::h264_frame_num_range;
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
+        use crate::webcam::decode::{VideoDecoder, Decoder as _};
         let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
         let mut enc = H264EncoderWrapper::new(W as i32, H as i32, 20, false, 60.0, 4, false, 0, 0, 0, 0)
             .expect("x264 init");
@@ -1952,7 +1957,7 @@ mod qp_bound_sweep {
         let (out, reference) = encode(&mut enc, range + 1);
         assert_eq!(reference, Reference::None);
         assert_eq!(h264_frame_type(&out), FRAME_KEY);
-        let mut lossy = AvDecoder::new(Codec::H264).unwrap();
+        let mut lossy = VideoDecoder::new(Codec::H264).unwrap();
         for f in &frames[..range] {
             assert!(lossy.decode(f).expect("decode"));
         }

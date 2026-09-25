@@ -47,7 +47,6 @@ allow = [
     "CC0-1.0",
     "Unlicense",
     "Unicode-3.0",
-    "WTFPL",
     "MPL-2.0",
 ]
 confidence-threshold = 0.8

@@ -38,7 +38,7 @@ hanging or lagging. Performance preservation or improvements such as zero-copy a
 always important, and the GIL is held no longer than the work needs. End-to-end latency and an unrestricted frame
 rate are separate goals rather than two ends of one dial: neither is spent to buy the other. A change never drops a
 capability or falls back to an older implementation to make itself simpler; where one seems to be in the way, say
-what it is rather than removing it. Note that compatibility should be ensured for Python 3.9 to 3.15 or even higher, and CUDA/NVENC 11
+what it is rather than removing it. Note that compatibility should be ensured for Python 3.9 to 3.14 or even higher, and CUDA/NVENC 11
 to 13 or higher. Protocol clients form fallback ladders that bind the newest architecture first (ext- before
 zwlr-data-control in dcclient) and exist to keep selkies' Wayland path subprocess-free — they replace wtype/wl-copy
 style forks, so extend them in-process rather than shelling out. A nested KWin session forwards no delta from its host
@@ -73,11 +73,14 @@ holds AV1 alone at the resize headroom's level, which NVENC validates its sessio
 H.264 may stripe (`encoders/software.rs`);
 every other codec streams whole frames. Every session that can name what a frame predicts from
 does (`encoders/reference.rs`, `StripeFrame.reference_frame_id`), and `invalidate_reference`
-leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: NVENC where
-the device reports reference-picture invalidation, libx264 always, and the stream declares the
-decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that cannot refuses, and the caller forces an
+leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: libx264 and libvpx
+always (VP9 in libvpx's flexible reference mode, VP8 across its three buffers on a schedule `reference.rs`
+keeps), NVENC where the device reports reference-picture invalidation, VA-API where the driver takes the
+session's own H.264 or HEVC slice headers or addresses the VP8 buffers and the VP9 and AV1 slots; and the
+stream declares the decoded picture buffer its level admits, or the eight AV1 fixes whatever the level. A
+session that does not (x265, kvazaar, SVT-AV1, Tegra, a stateful V4L2 device) refuses, and the caller forces an
 IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
-since FFmpeg's decoder derives the picture order past that gap wrongly and withholds every picture after it. Every full-frame session is chosen by one ladder,
+since the FFmpeg decoder of Chromium and Firefox derives the picture order past that gap wrongly and withholds every picture after it. Every full-frame session is chosen by one ladder,
 `encoders::select_frame_encoder` (Tegra's vendor encoder where its library answers, then NVENC on the NVIDIA
 driver, VA-API otherwise, then a stateful V4L2 memory-to-memory device, then the codec's software encoder, then
 a demotion to H.264), shared by X11, Wayland zero-copy, and Wayland readback.
@@ -90,14 +93,20 @@ produces nothing. Both backends take the codec as
 a parameter rather than carrying a second copy of the interface: the queues, controls, and surface formats are
 the same whichever coded format the capture queue is set to, so a device that advertises H.265 serves it there.
 Only the picture type is codec-specific, because an H.265 NAL header is two bytes where H.264's is one. `encoders/nvenc.rs`
-is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/avcodec.rs` is
-the libavcodec session: VA-API for all five codecs (a 4:4:4 session tries the surface formats the
+is codec-parameterized (H.264, HEVC, AV1; a codec the GPU lacks is refused at open). `encoders/vaapi/` is
+the VA-API session, driving libva directly (`va-sys` carries bindings of the libva headers it vendors and opens
+the host's library at run time) for all five codecs: `mod.rs` holds the device, the surfaces, the video
+processor's convert, and the reference bookkeeping, one arm per codec writes the parameter buffers and, where
+the driver takes them packed, the H.264, HEVC, and AV1 headers themselves (`bits.rs`), which is how a session
+names the frame a picture predicts from; a 4:4:4 session tries the surface formats the
 driver allocates and its video processor renders, read through libva's `VAProfileNone`
-configuration, until one survives the surface pool, the convert, and the codec open: Intel's iHD
+configuration, until one survives the surface pool, the convert, and the codec open (Intel's iHD
 allocates planar 444P but its VPP writes 4:4:4 only packed, as XYUV, and its HEVC 4:4:4 entry point
-takes only what the VPP writes), and the software HEVC (x265 with the `gpl` feature, else
-kvazaar), VP8/VP9 (libvpx), and AV1 (SVT-AV1) encoders the linked FFmpeg carries — probed once
-(`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`), never assumed. Software H.264 is
+takes only what the VPP writes); `vaapi/mock.rs` stands in for a driver so the session's every buffer is checked
+without hardware. The software HEVC (x265 with the `gpl` feature, else kvazaar; `encoders/hevc.rs`), VP8/VP9
+(libvpx, `encoders/vpx.rs`), and AV1 (SVT-AV1, `encoders/svtav1.rs`) encoders are linked directly and bound at
+build time from the headers of the copies that are linked (`codec-sys`), so which library serves a codec is the
+build's (`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`). Software H.264 is
 resolved at build time, never by a setting: the default `gpl` feature makes libx264 the encoder behind every
 CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
 `--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
@@ -119,7 +128,7 @@ kernel the driver JIT-compiles (`encoders/argb_to_nv12.cu`, `scripts/build-ptx.s
 the packed surface, a pitch-linear dmabuf import, or a texture over an array-typed one and writes
 the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
 driver that refuses the kernel.
-`AvDecoder::color_tags` reads what a stream declares, and the unit tests hold each
+`VideoDecoder::color_tags` reads what a stream declares, and the unit tests hold each
 encoder to it; the sequence headers travel with every IDR so a client joining or resynchronizing on any key
 frame can decode, which `encoders/v4l2m2m.rs` keeps true itself for the devices whose drivers will not
 (`REPEAT_SEQ_HEADER` is asked for and the parameter sets are put back where it is refused), since neither
@@ -134,10 +143,11 @@ client sends for it stays true. The CBR
 sessions of x264 and x265 cap the quantizer at 51: both libraries default to an out-of-spec range above
 it that forces macroblock skips on a VBV underflow, which freezes rows of a screen for a few frames, so a
 budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test both configurations (`cargo test --lib` and
-`cargo test --lib --no-default-features --features openh264`, the latter against an FFmpeg carrying
-`libkvazaar`); the OpenH264 crates are also dev-dependencies so its tests run under the default build. The
-wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d, and, for the GPL wheel, x264 and x265
-from source ahead of FFmpeg.
+`cargo test --lib --no-default-features --features openh264`, the latter with kvazaar's headers installed);
+the OpenH264 crates are dependencies of every build, since their decoder is the virtual camera's H.264 decoder,
+so the OpenH264 encoder's tests run under the default build too. The
+wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d, libde265, and, for the GPL wheel, x264
+and x265 from source.
 The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver pre-release
 the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the manifest
 and the lock, so a build ahead of a release carries the series version and a release the tag's.
@@ -191,7 +201,8 @@ sweep runs with `--skip nvfbc --skip dri3` and those checks run only against an 
 own; `x11::gpu_test_support` holds the painting and decoding helpers they share.
 
 The virtual camera (`pixelflux/src/webcam/`, Python class `VirtualCamera`) is the webcam counterpart of pcmflux's
-`AudioPlayback`: selkies only gates and hands encoded frames over; decoding (libavcodec, TurboJPEG), fitting into the
+`AudioPlayback`: selkies only gates and hands encoded frames over; decoding (OpenH264, libvpx, dav1d, libde265,
+TurboJPEG), fitting into the
 fixed device format, and publishing happen on the camera's own thread. `push` takes the frame's upright transform as
 optional arguments (`rotation` in clockwise degrees, then a horizontal `flip`); `convert::orient_i420` bakes it
 right after decode, ahead of the fit, and an upright MJPEG frame keeps its pass-through. Sinks are the shared-memory ring served to the
@@ -199,7 +210,7 @@ Selkies V4L2 interposer (`ring.rs`/`server.rs`; the layout is mirrored byte-for-
 `selkies/addons/v4l2-interposer/v4l2_interposer.c` and checked by selkies' `tests/unit/test_webcam_abi.py`), a
 v4l2loopback output device (`v4l2out.rs`), and a PipeWire `Video/Source` node (`pipewire.rs`, `libpipewire-0.3`
 loaded at run time, pods built by hand — never add a build-time PipeWire dependency). `cargo test --lib webcam`
-covers the ring, decoders (including an OpenH264→avcodec round trip), and pod layouts; the device-level and browser
+covers the ring, decoders (including an OpenH264 encode-and-decode round trip), and pod layouts; the device-level and browser
 checks live in selkies (`tests/integration/test_webcam_device.py`, `tests/e2e/test_webcam.py`).
 
 Licensing is part of the build matrix: `LICENSES.md` inventories every crate and native library of the default

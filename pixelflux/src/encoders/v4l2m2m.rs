@@ -876,6 +876,15 @@ impl V4l2M2mEncoder {
         }
     }
 
+    /// The kernel's stateful interface names no reference and takes no invalidation.
+    pub fn last_reference(&self) -> Reference {
+        Reference::Untracked
+    }
+
+    pub fn invalidate_reference(&mut self, _frame_id: u16) -> bool {
+        false
+    }
+
     /// The range the stream declares, which is the device's to decide: a session that says
     /// nothing is described as limited, since that is what a decoder given nothing assumes.
     pub fn is_full_range(&self) -> bool {
@@ -1297,46 +1306,37 @@ mod hardware_tests {
         assert!(encoder.fps >= 15.0, "the session stepped below the floor");
     }
 
-    /// What the stream declares, read back by a decoder that is not ours: FFmpeg parses the
-    /// sequence parameter set the session carries and reports the signal in it. This is the check
-    /// that a written set is a set a decoder accepts, rather than one our own reader agrees with.
+    /// What the stream declares, read back by a decoder that is not ours: OpenH264 decodes the
+    /// stream and the sequence parameter set the session carries reports the signal in it.
+    /// This is the check that a written set is a set a decoder accepts, rather than one our
+    /// own reader agrees with.
     #[test]
     #[ignore]
     fn v4l2_the_color_reads_back_through_a_decoder() {
-        use crate::webcam::decode::{AvDecoder, Decoder as _};
-        use ffmpeg_sys_next::AVColorRange::{AVCOL_RANGE_JPEG, AVCOL_RANGE_MPEG};
-        use ffmpeg_sys_next::AVColorSpace::{AVCOL_SPC_BT709, AVCOL_SPC_SMPTE170M};
+        use crate::webcam::decode::{ColorTags, Decoder as _, VideoDecoder};
 
         let mut encoder =
             V4l2M2mEncoder::new(Codec::H264, &settings(1280, 720), false).expect("the session comes up");
         let frame = chart(1280, 720);
         let unit = encoder.encode_host(&frame, 1280 * 4, false, 0, 26, true).expect("a frame");
-        let mut decoder = AvDecoder::new(Codec::H264).expect("a decoder");
+        let mut decoder = VideoDecoder::new(Codec::H264).expect("a decoder");
         assert!(decoder.decode(&unit).expect("the stream decodes"), "no frame came back");
 
         let Some(signal) = encoder.signal() else {
             assert_eq!(
-                decoder.color_tags().map(|(space, _)| space),
-                Some(ffmpeg_sys_next::AVColorSpace::AVCOL_SPC_UNSPECIFIED),
+                decoder.color_tags().map(|tags| tags.matrix),
+                Some(2),
                 "the session claims nothing, so the stream must claim nothing either"
             );
             return;
         };
-        let space = match signal.matrix {
-            1 => AVCOL_SPC_BT709,
-            6 => AVCOL_SPC_SMPTE170M,
-            other => panic!("the session declares matrix {other}, which this check does not map"),
-        };
-        let range = if signal.full_range { AVCOL_RANGE_JPEG } else { AVCOL_RANGE_MPEG };
         assert_eq!(
             decoder.color_tags(),
-            Some((space, range)),
-            "the decoder read something other than what the session declares"
+            Some(ColorTags { matrix: signal.matrix, full_range: signal.full_range }),
+            "the decoder reads a different signal than the session declares"
         );
     }
 
-    /// A size past the device's range is refused before a session exists, so the ladder falls
-    /// through to software rather than bringing up a stream that produces nothing.
     #[test]
     #[ignore]
     fn v4l2_refuses_a_size_past_the_ceiling() {

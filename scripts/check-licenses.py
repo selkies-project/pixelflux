@@ -177,17 +177,23 @@ NATIVE: Dict[str, Dict[str, object]] = {
         library="libx264", license="GPL-2.0-or-later", rank=COPYLEFT,
         how="linked shared library (bundled into the wheel by auditwheel)",
         note="striped software H.264; the only GPL component, default feature `gpl`"),
-    "ffmpeg-sys-next": dict(
-        library="FFmpeg libavcodec, libavfilter, libavutil (plus the libswresample, "
-                "libswscale, libavformat they pull in), and through libavcodec the "
-                "codec libraries it wraps: kvazaar, libvpx, SVT-AV1, dav1d (BSD) on "
-                "every wheel, x265 (GPL-2.0-or-later) on the GPL wheel",
-        license="LGPL-2.1-or-later", rank=WEAK,
-        how="linked shared libraries (the non-GPL wheels bundle FFmpeg n8.1 built without "
-            "--enable-gpl, the GPL wheels one built --enable-gpl --enable-libx265; a "
-            "GPL-built system FFmpeg makes the linked set GPL)",
-        note="VA-API encoders and filters, the software HEVC/VP8/VP9/AV1 encoders, the "
-             "virtual camera's decoders; crate itself is WTFPL"),
+    "codec-sys": dict(
+        library="libvpx, SVT-AV1, dav1d, and libde265 on every wheel; x265 "
+                "(GPL-2.0-or-later) on the GPL wheel, kvazaar on the non-GPL one",
+        license="BSD-3-Clause (libvpx, kvazaar; SVT-AV1 with the Alliance for Open Media "
+                "patent license), BSD-2-Clause (dav1d), LGPL-3.0-or-later (libde265)",
+        rank=WEAK,
+        how="linked shared libraries, bound at build time from the headers of the copies "
+            "that are linked (bundled into the wheels by auditwheel); crate itself MIT OR "
+            "Apache-2.0, path dependency",
+        note="the software HEVC/VP8/VP9/AV1 encoders and the virtual camera's AV1 and HEVC "
+             "decoders"),
+    "va-sys": dict(
+        library="libva (libva.so.2, libva-drm.so.2)", license="MIT", rank=PERMISSIVE,
+        how="dlopen at run time, never linked or shipped; the bindings are generated from "
+            "the libva headers vendored under pixelflux/va-sys/headers/ (MIT); crate itself "
+            "MIT OR Apache-2.0, path dependency",
+        note="VA-API encoders and video processor"),
     "openh264-sys2": dict(
         library="Cisco OpenH264 2.6 (vendored source)", license="BSD-2-Clause",
         rank=PERMISSIVE, how="compiled from vendored source and linked statically",
@@ -243,7 +249,7 @@ NATIVE: Dict[str, Dict[str, object]] = {
                  note="libm, libpthread, libdl are part of it"),
     "libloading": dict(
         library="libEGL.so.1 (Mesa/Khronos, MIT), libpipewire-0.3.so.0 (MIT), "
-                "libwayland-server.so.0 (MIT), libva.so.2 (MIT), "
+                "libwayland-server.so.0 (MIT), libva.so.2 and libva-drm.so.2 (MIT), "
                 "libcuda.so.1/libnvidia-encode.so.1/libnvidia-fbc.so.1 "
                 "(proprietary), and on aarch64 the Jetson Linux "
                 "libnvv4l2.so/libnvbuf_utils.so/libnvbufsurface.so/"
