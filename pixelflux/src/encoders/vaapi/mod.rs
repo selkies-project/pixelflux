@@ -259,11 +259,19 @@ impl Device {
     }
 
     fn create_buffer(&self, context: VAContextID, kind: VABufferType, data: &[u8]) -> Result<VABufferID, String> {
+        self.create_buffer_raw(context, kind, data.len() as c_uint, data.as_ptr() as *mut c_void)
+    }
+
+    /// A buffer the driver fills, created without initial data: iHD refuses a coded buffer
+    /// handed any.
+    fn create_output_buffer(&self, context: VAContextID, kind: VABufferType, size: u32) -> Result<VABufferID, String> {
+        self.create_buffer_raw(context, kind, size as c_uint, ptr::null_mut())
+    }
+
+    fn create_buffer_raw(&self, context: VAContextID, kind: VABufferType, size: c_uint, data: *mut c_void) -> Result<VABufferID, String> {
         let mut id = VA_INVALID_ID;
         self.check(
-            unsafe {
-                (self.api.vaCreateBuffer)(self.display, context, kind, data.len() as c_uint, 1, data.as_ptr() as *mut c_void, &mut id)
-            },
+            unsafe { (self.api.vaCreateBuffer)(self.display, context, kind, size, 1, data, &mut id) },
             &format!("vaCreateBuffer(type {kind})"),
         )?;
         Ok(id)
@@ -760,7 +768,7 @@ impl VaapiEncoder {
             },
             "no VA-API encode context",
         )?;
-        me.coded = device.create_buffer(me.context, VAEncCodedBufferType, &vec![0u8; coded_buffer_size(me.surface_width, me.surface_height) as usize])?;
+        me.coded = device.create_output_buffer(me.context, VAEncCodedBufferType, coded_buffer_size(me.surface_width, me.surface_height))?;
         me.open_vpp(device, input)?;
         Ok(me)
     }
@@ -1174,7 +1182,7 @@ impl VaapiEncoder {
         let (reference, key_pts, slots, slot_surfaces) = match &self.references {
             Some(References::Window(w)) => (
                 if key { None } else { w.newest_valid().and_then(|(_, p)| self.surfaces_of.get(&p).map(|&s| (p, s))) },
-                w.key_pts(),
+                if key { pts } else { w.key_pts() },
                 SlotPlan::KEY,
                 [VA_INVALID_SURFACE; 3],
             ),

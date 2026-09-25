@@ -329,6 +329,9 @@ unsafe extern "C" fn create_context(_dpy: VADisplay, config: VAConfigID, _w: c_i
 }
 
 unsafe extern "C" fn create_buffer(_dpy: VADisplay, context: VAContextID, kind: VABufferType, size: c_uint, num: c_uint, data: *mut c_void, out: *mut VABufferID) -> VAStatus {
+    if kind == VAEncCodedBufferType && !data.is_null() {
+        return VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus;
+    }
     with(|d| unsafe {
         let bytes = if data.is_null() { vec![0u8; (size * num) as usize] } else { std::slice::from_raw_parts(data as *const u8, (size * num) as usize).to_vec() };
         d.buffers.push((context, kind, bytes));

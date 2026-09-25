@@ -191,6 +191,77 @@ fn a_key_frame_carries_the_sequence_and_a_delta_does_not() {
     }
 }
 
+/// A key frame forced mid-stream, which a client requests after a settings change, starts the
+/// counts a codec keeps from the key over again: an H.264 IDR carries `frame_num` 0 and the
+/// delta after it counts 1 from there, an HEVC IDR the picture order count 0, an AV1 key
+/// frame the order hint 0. A decoder given an IDR numbered from the previous key refuses the
+/// prediction that follows it.
+#[test]
+fn a_key_frame_forced_mid_stream_restarts_the_count() {
+    for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+        mock::reset(Driver::generous());
+        let mut enc = session(codec, false);
+        for t in 0..6u64 {
+            encode(&mut enc, t, t == 0);
+        }
+        let out = encode(&mut enc, 6, true);
+        assert_eq!(parse_video_type(out[1]), Some((codec, FRAME_KEY)), "{codec:?}");
+        assert_eq!(enc.last_reference(), Reference::None);
+        mock::with(|d| match codec {
+            Codec::H264 => {
+                let pic: VAEncPictureParameterBufferH264 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!((pic.CurrPic.frame_idx, pic.CurrPic.TopFieldOrderCnt, pic.frame_num), (0, 0, 0));
+                let header = d.last_packed().into_iter().find(|p| p.0 == VAEncPackedHeaderSlice).unwrap().1;
+                let rbsp = nal(&header, 5, false);
+                let mut r = Reader { bytes: &rbsp, pos: 0 };
+                assert_eq!(r.ue(), 0, "first_mb_in_slice");
+                assert_eq!(r.ue(), 7, "slice_type I");
+                assert_eq!(r.ue(), 0, "pps id");
+                assert_eq!(r.u(16), 0, "frame_num of an IDR");
+                assert_eq!(r.ue(), 1, "idr_pic_id of the second IDR");
+            }
+            Codec::H265 => {
+                let pic: VAEncPictureParameterBufferHEVC = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!(pic.decoded_curr_pic.pic_order_cnt, 0);
+            }
+            _ => {
+                let pic: VAEncPictureParameterBufferAV1 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!(pic.order_hint, 0);
+            }
+        });
+        let out = encode(&mut enc, 7, false);
+        assert_eq!(parse_video_type(out[1]), Some((codec, FRAME_DELTA)), "{codec:?}");
+        assert_eq!(enc.last_reference(), Reference::Frame(6));
+        mock::with(|d| match codec {
+            Codec::H264 => {
+                let pic: VAEncPictureParameterBufferH264 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!((pic.CurrPic.frame_idx, pic.frame_num), (1, 1));
+                let held: Vec<u32> = pic.ReferenceFrames.iter().filter(|r| r.flags != VA_PICTURE_H264_INVALID).map(|r| r.frame_idx).collect();
+                assert_eq!(held, [0], "only the new IDR is held");
+                let header = d.last_packed().into_iter().find(|p| p.0 == VAEncPackedHeaderSlice).unwrap().1;
+                let rbsp = nal(&header, 1, false);
+                let mut r = Reader { bytes: &rbsp, pos: 0 };
+                assert_eq!(r.ue(), 0, "first_mb_in_slice");
+                assert_eq!(r.ue(), 5, "slice_type P");
+                assert_eq!(r.ue(), 0, "pps id");
+                assert_eq!(r.u(16), 1, "frame_num counted from the new IDR");
+                assert_eq!(r.u(1), 0, "num_ref_idx_active_override_flag");
+                assert_eq!(r.u(1), 0, "the IDR is the newest frame, so the list stands");
+            }
+            Codec::H265 => {
+                let pic: VAEncPictureParameterBufferHEVC = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!(pic.decoded_curr_pic.pic_order_cnt, 1);
+                let kept: Vec<i32> = pic.reference_frames.iter().filter(|r| r.flags != VA_PICTURE_HEVC_INVALID).map(|r| r.pic_order_cnt).collect();
+                assert_eq!(kept, [0]);
+            }
+            _ => {
+                let pic: VAEncPictureParameterBufferAV1 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!(pic.order_hint, 1);
+            }
+        });
+    }
+}
+
 /// H.264 keeps the decoded picture buffer the level admits, names the newest surviving frame
 /// in the slice header once a client lost one, and codes a key frame once the loss reaches
 /// past the buffer. What the session writes into the SPS is what the crate's own reader and
