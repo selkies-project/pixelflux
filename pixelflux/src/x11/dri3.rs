@@ -794,7 +794,7 @@ where
         let fps = (controls.fps_milli.load(Ordering::Relaxed).max(1) as f64) / 1000.0;
         let frame_dur = Duration::from_secs_f64(1.0 / fps.max(1.0));
         let trigger = wait_for_frame(&gpu.x.conn, Some(&gpu.x.damage), &pace, frame_dur);
-        pace.ticked(trigger, frame_dur, Instant::now(), false);
+        let woke = Instant::now();
         // The report is spent where it is read, so a change racing this frame wakes the next one
         // rather than being cleared along with what the blit captured.
         let is_dirty = trigger == TickTrigger::Damage || first_frame;
@@ -884,6 +884,13 @@ where
             false,
             pending_force_idr,
         );
+        // A tick that publishes nothing is no frame: counted as one, it would hold a change
+        // landing just after it back by a pull's worth of budget or a whole period.
+        if decision.send {
+            pace.ticked(trigger, frame_dur, woke, false);
+        } else {
+            pace.defer(woke + frame_dur);
+        }
         let mut delivered = false;
         if decision.send {
             let idx = match gpu.grab(want_cursor) {
