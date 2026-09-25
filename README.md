@@ -465,9 +465,10 @@ Both backends implement the [Anthropic Computer Use specification](https://githu
 
 ```bash
 export PIXELFLUX_CU=5000
+export PIXELFLUX_CU_TOKEN="$(openssl rand -hex 32)"
 ```
 
-A bare port is served on the loopback addresses only (`127.0.0.1,::1`); the API carries no authentication, so open it to other hosts deliberately by naming the addresses to listen on as comma-separated `host:port` entries, `PIXELFLUX_CU=0.0.0.0:5000,[::]:5000` for every interface. The same value is what `start_computer_use()` takes when a script starts the server itself.
+A caller drives the desktop with its owner's full authority, so every request carries a bearer token and the server does not start without one: set `PIXELFLUX_CU_TOKEN` beside `PIXELFLUX_CU`, or pass it to `start_computer_use(bind, token)` when a script starts the server itself, and send it as `Authorization: Bearer <token>` (401 without it). A bare port is served on the loopback addresses only (`127.0.0.1,::1`), which every account on the host can reach; name the addresses to listen on as comma-separated `host:port` entries to open it to other hosts, `PIXELFLUX_CU=0.0.0.0:5000,[::]:5000` for every interface. A recording `/record_start` names is a file name inside `PIXELFLUX_RECORD_DIR`, refused when that is unset; without a name it goes to `PIXELFLUX_RECORD`, else a timestamped file in that directory or `/tmp`, readable by its owner alone.
 
 When using Computer Use, call `ensure_wayland_display()` before starting a capture to bring the compositor socket up early — this lets apps launched alongside your script connect to `WAYLAND_DISPLAY` immediately. GPU auto-selection (`auto_gpu` on `CaptureSettings`) works normally; the screenshot path forces a single-frame CPU readback when the GPU is in zero-copy mode.
 
@@ -487,7 +488,7 @@ All actions are `POST` requests to `/computer-use` with a JSON body.
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"screenshot"}' | jq -r '.data' | base64 -d > screen.png
 ```
 
@@ -495,7 +496,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"mouse_move","coordinate":[500,300]}'
 ```
 
@@ -504,12 +505,12 @@ curl -s -X POST http://localhost:5000/computer-use \
 ```bash
 # Simple click
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"left_click"}'
 
 # Right click at a specific position while holding Shift
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"right_click","coordinate":[800,600],"text":"shift"}'
 ```
 
@@ -517,11 +518,11 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"double_click","coordinate":[400,300]}'
 
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"triple_click","text":"ctrl"}'
 ```
 
@@ -529,7 +530,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"left_click_drag","start_coordinate":[100,100],"coordinate":[500,300]}'
 ```
 
@@ -537,7 +538,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"left_mouse_down"}'
 ```
 
@@ -545,7 +546,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"type","text":"Hello, world!"}'
 ```
 
@@ -554,16 +555,16 @@ curl -s -X POST http://localhost:5000/computer-use \
 ```bash
 # Single key
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"key","text":"Return"}'
 
 # Key combination
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"key","text":"ctrl+s"}'
 
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"key","text":"ctrl+alt+Delete"}'
 ```
 
@@ -571,7 +572,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"hold_key","text":"ctrl","duration":2.0}'
 ```
 
@@ -580,12 +581,12 @@ curl -s -X POST http://localhost:5000/computer-use \
 ```bash
 # Scroll down 3 clicks
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"scroll","scroll_direction":"down","scroll_amount":3}'
 
 # Scroll at a position while holding Shift
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"scroll","coordinate":[500,400],"scroll_direction":"up","scroll_amount":5,"text":"shift"}'
 ```
 
@@ -593,7 +594,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"cursor_position"}' | jq -r '.text'
 # → X=500,Y=300
 ```
@@ -602,7 +603,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"wait","duration":0.5}'
 ```
 
@@ -610,7 +611,7 @@ curl -s -X POST http://localhost:5000/computer-use \
 
 ```bash
 curl -s -X POST http://localhost:5000/computer-use \
-  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $PIXELFLUX_CU_TOKEN" -H 'Content-Type: application/json' \
   -d '{"action":"zoom","region":[100,200,400,350]}' | jq -r '.data' | base64 -d > zoomed.png
 ```
 

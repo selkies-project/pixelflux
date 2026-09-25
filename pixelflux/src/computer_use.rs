@@ -14,8 +14,15 @@
 //! Wayland compositor owned by this process when one is registered, otherwise the X server named
 //! by `DISPLAY` (XTEST injection on a private connection, no active capture required).
 //!
+//! A caller drives the session with its owner's full authority, and a loopback address is open to
+//! every account on the host, so the server does not start without a token (`PIXELFLUX_CU_TOKEN`,
+//! or the caller's own through [`start_cu_server`]) and every request has to carry it as
+//! `Authorization: Bearer <token>`.
+//!
 //! The same server also exposes the built-in MP4 recorder at `/record_start`, `/record_stop`,
 //! and `/record_status`, so a headless script can drive a session and record it over plain HTTP.
+//! A recording the caller names is a file name inside `PIXELFLUX_RECORD_DIR`, the directory the
+//! operator gives callers, and nowhere else.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
@@ -737,7 +744,8 @@ static WAYLAND_TX: Mutex<Option<smithay::reexports::calloop::channel::Sender<Thr
 /// `PIXELFLUX_RECORD_*` environment variables and built-in defaults.
 #[derive(Deserialize, Default)]
 struct RecordStartRequest {
-    /// Output MP4 path (default: `$PIXELFLUX_RECORD`, else `/tmp/pixelflux-record-<unix_ts>.mp4`).
+    /// Output file name inside `PIXELFLUX_RECORD_DIR` (default: `$PIXELFLUX_RECORD`, else
+    /// `pixelflux-record-<unix_ts>.mp4` in that directory or `/tmp`).
     path: Option<String>,
     /// Wayland output id to record (default 0; ignored on X11).
     display: Option<u32>,
@@ -747,6 +755,19 @@ struct RecordStartRequest {
     bitrate_kbps: Option<i32>,
     /// Unix socket serving an Ogg Opus stream to record as the audio track.
     audio_socket: Option<String>,
+}
+
+/// The path of a recording the caller names `name`: a plain file name inside `dir`, so a request
+/// can neither leave the operator's directory nor name a file anywhere when none was given.
+fn named_record_path(dir: Option<&str>, name: &str) -> Result<String, String> {
+    let dir = dir.ok_or("a recording named by the caller needs PIXELFLUX_RECORD_DIR")?;
+    let mut parts = std::path::Path::new(name).components();
+    match (parts.next(), parts.next()) {
+        (Some(std::path::Component::Normal(file)), None) => {
+            Ok(std::path::Path::new(dir).join(file).to_string_lossy().into_owned())
+        }
+        _ => Err(format!("'{name}' is not a file name")),
+    }
 }
 
 /// Handle the recorder REST endpoints sharing the CU server: `record_start`,
@@ -763,16 +784,20 @@ fn handle_record_endpoint(url: &str, body: &str) -> Option<String> {
                     Err(e) => return Some(format!("{{\"error\":\"Invalid JSON: {}\"}}", e)),
                 }
             };
-            let path = req
-                .path
-                .or_else(|| std::env::var("PIXELFLUX_RECORD").ok().filter(|p| !p.is_empty()))
-                .unwrap_or_else(|| {
+            let record_dir = std::env::var("PIXELFLUX_RECORD_DIR").ok().filter(|d| !d.is_empty());
+            let path = match req.path {
+                Some(name) => match named_record_path(record_dir.as_deref(), &name) {
+                    Ok(path) => path,
+                    Err(e) => return Some(serde_json::json!({ "error": e }).to_string()),
+                },
+                None => std::env::var("PIXELFLUX_RECORD").ok().filter(|p| !p.is_empty()).unwrap_or_else(|| {
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    format!("/tmp/pixelflux-record-{ts}.mp4")
-                });
+                    format!("{}/pixelflux-record-{ts}.mp4", record_dir.as_deref().unwrap_or("/tmp"))
+                }),
+            };
             let mut opts = crate::recorder::RecordOptions::from_env(path);
             if let Some(d) = req.display {
                 opts.display_id = d;
@@ -854,36 +879,54 @@ pub(crate) fn wayland_command_sender(
 /// Start the CU server if `PIXELFLUX_CU` names a bind (the standalone fallback;
 /// a selkies-managed session passes the setting through [`start_cu_server`]).
 pub fn spawn_cu_from_env() {
-    if let Ok(bind) = std::env::var("PIXELFLUX_CU") {
-        start_cu_server(&bind);
-    }
+    if let Ok(bind) = std::env::var("PIXELFLUX_CU")
+        && let Err(e) = start_cu_server(&bind, None) {
+            println!("[ComputerUse] Not started: {e}");
+        }
 }
+
+/// The token every request has to carry, fixed when the server starts.
+static CU_TOKEN: OnceLock<String> = OnceLock::new();
 
 /// Start the CU server on `bind`, comma-separated entries: a bare port listens on
 /// the loopback addresses only, `host:port` names the address to listen on
-/// (`0.0.0.0:port,[::]:port` accepts every interface). Guarded so that exactly one
-/// server binds per process no matter how many call sites (module import, Wayland
+/// (`0.0.0.0:port,[::]:port` accepts every interface), requiring `token`, else
+/// `PIXELFLUX_CU_TOKEN`, of every request. Guarded so that exactly one server
+/// binds per process no matter how many call sites (module import, Wayland
 /// compositor init, the selkies setting) race to spawn it; backend selection stays
 /// per-request, so a server bound at import serves a compositor that only starts
 /// later.
-pub fn start_cu_server(bind: &str) {
+pub fn start_cu_server(bind: &str, token: Option<&str>) -> Result<(), String> {
     static SPAWNED: OnceLock<()> = OnceLock::new();
     if SPAWNED.get().is_some() {
-        return;
+        return Ok(());
     }
-    let listeners = match cu_listeners(bind) {
-        Ok(listeners) => listeners,
-        Err(e) => {
-            println!("[ComputerUse] Not started: {e}");
-            return;
-        }
-    };
+    let token = token
+        .map(str::to_string)
+        .or_else(|| std::env::var("PIXELFLUX_CU_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+        .ok_or("no token: set PIXELFLUX_CU_TOKEN, the bearer token every request has to carry")?;
+    let listeners = cu_listeners(bind)?;
     if SPAWNED.set(()).is_err() {
-        return;
+        return Ok(());
     }
+    let _ = CU_TOKEN.set(token);
     for listener in listeners {
         thread::spawn(move || run_cu_server(listener));
     }
+    Ok(())
+}
+
+/// Whether `request` carries the server's token, compared in constant time.
+fn authorized(request: &tiny_http::Request) -> bool {
+    let Some(token) = CU_TOKEN.get() else { return false };
+    request.headers().iter().any(|h| {
+        h.field.equiv("Authorization")
+            && h.value.as_str().strip_prefix("Bearer ").is_some_and(|given| {
+                given.len() == token.len()
+                    && given.bytes().zip(token.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+            })
+    })
 }
 
 /// Bound listeners for a CU bind: for each comma-separated entry, both loopback
@@ -1035,8 +1078,17 @@ pub fn run_cu_server(listener: TcpListener) {
 
     let mut last_backend = "";
     for mut request in server.incoming_requests() {
+        if !authorized(&request) {
+            let _ = request.respond(
+                tiny_http::Response::from_string("{\"error\":\"unauthorized\"}".to_string())
+                    .with_status_code(401)
+                    .with_header("WWW-Authenticate: Bearer".parse::<tiny_http::Header>().unwrap())
+                    .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap()),
+            );
+            continue;
+        }
         // A CU body is a single input command: cap its size so a hostile client
-        // of the (unauthenticated) endpoint cannot exhaust memory with a giant POST.
+        // cannot exhaust memory with a giant POST.
         const MAX_CU_BODY: u64 = 4 * 1024 * 1024;
         let mut body = String::new();
         if let Err(e) = request
@@ -1108,6 +1160,20 @@ pub fn run_cu_server(listener: TcpListener) {
                     "Content-Type: application/json".parse::<tiny_http::Header>().unwrap()
                 )
         );
+    }
+}
+
+#[cfg(test)]
+mod record_path_tests {
+    use super::named_record_path;
+
+    #[test]
+    fn a_named_recording_stays_in_the_operators_directory() {
+        assert_eq!(named_record_path(Some("/rec"), "take.mp4").unwrap(), "/rec/take.mp4");
+        for name in ["/etc/passwd", "../x.mp4", "a/b.mp4", "..", ".", ""] {
+            assert!(named_record_path(Some("/rec"), name).is_err(), "{name:?}");
+        }
+        assert!(named_record_path(None, "take.mp4").is_err(), "no directory, no named file");
     }
 }
 

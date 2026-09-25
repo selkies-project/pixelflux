@@ -8148,11 +8148,14 @@ pyo3::create_exception!(
 
 /// Start the Computer-Use HTTP server on comma-separated entries: a bare port
 /// listens on the loopback addresses only, `host:port` names the address to
-/// listen on. Idempotent; the PIXELFLUX_CU env var remains the standalone
-/// fallback.
+/// listen on. Every request has to carry `token` (else `PIXELFLUX_CU_TOKEN`) as
+/// a bearer token, and the server does not start without one. Idempotent; the
+/// PIXELFLUX_CU env var remains the standalone fallback.
 #[pyfunction]
-fn start_computer_use(bind: String) {
-    crate::computer_use::start_cu_server(&bind);
+#[pyo3(signature = (bind, token = None))]
+fn start_computer_use(bind: String, token: Option<String>) -> PyResult<()> {
+    crate::computer_use::start_cu_server(&bind, token.as_deref())
+        .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
 }
 
 /// PNG of one display's framebuffer with the cursor drawn in, the same image the

@@ -39,6 +39,7 @@ pub mod mp4;
 pub mod ogg;
 
 use std::collections::VecDeque;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -552,7 +553,15 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         }
     };
 
-    let file = std::fs::File::create(&opts.path)
+    // The recording is the desktop: readable by its owner alone, and never written through a
+    // link someone else may have planted at a predictable name in a shared directory.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&opts.path)
         .map_err(|e| format!("cannot create {}: {e}", opts.path))?;
     let shared = RecShared::new();
     let (tx, rx) = bounded::<Tap>(QUEUE_CAP);
