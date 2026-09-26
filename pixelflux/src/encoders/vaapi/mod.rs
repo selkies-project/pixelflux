@@ -989,7 +989,7 @@ impl VaapiEncoder {
             rc.target_percentage = 100;
             rc.window_size = (vbv as u64 * 1000 / bps.max(1) as u64) as u32;
             rc.initial_qp = 0;
-            rc.min_qp = self.negotiated.min_qp;
+            rc.min_qp = if matches!(self.arm, Arm::H264(_)) { self.negotiated.min_qp.max(h264::MIN_QP) } else { self.negotiated.min_qp };
             rc.max_qp = self.negotiated.max_qp;
             rc.basic_unit_size = 0;
             rc.ICQ_quality_factor = 1;

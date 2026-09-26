@@ -950,3 +950,29 @@ fn a_session_cuts_no_more_slices_than_the_driver_takes() {
         }
     }
 }
+
+/// An H.264 picture is coded no finer than the floor radeonsi's VCN 1 codes sharp edges at, at a
+/// constant quantizer and as the bound of a constant rate; HEVC keeps the quantizer asked.
+#[test]
+fn an_h264_picture_is_coded_no_finer_than_the_floor() {
+    for (codec, cbr, wanted) in [(Codec::H264, false, 7), (Codec::H264, true, 7), (Codec::H265, false, 5)] {
+        mock::reset(Driver::generous());
+        let mut enc = session(codec, cbr);
+        enc.encode_host(&frame(), (W * 4) as usize, false, 0, 5, true).unwrap();
+        mock::with(|d| {
+            if cbr {
+                let (_, bytes) = d.last_misc().into_iter().find(|m| m.0 == VAEncMiscParameterTypeRateControl).unwrap();
+                let rc: VAEncMiscParameterRateControl = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
+                assert_eq!(rc.min_qp, wanted, "{codec:?} constant rate");
+            } else if codec == Codec::H264 {
+                let pic: VAEncPictureParameterBufferH264 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                let slice: VAEncSliceParameterBufferH264 = d.last_param(VAEncSliceParameterBufferType).unwrap();
+                assert_eq!(pic.pic_init_qp as i32 + slice.slice_qp_delta as i32, wanted as i32, "{codec:?}");
+            } else {
+                let slice: VAEncSliceParameterBufferHEVC = d.last_param(VAEncSliceParameterBufferType).unwrap();
+                let pic: VAEncPictureParameterBufferHEVC = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                assert_eq!(pic.pic_init_qp as i32 + slice.slice_qp_delta as i32, wanted as i32, "{codec:?}");
+            }
+        });
+    }
+}

@@ -22,6 +22,9 @@ use super::{Buffers, Frame, Negotiated};
 const LOG2_MAX_FRAME_NUM_MINUS4: u32 = 12;
 /// The quantizer the PPS names; every slice carries its own delta from it.
 const PIC_INIT_QP: u32 = 26;
+/// The lowest quantizer a picture is coded at: below it radeonsi's VCN 1 codes sharp-edged intra
+/// blocks that decode wrong.
+pub(super) const MIN_QP: u32 = 7;
 
 pub(super) struct Arm {
     profile: VAProfile,
@@ -259,7 +262,7 @@ impl Arm {
         if !frame.key && reference.is_none() {
             return Err("a predicted H.264 picture without a reference".into());
         }
-        let slice_qp = if n.rc_mode == VA_RC_CQP { frame.qp.clamp(1, 51) } else { PIC_INIT_QP };
+        let slice_qp = if n.rc_mode == VA_RC_CQP { frame.qp.clamp(MIN_QP, 51) } else { PIC_INIT_QP };
         let slice_qp_delta = slice_qp as i32 - PIC_INIT_QP as i32;
         let (slice_count, slice_rows) = self.slices;
         for i in 0..slice_count {
