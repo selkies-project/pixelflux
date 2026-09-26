@@ -55,9 +55,6 @@ use super::session::{check_host_frame, RateSettings};
 use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 
-/// The quality level asked of every session, or the driver's highest where its range ends
-/// below it; libva's level 1 is the best quality and the slowest.
-const QUALITY_LEVEL: u32 = 6;
 /// The slices an H.264 or HEVC picture is cut into.
 const SLICES: u32 = 4;
 /// The bytes a coded buffer holds: the uncompressed picture and some, an upper bound on any
@@ -526,7 +523,8 @@ pub struct VaapiEncoder {
     last_reference: Reference,
     rate: RateSettings,
     qp: u32,
-    /// The quality level the driver takes, clamped to its range; None where it reports none.
+    /// The quality level asked of the driver: the highest it takes, its fastest, where libva's
+    /// level 1 is the best quality and the slowest; None where it reports none.
     quality_level: Option<u32>,
     /// Whether the next frame opens a sequence: a key frame carrying the sequence parameters
     /// and the rate control.
@@ -768,7 +766,7 @@ impl VaapiEncoder {
         {
             w.set_frame_num_range(a.frame_num_range());
         }
-        me.quality_level = quality_range.map(|max| QUALITY_LEVEL.min(max));
+        me.quality_level = quality_range;
 
         let recon_count = match me.arm {
             Arm::Vp8(_) => 4,

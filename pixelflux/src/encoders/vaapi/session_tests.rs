@@ -166,7 +166,7 @@ fn a_key_frame_carries_the_sequence_and_a_delta_does_not() {
                     }
                     if kind == VAEncMiscParameterTypeQualityLevel {
                         let q: VAEncMiscParameterBufferQualityLevel = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
-                        assert_eq!(q.quality_level, 6);
+                        assert_eq!(q.quality_level, 7, "the driver's fastest level");
                     }
                 }
                 let packed: Vec<u32> = d.last_packed().into_iter().map(|p| p.0).collect();

@@ -137,8 +137,8 @@ frame can decode, which `encoders/v4l2m2m.rs` keeps true itself for the devices 
 FFmpeg's nor GStreamer's M2M encoder guarantees it. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
 ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
-ultrafast with wavefront threads) and NVENC at preset P3 with two-pass quarter-resolution rate control
-(`gpu_bench_tuning` measures the alternatives); the VP8, VP9, and AV1 quantizer tables in `codec.rs` were
+ultrafast with wavefront threads), NVENC at preset P3 with two-pass quarter-resolution rate control
+(`gpu_bench_tuning` measures the alternatives), and VA-API at the fastest quality level the driver takes; the VP8, VP9, and AV1 quantizer tables in `codec.rs` were
 measured at those settings and must be re-measured whenever they change (`encoders::codec` documents the
 method). VP9 carries 4:4:4 as profile 1 at the same limited range as its 4:2:0, so the decoder hint the
 client sends for it stays true. The CBR
