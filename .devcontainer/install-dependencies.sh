@@ -9,14 +9,15 @@ set -euxo pipefail
 sudo apt-get update
 # System C libraries the crate links against (x264-sys -> libx264, codec-sys -> the
 # software codec libraries it binds from their headers, x11rb -> libxcb + shm +
-# xfixes, GBM/DRM, Wayland/xkb) plus the build toolchain (nasm is needed to build
-# the vendored OpenH264 and libjpeg-turbo sources, which are statically linked and
-# need no system copy). The VA-API session opens libva at run time, so only its
-# runtime package is needed.
+# xfixes, GBM/DRM, Wayland/xkb, pixman, and the libinput and libudev the compositor's
+# crates link) plus the build toolchain (cmake and nasm build the vendored libjpeg-turbo
+# source and nasm the vendored OpenH264, both statically linked and needing no system
+# copy). The VA-API session opens libva at run time, so only its runtime package is
+# needed.
 sudo apt-get install -y \
-  build-essential pkg-config nasm clang libclang-dev curl ca-certificates \
+  build-essential pkg-config cmake nasm clang libclang-dev curl ca-certificates \
   libx264-dev libx265-dev libvpx-dev libsvtav1enc-dev libdav1d-dev libde265-dev \
-  libva2 libdrm-dev libgbm-dev \
+  libva2 libdrm-dev libgbm-dev libpixman-1-dev libinput-dev libudev-dev \
   libwayland-dev libxkbcommon-dev \
   libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev \
   python3-dev python3-pip
@@ -31,6 +32,7 @@ if ! command -v cargo >/dev/null 2>&1; then
   source "$HOME/.cargo/env"
 fi
 
-# Build and install the extension from source.
-pip3 install --upgrade pip setuptools-rust
-pip3 install .
+# Build and install the extension from source, into the system Python the distribution
+# marks externally managed: the container is the environment.
+pip3 install --break-system-packages setuptools-rust
+pip3 install --break-system-packages .
