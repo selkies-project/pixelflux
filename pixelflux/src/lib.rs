@@ -337,10 +337,10 @@ pub struct RustCaptureSettings {
 }
 
 /// The per-frame decision/quality knobs every encoder re-reads from the settings on each
-/// tick, so they retune a running capture with no encoder re-init: x264 reconfigures, NVENC
-/// CQP retargets, VAAPI re-opens only its codec ctx, JPEG is stateless. Applied on the
-/// thread that owns the settings copy. Structural switches (encoder, chroma, RC mode,
-/// device) still need a capture restart.
+/// tick, so they retune a running capture: x264, x265, and libvpx reconfigure, NVENC and
+/// VA-API retarget their constant quantizer, kvazaar and SVT-AV1 re-open, JPEG is stateless.
+/// Applied on the thread that owns the settings copy. Structural switches (encoder, chroma,
+/// RC mode, device) still need a capture restart.
 #[derive(Clone, Copy, Debug)]
 pub struct LiveTunables {
     pub jpeg_quality: i32,
