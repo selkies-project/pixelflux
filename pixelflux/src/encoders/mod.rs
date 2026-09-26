@@ -211,10 +211,15 @@ fn encodes_in_child(codec: Codec) -> bool {
 /// Whether a forked child outlives `f`: a fatal signal in it is the finding, an exit is not, and
 /// neither reaches the caller. The child has a minute, and one that neither returns nor dies
 /// in it has stalled, which is as final. What it prints goes nowhere, so a library that
-/// announces itself on open speaks for a session and not for the probe. One a sandbox refuses
-/// to fork counts as alive.
+/// announces itself on open speaks for a session and not for the probe. The fork waits out any
+/// SVT-AV1 handle another thread is creating or releasing (`svtav1::LIFECYCLE`), whose
+/// process-wide state the child would otherwise inherit half-built. One a sandbox refuses to
+/// fork counts as alive.
 fn survives_in_child(f: impl FnOnce()) -> bool {
-    match unsafe { libc::fork() } {
+    let lifecycle = svtav1::LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let pid = unsafe { libc::fork() };
+    drop(lifecycle);
+    match pid {
         0 => {
             unsafe {
                 libc::signal(libc::SIGALRM, libc::SIG_DFL);
@@ -408,6 +413,27 @@ mod tests {
         assert!(!survives_in_child(|| unsafe {
             libc::raise(libc::SIGILL);
         }));
+    }
+
+    /// A probe forked while other threads open and close SVT-AV1 sessions still finds the
+    /// encoder.
+    #[test]
+    fn the_av1_probe_survives_sessions_opening_beside_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let settings = RustCaptureSettings { width: 64, height: 64, target_fps: 30.0, codec: Codec::Av1, ..Default::default() };
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        drop(software_session(&settings, Codec::Av1, false));
+                    }
+                });
+            }
+            let found = (0..4).all(|_| encodes_in_child(Codec::Av1));
+            stop.store(true, Ordering::Relaxed);
+            assert!(found);
+        });
     }
 
     /// The build serves every video codec in software, JPEG never, and the GPL-free build

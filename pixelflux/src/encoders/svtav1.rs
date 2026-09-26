@@ -19,6 +19,7 @@
 
 use std::ffi::CString;
 use std::ptr;
+use std::sync::Mutex;
 
 use codec_sys::svtav1::*;
 
@@ -40,6 +41,12 @@ const MANAGED_REFS: u8 = 4;
 /// SVT-AV1 before 2.0 codes a key frame asked for mid-stream only in its random-access quality
 /// mode; a session on one re-opens the encoder for it, and the first frame answers.
 const KEYFRAME_BY_REOPEN: bool = SVT_AV1_VERSION_MAJOR < 2;
+
+/// Held while a handle is created or released and while the probe forks: before 4.0 the
+/// library rebuilds a process-wide processor table in every handle it creates and frees it in
+/// every one it releases, and from 4.1 handle setup takes process-wide locks that a child
+/// forked meanwhile inherits held.
+pub(crate) static LIFECYCLE: Mutex<()> = Mutex::new(());
 
 /// One SVT-AV1 session for one capture.
 pub struct SvtAv1Encoder {
@@ -125,6 +132,7 @@ impl SvtAv1Encoder {
     /// Stand the encoder up with the live settings. The first frame it codes is a key frame.
     fn open(&mut self) -> Result<(), String> {
         self.close();
+        let _lifecycle = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
         let code = unsafe { init_handle(&mut self.handle, &mut *self.config) };
         if code != EB_ErrorNone || self.handle.is_null() {
             return Err(error("SVT-AV1 handed out no encoder handle", code));
@@ -226,6 +234,7 @@ impl SvtAv1Encoder {
                     }
                 }
             }
+            let _lifecycle = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
             svt_av1_enc_deinit(self.handle);
             svt_av1_enc_deinit_handle(self.handle);
         }
@@ -377,5 +386,27 @@ impl SvtAv1Encoder {
             }
         }
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sessions opened and closed on many threads at once each encode their frame.
+    #[test]
+    fn sessions_open_and_close_on_many_threads_at_once() {
+        let settings = RustCaptureSettings { width: 64, height: 64, target_fps: 30.0, codec: Codec::Av1, ..Default::default() };
+        let frame = vec![0u8; 64 * 64 * 4];
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for n in 0..4 {
+                        let mut enc = SvtAv1Encoder::new(&settings, false).expect("session");
+                        enc.encode_host(&frame, 64 * 4, false, n, 30, true).expect("frame");
+                    }
+                });
+            }
+        });
     }
 }
