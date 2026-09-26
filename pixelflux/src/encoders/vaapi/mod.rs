@@ -52,7 +52,8 @@ use super::reference::{Reference, ReferenceSlots, ReferenceWindow, SlotPlan, REF
 use super::session::{check_host_frame, RateSettings};
 use crate::RustCaptureSettings;
 
-/// The compression level asked of every session, the middle of the range a driver offers.
+/// The quality level asked of every session, or the driver's highest where its range ends
+/// below it; libva's level 1 is the best quality and the slowest.
 const QUALITY_LEVEL: u32 = 6;
 /// The slices an H.264 or HEVC picture is cut into.
 const SLICES: u32 = 4;
