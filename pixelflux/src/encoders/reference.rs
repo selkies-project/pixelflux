@@ -62,14 +62,33 @@ pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
     next_pts: u64,
-    key: Option<u16>,
+    age: KeyAge,
     key_pts: u64,
     frame_num_range: u64,
 }
 
-/// Whether frame id `a` came before `b`, across the wrap.
-fn before(a: u16, b: u16) -> bool {
-    a != b && b.wrapping_sub(a) < 0x8000
+/// How far a frame id lies behind the newest frame recorded, in capture frames counted across
+/// the id's wrap, and whether it went out at or after the last key frame. A session can run far
+/// longer than the id takes to wrap between key frames, so the ids alone cannot order a frame
+/// against the key.
+#[derive(Default)]
+struct KeyAge {
+    newest: u16,
+    since_key: u64,
+}
+
+impl KeyAge {
+    fn record(&mut self, frame_id: u16, key: bool) {
+        self.since_key = if key { 0 } else { self.since_key + frame_id.wrapping_sub(self.newest) as u64 };
+        self.newest = frame_id;
+    }
+
+    /// How many frames `frame_id` went out before the newest one; `None` for a frame before the
+    /// last key frame or one never sent.
+    fn behind(&self, frame_id: u16) -> Option<u64> {
+        let behind = self.newest.wrapping_sub(frame_id) as u64;
+        (behind < 0x8000 && behind <= self.since_key).then_some(behind)
+    }
 }
 
 impl ReferenceWindow {
@@ -78,7 +97,7 @@ impl ReferenceWindow {
             frames: VecDeque::new(),
             capacity: capacity.max(1) as usize,
             next_pts: 0,
-            key: None,
+            age: KeyAge::default(),
             key_pts: 0,
             frame_num_range: 0,
         }
@@ -129,9 +148,9 @@ impl ReferenceWindow {
     pub fn record(&mut self, frame_id: u16, key: bool) -> Reference {
         let pts = self.next_pts;
         self.next_pts += 1;
+        self.age.record(frame_id, key);
         let reference = if key {
             self.frames.clear();
-            self.key = Some(frame_id);
             self.key_pts = pts;
             Reference::None
         } else {
@@ -149,9 +168,6 @@ impl ReferenceWindow {
         let Some(&(oldest, _, _)) = self.frames.front() else {
             return Invalidation::Ignored;
         };
-        if self.key.is_some_and(|key| before(frame_id, key)) {
-            return Invalidation::Ignored;
-        }
         match self.frames.iter().position(|f| f.0 == frame_id) {
             Some(at) => {
                 let pts = self.frames[at].1;
@@ -162,7 +178,7 @@ impl ReferenceWindow {
                 }
                 if wraps { Invalidation::KeyFrame } else { Invalidation::Forget(pts) }
             }
-            None if before(frame_id, oldest) => {
+            None if self.age.behind(frame_id).is_some_and(|b| b > self.age.newest.wrapping_sub(oldest) as u64) => {
                 for f in self.frames.iter_mut() {
                     f.2 = true;
                 }
@@ -188,7 +204,7 @@ pub struct ReferenceSlots {
     slots: [Option<(u16, u64, bool)>; 3],
     recent: VecDeque<(u16, u64)>,
     next_pts: u64,
-    key: Option<u16>,
+    age: KeyAge,
     key_pts: u64,
 }
 
@@ -231,7 +247,7 @@ impl Default for ReferenceSlots {
 
 impl ReferenceSlots {
     pub fn new() -> Self {
-        Self { slots: [None; 3], recent: VecDeque::new(), next_pts: 0, key: None, key_pts: 0 }
+        Self { slots: [None; 3], recent: VecDeque::new(), next_pts: 0, age: KeyAge::default(), key_pts: 0 }
     }
 
     /// The timestamp the next frame is encoded with.
@@ -279,9 +295,9 @@ impl ReferenceSlots {
     pub fn record(&mut self, frame_id: u16, plan: SlotPlan) -> Reference {
         let pts = self.next_pts;
         self.next_pts += 1;
+        self.age.record(frame_id, plan.predict_from == 0);
         let reference = match plan.predict_from {
             0 => {
-                self.key = Some(frame_id);
                 self.key_pts = pts;
                 Reference::None
             }
@@ -301,16 +317,15 @@ impl ReferenceSlots {
 
     /// Leave `frame_id` and every frame encoded after it out of the references.
     pub fn invalidate(&mut self, frame_id: u16) -> Invalidation {
-        if self.key.is_some_and(|key| before(frame_id, key)) {
-            return Invalidation::Ignored;
-        }
         let lost_pts = match self.recent.iter().find(|r| r.0 == frame_id) {
-            Some(&(_, pts)) => pts,
+            Some(&(_, pts)) if pts >= self.key_pts => pts,
+            Some(_) => return Invalidation::Ignored,
             None => {
                 // A frame older than what is remembered was sent before every buffered one,
-                // so everything held predicts through it; a newer one was never sent.
+                // so everything held predicts through it; one before the key frame, or a
+                // newer one, was never a reference.
                 let Some(&(oldest, _)) = self.recent.front() else { return Invalidation::Ignored };
-                if !before(frame_id, oldest) {
+                if !self.age.behind(frame_id).is_some_and(|b| b > self.age.newest.wrapping_sub(oldest) as u64) {
                     return Invalidation::Ignored;
                 }
                 0
@@ -480,6 +495,34 @@ mod tests {
         assert!(held(&w).is_empty(), "the next frame has to be a key frame");
         w.record(15, true);
         assert_eq!(held(&w), [5]);
+    }
+
+    /// A loss is answered however long the stream has run since its key frame: the ids wrap
+    /// every 65536 frames, so past half of that an id no longer orders a frame against the key,
+    /// and a capture that skips unchanged frames leaves gaps between the ids it encodes.
+    #[test]
+    fn a_loss_long_after_the_key_frame_is_still_answered() {
+        let mut w = ReferenceWindow::new(8);
+        let mut s = ReferenceSlots::new();
+        let id = |n: u32| (n * 3) as u16;
+        w.record(id(0), true);
+        s.record(id(0), SlotPlan::KEY);
+        for n in 1..=40_000u32 {
+            w.record(id(n), false);
+            let plan = s.plan(false);
+            s.record(id(n), plan);
+        }
+        assert_eq!(w.invalidate(id(39_998)), Invalidation::Forget(39_998));
+        assert_eq!(s.invalidate(id(39_998)), Invalidation::Forget(39_998));
+        assert_eq!(w.invalidate(id(39_900)), Invalidation::KeyFrame, "sent since the key, and older than the window");
+        assert_eq!(w.invalidate(id(39_999) + 1), Invalidation::Ignored, "a frame the capture skipped was never sent");
+        let mut w = ReferenceWindow::new(8);
+        w.record(id(0), false);
+        for n in 1..=40_000u32 {
+            w.record(id(n), n == 39_990);
+        }
+        assert_eq!(w.invalidate(id(39_989)), Invalidation::Ignored, "before the key frame");
+        assert_eq!(w.invalidate(id(39_995)), Invalidation::Forget(39_995));
     }
 
     #[test]
