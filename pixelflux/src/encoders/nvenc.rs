@@ -1143,7 +1143,8 @@ pub struct NvencEncoder {
     external_input: Option<ExternalInput>,
     pinned_hosts: HashMap<usize, usize>,
     cuda: Arc<CudaFunctions>,
-    egl: Arc<EglFunctions>,
+    /// The EGL entry points a dmabuf import takes, loaded for a session given an EGL display.
+    egl: Option<Arc<EglFunctions>>,
     _nvenc_lib: Arc<NvencLibrary>,
     nvenc_funcs: NV_ENCODE_API_FUNCTION_LIST,
     omit_stripe_headers: bool,
@@ -1516,7 +1517,7 @@ impl NvencEncoder {
             .ok_or_else(|| format!("NVENC has no {} encoder", codec.display()))?;
         crate::log::debug!("[NVENC] Initializing {}...", codec.display());
 
-        let egl = Arc::new(Self::load_egl()?);
+        let egl = if egl_display.is_null() { None } else { Some(Arc::new(Self::load_egl()?)) };
         let cuda = Arc::new(Self::load_cuda()?);
         let nvenc_lib = Arc::new(Self::load_nvenc()?);
         nvenc_negotiate(&nvenc_lib);
@@ -2401,7 +2402,9 @@ impl NvencEncoder {
             (self.nvenc_funcs.nvEncUnregisterResource.unwrap())(self.encoder_session, registered);
         }
         (self.cuda.cuGraphicsUnregisterResource)(cache.cuda_resource);
-        (self.egl.eglDestroyImageKHR)(self.egl_display, cache.egl_image);
+        if let Some(egl) = &self.egl {
+            (egl.eglDestroyImageKHR)(self.egl_display, cache.egl_image);
+        }
     }
 
     /// Register the packed input surface with NVENC in the byte order `format` names, when it is
@@ -2720,6 +2723,10 @@ impl NvencEncoder {
             }
 
             if !self.dmabuf_cache.contains_key(&fd) {
+                let Some(egl) = self.egl.clone() else {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err("a session opened without an EGL display imports no dmabuf".into());
+                };
                 let stride = dmabuf.strides().next().unwrap_or(0) as i32;
                 let offset = dmabuf.offsets().next().unwrap_or(0) as i32;
 
@@ -2743,7 +2750,7 @@ impl NvencEncoder {
                     EGL_NONE,
                 ];
 
-                let egl_image = (self.egl.eglCreateImageKHR)(
+                let egl_image = (egl.eglCreateImageKHR)(
                     self.egl_display,
                     ptr::null_mut(),
                     EGL_LINUX_DMA_BUF_EXT,
@@ -2759,7 +2766,7 @@ impl NvencEncoder {
                 if (self.cuda.cuGraphicsEGLRegisterImage)(&mut cuda_resource, egl_image, 1)
                     != CUresult::CUDA_SUCCESS
                 {
-                    (self.egl.eglDestroyImageKHR)(self.egl_display, egl_image);
+                    (egl.eglDestroyImageKHR)(self.egl_display, egl_image);
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     return Err("Failed to register EGLImage".into());
                 }
@@ -2773,7 +2780,7 @@ impl NvencEncoder {
                 ) != CUresult::CUDA_SUCCESS
                 {
                     (self.cuda.cuGraphicsUnregisterResource)(cuda_resource);
-                    (self.egl.eglDestroyImageKHR)(self.egl_display, egl_image);
+                    (egl.eglDestroyImageKHR)(self.egl_display, egl_image);
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                     return Err("Failed to map EGL frame".into());
                 }
@@ -3555,8 +3562,9 @@ mod gpu_tests {
         }
     }
 
-    /// On a real GPU: every codec the device lists an engine for comes up, frames it
-    /// emits carry the codec's wire id and a kind the bitstream agrees with, decode back
+    /// On a real GPU: every codec the device lists an engine for comes up on host frames
+    /// without loading EGL, frames it emits carry the codec's wire id and a kind the
+    /// bitstream agrees with, decode back
     /// to the painted picture, and a key frame forced mid-stream starts a fresh decoder on
     /// its own; a codec the device lacks (AV1 before Ada) is refused with a message naming
     /// it. HEVC 4:4:4 is taken where the device carries it, AV1 never quietly. Ignored by
@@ -3579,6 +3587,7 @@ mod gpu_tests {
                 }
             };
             assert_eq!(enc.codec(), codec);
+            assert!(enc.egl.is_none(), "a session on host frames loads no EGL");
             let mut dec = VideoDecoder::new(codec).expect("decoder");
             for i in 0..6u64 {
                 let src = frame(w, h, 10 + i as u8);
