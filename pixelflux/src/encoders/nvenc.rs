@@ -40,7 +40,7 @@ use super::codec::{
     av1_level, h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
     Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN,
 };
-use super::reference::{Invalidation, Reference, ReferenceWindow, REFERENCE_FRAMES};
+use super::reference::{Invalidation, Reference, ReferenceWindow};
 use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
@@ -852,6 +852,10 @@ const SLICE_MODE_COUNT: u32 = 3;
 /// a fixed quantizer is measured by `gpu_bench_slices`. AV1 partitions by tiles instead, asked
 /// for as 1x1 in `configure_codec`.
 const SLICES_PER_FRAME: u32 = 4;
+
+/// The frames an AV1 frame predicts from, LAST, LAST2, LAST3, and GOLDEN (`numFwdRefs` tops out
+/// at four): the device reaches no further back past a loss, whatever the buffer holds.
+const AV1_REFERENCES: u32 = 4;
 
 /// Output bitstream buffers per session: one, because `submit_frame` locks, copies, and unlocks
 /// each frame's bitstream before it returns, so no second buffer is ever outstanding (the lock
@@ -1799,7 +1803,7 @@ impl NvencEncoder {
             );
             let dpb = match codec {
                 Codec::H265 => h265_dpb_frames(level, width, height),
-                Codec::Av1 => REFERENCE_FRAMES,
+                Codec::Av1 => AV1_REFERENCES,
                 _ => h264_dpb_frames(level, width, height),
             };
             Self::configure_codec(&mut config, codec, is_444, level, dpb, &tuning);
@@ -2138,7 +2142,7 @@ impl NvencEncoder {
         let level = self.level_for(width, height, fps);
         match self.codec {
             Codec::H265 => h265_dpb_frames(level, width, height),
-            Codec::Av1 => REFERENCE_FRAMES,
+            Codec::Av1 => AV1_REFERENCES,
             _ => h264_dpb_frames(level, width, height),
         }
     }
@@ -3340,6 +3344,7 @@ mod tests {
 #[cfg(test)]
 mod gpu_tests {
     use super::*;
+    use crate::encoders::reference::REFERENCE_FRAMES;
 
     /// Test helper: H.264 full-frame capture settings at `w×h`, `fps`, CRF 25.
     fn settings(w: i32, h: i32, fps: f64) -> RustCaptureSettings {
