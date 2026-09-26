@@ -931,3 +931,20 @@ fn a_loss_across_the_wrap_of_the_drivers_frame_num_costs_a_key_frame() {
     let out = encode(&mut enc, 130, false);
     assert_eq!(parse_video_type(out[1]), Some((Codec::H264, FRAME_KEY)), "frame 128 carried frame_num 0");
 }
+
+/// A driver taking fewer slices than a session asks for gets as many as it takes, rather than
+/// no session at all.
+#[test]
+fn a_session_cuts_no_more_slices_than_the_driver_takes() {
+    for codec in [Codec::H264, Codec::H265] {
+        for max in [1, 2] {
+            let mut few = Driver::generous();
+            few.attributes.retain(|a| a.0 != VAConfigAttribEncMaxSlices);
+            few.attributes.push((VAConfigAttribEncMaxSlices, max));
+            mock::reset(few);
+            let mut enc = open(codec, &settings(codec, false)).unwrap_or_else(|e| panic!("{codec:?} at most {max}: {e}"));
+            encode(&mut enc, 0, true);
+            assert_eq!(mock::with(|d| d.last_buffers(VAEncSliceParameterBufferType).len()), max as usize, "{codec:?}");
+        }
+    }
+}

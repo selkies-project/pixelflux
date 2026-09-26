@@ -805,16 +805,17 @@ fn arm_block(arm: &Arm) -> u32 {
 }
 
 /// How many slices a picture of `rows` block rows is cut into and how many rows each
-/// takes, for `wanted` slices under the driver's slice structure: arbitrary rows as asked,
-/// a power of two of rows where that is all the driver takes, one row each where it takes
-/// only equal rows.
+/// takes, for `wanted` slices under the driver's slice structure and at most `max_slices`:
+/// arbitrary rows as asked, a power of two of rows where that is all the driver takes, one row
+/// each where it takes only equal rows.
 fn slice_layout(structure: u32, max_slices: u32, rows: u32, wanted: u32) -> Result<(u32, u32), String> {
-    let wanted = wanted.min(rows).max(1);
+    let max_slices = max_slices.max(1);
+    let wanted = wanted.min(rows).min(max_slices).max(1);
     let (count, size) = if structure & (VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS | VA_ENC_SLICE_STRUCTURE_ARBITRARY_MACROBLOCKS) != 0 {
         (wanted, rows / wanted)
     } else if structure & VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS != 0 {
         let mut k = 1;
-        while 2 * k * (wanted - 1) + 1 < rows {
+        while (wanted > 1 && 2 * k * (wanted - 1) + 1 < rows) || rows.div_ceil(k) > max_slices {
             k *= 2;
         }
         (rows.div_ceil(k), k)
@@ -1462,6 +1463,10 @@ mod tests {
         assert!(slice_layout(VA_ENC_SLICE_STRUCTURE_EQUAL_ROWS, 32, 68, 4).is_err(), "more slices than the driver takes");
         assert!(slice_layout(0, 32, 68, 4).is_err());
         assert_eq!(slice_layout(VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS, 32, 2, 4), Ok((2, 1)), "no more slices than rows");
+        assert_eq!(slice_layout(VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS, 2, 68, 4), Ok((2, 34)), "no more slices than the driver takes");
+        assert_eq!(slice_layout(VA_ENC_SLICE_STRUCTURE_ARBITRARY_ROWS, 1, 68, 4), Ok((1, 68)));
+        assert_eq!(slice_layout(VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS, 4, 68, 4), Ok((3, 32)));
+        assert_eq!(slice_layout(VA_ENC_SLICE_STRUCTURE_POWER_OF_TWO_ROWS, 1, 68, 4), Ok((1, 128)));
     }
 
     /// Construction either stands a session up or says why it could not; a half-built
