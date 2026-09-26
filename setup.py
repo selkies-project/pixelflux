@@ -21,11 +21,11 @@ def crate_version() -> str:
     return re.sub(r"-(alpha|beta|rc|dev|post)\.(\d+)$", lambda m: spelled[m.group(1)] + m.group(2), semver)
 
 
-# The software H.264 encoder is chosen at build time. The default build enables the GPL
-# components (GPL-2.0+ libx264 encodes every software H.264 session). Set
-# PIXELFLUX_ENABLE_GPL=0 (or "false"/"no") to build without them: the BSD-licensed
-# OpenH264 then encodes every software H.264 session instead, with no other difference
-# in the API (pixelflux.SOFTWARE_H264_ENCODER reports which one a build carries).
+# The software H.264 and H.265 encoders are chosen at build time. The default build enables
+# the GPL components (GPL-2.0+ libx264 and x265 encode every software H.264 and H.265
+# session). Set PIXELFLUX_ENABLE_GPL=0 (or "false"/"no") to build without them: the
+# BSD-licensed OpenH264 and kvazaar then encode those sessions, with no other difference
+# in the API (pixelflux.SOFTWARE_ENCODERS reports which encoder a build carries per codec).
 _enable_gpl = os.environ.get("PIXELFLUX_ENABLE_GPL", "1").strip().lower() not in (
     "0",
     "false",
@@ -35,15 +35,15 @@ _enable_gpl = os.environ.get("PIXELFLUX_ENABLE_GPL", "1").strip().lower() not in
 if _enable_gpl:
     print(
         "NOTICE: pixelflux is being built WITH GPL-licensed components "
-        "(GPL-2.0+ libx264 as the software H.264 encoder), which is the default. "
-        "Set PIXELFLUX_ENABLE_GPL=0 to exclude every GPL-licensed component.",
+        "(GPL-2.0+ libx264 and x265 as the software H.264 and H.265 encoders), which is the "
+        "default. Set PIXELFLUX_ENABLE_GPL=0 to exclude every GPL-licensed component.",
         file=sys.stderr,
     )
 else:
     print(
         "NOTICE: pixelflux is being built WITHOUT GPL-licensed components "
-        "(PIXELFLUX_ENABLE_GPL=0): libx264 is excluded and OpenH264 (BSD) is the "
-        "software H.264 encoder.",
+        "(PIXELFLUX_ENABLE_GPL=0): libx264 and x265 are excluded, and OpenH264 and kvazaar "
+        "(BSD) are the software H.264 and H.265 encoders.",
         file=sys.stderr,
     )
 

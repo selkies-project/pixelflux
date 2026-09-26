@@ -178,7 +178,7 @@ NATIVE: Dict[str, Dict[str, object]] = {
     "x264-sys": dict(
         library="libx264", license="GPL-2.0-or-later", rank=COPYLEFT,
         how="linked shared library (bundled into the wheel by auditwheel)",
-        note="striped software H.264; the only GPL component, default feature `gpl`"),
+        note="striped software H.264, default feature `gpl`"),
     "codec-sys": dict(
         library="libvpx, SVT-AV1, dav1d, and libde265 on every wheel; x265 "
                 "(GPL-2.0-or-later) on the GPL wheel, kvazaar on the non-GPL one",
