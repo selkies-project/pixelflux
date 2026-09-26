@@ -418,7 +418,7 @@ fn readable(conn: &RustConnection, timeout: Duration) -> bool {
         revents: 0,
     };
     let deadline = libc::timespec {
-        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_sec: timeout.as_secs() as _,
         tv_nsec: timeout.subsec_nanos() as libc::c_long,
     };
     unsafe { libc::ppoll(&mut poll, 1, &deadline, std::ptr::null()) > 0 }
