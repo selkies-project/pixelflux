@@ -386,6 +386,9 @@ impl VpxBackend {
         }
         let Some(image) = image else { return Ok(None) };
         let img = unsafe { image.as_ref() };
+        if img.bit_depth != 8 {
+            return Err(DecodeError::Fatal(format!("unsupported libvpx bit depth {}", img.bit_depth)));
+        }
         let chroma = match (img.x_chroma_shift, img.y_chroma_shift) {
             (1, 1) => Chroma::C420,
             (1, 0) => Chroma::C422,
@@ -796,6 +799,22 @@ mod tests {
 
     /// The VP8 color bits are the first two bool-coded fields of a key frame: a header whose
     /// first partition begins with two zero bits reads as BT.601 at limited range.
+    /// A VP9 profile 2 key frame, 10-bit 4:2:0 at 320x240, is refused rather than read as 8-bit:
+    /// a libvpx built with high bit depth hands it back in 16-bit samples, and one built without
+    /// cannot decode it.
+    #[test]
+    fn a_10_bit_vp9_frame_never_decodes_as_8_bit() {
+        const KEY: [u8; 77] = [
+            0x92, 0x49, 0x83, 0x42, 0x00, 0x09, 0xf8, 0x07, 0x7b, 0x03, 0x1c, 0x12, 0x0e, 0x0c, 0x2c, 0x00, 0x00, 0x48,
+            0x47, 0xa8, 0x3d, 0x8f, 0xc8, 0xc0, 0x0c, 0x30, 0x00, 0x6b, 0x41, 0x13, 0x20, 0x95, 0xe2, 0x6a, 0x41, 0xdc,
+            0xb8, 0x00, 0x11, 0x50, 0x1b, 0x55, 0x82, 0x76, 0x20, 0x4f, 0xd6, 0xa9, 0x82, 0x10, 0xc5, 0xe9, 0x8f, 0xe0,
+            0xa3, 0xf7, 0xcd, 0x66, 0x00, 0xbc, 0xd3, 0xeb, 0x11, 0x3a, 0xb5, 0xed, 0x25, 0x7b, 0x25, 0x6d, 0xa9, 0x8e,
+            0xf7, 0xf7, 0xfa, 0x2b, 0x10,
+        ];
+        let mut d = VideoDecoder::new(Codec::Vp9).unwrap();
+        assert!(!matches!(d.decode(&KEY), Ok(true)), "a 10-bit picture was handed on as an 8-bit one");
+    }
+
     #[test]
     fn vp8_color_bits_read_from_the_first_partition() {
         let mut key = vec![0x10, 0, 0, 0x9d, 0x01, 0x2a, 64, 0, 48, 0];
