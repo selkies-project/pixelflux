@@ -65,6 +65,7 @@ Every release on the [GitHub Releases page](https://github.com/selkies-project/p
 ```bash
 pip install ./pixelflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
 ```
+A wheel leaves a few libraries to the host, the ones a desktop already carries: `libgbm1`, `libpixman-1-0`, and `libxkbcommon0` on Debian and Ubuntu (`mesa-libgbm`, `pixman`, and `libxkbcommon` on Fedora and RHEL), and `libegl1` for NVENC's zero-copy dmabuf import; a musllinux wheel also takes the C++ runtime from Alpine (`apk add libstdc++ libgcc mesa-gbm pixman libxkbcommon`).
 
 **Option B: Install from local source**
 ```bash
