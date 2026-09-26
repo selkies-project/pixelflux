@@ -4457,9 +4457,10 @@ mod gpu_tests {
     /// color when the matrix the VUI declares is inverted, which is what a client does with
     /// every frame. 4:2:0 comes through the kernel and 4:4:4 through NVENC's own conversion, so
     /// this is what holds both to the declared matrix — the siting check cannot see a wrong one,
-    /// its tile being neutral whichever matrix converts it. No software decoder reads 4:4:4
-    /// H.264, so that stream is held to what its SPS declares and the 4:4:4 picture is read
-    /// back from the HEVC session, which converts the same way. Ignored by default.
+    /// its tile being neutral whichever matrix converts it. OpenH264, the H.264 decoder the tests
+    /// carry, refuses a 4:4:4 stream's SPS, so that stream is held to what its SPS declares and
+    /// the 4:4:4 picture is read back from the HEVC session, which converts the same way. Ignored
+    /// by default.
     #[test]
     #[ignore]
     fn gpu_chart_decodes_to_the_color_that_was_painted() {
