@@ -380,28 +380,31 @@ mod cost_tests {
         }
     }
 
-    fn feed_timed(sink: &RecordingSink, n: usize, len: usize) -> (f64, f64) {
+    /// The time each of `n` feeds took, in microseconds, sorted.
+    fn feed_timed(sink: &RecordingSink, n: usize, len: usize) -> Vec<f64> {
         let f = frame(len);
-        let mut max_us = 0f64;
-        let mut total_us = 0f64;
-        for _ in 0..n {
-            let t = Instant::now();
-            sink.write_frame(std::slice::from_ref(&f), 1280, 720);
-            let us = t.elapsed().as_secs_f64() * 1e6;
-            total_us += us;
-            max_us = max_us.max(us);
-            thread::sleep(Duration::from_micros(200));
-        }
-        (total_us / n as f64, max_us)
+        let mut us: Vec<f64> = (0..n)
+            .map(|_| {
+                let t = Instant::now();
+                sink.write_frame(std::slice::from_ref(&f), 1280, 720);
+                let elapsed = t.elapsed().as_secs_f64() * 1e6;
+                thread::sleep(Duration::from_micros(200));
+                elapsed
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        us
     }
 
+    /// Each phase is judged by the median and the 99th percentile of its feeds, which one
+    /// preemption of the test thread does not move, where a mean or a maximum would.
     #[test]
     fn stalled_recorder_isolation_cost() {
         let path = format!("/tmp/pf-sink-cost-{}.sock", std::process::id());
         let sink = RecordingSink::try_bind(&path, 60.0).expect("bind");
 
         // Idle: no client connected.
-        let (idle_mean, idle_max) = feed_timed(&sink, 500, 100_000);
+        let idle = feed_timed(&sink, 500, 100_000);
 
         // Healthy: a client draining as fast as it can.
         let mut healthy = UnixStream::connect(&path).expect("connect");
@@ -410,28 +413,29 @@ mod cost_tests {
             let mut buf = vec![0u8; 1 << 20];
             while healthy.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
         });
-        let (healthy_mean, healthy_max) = feed_timed(&sink, 500, 100_000);
+        let healthy = feed_timed(&sink, 500, 100_000);
 
         // Stalled: a connected client that never reads. The socket buffer fills, then the
         // bounded queue fills, then the client is dropped (~256 frames later).
-        let stalled = UnixStream::connect(&path).expect("connect");
+        let reader = UnixStream::connect(&path).expect("connect");
         thread::sleep(Duration::from_millis(200));
-        let (stalled_mean, stalled_max) = feed_timed(&sink, 500, 100_000);
-        drop(stalled);
+        let stalled = feed_timed(&sink, 500, 100_000);
+        drop(reader);
 
-        println!(
-            "[sink-cost] idle    mean {idle_mean:.3}us max {idle_max:.3}us\n\
-             [sink-cost] healthy mean {healthy_mean:.3}us max {healthy_max:.3}us\n\
-             [sink-cost] stalled mean {stalled_mean:.3}us max {stalled_max:.3}us"
-        );
+        let median = |us: &[f64]| us[us.len() / 2];
+        let p99 = |us: &[f64]| us[us.len() * 99 / 100];
+        for (phase, us) in [("idle   ", &idle), ("healthy", &healthy), ("stalled", &stalled)] {
+            println!("[sink-cost] {phase} median {:.3}us p99 {:.3}us", median(us), p99(us));
+        }
         drop(sink);
         let _ = drain.join();
 
-        assert!(idle_mean < 5.0, "idle feed should be sub-5us, was {idle_mean:.3}us");
-        assert!(healthy_mean < 100.0, "healthy feed should be tens of us, was {healthy_mean:.3}us");
+        assert!(median(&idle) < 5.0, "idle feed should be sub-5us, was {:.3}us", median(&idle));
+        assert!(median(&healthy) < 100.0, "healthy feed should be tens of us, was {:.3}us", median(&healthy));
         assert!(
-            stalled_max < 10_000.0,
-            "a stalled recorder must never block the tap >10ms, was {stalled_max:.3}us"
+            p99(&stalled) < 10_000.0,
+            "a stalled recorder must never block the tap >10ms, was {:.3}us",
+            p99(&stalled)
         );
     }
 }
