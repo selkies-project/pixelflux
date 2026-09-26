@@ -61,7 +61,7 @@ const BITRATE_CEILING_BPS: u32 = 100_000_000;
 /// bands, while a stripe of the striped path is single-threaded and single-slice, its parallelism
 /// coming from the stripes encoding concurrently. `is_cbr` selects the rate-control mode: `true` is
 /// CBR (bitrate-mode RC driving a target bitrate), `false` is CRF/CQP (the same bitrate-mode RC but
-/// with the QP pinned to a single value). `omit_stripe_headers` drops the 10-byte wire header for
+/// with the QP pinned to a single value). `omit_stripe_headers` drops the wire header for
 /// bare Annex-B output.
 ///
 /// The live rate-control state is mirrored so a change can be detected, rolled back, or carried
@@ -668,7 +668,7 @@ mod tests {
     }
 
     /// With `omit_stripe_headers` set, the output is bare Annex-B (start-code prefixed) with
-    /// no 10-byte wire header.
+    /// no wire header.
     #[test]
     fn omit_stripe_headers_yields_bare_annexb() {
         let s = RustCaptureSettings {
