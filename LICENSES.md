@@ -344,7 +344,7 @@ table below.
 
 `PIXELFLUX_ENABLE_GPL=0` (`--no-default-features --features openh264`):
 
-- the 243 crates above, all permissive (pixelflux itself MPL-2.0), with
+- the 245 crates above, all permissive (pixelflux itself MPL-2.0), with
   OpenH264 and libjpeg-turbo compiled from vendored BSD/IJG source;
 - linked: kvazaar, libvpx, SVT-AV1, and dav1d (BSD), libde265
   (LGPL-3.0-or-later), libgbm, libpixman-1, libxkbcommon (MIT), and the C
