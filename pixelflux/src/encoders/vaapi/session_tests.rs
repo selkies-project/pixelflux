@@ -976,3 +976,29 @@ fn an_h264_picture_is_coded_no_finer_than_the_floor() {
         });
     }
 }
+
+/// A constant-rate session caps each coded frame at its buffer where the driver takes a cap,
+/// and sends none where it does not.
+#[test]
+fn a_constant_rate_session_caps_each_frame_at_its_buffer() {
+    for offered in [true, false] {
+        let mut driver = Driver::generous();
+        if offered {
+            driver.attributes.push((VAConfigAttribMaxFrameSize, 1));
+        }
+        mock::reset(driver);
+        let mut enc = session(Codec::H264, true);
+        encode(&mut enc, 0, true);
+        mock::with(|d| {
+            let cap = d.last_misc().into_iter().find(|m| m.0 == VAEncMiscParameterTypeMaxFrameSize);
+            match cap {
+                Some((_, bytes)) => {
+                    assert!(offered, "a cap the driver does not take");
+                    let cap: VAEncMiscParameterBufferMaxFrameSize = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
+                    assert_eq!(cap.max_frame_size, 200_000, "the buffer, 1.5 frames at 4 Mbps and 30 fps, in bits");
+                }
+                None => assert!(!offered, "no cap where the driver takes one"),
+            }
+        });
+    }
+}

@@ -523,6 +523,8 @@ pub struct VaapiEncoder {
     last_reference: Reference,
     rate: RateSettings,
     qp: u32,
+    /// Whether the driver caps each coded frame at the size a constant-rate session names.
+    frame_cap: bool,
     /// The quality level asked of the driver: the highest it takes, its fastest, where libva's
     /// level 1 is the best quality and the slowest; None where it reports none.
     quality_level: Option<u32>,
@@ -728,6 +730,7 @@ impl VaapiEncoder {
             last_reference: Reference::Untracked,
             rate,
             qp: codec.quantizer(settings.video_crf),
+            frame_cap: false,
             quality_level: None,
             sequence_start: true,
             omit_headers: settings.omit_stripe_headers,
@@ -767,6 +770,7 @@ impl VaapiEncoder {
             w.set_frame_num_range(a.frame_num_range());
         }
         me.quality_level = quality_range;
+        me.frame_cap = device.attribute(profile, entrypoint, VAConfigAttribMaxFrameSize).is_some_and(|v| v & 1 != 0);
 
         let recon_count = match me.arm {
             Arm::Vp8(_) => 4,
@@ -976,8 +980,8 @@ impl VaapiEncoder {
     }
 
     /// The rate control of a sequence: the target, buffer, and frame rate a constant-rate
-    /// session holds, with no filler data up to the target, and the frame rate and quality
-    /// level of any.
+    /// session holds, with no filler data up to the target and each frame capped at the buffer
+    /// where the driver takes a cap, and the frame rate and quality level of any.
     fn rate_control(&self, out: &mut Buffers) {
         if self.rate.cbr {
             let bps = self.negotiated.bits_per_second;
@@ -999,6 +1003,10 @@ impl VaapiEncoder {
             out.push_misc(VAEncMiscParameterTypeRateControl, &rc);
             let hrd = VAEncMiscParameterHRD { initial_buffer_fullness: vbv, buffer_size: vbv, va_reserved: [0; 4] };
             out.push_misc(VAEncMiscParameterTypeHRD, &hrd);
+            if self.frame_cap {
+                let cap = VAEncMiscParameterBufferMaxFrameSize { type_: VAEncMiscParameterTypeMaxFrameSize, max_frame_size: vbv, va_reserved: [0; 4] };
+                out.push_misc(VAEncMiscParameterTypeMaxFrameSize, &cap);
+            }
         }
         let mut frame_rate: VAEncMiscParameterFrameRate = unsafe { std::mem::zeroed() };
         frame_rate.framerate = (1 << 16) | self.negotiated.fps;
