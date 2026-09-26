@@ -258,11 +258,12 @@ impl X11Pipeline {
     }
 
     /// The encoder's name for the stream log: the hardware backend, the software library of a
-    /// full-frame session, or `CPU` for the striped software path.
+    /// full-frame session, or `CPU` with the library of the striped software path.
     pub fn encoder_name(&self) -> String {
         match &self.hw {
             Some(enc) if enc.is_hardware() => enc.backend_name().to_string(),
             Some(enc) => format!("CPU ({})", enc.backend_name()),
+            None if !self.settings.codec.is_video() => "CPU (turbojpeg)".to_string(),
             None => format!("CPU ({})", crate::encoders::software_library(Codec::H264)),
         }
     }
@@ -708,6 +709,21 @@ mod tests {
         assert_eq!(totals.frames, 1);
         assert_eq!(totals.bytes, stripes.iter().map(|s| s.data.len() as u64).sum::<u64>());
         assert!(totals.encode_ns >= 1_000_000 && totals.pipeline_ns >= 2_000_000);
+    }
+
+    /// A JPEG stream's log line names the library that encodes it, as its report does.
+    #[test]
+    fn x11_jpeg_pipeline_names_its_encoder() {
+        let report = crate::report::StreamReport::new("x11");
+        let _scope = crate::report::enter(&report);
+        let p = X11Pipeline::new(RustCaptureSettings {
+            width: 64,
+            height: 64,
+            codec: Codec::Jpeg,
+            use_cpu: true,
+            ..Default::default()
+        });
+        assert_eq!(p.encoder_name(), format!("CPU ({})", report.info().encoder));
     }
 
     /// On a host with a hardware encoder the report names it, the GPU it runs on, and the node.
