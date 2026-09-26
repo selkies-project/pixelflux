@@ -366,8 +366,8 @@ fn neg_api() -> u32 {
 
 /// A struct as long as the negotiated API's layout of it, which can run eight bytes past the
 /// pinned header's: `NV_ENC_INITIALIZE_PARAMS` below 12.2, and so the reconfigure params that
-/// embed it. The tail is zeroed and pixelflux's, so the driver reads and writes inside memory
-/// this owns.
+/// embed it, and `NV_ENC_LOCK_BITSTREAM` at 12.1. The tail is zeroed and pixelflux's, so the
+/// driver reads and writes inside memory this owns.
 #[repr(C)]
 struct Negotiated<T> {
     value: T,
@@ -2653,14 +2653,15 @@ impl NvencEncoder {
             return Err(format!("Encode Picture failed: {:?}", res));
         }
 
-        let mut lock_params = NV_ENC_LOCK_BITSTREAM {
+        let mut negotiated = Negotiated::new(NV_ENC_LOCK_BITSTREAM {
             version: sv(NvStruct::LockBitstream),
             outputBitstream: output_bitstream,
             ..Default::default()
-        };
+        });
+        let lock_params = &mut negotiated.value;
         lock_params.set_doNotWait(0);
         let lock_fn = self.nvenc_funcs.nvEncLockBitstream.unwrap();
-        let status = lock_fn(self.encoder_session, &mut lock_params);
+        let status = lock_fn(self.encoder_session, lock_params);
         if status != NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(format!("Lock Bitstream failed: {status:?}"));
         }
@@ -3923,6 +3924,27 @@ mod gpu_tests {
             let reconfigure = guarded(reconfigure_params(enc.init_params, nvenc_cur_ver(), true, true));
             let status = (funcs.nvEncReconfigureEncoder.unwrap())(enc.encoder_session, &mut reconfigure.value);
             assert_eq!(status, NVENCSTATUS::NV_ENC_SUCCESS, "reconfigure");
+            let output = enc.bitstream_buffers[0];
+            let mut pic = NV_ENC_PIC_PARAMS {
+                version: sv(NvStruct::PicParams),
+                inputWidth: enc.width,
+                inputHeight: enc.height,
+                inputBuffer: enc.mapped_input_buffer,
+                outputBitstream: output,
+                bufferFmt: enc.input_format,
+                pictureStruct: NV_ENC_PIC_STRUCT::NV_ENC_PIC_STRUCT_FRAME,
+                ..Default::default()
+            };
+            assert_eq!((funcs.nvEncEncodePicture.unwrap())(enc.encoder_session, &mut pic), NVENCSTATUS::NV_ENC_SUCCESS);
+            let lock = guarded(Negotiated::new(NV_ENC_LOCK_BITSTREAM {
+                version: sv(NvStruct::LockBitstream),
+                outputBitstream: output,
+                ..Default::default()
+            }));
+            let status = (funcs.nvEncLockBitstream.unwrap())(enc.encoder_session, &mut lock.value);
+            assert_eq!(status, NVENCSTATUS::NV_ENC_SUCCESS, "lock");
+            assert!(lock.value.bitstreamSizeInBytes > 0, "the locked bitstream carries the picture");
+            (funcs.nvEncUnlockBitstream.unwrap())(enc.encoder_session, output);
             (enc.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
         let (maj, min) = nvenc_cur_ver();
@@ -5325,17 +5347,18 @@ mod gpu_tests {
         let t0 = std::time::Instant::now();
         let st = (enc.nvenc_funcs.nvEncEncodePicture.unwrap())(enc.encoder_session, &mut pic_params);
         assert_eq!(st, NVENCSTATUS::NV_ENC_SUCCESS);
-        let mut lock_params = NV_ENC_LOCK_BITSTREAM {
+        let mut negotiated = Negotiated::new(NV_ENC_LOCK_BITSTREAM {
             version: sv(NvStruct::LockBitstream),
             outputBitstream: output_bitstream,
             ..Default::default()
-        };
+        });
+        let lock_params = &mut negotiated.value;
         lock_params.set_doNotWait(matches!(strategy, LockWait::Block).then_some(0).unwrap_or(1));
         let lock_fn = enc.nvenc_funcs.nvEncLockBitstream.unwrap();
         let mut busy = 0u64;
         let mut empty_successes = 0u64;
         loop {
-            match lock_fn(enc.encoder_session, &mut lock_params) {
+            match lock_fn(enc.encoder_session, lock_params) {
                 NVENCSTATUS::NV_ENC_SUCCESS if lock_params.bitstreamSizeInBytes > 0 => break,
                 NVENCSTATUS::NV_ENC_SUCCESS => {
                     empty_successes += 1;
@@ -5418,11 +5441,12 @@ mod version_tests {
 
     /// The structs handed to the driver run as long as the longest layout a negotiable version
     /// gives them: the initialize params 1808 bytes and the reconfigure params around them 1824
-    /// in the SDK 10.0 to 12.1 headers.
+    /// in the SDK 10.0 to 12.1 headers, and the lock params 1552 in the 12.1 one.
     #[test]
     fn negotiated_structs_hold_the_longest_layout() {
         assert_eq!(std::mem::size_of::<Negotiated<NV_ENC_INITIALIZE_PARAMS>>(), 1808);
         assert_eq!(std::mem::size_of::<Negotiated<NV_ENC_RECONFIGURE_PARAMS>>(), 1824);
+        assert_eq!(std::mem::size_of::<Negotiated<NV_ENC_LOCK_BITSTREAM>>(), 1552);
     }
 
     /// `nvenc_struct_ver` must reproduce the exact `NV_ENC_*_VER` words each SDK defined, for
