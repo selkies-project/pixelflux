@@ -210,13 +210,20 @@ fn encodes_in_child(codec: Codec) -> bool {
 
 /// Whether a forked child outlives `f`: a fatal signal in it is the finding, an exit is not, and
 /// neither reaches the caller. The child has a minute, and one that neither returns nor dies
-/// in it has stalled, which is as final. One a sandbox refuses to fork counts as alive.
+/// in it has stalled, which is as final. What it prints goes nowhere, so a library that
+/// announces itself on open speaks for a session and not for the probe. One a sandbox refuses
+/// to fork counts as alive.
 fn survives_in_child(f: impl FnOnce()) -> bool {
     match unsafe { libc::fork() } {
         0 => {
             unsafe {
                 libc::signal(libc::SIGALRM, libc::SIG_DFL);
                 libc::alarm(60);
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                if null >= 0 {
+                    libc::dup2(null, 1);
+                    libc::dup2(null, 2);
+                }
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             unsafe { libc::_exit(0) }
@@ -339,6 +346,26 @@ mod tests {
         // An engine's codecs go most efficient first, whatever the build encodes in software.
         let engine = [Codec::H264, Codec::H265, Codec::Av1];
         assert_eq!(&fallback_codecs(Codec::Vp8, &engine, true)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
+    }
+
+    /// The probe of every software encoder prints nothing where the host sees it, though a
+    /// library announces itself on open (kvazaar's preset and SIMD banner, SVT-AV1's
+    /// configuration, x265's NUMA warnings in a container).
+    #[test]
+    fn the_software_probe_prints_nothing() {
+        if std::env::var_os("PIXELFLUX_PROBE_CHILD").is_some() {
+            for codec in Codec::VIDEO {
+                encodes_in_child(codec);
+            }
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "encoders::tests::the_software_probe_prints_nothing", "--nocapture", "--test-threads=1"])
+            .env("PIXELFLUX_PROBE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "the probes wrote to the host's stderr");
     }
 
     /// A capture start takes what its node's probe settled rather than opening the backend
