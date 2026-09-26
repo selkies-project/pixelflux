@@ -388,8 +388,7 @@ The default build (`gpl` feature, what the published wheels and
   (BSD-2-Clause) and libjpeg-turbo (IJG/BSD-3-Clause/Zlib) and the bundled
   codec libraries' notices are not included in the wheel; this file is the
   inventory, their license texts live in the upstream sources named above.
-- selkies' container images install the distribution `x264` package for the
-  wheel's libx264; its AppImage takes pixelflux's wheel as it is.
+- selkies' container images and AppImage take pixelflux's wheel as it is.
 
 ## How this is enforced
 
