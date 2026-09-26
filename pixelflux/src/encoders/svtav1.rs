@@ -6,10 +6,11 @@
 
 //! Software AV1 through SVT-AV1 at preset 11 in its real-time mode, one frame in and one
 //! packet out (two frames deep before 2.3), with rate control either constant-rate at the
-//! session's bitrate and VBV or a constant quantizer. The library takes no live change of
-//! either and exposes no reference control, so a quality, rate, or frame-rate change re-opens
-//! the encoder, and a frame a client lost costs the key frame the caller codes on the refusal,
-//! which SVT-AV1 before 2.0 codes only from a re-open as well.
+//! session's bitrate and VBV or a constant quantizer. A new bitrate reaches the running
+//! encoder with the next picture where the release takes one (`HAS_EVENTS`); a quality,
+//! frame-rate, or VBV change re-opens it, as a bitrate change does on an earlier release. A
+//! frame a client lost costs the key frame the caller codes on the refusal, which SVT-AV1
+//! before 2.0 codes only from a re-open as well.
 
 use std::ffi::CString;
 use std::ptr;
@@ -23,6 +24,9 @@ use crate::RustCaptureSettings;
 
 /// The lowest quantizer level the real-time mode runs at; below it the library faults.
 const RTC_MIN_LEVEL: u32 = 3;
+
+/// The highest constant-rate target the library takes, at open and live alike.
+const MAX_BITRATE_BPS: u64 = 100_000_000;
 
 /// SVT-AV1 before 2.0 codes a key frame asked for mid-stream only in its random-access quality
 /// mode; a session on one re-opens the encoder for it, and the first frame answers.
@@ -40,6 +44,8 @@ pub struct SvtAv1Encoder {
     rate: RateSettings,
     omit_headers: bool,
     fresh: bool,
+    /// The change the next picture carries to the running encoder.
+    events: Events,
     next_pts: u64,
     pending: Pending,
 }
@@ -72,6 +78,7 @@ impl SvtAv1Encoder {
             rate: RateSettings::new(settings),
             omit_headers: settings.omit_stripe_headers,
             fresh: true,
+            events: Events::default(),
             next_pts: 0,
             pending: Pending::default(),
         };
@@ -160,6 +167,7 @@ impl SvtAv1Encoder {
         header.p_buffer = io as *mut EbSvtIOFormat as *mut u8;
         header.n_alloc_len = (self.planes.y.len() + self.planes.u.len() + self.planes.v.len()) as u32;
         self.fresh = true;
+        self.events = Events::default();
         Ok(())
     }
 
@@ -220,11 +228,21 @@ impl SvtAv1Encoder {
         false
     }
 
-    /// Re-open the encoder when a rate or frame-rate setting changed.
+    /// Apply a rate or frame-rate change: a new bitrate with the next picture where the library
+    /// takes one live, since the VBV it holds spans the same time at any bitrate; anything else
+    /// re-opens the encoder.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         let Some(rate) = self.rate.changed(settings) else { return Ok(()) };
+        let live = HAS_EVENTS
+            && rate.fps == self.rate.fps
+            && rate.vbv_multiplier == self.rate.vbv_multiplier
+            && rate.bps() <= MAX_BITRATE_BPS;
         self.rate = rate;
-        self.open()
+        if !live {
+            return self.open();
+        }
+        self.events.target_bit_rate = rate.bps() as u32;
+        Ok(())
     }
 
     /// Encode one packed host frame at the quality index `crf`, as a key frame when `force_idr`.
@@ -256,10 +274,11 @@ impl SvtAv1Encoder {
             header.flags = 0;
             header.pic_type = if force_idr || self.fresh { EB_AV1_KEY_PICTURE } else { EB_AV1_INVALID_PICTURE };
         }
-        let code = unsafe { svt_av1_enc_send_picture(self.handle, &mut self.input.0) };
+        let code = unsafe { send_picture(self.handle, &mut self.input.0, self.events) };
         if code != EB_ErrorNone {
             return Err(error("SVT-AV1 refused the frame", code));
         }
+        self.events = Events::default();
         self.next_pts += 1;
         self.fresh = false;
         self.pending.push(pts, frame_number as u16);

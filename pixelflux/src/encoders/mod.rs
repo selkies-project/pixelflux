@@ -1050,10 +1050,14 @@ mod software_tests {
         dec.decode(&packet[VIDEO_HEADER_LEN..]).unwrap_or_else(|e| panic!("decode: {e:?}"))
     }
 
-    /// Whether the session takes a new bitrate without a key frame, as libvpx does a new
-    /// quantizer too.
+    /// Whether the session takes a new bitrate without a key frame: libvpx, and SVT-AV1 where the
+    /// release takes one with a picture. A new quantizer reaches libvpx alone live.
     fn takes_a_live_rate(enc: &FrameEncoder) -> bool {
-        enc.backend_name() == "libvpx"
+        match enc.backend_name() {
+            "libvpx" => true,
+            "svt-av1" => codec_sys::svtav1::HAS_EVENTS,
+            _ => false,
+        }
     }
 
     /// Every codec's frames carry its own wire id and kind, decode back to the source picture,

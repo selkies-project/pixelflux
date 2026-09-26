@@ -60,12 +60,49 @@ pub mod kvazaar {
 }
 
 /// SVT-AV1: the AV1 encoder. `svtav1_handle_priv` is set for a release before 3.0, whose
-/// handle takes an application pointer, and `svtav1_rtc` for one from 3.1, which has the
-/// real-time mode.
+/// handle takes an application pointer, `svtav1_rtc` for one from 3.1, which has the
+/// real-time mode, and `svtav1_events` for one whose header names the reference-management
+/// events (4.2 on), the release whose low-delay constant-rate session takes a new bitrate with
+/// any picture.
 #[cfg(feature = "svtav1")]
 pub mod svtav1 {
     include!(concat!(env!("OUT_DIR"), "/svtav1.rs"));
     pub const HAS_RTC: bool = cfg!(svtav1_rtc);
+    pub const HAS_EVENTS: bool = cfg!(svtav1_events);
+
+    /// What a picture carries to a running encoder besides its pixels, where the release takes it
+    /// (`HAS_EVENTS`): the constant-rate target in bits per second from that picture on, zero to
+    /// leave it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Events {
+        pub target_bit_rate: u32,
+    }
+
+    /// `svt_av1_enc_send_picture`, with `events` attached where the release takes them.
+    ///
+    /// # Safety
+    /// `handle` is an initialized encoder and `header` a picture it may read.
+    pub unsafe fn send_picture(handle: *mut EbComponentType, header: *mut EbBufferHeaderType, events: Events) -> EbErrorType {
+        #[cfg(svtav1_events)]
+        if events != Events::default() {
+            let mut rate = SvtAv1RateInfo { seq_qp: 0, target_bit_rate: events.target_bit_rate };
+            let mut node = EbPrivDataNode {
+                node_type: RATE_CHANGE_EVENT,
+                data: (&mut rate as *mut SvtAv1RateInfo).cast(),
+                size: std::mem::size_of::<SvtAv1RateInfo>() as u32,
+                next: std::ptr::null_mut(),
+            };
+            unsafe {
+                (*header).p_app_private = (&mut node as *mut EbPrivDataNode).cast();
+                let code = svt_av1_enc_send_picture(handle, header);
+                (*header).p_app_private = std::ptr::null_mut();
+                return code;
+            }
+        }
+        #[cfg(not(svtav1_events))]
+        let _ = events;
+        unsafe { svt_av1_enc_send_picture(handle, header) }
+    }
 
     /// `svt_av1_enc_init_handle`, with the application pointer a release before 3.0 took.
     ///

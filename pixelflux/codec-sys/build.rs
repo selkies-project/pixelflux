@@ -46,6 +46,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(svtav1_handle_priv)");
     println!("cargo::rustc-check-cfg=cfg(svtav1_rtc)");
+    println!("cargo::rustc-check-cfg=cfg(svtav1_events)");
     println!("cargo::rustc-check-cfg=cfg(x265_layer_pointers)");
     for lib in LIBS {
         if env::var(format!("CARGO_FEATURE_{}", lib.feature.to_uppercase())).is_err() {
@@ -113,6 +114,9 @@ fn main() {
             }
             if (major, minor) >= (3, 1) {
                 println!("cargo:rustc-cfg=svtav1_rtc");
+            }
+            if std::fs::read_to_string(out.join("svtav1.rs")).unwrap().contains("REF_USE_EVENT") {
+                println!("cargo:rustc-cfg=svtav1_events");
             }
         }
     }
