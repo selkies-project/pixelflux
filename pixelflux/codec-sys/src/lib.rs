@@ -71,11 +71,15 @@ pub mod svtav1 {
     pub const HAS_EVENTS: bool = cfg!(svtav1_events);
 
     /// What a picture carries to a running encoder besides its pixels, where the release takes it
-    /// (`HAS_EVENTS`): the constant-rate target in bits per second from that picture on, zero to
-    /// leave it.
+    /// (`HAS_EVENTS`): the constant-rate target in bits per second from that picture on, and the
+    /// ids of the anchors to store the picture as, to release, and to predict it from alone; zero
+    /// leaves each out.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Events {
         pub target_bit_rate: u32,
+        pub store: u32,
+        pub clear: u32,
+        pub predict_from: u32,
     }
 
     /// `svt_av1_enc_send_picture`, with `events` attached where the release takes them.
@@ -85,15 +89,27 @@ pub mod svtav1 {
     pub unsafe fn send_picture(handle: *mut EbComponentType, header: *mut EbBufferHeaderType, events: Events) -> EbErrorType {
         #[cfg(svtav1_events)]
         if events != Events::default() {
+            fn node<T>(node_type: PrivDataType, data: &mut T) -> EbPrivDataNode {
+                let size = std::mem::size_of::<T>() as u32;
+                EbPrivDataNode { node_type, data: (data as *mut T).cast(), size, next: std::ptr::null_mut() }
+            }
             let mut rate = SvtAv1RateInfo { seq_qp: 0, target_bit_rate: events.target_bit_rate };
-            let mut node = EbPrivDataNode {
-                node_type: RATE_CHANGE_EVENT,
-                data: (&mut rate as *mut SvtAv1RateInfo).cast(),
-                size: std::mem::size_of::<SvtAv1RateInfo>() as u32,
-                next: std::ptr::null_mut(),
-            };
+            let mut ids = [events.store, events.clear, events.predict_from].map(|pic_id| SvtAv1RefFrameCmd { pic_id });
+            let mut nodes = Vec::with_capacity(4);
+            if events.target_bit_rate != 0 {
+                nodes.push(node(RATE_CHANGE_EVENT, &mut rate));
+            }
+            for (node_type, cmd) in [REF_STORE_EVENT, REF_CLEAR_EVENT, REF_USE_EVENT].into_iter().zip(&mut ids) {
+                if cmd.pic_id != 0 {
+                    nodes.push(node(node_type, cmd));
+                }
+            }
+            for i in 1..nodes.len() {
+                let next: *mut EbPrivDataNode = &mut nodes[i];
+                nodes[i - 1].next = next;
+            }
             unsafe {
-                (*header).p_app_private = (&mut node as *mut EbPrivDataNode).cast();
+                (*header).p_app_private = nodes.as_mut_ptr().cast();
                 let code = svt_av1_enc_send_picture(handle, header);
                 (*header).p_app_private = std::ptr::null_mut();
                 return code;
@@ -102,6 +118,16 @@ pub mod svtav1 {
         #[cfg(not(svtav1_events))]
         let _ = events;
         unsafe { svt_av1_enc_send_picture(handle, header) }
+    }
+
+    /// Hold `count` anchors for the application where the release manages them (`HAS_EVENTS`).
+    pub fn set_managed_refs(config: &mut EbSvtAv1EncConfiguration, count: u8) {
+        #[cfg(svtav1_events)]
+        {
+            config.max_managed_refs = count;
+        }
+        #[cfg(not(svtav1_events))]
+        let _ = (config, count);
     }
 
     /// `svt_av1_enc_init_handle`, with the application pointer a release before 3.0 took.

@@ -1124,8 +1124,8 @@ mod software_tests {
 
     /// A session whose library keeps its references to itself says so instead of pretending:
     /// it names no reference on any frame and refuses the request, which is what leaves the
-    /// caller a key frame to code. x265, kvazaar, and SVT-AV1 offer nothing to steer; libvpx
-    /// does, and its sessions track every frame.
+    /// caller a key frame to code. x265, kvazaar, and a constant-quality SVT-AV1 session offer
+    /// nothing to steer; libvpx does, and its sessions track every frame.
     #[test]
     fn a_session_that_cannot_invalidate_names_no_reference() {
         use super::reference::Reference;
@@ -1148,6 +1148,48 @@ mod software_tests {
             assert_eq!(enc.last_reference(), Reference::Frame(0), "{codec:?}");
             assert!(enc.invalidate_reference(1), "{codec:?}");
         }
+    }
+
+    /// A constant-rate AV1 session names its references where the release takes reference
+    /// commands: a frame a client lost is predicted past from an anchor, a decoder that never saw
+    /// the lost frames decodes what follows exactly as one that saw everything, and a key frame
+    /// asked for still comes. On an earlier release the session names none and refuses.
+    #[test]
+    fn a_constant_rate_av1_session_predicts_past_a_lost_frame() {
+        use super::reference::Reference;
+        let mut s = settings(Codec::Av1);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 2000;
+        let mut enc = session(Codec::Av1, &s, false);
+        let mut frames: Vec<Vec<u8>> = (0..8usize).map(|t| enc.encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0).unwrap()).collect();
+        if !codec_sys::svtav1::HAS_EVENTS {
+            assert_eq!(enc.last_reference(), Reference::Untracked);
+            assert!(!enc.invalidate_reference(5));
+            return;
+        }
+        assert_eq!(enc.last_reference(), Reference::Frame(6));
+        // Frame 5 is reported lost once 6 and 7 have gone out: GOLDEN holds 6, so the next frame
+        // predicts from ALTREF, the key frame.
+        assert!(enc.invalidate_reference(5));
+        for t in 8..10usize {
+            frames.push(enc.encode_host(&frame(t), W * 4, false, t as u64, 25, false).unwrap());
+            assert_eq!(parse_video_type(frames[t][1]), Some((Codec::Av1, FRAME_DELTA)), "frame {t}");
+            assert_eq!(enc.last_reference(), Reference::Frame(if t == 8 { 0 } else { 8 }), "frame {t}");
+        }
+        let (mut whole, mut lossy) = (VideoDecoder::new(Codec::Av1).unwrap(), VideoDecoder::new(Codec::Av1).unwrap());
+        for (i, f) in frames.iter().enumerate() {
+            assert!(decode_one(&mut whole, f), "frame {i}");
+            if !(5..8).contains(&i) {
+                assert!(decode_one(&mut lossy, f), "frame {i} without frames 5-7");
+            }
+        }
+        let (a, b) = (whole.frame().unwrap(), lossy.frame().unwrap());
+        let same = a.y.chunks(a.y_stride).zip(b.y.chunks(b.y_stride)).take(H).all(|(x, y)| x[..W] == y[..W]);
+        assert!(same, "the decoder that lost frames 5-7 shows frame 9 unlike the one that saw them");
+        let key = enc.encode_host(&frame(10), W * 4, false, 10, 25, true).unwrap();
+        assert_eq!(parse_video_type(key[1]), Some((Codec::Av1, FRAME_KEY)));
+        assert_eq!(enc.last_reference(), Reference::None);
+        assert!(decode_one(&mut VideoDecoder::new(Codec::Av1).unwrap(), &key), "the key frame decodes alone");
     }
 
     /// The byte order a session is built for reaches the conversion: a red picture handed as

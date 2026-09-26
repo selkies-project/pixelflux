@@ -8,7 +8,12 @@
 //! packet out (two frames deep before 2.3), with rate control either constant-rate at the
 //! session's bitrate and VBV or a constant quantizer. A new bitrate reaches the running
 //! encoder with the next picture where the release takes one (`HAS_EVENTS`); a quality,
-//! frame-rate, or VBV change re-opens it, as a bitrate change does on an earlier release. A
+//! frame-rate, or VBV change re-opens it, as a bitrate change does on an earlier release.
+//!
+//! A constant-rate session on such a release names its references: it predicts every frame
+//! from the one before in a flat structure and has the library store anchors on the schedule
+//! of `ReferenceSlots`, its GOLDEN and ALTREF, so a frame a client lost is predicted past from
+//! an anchor older than it. Any other session leaves the references to the library, and a
 //! frame a client lost costs the key frame the caller codes on the refusal, which SVT-AV1
 //! before 2.0 codes only from a re-open as well.
 
@@ -18,7 +23,7 @@ use std::ptr;
 use codec_sys::svtav1::*;
 
 use super::codec::{av1_is_key, frame_type_from_key, push_video_header, vpx_level, Codec, VIDEO_HEADER_LEN};
-use super::reference::Reference;
+use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{encode_threads, Pending, Planes, Quality, RateSettings};
 use crate::RustCaptureSettings;
 
@@ -27,6 +32,10 @@ const RTC_MIN_LEVEL: u32 = 3;
 
 /// The highest constant-rate target the library takes, at open and live alike.
 const MAX_BITRATE_BPS: u64 = 100_000_000;
+
+/// The anchors a session that names its references has the library hold: GOLDEN and ALTREF, and
+/// the ones they replaced until a picture releases them.
+const MANAGED_REFS: u8 = 4;
 
 /// SVT-AV1 before 2.0 codes a key frame asked for mid-stream only in its random-access quality
 /// mode; a session on one re-opens the encoder for it, and the first frame answers.
@@ -46,8 +55,18 @@ pub struct SvtAv1Encoder {
     fresh: bool,
     /// The change the next picture carries to the running encoder.
     events: Events,
+    /// The buffers of a session that names its references, LAST the library's own.
+    references: Option<ReferenceSlots>,
+    /// The anchors the library holds, by the id each was stored under.
+    anchors: Vec<u32>,
+    last_reference: Reference,
     next_pts: u64,
     pending: Pending,
+}
+
+/// The id an anchor is stored under: its timestamp, off the zero the library reserves.
+fn anchor_id(pts: u64) -> u32 {
+    (pts % u32::MAX as u64) as u32 + 1
 }
 
 unsafe impl Send for SvtAv1Encoder {}
@@ -79,6 +98,9 @@ impl SvtAv1Encoder {
             omit_headers: settings.omit_stripe_headers,
             fresh: true,
             events: Events::default(),
+            references: None,
+            anchors: Vec::new(),
+            last_reference: Reference::Untracked,
             next_pts: 0,
             pending: Pending::default(),
         };
@@ -109,6 +131,7 @@ impl SvtAv1Encoder {
         }
         let rate = self.rate;
         let bps = rate.bps();
+        let tracks = HAS_EVENTS && rate.cbr;
         {
             let cfg = &mut *self.config;
             cfg.enc_mode = 11;
@@ -134,6 +157,9 @@ impl SvtAv1Encoder {
                 let vbv = (rate.vbv() as u64).max(bps / 50);
                 cfg.maximum_buffer_size_ms = (vbv * 1000 / bps.max(1)) as i64;
             }
+            if tracks {
+                set_managed_refs(cfg, MANAGED_REFS);
+            }
         }
         // Preset 11 in the real-time mode: a quarter less encode time than preset 10 for more
         // bytes at a fixed quantizer, which the quantizer table absorbs; the presets above it
@@ -147,6 +173,9 @@ impl SvtAv1Encoder {
         self.set("tile-columns", "0")?;
         self.set("tile-rows", "0")?;
         self.set("lp", &self.threads.min(6).to_string())?;
+        if tracks {
+            self.set("hierarchical-levels", "0")?;
+        }
         if rate.cbr {
             self.set("rc", "2")?;
         } else {
@@ -168,6 +197,8 @@ impl SvtAv1Encoder {
         header.n_alloc_len = (self.planes.y.len() + self.planes.u.len() + self.planes.v.len()) as u32;
         self.fresh = true;
         self.events = Events::default();
+        self.references = tracks.then(ReferenceSlots::new);
+        self.anchors.clear();
         Ok(())
     }
 
@@ -219,13 +250,15 @@ impl SvtAv1Encoder {
     }
 
     pub fn last_reference(&self) -> Reference {
-        Reference::Untracked
+        if self.references.is_some() { self.last_reference } else { Reference::Untracked }
     }
 
-    /// The library keeps its reference structure to itself: refused, so the caller codes a
-    /// key frame.
-    pub fn invalidate_reference(&mut self, _frame_id: u16) -> bool {
-        false
+    /// Leave frame `frame_id` and every frame after it out of the predictions where the session
+    /// names its references; refused otherwise, so the caller codes a key frame.
+    pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
+        let Some(references) = self.references.as_mut() else { return false };
+        references.invalidate(frame_id);
+        true
     }
 
     /// Apply a rate or frame-rate change: a new bitrate with the next picture where the library
@@ -261,6 +294,21 @@ impl SvtAv1Encoder {
         }
         self.planes.convert(pixels, stride, rgba, false, false, self.threads as usize)?;
         let pts = self.next_pts;
+        let mut key = force_idr || self.fresh;
+        let mut plan = SlotPlan::KEY;
+        if let Some(references) = &self.references {
+            plan = references.plan(key);
+            key = plan.predict_from == 0;
+            let anchor = |slot: u8| references.slot(slot).map_or(0, |(_, held, _)| anchor_id(held));
+            let refreshed = |slot: u8| plan.refresh.refreshes(slot);
+            let stored = if refreshed(SlotRefresh::GOLDEN | SlotRefresh::ALTREF) { anchor_id(references.next_pts()) } else { 0 };
+            let kept = [SlotRefresh::GOLDEN, SlotRefresh::ALTREF].map(|slot| if refreshed(slot) { stored } else { anchor(slot) });
+            let from = if key || plan.predict_from == SlotRefresh::LAST { 0 } else { anchor(plan.predict_from) };
+            let released = self.anchors.iter().copied().find(|a| !kept.contains(a) && *a != from);
+            self.events.store = stored;
+            self.events.predict_from = from;
+            self.events.clear = if key { 0 } else { released.unwrap_or(0) };
+        }
         {
             let (header, io) = &mut *self.input;
             io.luma = self.planes.y.as_mut_ptr();
@@ -272,9 +320,10 @@ impl SvtAv1Encoder {
             header.n_filled_len = header.n_alloc_len;
             header.pts = pts as i64;
             header.flags = 0;
-            header.pic_type = if force_idr || self.fresh { EB_AV1_KEY_PICTURE } else { EB_AV1_INVALID_PICTURE };
+            header.pic_type = if key { EB_AV1_KEY_PICTURE } else { EB_AV1_INVALID_PICTURE };
         }
-        let code = unsafe { send_picture(self.handle, &mut self.input.0, self.events) };
+        let sent = self.events;
+        let code = unsafe { send_picture(self.handle, &mut self.input.0, sent) };
         if code != EB_ErrorNone {
             return Err(error("SVT-AV1 refused the frame", code));
         }
@@ -298,17 +347,28 @@ impl SvtAv1Encoder {
             let packet_pts = p.pts.max(0) as u64;
             unsafe { svt_av1_enc_release_out_buffer(&mut packet) };
             let id = self.pending.take(packet_pts).unwrap_or(frame_number as u16);
+            let is_key = av1_is_key(&bytes);
+            if let Some(references) = self.references.as_mut() {
+                self.last_reference = references.record(id, if is_key { SlotPlan::KEY } else { plan });
+                if is_key {
+                    self.anchors.clear();
+                }
+                self.anchors.retain(|&a| a != sent.clear);
+                if sent.store != 0 {
+                    self.anchors.push(sent.store);
+                }
+            }
             if !self.omit_headers {
                 output.reserve(VIDEO_HEADER_LEN + bytes.len());
                 push_video_header(
                     &mut output,
                     Codec::Av1,
-                    frame_type_from_key(av1_is_key(&bytes)),
+                    frame_type_from_key(is_key),
                     id,
                     0,
                     self.planes.width as u16,
                     self.planes.height as u16,
-                    Reference::Untracked,
+                    self.last_reference(),
                 );
             }
             output.extend_from_slice(&bytes);
