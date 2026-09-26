@@ -4743,11 +4743,13 @@ mod gpu_tests {
     }
 
     /// Test helper: the raw GBM device and GLES renderer of the render node named by
-    /// `PIXELFLUX_TEST_RENDER_NODE` (default `/dev/dri/renderD128`), brought up exactly as the
-    /// compositor brings them up.
+    /// `PIXELFLUX_TEST_RENDER_NODE`, else the NVIDIA GPU's, brought up exactly as the compositor
+    /// brings them up.
     fn gpu_render() -> (gbm::Device<std::fs::File>, smithay::backend::renderer::gles::GlesRenderer) {
         let node = std::env::var("PIXELFLUX_TEST_RENDER_NODE")
-            .unwrap_or_else(|_| "/dev/dri/renderD128".to_string());
+            .ok()
+            .or_else(|| crate::auto_select_render_node(Some("nvidia")))
+            .expect("no NVIDIA render node");
         crate::gpu_render_init(std::path::Path::new(&node)).expect("GPU render init")
     }
 
@@ -4876,7 +4878,7 @@ mod gpu_tests {
     /// registration enabled (in place when the driver maps the import pitch-linear, otherwise the
     /// copy arm) and then with it disabled — the two streams must agree, and the decoded content
     /// of both must match the paint. Prints which path the driver gave. Ignored by default; needs
-    /// `PIXELFLUX_TEST_RENDER_NODE` or `/dev/dri/renderD128` backed by the NVIDIA GPU.
+    /// a render node of the NVIDIA GPU.
     #[test]
     #[ignore]
     fn gpu_dmabuf_direct_and_copy_paths_decode_to_the_paint() {
