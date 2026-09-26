@@ -216,7 +216,9 @@ impl Arm {
     }
 
     /// The picture: its frame number and order count since the key frame, the decoded picture
-    /// buffer as `ReferenceFrames`, and every slice with its packed header.
+    /// buffer as `ReferenceFrames`, and every slice with its packed header, whose reference
+    /// list modification moves any reference but the newest held frame, which the default
+    /// list puts first, to the front by its distance in frame numbers.
     pub(super) fn picture(&mut self, n: &Negotiated, frame: &Frame, out: &mut Buffers) -> Result<(), String> {
         let frame_num = ((frame.pts - frame.key_pts) % self.frame_num_range() as u64) as u32;
         let poc = 2 * (frame.pts - frame.key_pts) as i32;
@@ -278,8 +280,6 @@ impl Arm {
                 }
                 if !frame.key {
                     w.flag(false);
-                    // The default list puts the previous frame first; any other reference
-                    // is moved there by its distance in frame numbers.
                     let (ref_pts, _) = frame.reference.unwrap();
                     let ref_frame_num = ((ref_pts - frame.key_pts) % self.frame_num_range() as u64) as u32;
                     let newest = held.first().map(|h| h.0) == Some(ref_pts);

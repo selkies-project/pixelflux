@@ -24,7 +24,7 @@ const PIC_INIT_QP_CBR: u32 = 30;
 const PIC_INIT_QP_CQP: u32 = 26;
 
 /// The coding tools and block sizes a session runs with: what the driver reports, or the
-/// sizes the first encoder implementation took where it reports none.
+/// defaults of `Arm::new` where it reports none.
 #[derive(Clone, Copy)]
 struct Tools {
     ctu_size: u32,
@@ -360,8 +360,9 @@ impl Arm {
         }
     }
 
-    /// The picture: its order count since the key frame, the kept frames as the driver's
-    /// reference list and the slice header's reference picture set, and every slice.
+    /// The picture: its order count since the key frame, the frames the client still has,
+    /// newest first, as the driver's reference list and the slice header's reference picture
+    /// set, and every slice.
     pub(super) fn picture(&mut self, n: &Negotiated, frame: &Frame, out: &mut Buffers) -> Result<(), String> {
         let t = self.tools;
         let poc_of = |pts: u64| (pts - frame.key_pts) as i32;
@@ -370,8 +371,6 @@ impl Arm {
         if !frame.key && reference_pts.is_none() {
             return Err("a predicted HEVC picture without a reference".into());
         }
-        // The frames the decoder keeps: the ones the client still has, newest first, since a
-        // frame it lost is nothing to keep.
         let mut kept: Vec<(u64, VASurfaceID)> = frame.held.iter().filter(|h| !frame.key && !h.2 && h.0 >= frame.key_pts).map(|h| (h.0, h.1)).collect();
         kept.sort_by_key(|k| std::cmp::Reverse(k.0));
         kept.truncate(15);

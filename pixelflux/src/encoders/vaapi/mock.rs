@@ -42,8 +42,7 @@ pub(crate) struct Driver {
     /// Every picture rendered: its context, target surface, and the buffers rendered into
     /// it, by index into `buffers`.
     pub pictures: Vec<(VAContextID, VASurfaceID, Vec<usize>)>,
-    /// The bytes handed back as the coded picture, or the packed headers of the last picture
-    /// where none is set.
+    /// The bytes handed back as the coded picture in place of what `coded_picture` builds.
     pub coded: Option<Vec<u8>>,
     /// The buffers of the images created or derived so far.
     pub images: Vec<VABufferID>,

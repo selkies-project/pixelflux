@@ -427,25 +427,21 @@ fn vp8_follows_the_slot_plan() {
     assert_eq!(refreshes[1], (1, 0, 0));
     assert_eq!(refreshes[2], (1, 1, 0), "frame 2 is a golden anchor");
     assert_eq!(refreshes[8], (1, 0, 1), "frame 8 is an altref anchor");
-    // Frames 5 and 6 lost: LAST holds 8, GOLDEN 6, ALTREF 8, so nothing survives but the key
-    // frame's golden... which frame 6 replaced; the next frame is a key frame.
     assert!(enc.invalidate_reference(5));
     let out = encode(&mut enc, 9, false);
-    assert_eq!(parse_video_type(out[1]), Some((Codec::Vp8, FRAME_KEY)));
-    // With a golden anchor older than the loss, the recovery frame predicts from it and
-    // refreshes every buffer.
+    assert_eq!(parse_video_type(out[1]), Some((Codec::Vp8, FRAME_KEY)), "a loss from frame 5 on takes LAST (8), GOLDEN (6), and ALTREF (8)");
     for t in 10..14u64 {
         encode(&mut enc, t, false);
     }
     assert!(enc.invalidate_reference(12));
     encode(&mut enc, 14, false);
-    assert_eq!(enc.last_reference(), Reference::Frame(11), "the golden anchor of frame 11");
+    assert_eq!(enc.last_reference(), Reference::Frame(11), "the golden anchor of frame 11, older than the loss");
     mock::with(|d| {
         let pic: VAEncPictureParameterBufferVP8 = d.last_param(VAEncPictureParameterBufferType).unwrap();
         let r = unsafe { pic.ref_flags.bits };
         let p = unsafe { pic.pic_flags.bits };
-        assert_eq!((r.no_ref_last(), r.no_ref_gf(), r.no_ref_arf()), (1, 0, 1));
-        assert_eq!((p.refresh_last(), p.refresh_golden_frame(), p.refresh_alternate_frame()), (1, 1, 1));
+        assert_eq!((r.no_ref_last(), r.no_ref_gf(), r.no_ref_arf()), (1, 0, 1), "the recovery predicts from GOLDEN alone");
+        assert_eq!((p.refresh_last(), p.refresh_golden_frame(), p.refresh_alternate_frame()), (1, 1, 1), "the recovery refreshes every buffer");
     });
 }
 
@@ -486,11 +482,13 @@ fn av1_names_its_reference_slot_in_the_frame_header() {
         for i in 0..7 {
             assert_eq!(r.u(3), 4, "ref_frame_idx[{i}]");
         }
-        // render_and_frame_size_different, allow_high_precision_mv, is_filter_switchable,
-        // interpolation_filter, is_motion_mode_switchable, disable_frame_end_update_cdf,
-        // uniform_tile_spacing_flag, and one increment bit each for columns and rows; no
-        // use_ref_frame_mvs, the sequence having no reference motion vectors.
-        assert_eq!(pic.bit_offset_qindex as usize, r.pos + 1 + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1, "the quantizer follows the render and filter bits and the tiling");
+        assert_eq!(
+            pic.bit_offset_qindex as usize,
+            r.pos + 1 + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1,
+            "the quantizer follows render_and_frame_size_different, allow_high_precision_mv, is_filter_switchable, interpolation_filter, \
+             is_motion_mode_switchable, disable_frame_end_update_cdf, uniform_tile_spacing_flag, and one tile increment bit each for \
+             columns and rows, with no use_ref_frame_mvs in a sequence without reference motion vectors"
+        );
         r.pos = pic.bit_offset_qindex as usize;
         assert_eq!(r.u(8), 128, "a constant-rate session's quantizer, which the driver rewrites");
         assert_eq!(pic.size_in_bits_frame_hdr_obu as usize, 8 * header.len());

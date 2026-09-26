@@ -831,7 +831,7 @@ fn slice_layout(structure: u32, max_slices: u32, rows: u32, wanted: u32) -> Resu
 impl VaapiEncoder {
     /// The video processor: a configuration and a context on the converted surface, and the
     /// color standards it is told to convert between, chosen the way libavfilter's `scale_vaapi`
-    /// chose them: explicit color properties where the driver takes them, else the standard
+    /// chooses them: explicit color properties where the driver takes them, else the standard
     /// nearest to the matrix and range asked for.
     fn open_vpp(&mut self, device: &Device, input: Input) -> Result<(), String> {
         let api = device.api;
