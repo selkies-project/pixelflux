@@ -67,9 +67,11 @@ impl Drop for VpxEncoder {
     }
 }
 
+/// The session's last error, with libvpx's detail where it has one. The context is handed
+/// over mutable because libvpx before 1.14 declares the parameter so, though it only reads it.
 fn error(ctx: &vpx_codec_ctx_t, what: &str) -> String {
     unsafe {
-        let detail = vpx_codec_error_detail(ctx);
+        let detail = vpx_codec_error_detail(ptr::from_ref(ctx).cast_mut());
         let text = CStr::from_ptr(vpx_codec_err_to_string(ctx.err)).to_string_lossy();
         if detail.is_null() {
             format!("{what}: {text}")
