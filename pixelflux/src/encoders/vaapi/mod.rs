@@ -974,7 +974,8 @@ impl VaapiEncoder {
     }
 
     /// The rate control of a sequence: the target, buffer, and frame rate a constant-rate
-    /// session holds, the frame rate and quality level of any.
+    /// session holds, with no filler data up to the target, and the frame rate and quality
+    /// level of any.
     fn rate_control(&self, out: &mut Buffers) {
         if self.rate.cbr {
             let bps = self.negotiated.bits_per_second;
@@ -989,7 +990,10 @@ impl VaapiEncoder {
             rc.basic_unit_size = 0;
             rc.ICQ_quality_factor = 1;
             rc.quality_factor = 0;
-            unsafe { rc.rc_flags.bits.set_mb_rate_control(2) };
+            unsafe {
+                rc.rc_flags.bits.set_mb_rate_control(2);
+                rc.rc_flags.bits.set_disable_bit_stuffing(1);
+            }
             out.push_misc(VAEncMiscParameterTypeRateControl, &rc);
             let hrd = VAEncMiscParameterHRD { initial_buffer_fullness: vbv, buffer_size: vbv, va_reserved: [0; 4] };
             out.push_misc(VAEncMiscParameterTypeHRD, &hrd);

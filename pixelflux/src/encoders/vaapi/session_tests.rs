@@ -154,6 +154,7 @@ fn a_key_frame_carries_the_sequence_and_a_delta_does_not() {
                         assert_eq!((rc.bits_per_second, rc.target_percentage), (4_000_000, 100));
                         assert_eq!(rc.window_size, 50, "1.5 frames of VBV at 30 fps, in ms");
                         assert_eq!(unsafe { rc.rc_flags.bits.mb_rate_control() }, 2);
+                        assert_eq!(unsafe { rc.rc_flags.bits.disable_bit_stuffing() }, 1, "no filler data");
                     }
                     if kind == VAEncMiscParameterTypeHRD {
                         let hrd: VAEncMiscParameterHRD = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
