@@ -815,6 +815,16 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>,
 /// session cap of consumer boards, or its memory): nothing lasting, unlike its other refusals.
 pub(crate) const SESSIONS_TAKEN: &str = "the device has no NVENC session to spare";
 
+/// Why the driver refused to open a session: `SESSIONS_TAKEN` for the statuses it answers when
+/// none is left, `NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY` at the cap of a consumer board and
+/// `NV_ENC_ERR_OUT_OF_MEMORY` when its memory runs out.
+fn session_refusal(status: NVENCSTATUS) -> String {
+    match status {
+        NVENCSTATUS::NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY | NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => SESSIONS_TAKEN.into(),
+        _ => "Failed to open NVENC session".into(),
+    }
+}
+
 /// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes
 /// and whether each in 4:4:4, and close it.
 unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) -> Result<Vec<(Codec, bool)>, String> {
@@ -839,8 +849,7 @@ unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) 
     let mut session: *mut c_void = ptr::null_mut();
     match open_fn(&mut session_params, &mut session) {
         NVENCSTATUS::NV_ENC_SUCCESS => {}
-        NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => return Err(SESSIONS_TAKEN.into()),
-        _ => return Err("Failed to open NVENC session".into()),
+        status => return Err(session_refusal(status)),
     }
     let codecs = Codec::VIDEO
         .into_iter()
@@ -1664,11 +1673,12 @@ impl NvencEncoder {
 
             let mut encoder_session: *mut c_void = ptr::null_mut();
             let open_fn = function_list.nvEncOpenEncodeSessionEx.unwrap();
-            if open_fn(&mut session_params, &mut encoder_session) != NVENCSTATUS::NV_ENC_SUCCESS {
+            let status = open_fn(&mut session_params, &mut encoder_session);
+            if status != NVENCSTATUS::NV_ENC_SUCCESS {
                 (cuda.cuMemFree_v2)(input_device_ptr);
                 (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                 (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
-                return Err("Failed to open NVENC session".into());
+                return Err(session_refusal(status));
             }
 
             // The device's engine list decides whether the codec exists here at all (AV1
@@ -3954,13 +3964,14 @@ mod gpu_tests {
     /// On a real GPU whose driver caps the NVENC sessions a device runs at once, as it does on
     /// consumer boards, the probe of a device with every session taken answers `SESSIONS_TAKEN`,
     /// and once one frees it lists the codecs again. A device that takes 65 sessions at once has
-    /// no cap to reach and says so. Ignored by default.
+    /// no cap to reach and says so. The sessions are closed before anything is asserted, so a
+    /// failure leaves none held against the cap for the tests after it. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_a_device_out_of_sessions_says_so() {
         let enc = NvencEncoder::new(&settings(256, 128, 60.0), ptr::null()).expect("NVENC init");
         let mut sessions = Vec::new();
-        let capped = unsafe {
+        let refused = unsafe {
             loop {
                 let mut open = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
                     version: sv(NvStruct::OpenSessionExParams),
@@ -3971,24 +3982,24 @@ mod gpu_tests {
                 };
                 let mut session = ptr::null_mut();
                 match (enc.nvenc_funcs.nvEncOpenEncodeSessionEx.unwrap())(&mut open, &mut session) {
-                    NVENCSTATUS::NV_ENC_SUCCESS if sessions.len() < 63 => sessions.push(session),
-                    NVENCSTATUS::NV_ENC_SUCCESS => {
-                        sessions.push(session);
-                        break false;
-                    }
-                    NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => break true,
-                    other => panic!("session {} refused: {other:?}", sessions.len() + 2),
+                    NVENCSTATUS::NV_ENC_SUCCESS => sessions.push(session),
+                    status => break Some(status),
+                }
+                if sessions.len() == 64 {
+                    break None;
                 }
             }
         };
         let taken = probe_codecs(0);
+        let opened = sessions.len();
         for session in sessions.drain(..) {
             unsafe { (enc.nvenc_funcs.nvEncDestroyEncoder.unwrap())(session) };
         }
-        if !capped {
+        let Some(status) = refused else {
             println!("this device took 65 sessions at once: no cap to reach");
             return;
-        }
+        };
+        assert_eq!(session_refusal(status), SESSIONS_TAKEN, "session {} refused: {status:?}", opened + 2);
         assert_eq!(taken, Err(SESSIONS_TAKEN.to_string()), "every session taken");
         assert!(probe_codecs(0).is_ok_and(|codecs| !codecs.is_empty()), "a freed session is listed again");
     }
