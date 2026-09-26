@@ -3,7 +3,7 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-# Dev setup for the pure-Rust pixelflux PyO3 extension (replaces the old C++ setup.py build).
+# Dev setup for the pure-Rust pixelflux PyO3 extension.
 set -euxo pipefail
 
 sudo apt-get update
