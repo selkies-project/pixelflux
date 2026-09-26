@@ -795,3 +795,26 @@ fn the_video_processor_writes_the_picture_unscaled() {
         assert_eq!(d.regions, [(whole, whole)], "the source and output rectangles");
     });
 }
+
+/// A low-power entry point without the rate control a session asks for leaves it to the full
+/// entry point, as the constant-rate sessions of Intel parts whose low-power encoder runs
+/// constant quantizer only need; a session the low-power one serves stays there.
+#[test]
+fn a_session_falls_back_to_the_full_entry_point_for_its_rate_control() {
+    let driver = || {
+        let mut d = Driver::generous();
+        d.entrypoints = vec![VAEntrypointEncSliceLP, VAEntrypointEncSlice];
+        d.entrypoint_attributes = vec![(VAEntrypointEncSliceLP, VAConfigAttribRateControl, VA_RC_CQP)];
+        d
+    };
+    mock::reset(driver());
+    let enc = session(Codec::H264, true);
+    assert!(!enc.low_power(), "the constant-rate session takes the full entry point");
+    mock::with(|d| {
+        let (_, entrypoint, attribs) = &d.configs[0];
+        assert_eq!(*entrypoint, VAEntrypointEncSlice);
+        assert_eq!(attribs.iter().find(|a| a.type_ == VAConfigAttribRateControl).map(|a| a.value), Some(VA_RC_CBR));
+    });
+    mock::reset(driver());
+    assert!(session(Codec::H264, false).low_power(), "the constant-quantizer session stays on the low-power entry point");
+}

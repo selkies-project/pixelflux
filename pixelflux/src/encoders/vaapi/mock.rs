@@ -24,6 +24,8 @@ pub(crate) struct Driver {
     pub entrypoints: Vec<VAEntrypoint>,
     /// Configuration attributes by type, the same for every profile.
     pub attributes: Vec<(VAConfigAttribType, u32)>,
+    /// Attributes one entry point reports in place of `attributes`.
+    pub entrypoint_attributes: Vec<(VAEntrypoint, VAConfigAttribType, u32)>,
     /// The surface formats a configuration's surfaces may take.
     pub surface_fourccs: Vec<u32>,
     /// Whether `vaDeriveImage` answers.
@@ -266,11 +268,17 @@ unsafe extern "C" fn query_entrypoints(_dpy: VADisplay, profile: VAProfile, list
     VA_STATUS_SUCCESS as VAStatus
 }
 
-unsafe extern "C" fn get_attributes(_dpy: VADisplay, _profile: VAProfile, _entrypoint: VAEntrypoint, list: *mut VAConfigAttrib, count: c_int) -> VAStatus {
+unsafe extern "C" fn get_attributes(_dpy: VADisplay, _profile: VAProfile, entrypoint: VAEntrypoint, list: *mut VAConfigAttrib, count: c_int) -> VAStatus {
     with(|d| unsafe {
         for i in 0..count as usize {
             let attrib = &mut *list.add(i);
-            attrib.value = d.attributes.iter().find(|a| a.0 == attrib.type_).map_or(VA_ATTRIB_NOT_SUPPORTED, |a| a.1);
+            attrib.value = d
+                .entrypoint_attributes
+                .iter()
+                .find(|a| a.0 == entrypoint && a.1 == attrib.type_)
+                .map(|a| a.2)
+                .or_else(|| d.attributes.iter().find(|a| a.0 == attrib.type_).map(|a| a.1))
+                .unwrap_or(VA_ATTRIB_NOT_SUPPORTED);
         }
     });
     VA_STATUS_SUCCESS as VAStatus

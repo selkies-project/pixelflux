@@ -176,18 +176,20 @@ impl Device {
         Ok(profiles)
     }
 
-    /// The encode entry point of `profile`: the low-power one first, since recent Intel
+    /// The encode entry points of `profile`, the low-power one first, since recent Intel
     /// generations expose it as the only one for HEVC, VP9, and AV1 and it is the shorter path
-    /// where both exist; None where the profile encodes on neither.
-    fn encode_entrypoint(&self, profile: VAProfile) -> Option<VAEntrypoint> {
+    /// where both exist; a session the low-power one cannot serve, such as a constant-rate one
+    /// where it runs constant quantizer only, takes the full one. Empty where the profile
+    /// encodes on neither.
+    fn encode_entrypoints(&self, profile: VAProfile) -> Vec<VAEntrypoint> {
         let mut entrypoints = vec![0 as VAEntrypoint; unsafe { (self.api.vaMaxNumEntrypoints)(self.display) }.max(0) as usize];
         let mut listed: c_int = 0;
         let status = unsafe { (self.api.vaQueryConfigEntrypoints)(self.display, profile, entrypoints.as_mut_ptr(), &mut listed) };
         if status != VA_STATUS_SUCCESS as VAStatus {
-            return None;
+            return Vec::new();
         }
         let listed = &entrypoints[..listed.max(0) as usize];
-        [VAEntrypointEncSliceLP, VAEntrypointEncSlice].into_iter().find(|e| listed.contains(e))
+        [VAEntrypointEncSliceLP, VAEntrypointEncSlice].into_iter().filter(|e| listed.contains(e)).collect()
     }
 
     /// One configuration attribute of a profile and entry point, None where the driver does
@@ -296,13 +298,13 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>,
 /// whether the profile its 4:4:4 session opens under encodes and renders 4:4:4 surfaces too.
 pub(crate) fn probe_codecs_on(device: &Device) -> Result<Vec<(Codec, bool)>, String> {
     let profiles = device.profiles()?;
-    let entrypoint = |profile: VAProfile| profiles.contains(&profile).then(|| device.encode_entrypoint(profile)).flatten();
+    let entrypoints = |profile: VAProfile| if profiles.contains(&profile) { device.encode_entrypoints(profile) } else { Vec::new() };
     Ok(Codec::VIDEO
         .into_iter()
-        .filter(|&codec| profile_ladder(codec, false).into_iter().any(|p| entrypoint(p).is_some()))
+        .filter(|&codec| profile_ladder(codec, false).into_iter().any(|p| !entrypoints(p).is_empty()))
         .map(|codec| {
             let fullcolor = profile_ladder(codec, true).into_iter().any(|p| {
-                entrypoint(p).is_some_and(|e| {
+                entrypoints(p).into_iter().any(|e| {
                     device.attribute(p, e, VAConfigAttribRTFormat).is_none_or(|f| f & VA_RT_FORMAT_YUV444 != 0)
                 })
             });
@@ -579,17 +581,20 @@ impl VaapiEncoder {
             return Err(format!("no VA-API profile carries {} 4:4:4", codec.display()));
         }
         let listed = device.profiles()?;
-        let (profile, entrypoint) = ladder
+        let (profile, entrypoints) = ladder
             .iter()
             .filter(|p| listed.contains(p))
-            .find_map(|&p| device.encode_entrypoint(p).map(|e| (p, e)))
+            .map(|&p| (p, device.encode_entrypoints(p)))
+            .find(|(_, entrypoints)| !entrypoints.is_empty())
             .ok_or_else(|| format!("this VA-API driver encodes no {} {}", codec.display(), super::chroma_name(fullcolor)))?;
         let mut last = None;
         let formats: Vec<u32> = if fullcolor { FULLCOLOR_FOURCCS.to_vec() } else { vec![VA_FOURCC_NV12] };
-        for fourcc in formats {
-            match Self::open(&device, settings, codec, input, profile, entrypoint, fourcc, fullcolor) {
-                Ok(session) => return Ok(session),
-                Err(e) => last = Some(e),
+        for entrypoint in entrypoints {
+            for &fourcc in &formats {
+                match Self::open(&device, settings, codec, input, profile, entrypoint, fourcc, fullcolor) {
+                    Ok(session) => return Ok(session),
+                    Err(e) => last = Some(e),
+                }
             }
         }
         Err(last.unwrap_or_else(|| "no VA-API surface format to try".into()))
