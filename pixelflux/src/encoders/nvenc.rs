@@ -1157,8 +1157,8 @@ pub struct NvencEncoder {
     /// The 4:2:0 chroma convert, where the driver took the kernel and the session is not 4:4:4.
     /// `None` leaves NVENC's own conversion in place.
     csc: Option<ChromaConvert>,
-    /// The decoded picture buffer the session declared at open, in frames, which the driver
-    /// does not let a reconfigure change.
+    /// The decoded picture buffer the session declares, in frames, which a resize lowers where
+    /// the new level admits fewer and never raises.
     dpb: u32,
     /// The frames the decoder holds, so a lost one can be left out of the predictions and each
     /// frame can name what it predicts from; None where the device cannot invalidate a
@@ -2157,9 +2157,8 @@ impl NvencEncoder {
     /// milliseconds instead of a full rebuild. Flow:
     ///
     /// 1. **Reject the unchangeable**: a different encode device or codec, a chroma-format flip
-    ///    (4:4:4), an RC-mode flip, dimensions of zero or beyond the init-time `maxEncode`
-    ///    headroom, or a level whose decoded picture buffer is smaller than the one the session
-    ///    declared (the driver refuses to change it) all return `Err` so the caller rebuilds.
+    ///    (4:4:4), an RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode`
+    ///    headroom all return `Err` so the caller rebuilds.
     /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface, and
     ///    the dmabuf imports stay as they are, so the restart costs no IDR and no reset. Only the
     ///    pinned hosts are dropped -- the restart recreates the source buffers, often at the same
@@ -2170,10 +2169,12 @@ impl NvencEncoder {
     ///    direct import holds), and every pinned host. The dmabuf imports are re-created lazily by
     ///    the encode path; pinned hosts are dropped because the source shm segments are recreated
     ///    on resize and may reuse the same base addresses.
-    /// 4. **Reconfigure the session**: update the level for the new size, the CBR bitrate + VBV or
-    ///    the ConstQP, and the new dimensions / DAR / frame rate, then `NvEncReconfigureEncoder` with
-    ///    `resetEncoder` and `forceIDR` so the stream restarts cleanly at the new size. Driver
-    ///    rejection returns `Err`.
+    /// 4. **Reconfigure the session**: update the level for the new size, the decoded picture
+    ///    buffer where that level admits fewer frames (the driver takes a smaller one at the
+    ///    forced IDR and refuses to raise it again), the CBR bitrate + VBV or the ConstQP, and the
+    ///    new dimensions / DAR / frame rate, then `NvEncReconfigureEncoder` with `resetEncoder`
+    ///    and `forceIDR` so the stream restarts cleanly at the new size. Driver rejection returns
+    ///    `Err`.
     /// 5. **Reallocate the packed input** at the new size and register + map it as init does, in
     ///    the byte order the session was last fed.
     ///
@@ -2211,9 +2212,7 @@ impl NvencEncoder {
             self.omit_stripe_headers = settings.omit_stripe_headers;
             return Ok(false);
         }
-        if self.dpb_frames_at(new_w, new_h, settings.target_fps.max(1.0) as u32) < self.dpb {
-            return Err(format!("{new_w}x{new_h} admits fewer reference frames than the session holds"));
-        }
+        let dpb = self.dpb_frames_at(new_w, new_h, settings.target_fps.max(1.0) as u32).min(self.dpb);
 
         unsafe {
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
@@ -2260,6 +2259,11 @@ impl NvencEncoder {
                 self.current_qp = qp;
             }
             self.set_level(new_w, new_h, settings.target_fps as u32);
+            match self.codec {
+                Codec::H265 => self.encode_config.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = dpb,
+                Codec::Av1 => self.encode_config.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = dpb,
+                _ => self.encode_config.encodeCodecConfig.h264Config.maxNumRefFrames = dpb,
+            }
             self.init_params.encodeWidth = new_w;
             self.init_params.encodeHeight = new_h;
             self.init_params.darWidth = new_w;
@@ -2283,6 +2287,10 @@ impl NvencEncoder {
             }
             self.width = new_w;
             self.height = new_h;
+            self.dpb = dpb;
+            if let Some(references) = &mut self.references {
+                references.set_capacity(dpb);
+            }
 
             let mut input_device_ptr: CUdeviceptr = 0;
             let mut input_pitch: usize = 0;
@@ -3608,8 +3616,9 @@ mod gpu_tests {
     /// A frame a client lost is left out of the device's predictions: the next frame predicts
     /// from the newest frame before it and names it, a decoder that never saw the lost frames
     /// decodes it as one that saw everything does, the stream declares the decoded picture
-    /// buffer the level admits, and an in-place resize redeclares it. A device that cannot
-    /// invalidate a reference tracks none and says so. Ignored by default.
+    /// buffer the level admits, and an in-place resize redeclares it: a loss as deep as the new
+    /// buffer reaches is still predicted past, and a deeper one costs a key frame. A device that
+    /// cannot invalidate a reference tracks none and says so. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_predicts_past_a_lost_frame() {
@@ -3624,6 +3633,16 @@ mod gpu_tests {
                 .flat_map(|(ra, rb)| ra[..a.width].iter().zip(&rb[..a.width]).map(|(&x, &y)| (x as f64 - y as f64).abs()))
                 .sum::<f64>()
                 / (a.width * a.height) as f64
+        };
+        let apart_without = |codec: Codec, frames: &[Vec<u8>], lost: std::ops::Range<usize>| {
+            let (mut whole, mut lossy) = (VideoDecoder::new(codec).unwrap(), VideoDecoder::new(codec).unwrap());
+            for (i, f) in frames.iter().enumerate() {
+                assert!(whole.decode(f).expect("decode"), "{codec:?} frame {i}");
+                if !lost.contains(&i) {
+                    assert!(lossy.decode(f).expect("decode past the loss"), "{codec:?} frame {i}");
+                }
+            }
+            apart(&whole.frame().unwrap(), &lossy.frame().unwrap())
         };
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
@@ -3663,28 +3682,38 @@ mod gpu_tests {
             let (out, reference) = encode(&mut enc, 9, w, h);
             assert_eq!(reference, Reference::Frame(8), "{codec:?}");
             frames.push(out);
-            let (mut whole, mut lossy) = (VideoDecoder::new(codec).unwrap(), VideoDecoder::new(codec).unwrap());
-            for (i, f) in frames.iter().enumerate() {
-                assert!(whole.decode(f).expect("decode"), "{codec:?} frame {i}");
-                if !(5..8).contains(&i) {
-                    assert!(lossy.decode(f).expect("decode without 5-7"), "{codec:?} frame {i}");
-                }
-            }
-            let off = apart(&whole.frame().unwrap(), &lossy.frame().unwrap());
+            let off = apart_without(codec, &frames, 5..8);
             println!("{codec:?}: frame 9 without frames 5-7 is {off:.3} off the complete decode");
             assert!(off < 0.5, "{codec:?}: the decoder that lost frames 5-7 shows frame 9 {off:.2} off the one that saw them");
-            // The driver keeps the DPB a session opened with, so a grow to a level admitting fewer
-            // frames is refused in place and the session rebuilt at the new size.
+            // A grow to a level admitting fewer frames declares the smaller buffer at the IDR the
+            // resize forces.
             s.width = 1920;
             s.height = 1080;
-            assert!(enc.reconfigure_resolution(&s).is_err(), "{codec:?}: 1080p admits fewer than the eight held at 720p");
-            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("1080p session");
-            let (out, reference) = encode(&mut enc, 0, 1920, 1080);
+            assert!(enc.reconfigure_resolution(&s).expect("in-place grow"), "{codec:?}");
+            let dpb = enc.dpb as usize;
+            let (out, reference) = encode(&mut enc, 10, 1920, 1080);
             assert_eq!(reference, Reference::None);
             if codec == Codec::H264 {
                 assert_eq!(h264_max_num_ref_frames(&out), Some(4), "1080p at level 4.2 admits four");
             }
-            assert_eq!(encode(&mut enc, 1, 1920, 1080).1, Reference::Frame(0), "{codec:?}");
+            let mut frames = vec![out];
+            for i in 11..=10 + dpb {
+                let (out, reference) = encode(&mut enc, i, 1920, 1080);
+                assert_eq!(reference, Reference::Frame(i as u16 - 1), "{codec:?} frame {i}");
+                frames.push(out);
+            }
+            assert!(enc.invalidate_reference(12), "{codec:?}: the device refused the invalidation");
+            let (out, reference) = encode(&mut enc, 11 + dpb, 1920, 1080);
+            assert_eq!(reference, Reference::Frame(11), "{codec:?}: the oldest frame the buffer holds");
+            frames.push(out);
+            let (out, reference) = encode(&mut enc, 12 + dpb, 1920, 1080);
+            assert_eq!(reference, Reference::Frame(11 + dpb as u16), "{codec:?}");
+            frames.push(out);
+            let off = apart_without(codec, &frames, 2..dpb + 1);
+            println!("{codec:?}: at 1080p, frame {} without frames 12-{} is {off:.3} off the complete decode", 12 + dpb, 10 + dpb);
+            assert!(off < 0.5, "{codec:?}: the decoder that lost frames 12-{} shows {off:.2} off the one that saw them", 10 + dpb);
+            assert!(enc.invalidate_reference(11));
+            assert_eq!(encode(&mut enc, 13 + dpb, 1920, 1080).1, Reference::None, "{codec:?}: frame 11 left the buffer");
         }
     }
 
@@ -3757,6 +3786,34 @@ mod gpu_tests {
             .expect("encode 1080p");
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (1920, 1080));
+    }
+
+    /// On a real GPU, a resize the driver refuses ends in the rebuild its callers already do:
+    /// the ladder the session came from opens a new one at the new size, declaring the buffer
+    /// its own level admits. Forced by asking to raise the buffer a 1080p session declared,
+    /// which the driver refuses. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_refused_resize_is_rebuilt() {
+        use crate::encoders::sps::h264_max_num_ref_frames;
+        use crate::encoders::{select_frame_encoder, FrameEncoder, FrameSource};
+        let mut s = settings(1920, 1080, 60.0);
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let key = enc.encode_cpu_argb(&frame(1920, 1080, 10), 1920 * 4, 0, 25, true).expect("encode 1080p");
+        assert_eq!(h264_max_num_ref_frames(&key[VIDEO_HEADER_LEN..]), Some(4), "1080p at level 4.2 admits four");
+        enc.dpb = REFERENCE_FRAMES;
+        s.width = 1280;
+        s.height = 720;
+        let prior = Some(FrameEncoder::Nvenc(enc));
+        let Some(FrameEncoder::Nvenc(mut enc)) = select_frame_encoder(&mut s, FrameSource::Host { rgba: false }, prior, "test")
+        else {
+            panic!("the ladder rebuilt no NVENC session");
+        };
+        assert_eq!(enc.references.as_ref().map_or(0, ReferenceWindow::next_pts), 0, "a new session, not the refused one");
+        let key = enc.encode_cpu_argb(&frame(1280, 720, 20), 1280 * 4, 1, 25, false).expect("encode 720p");
+        assert_eq!(key[1] & 0x0f, FRAME_KEY);
+        assert_eq!(wire_dims(&key), (1280, 720));
+        assert_eq!(h264_max_num_ref_frames(&key[VIDEO_HEADER_LEN..]), Some(REFERENCE_FRAMES), "720p declares eight");
     }
 
     /// On a real GPU, a live CBR rate change moves the VBV initial delay with the buffer: after
