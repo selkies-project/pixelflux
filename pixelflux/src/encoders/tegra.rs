@@ -1146,8 +1146,8 @@ impl TegraEncoder {
 
     /// Name the references the frame about to be queued on `slot` may predict from, and note
     /// what that makes it predict from. An empty set is a key frame — the first, one asked for,
-    /// one the window needs because nothing it holds is left, and the periodic one the interval
-    /// no longer inserts.
+    /// one the window needs because nothing it holds is left, and the periodic one, coded here
+    /// since the encoder's own interval is parked.
     fn queue_references(&mut self, layout: &RpsLayout, slot: usize, frame_number: u64, force_idr: bool) -> Result<(), String> {
         let references = self.references.as_ref().ok_or("the reference window is missing")?;
         let key = force_idr
@@ -1967,8 +1967,9 @@ mod tests {
                 }
                 let (pixels, bar) = bar_scene(w, h, i);
                 let (out, _) = encode_frame(&mut enc, &pixels, w, i, i == 0);
+                // 39 is lost by the client, and 40, which predicts from it, is held back.
                 if i == 39 || i == 40 {
-                    continue; // 39 lost by the client, and 40, which predicts from it, held back
+                    continue;
                 }
                 assert!(dec.decode(&out).expect("decode"), "{codec:?} frame {i}");
                 let f = dec.frame().unwrap();
