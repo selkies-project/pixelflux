@@ -13,11 +13,13 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// One library: its pkg-config name, the header the bindings are generated from, and the
-/// items to keep (everything the header pulls in otherwise doubles the bindings).
+/// One library: its pkg-config name, the oldest release the crate builds and runs with, the
+/// header the bindings are generated from, and the items to keep (everything the header pulls
+/// in otherwise doubles the bindings).
 struct Lib {
     feature: &'static str,
     pkg: &'static str,
+    min: &'static str,
     header: &'static str,
     allow: &'static [&'static str],
 }
@@ -26,19 +28,21 @@ const LIBS: &[Lib] = &[
     Lib {
         feature: "vpx",
         pkg: "vpx",
+        min: "1.11",
         header: "vpx.h",
         allow: &["vpx_.*", "VPX_.*", "VP8.*", "VP9.*", "vp8e_.*", "vp9e_.*", "vp8_.*", "vpx_svc_.*"],
     },
-    Lib { feature: "x265", pkg: "x265", header: "x265w.h", allow: &["x265_.*", "X265_.*"] },
-    Lib { feature: "kvazaar", pkg: "kvazaar", header: "kvazaar.h", allow: &["kvz_.*", "KVZ_.*"] },
+    Lib { feature: "x265", pkg: "x265", min: "3.5", header: "x265w.h", allow: &["x265_.*", "X265_.*"] },
+    Lib { feature: "kvazaar", pkg: "kvazaar", min: "2.3.2", header: "kvazaar.h", allow: &["kvz_.*", "KVZ_.*"] },
     Lib {
         feature: "svtav1",
         pkg: "SvtAv1Enc",
+        min: "1.0",
         header: "svtav1.h",
         allow: &["svt_av1_.*", "Eb.*", "EB_.*", "SVT_AV1_.*", "Svt.*", "SvtAv1.*"],
     },
-    Lib { feature: "dav1d", pkg: "dav1d", header: "dav1dw.h", allow: &["dav1d_.*", "Dav1d.*", "DAV1D_.*"] },
-    Lib { feature: "de265", pkg: "libde265", header: "de265w.h", allow: &["de265_.*", "DE265_.*", "LIBDE265_.*"] },
+    Lib { feature: "dav1d", pkg: "dav1d", min: "1.0", header: "dav1dw.h", allow: &["dav1d_.*", "Dav1d.*", "DAV1D_.*"] },
+    Lib { feature: "de265", pkg: "libde265", min: "1.0.8", header: "de265w.h", allow: &["de265_.*", "DE265_.*", "LIBDE265_.*"] },
 ];
 
 fn main() {
@@ -52,9 +56,9 @@ fn main() {
         if env::var(format!("CARGO_FEATURE_{}", lib.feature.to_uppercase())).is_err() {
             continue;
         }
-        let probed = pkg_config::Config::new()
-            .probe(lib.pkg)
-            .unwrap_or_else(|e| panic!("{}: the `{}` feature needs {} (pkg-config): {e}", lib.pkg, lib.feature, lib.pkg));
+        let probed = pkg_config::Config::new().atleast_version(lib.min).probe(lib.pkg).unwrap_or_else(|e| {
+            panic!("{}: the `{}` feature needs {} {} or newer (pkg-config): {e}", lib.pkg, lib.feature, lib.pkg, lib.min)
+        });
         let header = format!("headers/{}", lib.header);
         println!("cargo:rerun-if-changed={header}");
         let mut builder = bindgen::builder()
