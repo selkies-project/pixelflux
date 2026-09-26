@@ -667,8 +667,9 @@ so no frame is converted on a CPU core.
     behind a loss back by. Every session whose encoder lets it name its references tracks them:
     libx264 and libvpx always, NVENC on the devices whose driver offers reference invalidation,
     VA-API where the driver takes the session's slice headers (H.264, H.265) or addresses
-    reference slots (VP8, VP9, AV1); a session that does not (x265, kvazaar, SVT-AV1, Tegra, a
-    stateful V4L2 device) reports `-2` and answers this with a keyframe instead, as does an H.264
+    reference slots (VP8, VP9, AV1), and Tegra for H.265 through the vendor's external reference
+    set (L4T R32 and R36); a session that does not (x265, kvazaar, SVT-AV1, Tegra's H.264 and AV1,
+    a stateful V4L2 device) reports `-2` and answers this with a keyframe instead, as does an H.264
     session for a loss covering the frame at its `frame_num` wrap, which the FFmpeg decoder of
     Chromium and Firefox cannot be predicted past.
 
