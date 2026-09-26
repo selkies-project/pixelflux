@@ -52,6 +52,7 @@ SETS: Dict[str, List[str]] = {
 # GPL dependency means adding a line here and in LICENSES.md.
 ALLOWED_COPYLEFT: Dict[str, Tuple[str, ...]] = {
     "x264-sys": ("gpl",),
+    "codec-sys": ("gpl",),
 }
 
 PERMISSIVE = 0
@@ -169,7 +170,8 @@ def classify_expression(expression: str) -> int:
 
 
 # Native libraries behind the crates that bind, vendor, or load them. `rank` is
-# the license category of the native code, `how` the way it reaches the
+# the license category of the native code, `copyleft_features` the crate
+# features that link a copyleft library, and `how` the way it reaches the
 # extension. Every crate named like a native binding (-sys, _sys, -ffi) has to
 # be described here, so a new binding fails the check until it is inventoried.
 NATIVE: Dict[str, Dict[str, object]] = {
@@ -182,7 +184,7 @@ NATIVE: Dict[str, Dict[str, object]] = {
                 "(GPL-2.0-or-later) on the GPL wheel, kvazaar on the non-GPL one",
         license="BSD-3-Clause (libvpx, kvazaar; SVT-AV1 with the Alliance for Open Media "
                 "patent license), BSD-2-Clause (dav1d), LGPL-3.0-or-later (libde265)",
-        rank=WEAK,
+        rank=WEAK, copyleft_features=("x265",),
         how="linked shared libraries, bound at build time from the headers of the copies "
             "that are linked (bundled into the wheels by auditwheel); crate itself MIT OR "
             "Apache-2.0, path dependency",
@@ -311,6 +313,7 @@ def audit(meta: dict, set_name: str) -> Tuple[List[dict], List[str]]:
     """Classify every crate of one configuration and collect the violations."""
     rows = []
     problems = []
+    features = {n["id"]: n.get("features", ()) for n in meta["resolve"]["nodes"]}
     for pkg in normal_closure(meta):
         name = pkg["name"]
         expr = pkg.get("license")
@@ -341,6 +344,9 @@ def audit(meta: dict, set_name: str) -> Tuple[List[dict], List[str]]:
         native_rank = PERMISSIVE
         if native is not None:
             native_rank = int(native["rank"])  # type: ignore[call-overload]
+            copyleft = native.get("copyleft_features", ())
+            if set(features[pkg["id"]]) & set(copyleft):  # type: ignore[call-overload]
+                native_rank = COPYLEFT
             if native_rank == COPYLEFT and set_name not in ALLOWED_COPYLEFT.get(name, ()):
                 problems.append("%s %s: links %s (%s) in the %s set"
                                 % (name, pkg["version"], native["library"],

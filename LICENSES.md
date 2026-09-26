@@ -397,8 +397,9 @@ The default build (`gpl` feature, what the published wheels and
   crate's SPDX expression, overlays the native libraries behind the binding
   crates (the `NATIVE` table in the script, the source of the component table
   above), and fails when a copyleft component appears in a configuration not
-  listed for it in `ALLOWED_COPYLEFT` (`x264-sys` → `gpl` only), when a crate
-  has no usable license metadata, or when a crate named like a native binding
+  listed for it in `ALLOWED_COPYLEFT` (`x264-sys`, and `codec-sys` where its
+  `x265` feature is on, → `gpl` only), when a crate has no usable license
+  metadata, or when a crate named like a native binding
   (`-sys`, `_sys`, `-ffi`) is not described in `NATIVE`. Run it from the
   repository root: `python3 scripts/check-licenses.py` (`--set non-gpl`,
   `--markdown`, `--metadata FILE` for a saved `cargo metadata` JSON). It
@@ -421,7 +422,7 @@ The default build (`gpl` feature, what the published wheels and
   graph (`cargo metadata --format-version 1 --manifest-path pixelflux/Cargo.toml
   > gpl.json`) and audit it under the non-GPL policy
   (`scripts/check-licenses.py --metadata gpl.json --set non-gpl`): it must
-  fail on `x264-sys`.
+  fail on `x264-sys` and on `codec-sys` for its `x265` feature.
 
 ## Open items
 
