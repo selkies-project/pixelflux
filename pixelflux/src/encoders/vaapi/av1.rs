@@ -178,7 +178,7 @@ impl Arm {
         if self.level_idx > 7 {
             w.flag(false);
         }
-        let (wbits, hbits) = (bit_width(n.width) - 1, bit_width(n.height) - 1);
+        let (wbits, hbits) = (bit_width(n.width - 1), bit_width(n.height - 1));
         w.u(4, (wbits - 1) as u64);
         w.u(4, (hbits - 1) as u64);
         w.u(wbits, (n.width - 1) as u64);

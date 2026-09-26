@@ -663,6 +663,16 @@ fn fullcolor_takes_the_surface_the_driver_renders() {
     }
 }
 
+/// A session at `width` x `height` and `fps` on the stood-in driver.
+fn sized(codec: Codec, cbr: bool, width: i32, height: i32, fps: f64) -> RustCaptureSettings {
+    RustCaptureSettings { width, height, target_fps: fps, ..settings(codec, cbr) }
+}
+
+fn encode_sized(enc: &mut VaapiEncoder, width: i32, height: i32, t: u64, key: bool) -> Vec<u8> {
+    let pixels = vec![0x40; (width * height * 4) as usize];
+    enc.encode_host(&pixels, (width * 4) as usize, false, t, 25, key).unwrap_or_else(|e| panic!("frame {t}: {e}"))
+}
+
 /// A driver that writes its own slice headers still takes each picture's number, order count,
 /// reconstruction surface, and reference from the session, so a session that tracks no
 /// references counts its frames all the same: both counts advance every frame, the
@@ -705,5 +715,27 @@ fn a_session_tracking_no_references_counts_its_frames() {
         }
         let pool: std::collections::HashSet<_> = recon.iter().collect();
         assert_eq!(pool.len(), REFERENCE_FRAMES as usize + 1, "{codec:?}: the whole reconstruction pool rotates");
+    }
+}
+
+/// The AV1 sequence header carries the frame size in as many bits as the size needs, since a
+/// decoder takes each picture's size from it; a field a bit short wraps to another size.
+#[test]
+fn av1_sequence_header_carries_the_frame_size() {
+    for (w, h) in [(1920, 1080), (1280, 720), (1366, 768), (1024, 512), (320, 240)] {
+        mock::reset(Driver::generous());
+        let mut enc = open(Codec::Av1, &sized(Codec::Av1, false, w, h, 30.0)).unwrap();
+        encode_sized(&mut enc, w, h, 0, true);
+        let sequence = mock::with(|d| d.last_packed().into_iter().find(|p| p.0 == VAEncPackedHeaderSequence).unwrap().1);
+        let mut r = Reader { bytes: &sequence, pos: 8 * (1 + 4) };
+        assert_eq!(r.u(3), 0, "seq_profile");
+        assert_eq!(r.u(4), 0, "still picture, reduced header, timing info, and display delay");
+        assert_eq!(r.u(5), 0, "operating_points_cnt_minus_1");
+        assert_eq!(r.u(12), 0, "operating_point_idc");
+        if r.u(5) > 7 {
+            r.u(1);
+        }
+        let (wbits, hbits) = (r.u(4) + 1, r.u(4) + 1);
+        assert_eq!((r.u(wbits) + 1, r.u(hbits) + 1), (w as u32, h as u32), "{w}x{h}");
     }
 }
