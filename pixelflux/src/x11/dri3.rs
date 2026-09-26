@@ -30,7 +30,7 @@
 //!
 //! Everything that can be checked is checked before a frame is delivered, and the path is
 //! declined otherwise: a codec no hardware engine serves, software encoding, a server without
-//! DRI3 1.2, Damage, or Render, a server drawing on a device other than the encode node, a buffer
+//! DRI3 1.2, Damage, or Render, a server drawing on a GPU other than the encode node's, a buffer
 //! the server will not import, or a first frame the encoder cannot read. A watermark is not among
 //! them: it is composited by the server through Render, as the cursor is. The capture then runs the XShm path with nothing half-built.
 
@@ -185,6 +185,13 @@ fn device_of_fd(fd: &OwnedFd) -> Result<u64, String> {
     file.metadata().map(|m| m.rdev()).map_err(|e| x_err("fstat of the DRI3 device", e))
 }
 
+/// Whether two DRM nodes belong to one GPU: an Xorg whose glamor runs on the modesetting
+/// driver hands DRI3 clients its primary node, where the encoder opens the render node.
+fn same_gpu(a: u64, b: u64) -> bool {
+    let gpu = |dev: u64| std::fs::canonicalize(format!("/sys/dev/char/{}:{}/device", libc::major(dev), libc::minor(dev))).ok();
+    a == b || gpu(a).is_some_and(|g| gpu(b) == Some(g))
+}
+
 impl XScreen {
     /// Connect and negotiate everything the blit needs, or say what the server lacks.
     fn open(node: i32) -> Result<(Self, OwnedFd), String> {
@@ -239,9 +246,9 @@ impl XScreen {
             .map(|m| m.rdev())
             .map_err(|e| x_err(&format!("encode node {encode_path}"), e))?;
         let server_dev = device_of_fd(&device_fd)?;
-        if server_dev != encode_dev {
+        if !same_gpu(server_dev, encode_dev) {
             return Err(format!(
-                "the X server draws on DRM device {}:{}, not on encode node {encode_path}",
+                "the X server draws on DRM device {}:{}, not on the GPU of encode node {encode_path}",
                 libc::major(server_dev),
                 libc::minor(server_dev)
             ));
@@ -1030,6 +1037,24 @@ mod gpu_tests {
     use super::super::gpu_test_support::{decoded_mean, paint_root, painted_ycbcr, settings};
     use crate::encoders::codec::{parse_video_type, FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN};
     use crate::webcam::decode::{VideoDecoder, Codec as DecCodec, Decoder};
+
+    /// The primary node of the encode node's GPU is the same GPU to the DRI3 check, as the
+    /// node an Xorg on the modesetting driver hands its DRI3 clients. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_dri3_counts_the_primary_node_of_the_encode_gpu_as_it() {
+        let node = settings(crate::encoders::codec::Codec::H264).encode_node_index.max(0);
+        let render = format!("/dev/dri/renderD{}", 128 + node);
+        let render_dev = std::fs::metadata(&render).expect("encode node").rdev();
+        let primary = std::fs::read_dir(format!("/sys/class/drm/renderD{}/device/drm", 128 + node))
+            .expect("the encode node's GPU in sysfs")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .find(|name| name.starts_with("card"))
+            .expect("a primary node on the encode node's GPU");
+        let primary_dev = std::fs::metadata(format!("/dev/dri/{primary}")).expect("primary node").rdev();
+        assert_ne!(primary_dev, render_dev, "{primary} and {render} are distinct nodes");
+        assert!(same_gpu(primary_dev, render_dev), "{primary} is the GPU of {render}");
+    }
 
     /// The watermark is composited by the server, so it reaches the frame without the CPU
     /// touching a pixel, and a translucent one blends as the readback paths blend it: Render's

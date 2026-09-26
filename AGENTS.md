@@ -183,7 +183,7 @@ the server's own render node and wrapped as pixmaps, the blit is waited for with
 imports each dmabuf in place through the same `encode_dmabuf` the Wayland zero-copy path uses; and
 the general XShm path otherwise. Each zero-copy backend is declined -- with one line saying why --
 for a codec its engine does not serve, software encoding, a server or device that does not qualify
-(DRI3 also asks that the server draw on the encode node and that the encoder read the first frame),
+(DRI3 also asks that the server draw on the encode node's GPU and that the encoder read the first frame),
 and NvFBC for a non-NVIDIA encode node, a watermark, or a driver without it; DRI3 composites a
 watermark through Render as it does the cursor, so that one costs it no readback. There is no
 setting either way: the server's and the driver's own answers decide, and a host without NvFBC
