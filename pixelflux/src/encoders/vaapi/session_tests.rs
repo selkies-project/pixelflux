@@ -1002,3 +1002,20 @@ fn a_constant_rate_session_caps_each_frame_at_its_buffer() {
         });
     }
 }
+
+/// The HEVC sequence declares a finite intra period, matching the range its picture order count
+/// wraps in, rather than i32::MAX, whose next power of two overflows radeonsi's UVD max_poc and
+/// hangs the encoder; a decoder derives the same order-count width from either.
+#[test]
+fn the_hevc_sequence_declares_a_finite_intra_period() {
+    mock::reset(Driver::generous());
+    let mut enc = session(Codec::H265, false);
+    encode(&mut enc, 0, true);
+    mock::with(|d| {
+        let seq: VAEncSequenceParameterBufferHEVC = d.last_param(VAEncSequenceParameterBufferType).unwrap();
+        let poc_lsb = 1u32 << (4 + 8);
+        assert_eq!(seq.intra_period, poc_lsb, "the intra period is the picture-order-count range");
+        assert_eq!(seq.intra_idr_period, poc_lsb);
+        assert!((seq.intra_period as u64).next_power_of_two() <= u32::MAX as u64, "its next power of two does not overflow");
+    });
+}

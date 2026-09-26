@@ -329,8 +329,8 @@ impl Arm {
         s.general_profile_idc = if n.fullcolor { 4 } else { 1 };
         s.general_level_idc = self.level_idc as u8;
         s.general_tier_flag = self.tier as u8;
-        s.intra_period = i32::MAX as u32;
-        s.intra_idr_period = i32::MAX as u32;
+        s.intra_period = 1 << (4 + LOG2_MAX_POC_LSB_MINUS4);
+        s.intra_idr_period = 1 << (4 + LOG2_MAX_POC_LSB_MINUS4);
         s.ip_period = 1;
         s.bits_per_second = n.bits_per_second;
         s.pic_width_in_luma_samples = surface_width as u16;
