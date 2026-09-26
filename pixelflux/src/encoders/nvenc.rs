@@ -364,14 +364,46 @@ fn neg_api() -> u32 {
     m | (n << 24)
 }
 
+/// `NV_ENC_RECONFIGURE_PARAMS` with room for the flag word of the layout below 12.2: the
+/// initialize params those SDKs embed run eight bytes longer, so a driver negotiated there reads
+/// `resetEncoder` and `forceIDR` eight bytes past where the pinned header puts them.
+#[repr(C)]
+struct ReconfigureParams {
+    params: NV_ENC_RECONFIGURE_PARAMS,
+    flags_before_12_2: [u32; 2],
+}
+
+impl ReconfigureParams {
+    /// Re-initialize with `init` at API `(maj, min)`, resetting the encoder and forcing an IDR
+    /// as asked.
+    fn new(init: NV_ENC_INITIALIZE_PARAMS, (maj, min): (u32, u32), reset: bool, force_idr: bool) -> Self {
+        let mut p = Self {
+            params: NV_ENC_RECONFIGURE_PARAMS {
+                version: nvenc_struct_ver(NvStruct::ReconfigureParams, maj, min),
+                reInitEncodeParams: init,
+                ..Default::default()
+            },
+            flags_before_12_2: [0; 2],
+        };
+        if (maj << 4) | min < 0xC2 {
+            p.flags_before_12_2[0] = reset as u32 | (force_idr as u32) << 1;
+        } else {
+            p.params.set_resetEncoder(reset as u32);
+            p.params.set_forceIDR(force_idr as u32);
+        }
+        p
+    }
+}
+
 /// Resolve the process-wide NVENC API version once, by probing the driver newest-first and
 /// remembering the highest version it accepts.
 ///
 /// The bundled nv-codec-headers are NVENC 13.0 (`pinned`), so a current driver negotiates 13.0
 /// natively while older drivers down-negotiate through 12.x / 11.x to the 10.0 floor (~R445). The
-/// compiled struct *layouts* are always the 13.0 ones; only the version *words* change per
-/// negotiated version (via the `NvStruct::rev` table), so each struct is stamped with the exact word
-/// the negotiated SDK defined. Steps:
+/// compiled struct *layouts* are the 13.0 ones, which older drivers read alike but for the
+/// reconfigure flags (`ReconfigureParams`); only the version *words* change per negotiated version
+/// (via the `NvStruct::rev` table), so each struct is stamped with the exact word the negotiated
+/// SDK defined. Steps:
 ///
 /// 1. **Cap the search** by the driver's max: query `get_max_version` when present, then optionally
 ///    lower it further from `PIXELFLUX_NVENC_MAX_API` (e.g. `"11.0"`) for testing / pinning. A cap
@@ -2271,18 +2303,7 @@ impl NvencEncoder {
             self.init_params.darHeight = new_h;
             self.init_params.frameRateNum = (settings.target_fps.max(1.0)) as u32;
             self.init_params.frameRateDen = 1;
-            self.init_params.encodeConfig = &mut self.encode_config;
-            let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
-                version: sv(NvStruct::ReconfigureParams),
-                reInitEncodeParams: self.init_params,
-                ..Default::default()
-            };
-            reconfig_params.set_resetEncoder(1);
-            reconfig_params.set_forceIDR(1);
-            let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
-            if reconfig_fn(self.encoder_session, &mut reconfig_params)
-                != NVENCSTATUS::NV_ENC_SUCCESS
-            {
+            if self.reconfigure(true, true) != NVENCSTATUS::NV_ENC_SUCCESS {
                 (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                 return Err("NvEncReconfigureEncoder rejected the resolution change".into());
             }
@@ -2467,6 +2488,14 @@ impl NvencEncoder {
         Ok(())
     }
 
+    /// Hand the live config to `nvEncReconfigureEncoder`, resetting the encoder and forcing an IDR
+    /// as asked.
+    unsafe fn reconfigure(&mut self, reset: bool, force_idr: bool) -> NVENCSTATUS {
+        self.init_params.encodeConfig = &mut self.encode_config;
+        let mut params = ReconfigureParams::new(self.init_params, nvenc_cur_ver(), reset, force_idr);
+        (self.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(self.encoder_session, &mut params.params)
+    }
+
     /// Reconfigure the live session's ConstQP when the quantizer the session quality index
     /// `crf` selects differs from the current one, returning whether a reconfigure actually
     /// happened.
@@ -2487,16 +2516,7 @@ impl NvencEncoder {
             self.encode_config.rcParams.constQP.qpInterP = target_qp;
             self.encode_config.rcParams.constQP.qpInterB = target_qp;
             self.encode_config.rcParams.constQP.qpIntra = target_qp;
-            self.init_params.encodeConfig = &mut self.encode_config;
-
-            let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
-                version: sv(NvStruct::ReconfigureParams),
-                reInitEncodeParams: self.init_params,
-                ..Default::default()
-            };
-
-            let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
-            let status = reconfig_fn(self.encoder_session, &mut reconfig_params);
+            let status = self.reconfigure(false, false);
             if status == NVENCSTATUS::NV_ENC_SUCCESS {
                 self.current_qp = target_qp;
                 return true;
@@ -2550,17 +2570,7 @@ impl NvencEncoder {
             if !changed {
                 return true;
             }
-            self.init_params.encodeConfig = &mut self.encode_config;
-            let mut reconfig_params = NV_ENC_RECONFIGURE_PARAMS {
-                version: sv(NvStruct::ReconfigureParams),
-                reInitEncodeParams: self.init_params,
-                ..Default::default()
-            };
-            if level_raised {
-                reconfig_params.set_forceIDR(1);
-            }
-            let reconfig_fn = self.nvenc_funcs.nvEncReconfigureEncoder.unwrap();
-            let status = reconfig_fn(self.encoder_session, &mut reconfig_params);
+            let status = self.reconfigure(false, level_raised);
             if status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
                     "[NVENC] Rate reconfigure refused ({status:?}): {}",
@@ -3356,14 +3366,7 @@ mod gpu_tests {
     /// for checks that vary one rate-control field, with the driver's answer.
     fn reconfigure_raw(enc: &mut NvencEncoder) -> (NVENCSTATUS, String) {
         unsafe {
-            enc.init_params.encodeConfig = &mut enc.encode_config;
-            let mut params = NV_ENC_RECONFIGURE_PARAMS {
-                version: sv(NvStruct::ReconfigureParams),
-                reInitEncodeParams: enc.init_params,
-                ..Default::default()
-            };
-            let status =
-                (enc.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(enc.encoder_session, &mut params);
+            let status = enc.reconfigure(false, false);
             let detail = if status == NVENCSTATUS::NV_ENC_SUCCESS {
                 "accepted".to_string()
             } else {
@@ -4172,6 +4175,38 @@ mod gpu_tests {
             assert!(enc.reconfigure_rate(&s), "{codec:?} live raise to 200 Mbit/s refused");
             assert!(enc.declared_level() > level, "{codec:?} level did not rise with the target");
             println!("{codec:?}: {kbps} kbps opened on level {level}; 200 Mbit/s live took level {}", enc.declared_level());
+        }
+    }
+
+    /// On a real GPU, a live reconfigure costs a key frame only where one is asked for: a plain
+    /// CBR rate change and a paint-over quantizer change go on predicting, and a target past the
+    /// level's bitrate ceiling raises it at a key frame. A driver negotiated below 12.2 reads the
+    /// flags elsewhere, so run it under `PIXELFLUX_NVENC_MAX_API` at each negotiable version too.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_reconfigures_cost_a_key_frame_only_where_asked() {
+        let f = frame(1920, 1080, 30);
+        let kind = |enc: &mut NvencEncoder, n: u64, crf: u32| {
+            enc.encode_cpu_argb(&f, 1920 * 4, n, crf, n == 0).expect("encode")[1] & 0x0f
+        };
+        let mut s = settings(1920, 1080, 60.0);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 8000;
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        kind(&mut enc, 0, 25);
+        for (n, kbps) in [(1, 6000), (2, 8000), (3, 6000)] {
+            s.video_bitrate_kbps = kbps;
+            assert!(enc.reconfigure_rate(&s));
+            assert_eq!(kind(&mut enc, n, 25), FRAME_DELTA, "{:?}: after the change to {kbps} kbit/s", nvenc_cur_ver());
+        }
+        s.video_bitrate_kbps = 200_000;
+        assert!(enc.reconfigure_rate(&s));
+        assert_eq!(kind(&mut enc, 4, 25), FRAME_KEY, "{:?}: the raised level reaches the stream at a key frame", nvenc_cur_ver());
+        let mut enc = NvencEncoder::new(&settings(1920, 1080, 60.0), ptr::null()).expect("NVENC init");
+        for n in 0..6u64 {
+            let want = if n == 0 { FRAME_KEY } else { FRAME_DELTA };
+            assert_eq!(kind(&mut enc, n, if n % 2 == 0 { 25 } else { 18 }), want, "{:?}: paint-over frame {n}", nvenc_cur_ver());
         }
     }
 
@@ -5210,6 +5245,20 @@ mod version_tests {
             assert_eq!(nvenc_struct_ver(s, maj, min), base, "{:?}", s);
         }
         assert_eq!(maj | (min << 24), NVENCAPI_VERSION);
+    }
+
+    /// A reconfigure's reset and IDR flags land where each version's own header puts them:
+    /// behind initialize params of 1808 bytes below 12.2, and of 1800 from it.
+    #[test]
+    fn reconfigure_flags_sit_where_each_version_reads_them() {
+        for (maj, min, at) in [(10, 0, 1816), (11, 0, 1816), (11, 1, 1816), (12, 0, 1816), (12, 1, 1816), (12, 2, 1808), (13, 0, 1808)] {
+            let params = ReconfigureParams::new(NV_ENC_INITIALIZE_PARAMS::default(), (maj, min), true, true);
+            let bytes = unsafe {
+                std::slice::from_raw_parts((&params as *const ReconfigureParams).cast::<u8>(), std::mem::size_of_val(&params))
+            };
+            let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!((word(1808), word(1816)), if at == 1816 { (0, 3) } else { (3, 0) }, "{maj}.{min}");
+        }
     }
 
     /// `nvenc_struct_ver` must reproduce the exact `NV_ENC_*_VER` words each SDK defined, for
