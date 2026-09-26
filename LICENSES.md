@@ -375,14 +375,15 @@ The default build (`gpl` feature, what the published wheels and
 
 ## Distribution notes
 
-- manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): kvazaar,
-  libvpx, SVT-AV1, dav1d, and libde265 — plus x264 and x265 for the GPL wheel —
-  are built from source in the image; auditwheel bundles them (`libx264.so`,
-  `libx265.so`, `libkvazaar.so`, `libvpx.so`, `libSvtAv1Enc.so`,
-  `libdav1d.so`, `libde265.so`) into `pixelflux.libs/` and leaves libgbm,
-  libEGL, libxkbcommon, libpixman-1, libX11/libxcb, zlib, liblzma, and the GCC
-  runtime to the host (`repair-wheel-command` excludes). libva is never
-  linked, so the host's own copy serves the driver it was built for.
+- manylinux and musllinux wheels (cibuildwheel, `pyproject.toml`): libvpx,
+  SVT-AV1, dav1d, and libde265 — plus x264 and x265 for the GPL wheel,
+  kvazaar for the non-GPL one — are built from source in the image;
+  auditwheel bundles them (`libx264.so`, `libx265.so`, `libkvazaar.so`,
+  `libvpx.so`, `libSvtAv1Enc.so`, `libdav1d.so`, `libde265.so`) into
+  `pixelflux.libs/` and leaves libgbm, libEGL, libxkbcommon, libpixman-1,
+  libX11/libxcb, zlib, liblzma, and the GCC runtime to the host
+  (`repair-wheel-command` excludes). libva is never linked, so the host's
+  own copy serves the driver it was built for.
 - The wheels carry pixelflux's own LICENSE only. The statically linked OpenH264
   (BSD-2-Clause) and libjpeg-turbo (IJG/BSD-3-Clause/Zlib) and the bundled
   codec libraries' notices are not included in the wheel; this file is the

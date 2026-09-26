@@ -146,8 +146,8 @@ budget the content cannot meet overshoots instead, as NVENC and libvpx do. Test 
 `cargo test --lib --no-default-features --features openh264`, the latter with kvazaar's headers installed);
 the OpenH264 crates are dependencies of every build, since their decoder is the virtual camera's H.264 decoder,
 so the OpenH264 encoder's tests run under the default build too. The
-wheel recipe (`pyproject.toml`) builds kvazaar, libvpx, SVT-AV1, dav1d, libde265, and, for the GPL wheel, x264
-and x265 from source.
+wheel recipe (`pyproject.toml`) builds libvpx, SVT-AV1, dav1d, libde265, and x264 and x265 for the GPL wheel or
+kvazaar for the non-GPL one from source.
 The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver pre-release
 the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the manifest
 and the lock, so a build ahead of a release carries the series version and a release the tag's.

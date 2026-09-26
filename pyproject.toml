@@ -50,10 +50,11 @@ before-all = """
     #
     # * libx264 and x265, only for the GPL wheel (the default; PIXELFLUX_ENABLE_GPL=0
     #   builds without them: OpenH264, vendored by its crate, is the software
-    #   H.264 encoder and kvazaar the software H.265 encoder instead).
-    # * kvazaar, libvpx, SVT-AV1 (BSD), and, for the virtual camera, dav1d (BSD)
-    #   and libde265 (LGPL): the software H.265, VP8/VP9, and AV1 encoders and the
-    #   AV1 and HEVC decoders, each linked directly and bound from its own headers.
+    #   H.264 encoder and kvazaar, built for that wheel alone, the software H.265
+    #   encoder instead).
+    # * libvpx, SVT-AV1 (BSD), and, for the virtual camera, dav1d (BSD) and
+    #   libde265 (LGPL): the software VP8/VP9 and AV1 encoders and the AV1 and
+    #   HEVC decoders, each linked directly and bound from its own headers.
     # libva is not built: the VA-API session carries bindings of the libva headers
     # it vendors and opens the host's library at run time. libjpeg-turbo is NOT
     # built either: turbojpeg-sys vendors + statically links its own copy by
@@ -135,8 +136,8 @@ before-all = """
     }
 
     build_codec_libraries() {
-        build_kvazaar && build_libvpx && build_svtav1 && build_dav1d && build_de265 && \
-        if [ "${gpl}" = 1 ]; then build_x264 && build_x265; fi
+        build_libvpx && build_svtav1 && build_dav1d && build_de265 && \
+        if [ "${gpl}" = 1 ]; then build_x264 && build_x265; else build_kvazaar; fi
     }
 
     # --- MANYLINUX (RPM-based) ---
