@@ -739,3 +739,44 @@ fn av1_sequence_header_carries_the_frame_size() {
         assert_eq!((r.u(wbits) + 1, r.u(hbits) + 1), (w as u32, h as u32), "{w}x{h}");
     }
 }
+
+/// VP8 reconstructs every frame into a surface none of its three buffers holds, and names
+/// each buffer by the surface its frame was reconstructed into, so a golden or altref anchor
+/// older than the pool is still intact when a frame predicts from it, as the recovery from a
+/// lost frame does.
+#[test]
+fn vp8_never_reconstructs_into_a_buffer_it_holds() {
+    mock::reset(Driver::generous());
+    let mut enc = session(Codec::Vp8, false);
+    let mut holds = [(VA_INVALID_SURFACE, 0u64); 3];
+    let mut content: HashMap<VASurfaceID, u64> = HashMap::new();
+    for t in 0..48u64 {
+        if t == 30 {
+            assert!(enc.invalidate_reference(29));
+        }
+        encode(&mut enc, t, t == 0);
+        mock::with(|d| {
+            let pic: VAEncPictureParameterBufferVP8 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+            let p = unsafe { pic.pic_flags.bits };
+            let key = p.frame_type() == 0;
+            if !key {
+                let named = [pic.ref_last_frame, pic.ref_gf_frame, pic.ref_arf_frame];
+                for (b, &(surface, frame)) in holds.iter().enumerate() {
+                    assert_eq!(named[b], surface, "frame {t}: buffer {b} is named by the surface frame {frame} was reconstructed into");
+                    assert_eq!(content.get(&surface), Some(&frame), "frame {t}: buffer {b}'s surface still holds frame {frame}");
+                }
+                assert!(!named.contains(&pic.reconstructed_frame), "frame {t} reconstructs into a surface a buffer holds");
+            }
+            content.insert(pic.reconstructed_frame, t);
+            let refresh = [p.refresh_last(), p.refresh_golden_frame(), p.refresh_alternate_frame()];
+            for (b, held) in holds.iter_mut().enumerate() {
+                if key || refresh[b] == 1 {
+                    *held = (pic.reconstructed_frame, t);
+                }
+            }
+        });
+        if t == 30 {
+            assert_eq!(enc.last_reference(), Reference::Frame(26), "the recovery predicts from the golden anchor");
+        }
+    }
+}

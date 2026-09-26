@@ -1180,7 +1180,6 @@ impl VaapiEncoder {
             Some(References::Slots(s)) => s.next_pts(),
             None => self.frame_count,
         };
-        let recon = self.recon[(pts % self.recon.len() as u64) as usize];
         let held: Vec<(u64, VASurfaceID, bool)> = match &self.references {
             Some(References::Window(w)) => w.held().filter_map(|(_, p, lost)| self.surfaces_of.get(&p).map(|&s| (p, s, lost))).collect(),
             _ => Vec::new(),
@@ -1205,6 +1204,10 @@ impl VaapiEncoder {
                 [VA_INVALID_SURFACE; 3],
             ),
         };
+        let recon = match &self.references {
+            Some(References::Slots(_)) => *self.recon.iter().find(|s| !slot_surfaces.contains(s)).ok_or("no VP8 reconstruction surface is free")?,
+            _ => self.recon[(pts % self.recon.len() as u64) as usize],
+        };
         let frame = Frame { key, pts, key_pts, recon, coded: self.coded, reference, held: &held, qp: self.qp, slots, slot_surfaces };
         let mut out = Buffers::new();
         if key {
@@ -1216,7 +1219,6 @@ impl VaapiEncoder {
         self.fresh = false;
         self.sequence_start = false;
         self.surfaces_of.insert(pts, recon);
-        self.surfaces_of.retain(|&p, _| p + self.recon.len() as u64 > pts);
         let frame_type = match self.codec {
             Codec::H264 => h264_frame_type(&coded),
             Codec::H265 => h265_frame_type(&coded),
@@ -1239,6 +1241,13 @@ impl VaapiEncoder {
                 Reference::Untracked
             }
         };
+        match &self.references {
+            Some(References::Slots(s)) => {
+                let held: Vec<u64> = [1u8, 2, 4].iter().filter_map(|&slot| s.slot(slot).map(|(_, p, _)| p)).collect();
+                self.surfaces_of.retain(|p, _| held.contains(p));
+            }
+            _ => self.surfaces_of.retain(|&p, _| p + self.recon.len() as u64 > pts),
+        }
         let mut output = Vec::with_capacity(VIDEO_HEADER_LEN + coded.len());
         if !self.omit_headers {
             push_video_header(&mut output, self.codec, frame_type, frame_id, 0, self.negotiated.width as u16, self.negotiated.height as u16, self.last_reference);
