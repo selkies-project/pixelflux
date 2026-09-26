@@ -903,6 +903,12 @@ fn render_node_index(path: &str) -> Option<i32> {
     Some(path.strip_prefix("/dev/dri/renderD")?.parse::<i32>().ok()? - 128)
 }
 
+/// The index of the first render node present, which a capture that names none encodes on:
+/// renderD128 need not exist, as in a container handed one GPU of several.
+fn first_render_node_index() -> Option<i32> {
+    render_node_index(&auto_select_render_node(None)?)
+}
+
 /// Resolve a usable `/dev/dri/renderD*` node, optionally matching a vendor/driver token.
 ///
 /// Cards under `/sys/class/drm` are walked in numeric order, skipping cards with no render node
@@ -1939,10 +1945,16 @@ fn start_capture_on_display(
         .map(|p| p.geometry_waiters)
         .unwrap_or_default();
 
-    if state.auto_gpu_selected && settings.encode_node_index < -1
-        && let Some(idx) = render_node_index(&state.render_node_path) {
+    if settings.encode_node_index < -1 {
+        let picked = if state.auto_gpu_selected {
+            render_node_index(&state.render_node_path)
+        } else {
+            first_render_node_index()
+        };
+        if let Some(idx) = picked {
             settings.encode_node_index = idx;
         }
+    }
 
     if settings.codec.is_video() {
         settings.width &= !1;
@@ -4425,9 +4437,9 @@ fn gpu_exposed() -> bool {
 /// 4. **StartCapture reconfigure** (per display): reprograms that output's mode / scale / refresh,
 ///    resizes its framebuffer and offscreen GBM buffer, and fullscreens the toplevels placed on
 ///    it. The encode device is resolved here: an operator's explicit `encode_node_index`
-///    (-1 software, >= 0 a device) always wins, and only the unset `-2` sentinel is filled from
-///    the auto-picked render node. H.264 output masks the dimensions even, because 4:2:0 needs
-///    even width and height.
+///    (-1 software, >= 0 a device) always wins, and only the unset `-2` sentinel is filled: from
+///    the auto-picked render node, else the first one present. H.264 output masks the dimensions
+///    even, because 4:2:0 needs even width and height.
 /// 5. **Encode-path choice + render loop**: only a same-GPU GLES session encodes zero-copy on this
 ///    calloop thread, because the dmabuf and its EGL context are calloop-affine; every readback
 ///    flavor (striped software H.264/JPEG, Pixman, or a cross-GPU hardware encoder) builds its
@@ -6917,6 +6929,8 @@ impl ScreenCapture {
                 && let Some(idx) = render_node_index(&picked) {
                     println!("[X11] AUTO_GPU selected {picked}.");
                     rs.encode_node_index = idx;
+                } else if let Some(idx) = first_render_node_index() {
+                    rs.encode_node_index = idx;
                 }
         }
 
@@ -8068,7 +8082,10 @@ fn hardware_fullcolor(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) ->
 fn probe_hardware(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> encoders::HardwareEncoders {
     let node = match encode_node_index {
         -1 => return Vec::new(),
-        index if index < -1 => auto_render_node(auto_gpu).and_then(|picked| render_node_index(&picked)).unwrap_or(0),
+        index if index < -1 => auto_render_node(auto_gpu)
+            .and_then(|picked| render_node_index(&picked))
+            .or_else(first_render_node_index)
+            .unwrap_or(0),
         index => index,
     };
     py.detach(|| encoders::hardware_encoders(node))
