@@ -2535,11 +2535,12 @@ impl NvencEncoder {
     /// In CBR mode the target bitrate, max bitrate, VBV, and its initial delay are updated (the VBV
     /// is ignored outside CBR); the target fps is updated in either mode. The session is
     /// reconfigured only when one of these actually changed — no RC reset, and a forced IDR only
-    /// where a target past the declared level's bitrate ceiling raises the level, which the
-    /// decoder learns from the sequence header a key frame carries; a level a lower target no
-    /// longer needs stays, since a level only ever has to be high enough — so calling it every
-    /// frame is cheap. A reconfigure the driver refuses leaves the session encoding at its
-    /// previous rate, logged with the driver's reason.
+    /// where a target past the declared level's bitrate ceiling, or a frame rate past its
+    /// macroblock rate, raises the level, which the decoder learns from the sequence header a key
+    /// frame carries; a level a lower target or frame rate no longer needs stays, since a level
+    /// only ever has to be high enough and the driver refuses one below the decoded picture
+    /// buffer the session declared — so calling it every frame is cheap. A reconfigure the driver
+    /// refuses leaves the session encoding at its previous rate, logged with the driver's reason.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> bool {
         unsafe {
             let mut changed = false;
@@ -2564,7 +2565,11 @@ impl NvencEncoder {
             if self.init_params.frameRateNum != fps {
                 self.init_params.frameRateNum = fps;
                 self.init_params.frameRateDen = 1;
-                self.set_level(self.init_params.encodeWidth, self.init_params.encodeHeight, fps);
+                let (w, h) = (self.init_params.encodeWidth, self.init_params.encodeHeight);
+                if self.level_for(w, h, fps) > self.declared_level() {
+                    self.set_level(w, h, fps);
+                    level_raised = true;
+                }
                 changed = true;
             }
             if !changed {
@@ -3829,6 +3834,60 @@ mod gpu_tests {
         assert_eq!(key[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&key), (1280, 720));
         assert_eq!(h264_max_num_ref_frames(&key[VIDEO_HEADER_LEN..]), Some(REFERENCE_FRAMES), "720p declares eight");
+    }
+
+    /// On a real GPU, a live frame-rate drop keeps the level the decoded picture buffer needs: a
+    /// 1080p session opened at 120 fps declares the eight frames its level admits there, and the
+    /// drop to 60 fps, whose own level admits fewer, is taken at that level, so a CBR session
+    /// spends about twice the bits on each frame. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_frame_rate_drop_keeps_the_level_the_buffer_needs() {
+        for codec in [Codec::H264, Codec::H265] {
+            let mut s = settings(1920, 1080, 120.0);
+            s.codec = codec;
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = 8000;
+            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+            let level = enc.declared_level();
+            let frames: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(1920, 1080, i)).collect();
+            let kbit = |enc: &mut NvencEncoder, range: std::ops::Range<u64>| {
+                let n = (range.end - range.start) as f64;
+                let bytes: usize = range
+                    .map(|i| enc.encode_cpu_argb(&frames[i as usize % 16], 1920 * 4, i, 25, i == 0).expect("encode").len() - VIDEO_HEADER_LEN)
+                    .sum();
+                bytes as f64 * 8.0 / n / 1000.0
+            };
+            kbit(&mut enc, 0..20);
+            let at120 = kbit(&mut enc, 20..80);
+            s.target_fps = 60.0;
+            assert!(enc.reconfigure_rate(&s), "{codec:?}: the driver refused 60 fps");
+            assert_eq!(enc.declared_level(), level, "{codec:?}: the level the buffer needs stays");
+            let at60 = kbit(&mut enc, 80..200);
+            println!("{codec:?}: {at120:.1} kbit a frame at 120 fps, {at60:.1} at 60");
+            assert!(at60 > 1.4 * at120, "{codec:?}: halving the frame rate left {at60:.1} kbit a frame against {at120:.1}");
+        }
+    }
+
+    /// On a real GPU, a live frame-rate rise past the declared level's macroblock rate raises the
+    /// level at a key frame, whose sequence header is where a decoder learns it: a 1080p session
+    /// opened at 60 fps declares level 4.2, and 120 fps takes 5.1. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_frame_rate_rise_raises_the_level_at_a_key_frame() {
+        let mut s = settings(1920, 1080, 60.0);
+        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let f = frame(1920, 1080, 30);
+        for i in 0..3u64 {
+            enc.encode_cpu_argb(&f, 1920 * 4, i, 25, i == 0).expect("encode");
+        }
+        assert_eq!(enc.declared_level(), 42);
+        s.target_fps = 120.0;
+        assert!(enc.reconfigure_rate(&s), "the driver refused 120 fps");
+        let pkt = enc.encode_cpu_argb(&f, 1920 * 4, 3, 25, false).expect("encode");
+        assert_eq!(pkt[1] & 0x0f, FRAME_KEY, "the raised level reaches the stream at a key frame");
+        let sps = crate::encoders::codec::annexb_nals(&pkt[VIDEO_HEADER_LEN..]).find(|n| n[0] & 0x1f == 7).expect("an SPS");
+        assert_eq!(sps[3], 51, "level_idc");
     }
 
     /// On a real GPU, a live CBR rate change moves the VBV initial delay with the buffer: after
