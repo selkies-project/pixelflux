@@ -1280,13 +1280,13 @@ impl AppState {
     }
 
     /// Drain the clipboard read staged by `new_selection` and hand its `(mime, bytes)` entries,
-    /// the flavours of one copy, to the Python callback off-thread.
+    /// the flavors of one copy, to the Python callback off-thread.
     ///
     /// Runs from the loop *after* the dispatch that stored the new client source, so the requests
     /// target the current selection rather than the previous one. It clones the callback, opens a
     /// pipe per mime, and asks the owning client source to write each into its pipe's writer. A
     /// spawned reader thread then reads the responses in turn. The overall bound is by SIZE (64
-    /// MiB per flavour, then delivered truncated) so a hostile client cannot balloon memory; time
+    /// MiB per flavor, then delivered truncated) so a hostile client cannot balloon memory; time
     /// only bounds INACTIVITY — a producer that keeps bytes flowing may take as long as it needs
     /// (a large transfer from a slow source still delivers), while one that goes silent for 10 s
     /// without closing its fd is dropped so each clipboard change cannot leak a pinned thread +
@@ -1605,7 +1605,7 @@ const CLIPBOARD_IMAGE_MIMES: &[&str] =
 const CLIPBOARD_TEXT_MIMES: &[&str] =
     &["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"];
 
-/// One staged clipboard flavour read to its end: the source's bytes, or nothing for a source
+/// One staged clipboard flavor read to its end: the source's bytes, or nothing for a source
 /// that wrote none or went silent.
 fn read_selection(reader: std::io::PipeReader) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -1648,12 +1648,12 @@ fn read_selection(reader: std::io::PipeReader) -> Option<Vec<u8>> {
 }
 
 /// Selection (clipboard) bridge between Wayland clients and Python. `SelectionUserData` is
-/// the Python-owned payload, one `(mime, bytes)` entry per offered flavour, served to
+/// the Python-owned payload, one `(mime, bytes)` entry per offered flavor, served to
 /// pasting clients when Python holds the selection.
 impl SelectionHandler for AppState {
     type SelectionUserData = std::sync::Arc<Vec<(String, Vec<u8>)>>;
 
-    /// A client took the clipboard: pick the flavours to read and stage them for the loop.
+    /// A client took the clipboard: pick the flavors to read and stage them for the loop.
     ///
     /// Only client-owned clipboard (not primary) selections are relayed to Python. Among the
     /// source's offered mimes it chooses the picture, else the markup and the plain text

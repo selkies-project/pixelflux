@@ -16,7 +16,7 @@ PKG_CONFIG_PATH = "/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/loca
 PATH = "$HOME/.cargo/bin:$PATH"
 
 [tool.cibuildwheel.linux]
-# PIXELFLUX_ENABLE_GPL selects the wheel flavour (see setup.py): it has to reach
+# PIXELFLUX_ENABLE_GPL selects the wheel flavor (see setup.py): it has to reach
 # the container for both before-all (whether libx264 is built) and the build.
 environment-pass = ["PIXELFLUX_ENABLE_GPL"]
 before-all = """
@@ -45,7 +45,7 @@ before-all = """
     # The same native builds on both platforms, so a wheel carries the same
     # native code whichever libc it targets. No distro package is used for any
     # of them: manylinux has none, Alpine's are GPL builds auditwheel would
-    # bundle into the non-GPL wheel, and the wheel flavour must decide whether
+    # bundle into the non-GPL wheel, and the wheel flavor must decide whether
     # a GPL library exists at all.
     #
     # * libx264 and x265, only for the GPL wheel (the default; PIXELFLUX_ENABLE_GPL=0

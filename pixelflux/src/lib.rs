@@ -642,7 +642,7 @@ pub enum ThreadCommand {
     SetCursorCallback(Option<Py<PyAny>>),
     SetClipboardCallback(Py<PyAny>),
     /// Server-side clipboard offer: the compositor owns the selection and serves one payload
-    /// per `(mime, data)` entry (plus text aliases), so a paste takes the flavour it asks for.
+    /// per `(mime, data)` entry (plus text aliases), so a paste takes the flavor it asks for.
     SetClipboard { entries: Vec<(String, Vec<u8>)> },
     KeyboardKey { scancode: u32, state: u32 },
     /// A whole ordered run of key events in one message. Typing a paste one event at a
@@ -5997,7 +5997,7 @@ impl WaylandBackend {
     }
 
     /// cb(entries: list[tuple[str, bytes]]) fires when a client app copies to the clipboard,
-    /// with the flavours of the copy: the picture, or the markup and the text beneath it.
+    /// with the flavors of the copy: the picture, or the markup and the text beneath it.
     fn set_clipboard_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
         self.send(ThreadCommand::SetClipboardCallback(callback))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set clipboard callback: {}", e)))?;
@@ -6006,7 +6006,7 @@ impl WaylandBackend {
 
     /// Compositor-side clipboard offer: serve one payload per `(mime, data)` entry, so a
     /// client pasting rich text takes the markup and one pasting into a plain field takes
-    /// the text the source itself wrote, instead of both taking whichever flavour was
+    /// the text the source itself wrote, instead of both taking whichever flavor was
     /// picked for them.
     fn set_clipboard(&self, entries: Vec<(String, Vec<u8>)>) -> PyResult<()> {
         self.send(ThreadCommand::SetClipboard { entries })
@@ -7640,7 +7640,7 @@ impl ScreenCapture {
             .map_or(Ok(String::new()), |be| be.bind(py).borrow().get_xkb_keymap_string(py))
     }
     /// cb(entries: list[tuple[str, bytes]]) fires when a client app copies to the clipboard,
-    /// with the flavours of the copy: the picture, or the markup and the text beneath it.
+    /// with the flavors of the copy: the picture, or the markup and the text beneath it.
     fn set_clipboard_callback(&self, py: Python<'_>, callback: Py<PyAny>) -> PyResult<()> {
         match wayland_backend_running(py) {
             Some(be) => be.bind(py).borrow().set_clipboard_callback(callback),
