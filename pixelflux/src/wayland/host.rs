@@ -945,8 +945,9 @@ pub struct HostSession {
     vk: Option<ZwpVirtualKeyboardV1>,
     keyboard: Mutex<HostKeyboardState>,
     vptr: Option<ZwlrVirtualPointerV1>,
-    /// Kernel input devices, taken ahead of every protocol rung where
-    /// `/dev/uinput` can serve them.
+    /// Kernel input devices, taken where `/dev/uinput` can serve them and the
+    /// compositor offers neither libei nor a virtual keyboard or pointer, ahead
+    /// of the portal's own methods.
     uinput: Option<crate::uinput::Pair>,
     /// The portal session when frames or an input device come through xdg-desktop-portal.
     portal: Option<Arc<PortalCtl>>,
