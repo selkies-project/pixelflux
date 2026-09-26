@@ -1354,7 +1354,7 @@ mod gpu_tests {
             println!("the NvFBC path declined this session on this host; nothing to capture");
             return;
         };
-        let mut dec = VideoDecoder::new(DecCodec::H264).expect("avcodec h264");
+        let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
         let mut pointers = Vec::new();
 
         let encode = |gpu: &mut GpuCapture, i: u64, key: bool, pointers: &mut Vec<CUdeviceptr>| -> Vec<u8> {
