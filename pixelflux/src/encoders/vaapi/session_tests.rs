@@ -662,3 +662,48 @@ fn fullcolor_takes_the_surface_the_driver_renders() {
         }
     }
 }
+
+/// A driver that writes its own slice headers still takes each picture's number, order count,
+/// reconstruction surface, and reference from the session, so a session that tracks no
+/// references counts its frames all the same: both counts advance every frame, the
+/// reconstruction surfaces rotate with the previous frame's as the reference, and a forced key
+/// frame restarts the counts.
+#[test]
+fn a_session_tracking_no_references_counts_its_frames() {
+    for codec in [Codec::H264, Codec::H265] {
+        let mut own_slices = Driver::generous();
+        own_slices.attributes.retain(|a| a.0 != VAConfigAttribEncPackedHeaders);
+        own_slices.attributes.push((VAConfigAttribEncPackedHeaders, VA_ENC_PACKED_HEADER_SEQUENCE));
+        mock::reset(own_slices);
+        let mut enc = session(codec, false);
+        let mut recon: Vec<VASurfaceID> = Vec::new();
+        for t in 0..24u64 {
+            let key = t == 0 || t == 20;
+            let out = encode(&mut enc, t, key);
+            assert_eq!(parse_video_type(out[1]), Some((codec, if key { FRAME_KEY } else { FRAME_DELTA })), "{codec:?} frame {t}");
+            let count = if t >= 20 { t - 20 } else { t };
+            let (current, reference) = mock::with(|d| {
+                let slices = d.last_buffers(VAEncSliceParameterBufferType);
+                if codec == Codec::H264 {
+                    let pic: VAEncPictureParameterBufferH264 = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                    let slice: VAEncSliceParameterBufferH264 = unsafe { ptr::read_unaligned(slices[0].as_ptr() as *const _) };
+                    assert_eq!((pic.frame_num as u64, pic.CurrPic.TopFieldOrderCnt as u64), (count, 2 * count), "frame {t}: frame_num and order count");
+                    (pic.CurrPic.picture_id, (!key).then(|| (slice.RefPicList0[0].picture_id, slice.RefPicList0[0].frame_idx as u64)))
+                } else {
+                    let pic: VAEncPictureParameterBufferHEVC = d.last_param(VAEncPictureParameterBufferType).unwrap();
+                    let slice: VAEncSliceParameterBufferHEVC = unsafe { ptr::read_unaligned(slices[0].as_ptr() as *const _) };
+                    assert_eq!(pic.decoded_curr_pic.pic_order_cnt as u64, count, "frame {t}: order count");
+                    (pic.decoded_curr_pic.picture_id, (!key).then(|| (slice.ref_pic_list0[0].picture_id, slice.ref_pic_list0[0].pic_order_cnt as u64)))
+                }
+            });
+            if let Some(reference) = reference {
+                assert_eq!(reference, (recon[t as usize - 1], count - 1), "{codec:?} frame {t} predicts from the previous frame");
+            }
+            assert_ne!(recon.last(), Some(&current), "{codec:?} frame {t} reconstructs into a surface of its own");
+            recon.push(current);
+            assert_eq!(enc.last_reference(), Reference::Untracked);
+        }
+        let pool: std::collections::HashSet<_> = recon.iter().collect();
+        assert_eq!(pool.len(), REFERENCE_FRAMES as usize + 1, "{codec:?}: the whole reconstruction pool rotates");
+    }
+}

@@ -153,13 +153,21 @@ impl Driver {
         })
     }
 
-    /// The coded picture the driver hands back: the packed headers where the session writes
-    /// them, else a frame tag of the kind the picture parameters ask for.
+    /// The coded picture the driver hands back: the packed headers the session wrote, then,
+    /// where it wrote no picture or slice header, a frame tag of the kind the picture
+    /// parameters ask for.
     fn coded_picture(&self) -> Vec<u8> {
-        let packed: Vec<u8> = self.last_packed().into_iter().flat_map(|(_, b)| b).collect();
-        if !packed.is_empty() {
-            return packed;
+        let packed = self.last_packed();
+        let mut coded: Vec<u8> = packed.iter().flat_map(|p| p.1.iter().copied()).collect();
+        if packed.iter().all(|p| p.0 == VAEncPackedHeaderSequence) {
+            coded.extend(self.frame_tag());
         }
+        coded
+    }
+
+    /// The bytes a driver writing its own headers codes a picture with, as far as the
+    /// session's frame labeling reads them.
+    fn frame_tag(&self) -> Vec<u8> {
         let Some((_, _, indices)) = self.pictures.last() else { return Vec::new() };
         for &i in indices {
             let (_, kind, bytes) = &self.buffers[i];

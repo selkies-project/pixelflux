@@ -508,6 +508,10 @@ pub struct VaapiEncoder {
     coded: VABufferID,
     arm: Arm,
     references: Option<References>,
+    /// The frames encoded and the count at the last key frame, which a session that tracks no
+    /// references keeps itself; a tracked one keeps both in its references.
+    frame_count: u64,
+    key_count: u64,
     /// The surface each held frame was reconstructed into, by timestamp.
     surfaces_of: HashMap<u64, VASurfaceID>,
     last_reference: Reference,
@@ -701,6 +705,8 @@ impl VaapiEncoder {
             coded: VA_INVALID_ID,
             arm: Arm::Vp8(vp8::Arm::new()),
             references: None,
+            frame_count: 0,
+            key_count: 0,
             surfaces_of: HashMap::new(),
             last_reference: Reference::Untracked,
             rate,
@@ -1172,7 +1178,7 @@ impl VaapiEncoder {
         let pts = match &self.references {
             Some(References::Window(w)) => w.next_pts(),
             Some(References::Slots(s)) => s.next_pts(),
-            None => self.surfaces_of.len() as u64,
+            None => self.frame_count,
         };
         let recon = self.recon[(pts % self.recon.len() as u64) as usize];
         let held: Vec<(u64, VASurfaceID, bool)> = match &self.references {
@@ -1192,7 +1198,12 @@ impl VaapiEncoder {
                 let reference = (plan.predict_from != 0).then(|| s.slot(plan.predict_from)).flatten().and_then(|(_, p, _)| self.surfaces_of.get(&p).map(|&surf| (p, surf)));
                 (reference, 0, plan, surfaces)
             }
-            None => (if key { None } else { self.surfaces_of.get(&(pts - 1)).map(|&s| (pts - 1, s)) }, 0, SlotPlan::KEY, [VA_INVALID_SURFACE; 3]),
+            None => (
+                if key { None } else { self.surfaces_of.get(&(pts - 1)).map(|&s| (pts - 1, s)) },
+                if key { pts } else { self.key_count },
+                SlotPlan::KEY,
+                [VA_INVALID_SURFACE; 3],
+            ),
         };
         let frame = Frame { key, pts, key_pts, recon, coded: self.coded, reference, held: &held, qp: self.qp, slots, slot_surfaces };
         let mut out = Buffers::new();
@@ -1220,7 +1231,13 @@ impl VaapiEncoder {
                 let plan = if is_key { s.plan(true) } else { slots };
                 s.record(frame_id, plan)
             }
-            None => Reference::Untracked,
+            None => {
+                self.frame_count = pts + 1;
+                if is_key {
+                    self.key_count = pts;
+                }
+                Reference::Untracked
+            }
         };
         let mut output = Vec::with_capacity(VIDEO_HEADER_LEN + coded.len());
         if !self.omit_headers {
