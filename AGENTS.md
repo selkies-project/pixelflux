@@ -78,7 +78,8 @@ always (VP9 in libvpx's flexible reference mode, VP8 across its three buffers on
 keeps), NVENC where the device reports reference-picture invalidation, VA-API where the driver takes the
 session's own H.264 or HEVC slice headers or addresses the VP8 buffers and the VP9 and AV1 slots, Tegra for
 H.265 through the vendor's external reference set (L4T R32 and R36); and the stream declares the decoded
-picture buffer its level admits, or the eight AV1 fixes whatever the level. A session that does not (x265,
+picture buffer its level admits, or for AV1 a fixed eight whatever the level, four under NVENC, whose AV1
+frames predict from no more. A session that does not (x265,
 kvazaar, SVT-AV1, Tegra's H.264 and AV1, a stateful V4L2 device) refuses, and the caller forces an
 IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
 since the FFmpeg decoder of Chromium and Firefox derives the picture order past that gap wrongly and withholds every picture after it. Every full-frame session is chosen by one ladder,
