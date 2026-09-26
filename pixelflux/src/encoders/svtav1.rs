@@ -42,6 +42,10 @@ const MANAGED_REFS: u8 = 4;
 /// mode; a session on one re-opens the encoder for it, and the first frame answers.
 const KEYFRAME_BY_REOPEN: bool = SVT_AV1_VERSION_MAJOR < 2;
 
+/// SVT-AV1 before 1.5 drains an encoder on release even when it took no frame, and waits for a
+/// packet that never comes; a session released before its first frame feeds it one.
+const FEED_BEFORE_RELEASE: bool = SVT_AV1_VERSION_MAJOR < 1 || (SVT_AV1_VERSION_MAJOR == 1 && SVT_AV1_VERSION_MINOR < 5);
+
 /// Held while a handle is created or released and while the probe forks: before 4.0 the
 /// library rebuilds a process-wide processor table in every handle it creates and frees it in
 /// every one it releases, and from 4.1 handle setup takes process-wide locks that a child
@@ -202,6 +206,12 @@ impl SvtAv1Encoder {
         *header = unsafe { std::mem::zeroed() };
         header.size = std::mem::size_of::<EbBufferHeaderType>() as u32;
         header.p_buffer = io as *mut EbSvtIOFormat as *mut u8;
+        io.luma = self.planes.y.as_mut_ptr();
+        io.cb = self.planes.u.as_mut_ptr();
+        io.cr = self.planes.v.as_mut_ptr();
+        io.y_stride = self.planes.width as u32;
+        io.cb_stride = self.planes.chroma_width() as u32;
+        io.cr_stride = self.planes.chroma_width() as u32;
         header.n_alloc_len = (self.planes.y.len() + self.planes.u.len() + self.planes.v.len()) as u32;
         self.fresh = true;
         self.events = Events::default();
@@ -216,6 +226,13 @@ impl SvtAv1Encoder {
             return;
         }
         unsafe {
+            if self.fresh && FEED_BEFORE_RELEASE {
+                let header = &mut self.input.0;
+                header.n_filled_len = header.n_alloc_len;
+                header.flags = 0;
+                header.pic_type = EB_AV1_KEY_PICTURE;
+                self.fresh = svt_av1_enc_send_picture(self.handle, header) != EB_ErrorNone;
+            }
             if !self.fresh {
                 let mut last: EbBufferHeaderType = std::mem::zeroed();
                 last.pic_type = EB_AV1_INVALID_PICTURE;
@@ -319,13 +336,7 @@ impl SvtAv1Encoder {
             self.events.clear = if key { 0 } else { released.unwrap_or(0) };
         }
         {
-            let (header, io) = &mut *self.input;
-            io.luma = self.planes.y.as_mut_ptr();
-            io.cb = self.planes.u.as_mut_ptr();
-            io.cr = self.planes.v.as_mut_ptr();
-            io.y_stride = self.planes.width as u32;
-            io.cb_stride = self.planes.chroma_width() as u32;
-            io.cr_stride = self.planes.chroma_width() as u32;
+            let header = &mut self.input.0;
             header.n_filled_len = header.n_alloc_len;
             header.pts = pts as i64;
             header.flags = 0;
@@ -392,6 +403,18 @@ impl SvtAv1Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session let go before its first frame closes.
+    #[test]
+    fn a_session_let_go_before_its_first_frame_closes() {
+        let (done, closed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let settings = RustCaptureSettings { width: 64, height: 64, target_fps: 30.0, codec: Codec::Av1, ..Default::default() };
+            drop(SvtAv1Encoder::new(&settings, false).expect("session"));
+            let _ = done.send(());
+        });
+        assert!(closed.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "the release never returned");
+    }
 
     /// Sessions opened and closed on many threads at once each encode their frame.
     #[test]
