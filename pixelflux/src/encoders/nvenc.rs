@@ -4173,13 +4173,14 @@ mod gpu_tests {
     fn gpu_vram_probe() {
         // The measurement wants the driver's own view of the device, which only nvidia-smi
         // gives from outside the session's context; a host or container without it reports that
-        // rather than failing a test that cannot measure anything.
+        // rather than failing a test that cannot measure anything. Summed over every GPU it lists,
+        // so the delta is the session's on whichever device it opened.
         fn used_mb() -> Option<i64> {
             let out = std::process::Command::new("nvidia-smi")
                 .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
                 .output()
                 .ok()?;
-            String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+            String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().parse::<i64>().ok()).sum()
         }
         let s = settings(1920, 1080, 60.0);
         let Some(before) = used_mb() else {
