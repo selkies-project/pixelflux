@@ -804,6 +804,10 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>,
     }
 }
 
+/// The probe's answer where the device refuses a session for want of one to spare (the
+/// session cap of consumer boards, or its memory): nothing lasting, unlike its other refusals.
+pub(crate) const SESSIONS_TAKEN: &str = "the device has no NVENC session to spare";
+
 /// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes
 /// and whether each in 4:4:4, and close it.
 unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) -> Result<Vec<(Codec, bool)>, String> {
@@ -826,8 +830,10 @@ unsafe fn probe_session_codecs(nvenc_lib: &NvencLibrary, cu_context: CUcontext) 
         ..Default::default()
     };
     let mut session: *mut c_void = ptr::null_mut();
-    if open_fn(&mut session_params, &mut session) != NVENCSTATUS::NV_ENC_SUCCESS {
-        return Err("Failed to open NVENC session".into());
+    match open_fn(&mut session_params, &mut session) {
+        NVENCSTATUS::NV_ENC_SUCCESS => {}
+        NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => return Err(SESSIONS_TAKEN.into()),
+        _ => return Err("Failed to open NVENC session".into()),
     }
     let codecs = Codec::VIDEO
         .into_iter()

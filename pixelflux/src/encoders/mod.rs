@@ -87,19 +87,30 @@ pub type HardwareEncoders = Vec<(Codec, &'static str, bool)>;
 /// session is then refused for (a size past the engine's maximum, a 4:4:4 the engine lacks)
 /// is still the ladder's to fall through on.
 pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
-    static PROBED: OnceLock<Mutex<HashMap<i32, HardwareEncoders>>> = OnceLock::new();
+    probe_node(encode_node_index).unwrap_or_default()
+}
+
+/// An encode node's probe answer: its hardware table, or the refusal of its NVENC or VA-API
+/// backend as `(backend, error)`.
+type ProbeAnswer = Result<HardwareEncoders, (&'static str, String)>;
+
+/// `hardware_encoders` with the refusal of a node whose backend could not be brought up. A
+/// device with no NVENC session to spare (`nvenc::SESSIONS_TAKEN`) says nothing lasting, so
+/// that answer is asked again.
+fn probe_node(encode_node_index: i32) -> ProbeAnswer {
+    static PROBED: OnceLock<Mutex<HashMap<i32, ProbeAnswer>>> = OnceLock::new();
     let node = encode_node_index.max(0);
     let mut probed = PROBED.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    if let Some(served) = probed.get(&node) {
-        return served.clone();
+    if let Some(answer) = probed.get(&node) {
+        return answer.clone();
     }
     #[cfg(target_arch = "aarch64")]
     if tegra::available() {
         let served: HardwareEncoders = tegra::served().into_iter().map(|c| (c, "tegra", false)).collect();
         let names: Vec<&str> = served.iter().map(|(c, ..)| c.display()).collect();
         println!("[pixelflux] Render node {node} encodes {} on tegra.", names.join(", "));
-        probed.insert(node, served.clone());
-        return served;
+        probed.insert(node, Ok(served.clone()));
+        return Ok(served);
     }
     let driver = crate::get_gpu_driver(node);
     let (backend, codecs) = if crate::driver_selects_nvenc(&driver) {
@@ -107,14 +118,14 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
     } else {
         ("vaapi", vaapi::probe_codecs(node))
     };
-    let served: HardwareEncoders = match codecs {
-        Ok(codecs) => codecs.into_iter().map(|(codec, fullcolor)| (codec, backend, fullcolor)).collect(),
+    let answer = match codecs {
+        Ok(codecs) => Ok(codecs.into_iter().map(|(codec, fullcolor)| (codec, backend, fullcolor)).collect()),
         Err(e) => {
             eprintln!("[pixelflux] No hardware encoder on render node {node} ({backend}): {e}");
-            Vec::new()
+            Err((backend, e))
         }
     };
-    if served.is_empty() && v4l2m2m::available() {
+    if answer.as_ref().map_or(true, Vec::is_empty) && v4l2m2m::available() {
         // The node index names nothing here: an M2M encoder is not a render node, and the
         // answer is the same whichever index was asked about. It is cached under the key all
         // the same, so a caller asking twice is answered from the same probe.
@@ -122,15 +133,19 @@ pub fn hardware_encoders(encode_node_index: i32) -> HardwareEncoders {
         let served: HardwareEncoders = codecs.iter().map(|&c| (c, "v4l2m2m", false)).collect();
         let names: Vec<&str> = codecs.iter().map(|c| c.display()).collect();
         println!("[pixelflux] A stateful V4L2 M2M encoder serves {}.", names.join(", "));
-        probed.insert(node, served.clone());
-        return served;
+        probed.insert(node, Ok(served.clone()));
+        return Ok(served);
     }
-    if !served.is_empty() {
+    if let Ok(served) = &answer
+        && !served.is_empty()
+    {
         let names: Vec<&str> = served.iter().map(|(codec, ..)| codec.display()).collect();
         println!("[pixelflux] Render node {node} encodes {} on {backend}.", names.join(", "));
     }
-    probed.insert(node, served.clone());
-    served
+    if !matches!(&answer, Err((_, e)) if e == nvenc::SESSIONS_TAKEN) {
+        probed.insert(node, answer.clone());
+    }
+    answer
 }
 
 /// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264
@@ -324,6 +339,28 @@ mod tests {
         // An engine's codecs go most efficient first, whatever the build encodes in software.
         let engine = [Codec::H264, Codec::H265, Codec::Av1];
         assert_eq!(&fallback_codecs(Codec::Vp8, &engine, true)[..3], &[Codec::Av1, Codec::H265, Codec::H264]);
+    }
+
+    /// A capture start takes what its node's probe settled rather than opening the backend
+    /// again: node 99 has no render device, so it reads as NVENC's, which has no VP8 engine.
+    #[test]
+    fn a_session_takes_the_answer_its_node_probe_settled() {
+        let report = crate::report::StreamReport::new("x11");
+        let _scope = crate::report::enter(&report);
+        let mut settings = RustCaptureSettings {
+            width: 256,
+            height: 128,
+            codec: Codec::Vp8,
+            encode_node_index: 99,
+            ..Default::default()
+        };
+        let encoder = select_frame_encoder(&mut settings, FrameSource::Host { rgba: false }, None, "test");
+        assert!(encoder.is_some_and(|enc| !enc.is_hardware()), "VP8 comes up in software");
+        let settled = match probe_node(99) {
+            Err((backend, e)) => format!("{} VP8 did not open: {e}", backend.to_uppercase()),
+            Ok(_) => "render node 99 has no VP8 engine".to_string(),
+        };
+        assert_eq!(report.info().encoder_reason, settled);
     }
 
     /// The software encoders that take a 4:4:4 session: x264 and x265, and libvpx for VP9 alone;
@@ -747,7 +784,23 @@ fn select_for_codec(
         let node = settings.encode_node_index.max(0);
         let driver = crate::get_gpu_driver(node);
         crate::log::debug!("[{tag}] Encode node {node}, driver {driver}.");
-        if crate::driver_selects_nvenc(&driver) {
+        // What the node's probe settled holds for every capture start: a backend it could not
+        // bring up, or a device with no engine for the codec, is not opened again.
+        let settled = match probe_node(node) {
+            Err((backend, e)) if e != nvenc::SESSIONS_TAKEN => {
+                Some(format!("{} {} did not open: {e}", backend.to_uppercase(), codec.display()))
+            }
+            Ok(served)
+                if !served.iter().any(|&(c, backend, _)| c == codec && matches!(backend, "nvenc" | "vaapi")) =>
+            {
+                Some(format!("render node {node} has no {} engine", codec.display()))
+            }
+            _ => None,
+        };
+        if let Some(reason) = settled {
+            drop(prior);
+            crate::report::encoder_reason(&reason);
+        } else if crate::driver_selects_nvenc(&driver) {
             if let Some(FrameEncoder::Nvenc(mut enc)) = prior {
                 match enc.reconfigure_resolution(settings) {
                     Ok(resized) => {
