@@ -153,7 +153,7 @@ fn probe_node(encode_node_index: i32) -> ProbeAnswer {
 /// SVT-AV1 encode such a request 4:2:0.
 pub fn software_fullcolor(codec: Codec) -> bool {
     match software_encoder(codec) {
-        Some(enc) => matches!(enc.library, "x264" | "x265") || (codec == Codec::Vp9 && enc.library == "libvpx"),
+        Some(enc) => matches!(enc.library, "x264" | "x265") || (codec == Codec::Vp9 && enc.library == "libvpx" && vpx::encodes_444()),
         None => false,
     }
 }
@@ -401,7 +401,7 @@ mod tests {
     fn software_fullcolor_follows_the_library() {
         assert_eq!(software_fullcolor(Codec::H264), software_library(Codec::H264) == "x264");
         assert_eq!(software_fullcolor(Codec::H265), software_library(Codec::H265) == "x265");
-        assert_eq!(software_fullcolor(Codec::Vp9), software_library(Codec::Vp9) == "libvpx");
+        assert_eq!(software_fullcolor(Codec::Vp9), software_library(Codec::Vp9) == "libvpx" && vpx::encodes_444());
         assert!(!software_fullcolor(Codec::Av1) && !software_fullcolor(Codec::Vp8));
     }
 
@@ -454,7 +454,7 @@ mod tests {
         assert_eq!(software_fullcolor(Codec::H264), cfg!(feature = "gpl"));
         assert_eq!(software_fullcolor(Codec::H265), cfg!(feature = "gpl"));
         assert!(!software_fullcolor(Codec::Vp8) && !software_fullcolor(Codec::Av1));
-        assert!(software_fullcolor(Codec::Vp9));
+        assert_eq!(software_fullcolor(Codec::Vp9), vpx::encodes_444());
     }
 
     /// A session's range is the session's to report, not something read off whether its

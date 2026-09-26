@@ -42,6 +42,13 @@ const VP9_LAYERS: u32 = 2;
 /// The libvpx quantizer levels a session leaves to the library's own bounds.
 const VP8_DEFAULT_MIN_LEVEL: u32 = 4;
 
+/// Whether the loaded libvpx codes VP9 4:4:4 in the flexible mode the sessions run: before 1.13
+/// its layer machinery re-sizes every frame at 4:2:0, so a profile 1 session writes headers
+/// over pictures no decoder takes.
+pub fn encodes_444() -> bool {
+    (unsafe { vpx_codec_version() }) >= (1 << 16) | (13 << 8)
+}
+
 /// One libvpx session for one capture.
 pub struct VpxEncoder {
     codec: Codec,
@@ -88,7 +95,7 @@ impl VpxEncoder {
             return Err(format!("libvpx encodes no {}", codec.display()));
         }
         let _ = rgba;
-        let fullcolor = codec == Codec::Vp9 && settings.video_fullcolor;
+        let fullcolor = codec == Codec::Vp9 && settings.video_fullcolor && encodes_444();
         let threads = encode_threads() as u32;
         let rate = RateSettings::new(settings);
         let quality = Quality::new(codec.quantizer(settings.video_crf));
