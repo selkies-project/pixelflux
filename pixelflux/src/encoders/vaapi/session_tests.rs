@@ -411,7 +411,7 @@ fn vp8_follows_the_slot_plan() {
     mock::reset(Driver::generous());
     let mut enc = session(Codec::Vp8, false);
     let mut refreshes = Vec::new();
-    for t in 0..9u64 {
+    for t in 0..25u64 {
         encode(&mut enc, t, t == 0);
         mock::with(|d| {
             let pic: VAEncPictureParameterBufferVP8 = d.last_param(VAEncPictureParameterBufferType).unwrap();
@@ -426,22 +426,22 @@ fn vp8_follows_the_slot_plan() {
     }
     assert_eq!(refreshes[0], (1, 1, 1), "the key frame refreshes every buffer");
     assert_eq!(refreshes[1], (1, 0, 0));
-    assert_eq!(refreshes[2], (1, 1, 0), "frame 2 is a golden anchor");
-    assert_eq!(refreshes[8], (1, 0, 1), "frame 8 is an altref anchor");
-    assert!(enc.invalidate_reference(5));
-    let out = encode(&mut enc, 9, false);
-    assert_eq!(parse_video_type(out[1]), Some((Codec::Vp8, FRAME_KEY)), "a loss from frame 5 on takes LAST (8), GOLDEN (6), and ALTREF (8)");
-    for t in 10..14u64 {
+    assert_eq!(refreshes[12], (1, 0, 1), "frame 12 is an altref anchor");
+    assert_eq!(refreshes[24], (1, 1, 0), "frame 24 is a golden anchor");
+    assert!(enc.invalidate_reference(12));
+    let out = encode(&mut enc, 25, false);
+    assert_eq!(parse_video_type(out[1]), Some((Codec::Vp8, FRAME_KEY)), "a loss from frame 12 on takes LAST and GOLDEN (24) and ALTREF (12)");
+    for t in 26..40u64 {
         encode(&mut enc, t, false);
     }
-    assert!(enc.invalidate_reference(12));
-    encode(&mut enc, 14, false);
-    assert_eq!(enc.last_reference(), Reference::Frame(11), "the golden anchor of frame 11, older than the loss");
+    assert!(enc.invalidate_reference(38));
+    encode(&mut enc, 40, false);
+    assert_eq!(enc.last_reference(), Reference::Frame(37), "the altref anchor of frame 37, older than the loss");
     mock::with(|d| {
         let pic: VAEncPictureParameterBufferVP8 = d.last_param(VAEncPictureParameterBufferType).unwrap();
         let r = unsafe { pic.ref_flags.bits };
         let p = unsafe { pic.pic_flags.bits };
-        assert_eq!((r.no_ref_last(), r.no_ref_gf(), r.no_ref_arf()), (1, 0, 1), "the recovery predicts from GOLDEN alone");
+        assert_eq!((r.no_ref_last(), r.no_ref_gf(), r.no_ref_arf()), (1, 1, 0), "the recovery predicts from ALTREF alone");
         assert_eq!((p.refresh_last(), p.refresh_golden_frame(), p.refresh_alternate_frame()), (1, 1, 1), "the recovery refreshes every buffer");
     });
 }
@@ -775,7 +775,7 @@ fn vp8_never_reconstructs_into_a_buffer_it_holds() {
             }
         });
         if t == 30 {
-            assert_eq!(enc.last_reference(), Reference::Frame(26), "the recovery predicts from the golden anchor");
+            assert_eq!(enc.last_reference(), Reference::Frame(24), "the recovery predicts from the golden anchor");
         }
     }
 }

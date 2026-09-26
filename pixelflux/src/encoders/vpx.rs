@@ -18,7 +18,9 @@
 //! its picture is kept out too: VP8's entropy probabilities persist across frames unless a
 //! frame declines to update them, so no frame does, and a VP9 decoder takes the previous
 //! frame's motion vectors and probability contexts whatever the references say, which only the
-//! codec's error-resilient mode switches off.
+//! codec's error-resilient mode switches off. VP8 runs error-resilient too, since its
+//! constant-rate control otherwise refreshes GOLDEN on a schedule of its own, whatever a frame's
+//! flags say.
 
 use std::ffi::{c_int, c_long, c_void, CStr};
 use std::ptr;
@@ -26,7 +28,7 @@ use std::ptr;
 use codec_sys::vpx::*;
 
 use super::codec::{frame_type_from_key, push_video_header, vp8_is_key, vp9_is_key, vpx_level, Codec, VIDEO_HEADER_LEN};
-use super::reference::{Reference, ReferenceSlots, ReferenceWindow, SlotPlan, SlotRefresh, REFERENCE_FRAMES};
+use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{encode_threads, Pending, Planes, Quality, RateSettings};
 use crate::RustCaptureSettings;
 
@@ -40,12 +42,6 @@ const VP9_LAYERS: u32 = 2;
 /// The libvpx quantizer levels a session leaves to the library's own bounds.
 const VP8_DEFAULT_MIN_LEVEL: u32 = 4;
 
-/// The references a session keeps: VP9's eight slots as a sliding window, VP8's three buffers.
-enum References {
-    Window(ReferenceWindow),
-    Slots(ReferenceSlots),
-}
-
 /// One libvpx session for one capture.
 pub struct VpxEncoder {
     codec: Codec,
@@ -56,10 +52,10 @@ pub struct VpxEncoder {
     quality: Quality,
     rate: RateSettings,
     omit_headers: bool,
-    references: References,
+    references: ReferenceSlots,
     last_reference: Reference,
     pending: Pending,
-    /// The slot plan of the frame being encoded, recorded once its packet returns (VP8).
+    /// The slot plan of the frame being encoded, recorded once its packet returns.
     plan: SlotPlan,
 }
 
@@ -105,7 +101,7 @@ impl VpxEncoder {
         cfg.g_threads = threads.min(64);
         cfg.g_lag_in_frames = 0;
         cfg.g_pass = VPX_RC_ONE_PASS;
-        cfg.g_error_resilient = if codec == Codec::Vp9 { VPX_ERROR_RESILIENT_DEFAULT } else { 0 };
+        cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
         cfg.g_profile = if fullcolor { 1 } else { 0 };
         cfg.g_bit_depth = 8;
         cfg.g_input_bit_depth = 8;
@@ -130,11 +126,7 @@ impl VpxEncoder {
             quality,
             rate,
             omit_headers: settings.omit_stripe_headers,
-            references: if codec == Codec::Vp9 {
-                References::Window(ReferenceWindow::new(REFERENCE_FRAMES))
-            } else {
-                References::Slots(ReferenceSlots::new())
-            },
+            references: if codec == Codec::Vp9 { ReferenceSlots::vp9() } else { ReferenceSlots::new() },
             last_reference: Reference::Untracked,
             pending: Pending::default(),
             plan: SlotPlan::KEY,
@@ -263,10 +255,7 @@ impl VpxEncoder {
     /// Leave frame `frame_id` and every frame after it out of the predictions; the next frame
     /// predicts from an earlier buffer, or is a key frame when none is left.
     pub fn invalidate_reference(&mut self, frame_id: u16) -> bool {
-        match &mut self.references {
-            References::Window(w) => w.invalidate(frame_id),
-            References::Slots(s) => s.invalidate(frame_id),
-        };
+        self.references.invalidate(frame_id);
         true
     }
 
@@ -296,29 +285,20 @@ impl VpxEncoder {
         let bt601 = self.codec == Codec::Vp8;
         self.planes.convert(pixels, stride, rgba, false, bt601, self.threads as usize)?;
 
-        let key = force_idr
-            || match &self.references {
-                References::Window(w) => !w.has_reference(),
-                References::Slots(s) => !s.has_reference(),
-            };
-        let pts = match &self.references {
-            References::Window(w) => w.next_pts(),
-            References::Slots(s) => s.next_pts(),
-        };
+        let key = force_idr || !self.references.has_reference();
+        let pts = self.references.next_pts();
         let mut flags: c_long = if key { VPX_EFLAG_FORCE_KF as c_long } else { 0 };
-        match &self.references {
-            References::Window(w) => {
+        self.plan = self.references.plan(key);
+        match self.codec {
+            Codec::Vp9 => {
                 let mut refs: vpx_svc_ref_frame_config = unsafe { std::mem::zeroed() };
-                if key {
-                    refs.update_buffer_slot[0] = 0xff;
-                } else {
-                    let (_, ref_pts) = w.newest_valid().expect("a reference or a key frame");
-                    let slot = (ref_pts % REFERENCE_FRAMES as u64) as c_int;
+                refs.update_buffer_slot[0] = self.plan.refresh.0 as c_int;
+                if !key {
+                    let slot = self.plan.predict_from.trailing_zeros() as c_int;
                     refs.lst_fb_idx[0] = slot;
                     refs.gld_fb_idx[0] = slot;
                     refs.alt_fb_idx[0] = slot;
                     refs.reference_last[0] = 1;
-                    refs.update_buffer_slot[0] = 1 << (pts % REFERENCE_FRAMES as u64);
                 }
                 let res = unsafe {
                     vpx_codec_control_(
@@ -331,8 +311,7 @@ impl VpxEncoder {
                     return Err(error(&self.ctx, "libvpx refused the reference configuration"));
                 }
             }
-            References::Slots(s) => {
-                self.plan = s.plan(key);
+            _ => {
                 flags |= VP8_EFLAG_NO_UPD_ENTROPY as c_long;
                 if !key {
                     for (buffer, no_ref, no_upd, force) in [
@@ -387,13 +366,8 @@ impl VpxEncoder {
             let bytes = unsafe { std::slice::from_raw_parts(frame.buf as *const u8, frame.sz) };
             let is_key = if self.codec == Codec::Vp8 { vp8_is_key(bytes) } else { vp9_is_key(bytes) };
             let id = self.pending.take(frame.pts as u64).unwrap_or(frame_number as u16);
-            self.last_reference = match &mut self.references {
-                References::Window(w) => w.record(id, is_key),
-                References::Slots(s) => {
-                    let plan = if is_key { s.plan(true) } else { self.plan };
-                    s.record(id, plan)
-                }
-            };
+            let plan = if is_key { self.references.plan(true) } else { self.plan };
+            self.last_reference = self.references.record(id, plan);
             if !self.omit_headers {
                 output.reserve(VIDEO_HEADER_LEN + bytes.len());
                 push_video_header(
@@ -459,7 +433,7 @@ mod tests {
 
     /// A frame a client lost is left out of the predictions: the next frame names the newest
     /// frame before it, and a decoder that never saw the lost frames decodes it exactly as one
-    /// that saw everything. VP9 reaches back through its eight slots, VP8 through its anchors.
+    /// that saw everything. VP9 reaches back through its recent frames, VP8 through its anchors.
     #[test]
     fn a_lost_frame_is_predicted_past() {
         for codec in [Codec::Vp8, Codec::Vp9] {
@@ -473,7 +447,7 @@ mod tests {
                 frames.push(out);
             }
             // Frame 5 is reported lost once 6 and 7 have gone out: VP9 predicts from 4 through
-            // its slots, VP8 from the altref anchor, the key frame, since its golden holds 6.
+            // its slots, VP8 from its golden anchor, which still holds the key frame.
             assert!(enc.invalidate_reference(5));
             let out = enc.encode_host(&frame(8), W * 4, false, 8, 25, false).expect("encode");
             let anchor = if codec == Codec::Vp9 { 4 } else { 0 };
@@ -494,21 +468,52 @@ mod tests {
         }
     }
 
+    /// A loss ten frames deep, past the last eight frames, is predicted past from an anchor, and
+    /// a decoder that never saw the lost frames decodes the frames after it exactly.
+    #[test]
+    fn a_loss_ten_frames_deep_is_predicted_past() {
+        for codec in [Codec::Vp8, Codec::Vp9] {
+            let s = settings(codec);
+            let mut enc = VpxEncoder::new(&s, codec, false).expect("session");
+            let mut frames = Vec::new();
+            for t in 0..30u64 {
+                frames.push(enc.encode_host(&frame(t as usize), W * 4, false, t, 25, t == 0).expect("encode"));
+            }
+            assert!(enc.invalidate_reference(20));
+            let out = enc.encode_host(&frame(30), W * 4, false, 30, 25, false).expect("encode");
+            assert_eq!(parse_video_type(out[1]).map(|(_, k)| k), Some(FRAME_DELTA), "{codec:?}");
+            let anchor = if codec == Codec::Vp9 { 16 } else { 12 };
+            assert_eq!(enc.last_reference(), Reference::Frame(anchor), "{codec:?}");
+            frames.push(out);
+            frames.push(enc.encode_host(&frame(31), W * 4, false, 31, 25, false).expect("encode"));
+            assert_eq!(enc.last_reference(), Reference::Frame(30), "{codec:?}");
+            let (mut whole, mut lossy) = (VideoDecoder::new(codec).unwrap(), VideoDecoder::new(codec).unwrap());
+            for (i, f) in frames.iter().enumerate() {
+                assert!(whole.decode(&f[VIDEO_HEADER_LEN..]).expect("decode"), "{codec:?} frame {i}");
+                if !(20..30).contains(&i) {
+                    assert!(lossy.decode(&f[VIDEO_HEADER_LEN..]).expect("decode without 20-29"), "{codec:?} frame {i}");
+                }
+            }
+            let apart = luma_distance(&whole.frame().unwrap(), &lossy.frame().unwrap());
+            assert!(apart == 0.0, "{codec:?}: the decoder that lost frames 20-29 shows frame 31 {apart:.2} off the one that saw them");
+        }
+    }
+
     /// A loss no buffer reaches past costs a key frame, and the count restarts there.
     #[test]
     fn a_loss_past_the_window_costs_a_key_frame() {
         for codec in [Codec::Vp8, Codec::Vp9] {
             let s = settings(codec);
             let mut enc = VpxEncoder::new(&s, codec, false).expect("session");
-            for t in 0..20u64 {
+            for t in 0..40u64 {
                 enc.encode_host(&frame(t as usize), W * 4, false, t, 25, t == 0).expect("encode");
             }
             assert!(enc.invalidate_reference(1));
-            let out = enc.encode_host(&frame(20), W * 4, false, 20, 25, false).expect("encode");
+            let out = enc.encode_host(&frame(40), W * 4, false, 40, 25, false).expect("encode");
             assert_eq!(parse_video_type(out[1]).map(|(_, k)| k), Some(FRAME_KEY), "{codec:?}");
             assert_eq!(enc.last_reference(), Reference::None);
-            enc.encode_host(&frame(21), W * 4, false, 21, 25, false).expect("encode");
-            assert_eq!(enc.last_reference(), Reference::Frame(20), "{codec:?}");
+            enc.encode_host(&frame(41), W * 4, false, 41, 25, false).expect("encode");
+            assert_eq!(enc.last_reference(), Reference::Frame(40), "{codec:?}");
         }
     }
 

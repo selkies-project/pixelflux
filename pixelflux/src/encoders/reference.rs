@@ -189,29 +189,39 @@ impl ReferenceWindow {
     }
 }
 
-/// The three buffers a VP8 encoder predicts from, LAST, GOLDEN, and ALTREF, with the frame each
-/// holds and whether a client reported it lost.
+/// The buffers a VP8 or VP9 encoder predicts from, with the frame each holds and whether a
+/// client reported it lost.
 ///
-/// A codec with three named buffers cannot hold the last eight frames the way a decoded picture
-/// buffer does, so the buffers are spent on anchors of different ages: every frame lands in LAST,
-/// every fourth in GOLDEN, and every sixteenth in ALTREF, on schedules that never meet, so a loss a
-/// few frames deep still finds an anchor older than it. A frame predicts from the newest buffer
-/// whose frame the client still has, LAST when the anchors are as new, and a frame coded from an
-/// anchor rather than LAST refreshes all three, since it is the newest picture both sides hold. The
-/// frame ids wrap; the timestamps are the session's own count of encoded frames and do not, and the
-/// recent ones are kept so a lost frame no buffer holds still dates the buffers coded after it.
+/// Some buffers are spent on anchors older than the last few frames, so a loss up to twelve
+/// frames deep still finds a frame older than it. VP8 has three, LAST, GOLDEN, and ALTREF: every
+/// frame lands in LAST, and every twelfth in GOLDEN and ALTREF by turns, so one anchor is always
+/// twelve to twenty-three frames old. VP9 has eight: the last four frames by turns in the first
+/// four, and every fourth frame by turns in the other four, the oldest twelve to fifteen frames
+/// back. A frame predicts from the newest buffer whose frame the client still has, the first
+/// such buffer when others are as new, and a VP8 frame coded from an anchor rather than LAST
+/// refreshes all three, since it is the newest picture both sides hold. The frame ids wrap; the
+/// timestamps are the session's own count of encoded frames and do not, and the recent ones are
+/// kept so a lost frame no buffer holds still dates the buffers coded after it.
 pub struct ReferenceSlots {
-    slots: [Option<(u16, u64, bool)>; 3],
+    slots: [Option<(u16, u64, bool)>; 8],
+    count: usize,
     recent: VecDeque<(u16, u64)>,
     next_pts: u64,
     age: KeyAge,
     key_pts: u64,
 }
 
-/// How many recent frames are remembered by id; the anchors reach sixteen back.
+/// How many recent frames are remembered by id; the anchors reach twenty-three back.
 const RECENT_FRAMES: usize = 64;
 
-/// The buffers a frame refreshes, as a bit per slot: LAST, GOLDEN, ALTREF.
+/// VP8's GOLDEN and ALTREF each take every `ANCHOR_PERIOD`th frame, half a period apart.
+const ANCHOR_PERIOD: u64 = 24;
+
+/// VP9 keeps the last `RING` frames, and every `RING`th frame in as many buffers again.
+const RING: u64 = 4;
+
+/// The buffers a frame refreshes, as a bit per slot: LAST, GOLDEN, ALTREF for VP8, the eight in
+/// order for VP9.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotRefresh(pub u8);
 
@@ -235,7 +245,7 @@ pub struct SlotPlan {
 }
 
 impl SlotPlan {
-    /// A key frame: it predicts from nothing and re-anchors every buffer.
+    /// A VP8 key frame: it predicts from nothing and re-anchors every buffer.
     pub const KEY: Self = Self { predict_from: 0, refresh: SlotRefresh(SlotRefresh::ALL) };
 }
 
@@ -246,8 +256,18 @@ impl Default for ReferenceSlots {
 }
 
 impl ReferenceSlots {
+    /// VP8's three buffers.
     pub fn new() -> Self {
-        Self { slots: [None; 3], recent: VecDeque::new(), next_pts: 0, age: KeyAge::default(), key_pts: 0 }
+        Self::with(3)
+    }
+
+    /// VP9's eight buffers.
+    pub fn vp9() -> Self {
+        Self::with(8)
+    }
+
+    fn with(count: usize) -> Self {
+        Self { slots: [None; 8], count, recent: VecDeque::new(), next_pts: 0, age: KeyAge::default(), key_pts: 0 }
     }
 
     /// The timestamp the next frame is encoded with.
@@ -257,7 +277,7 @@ impl ReferenceSlots {
 
     /// Whether a frame not coded as a key frame has a buffer left to predict from.
     pub fn has_reference(&self) -> bool {
-        self.slots.iter().any(|s| s.is_some_and(|(_, _, lost)| !lost))
+        self.slots[..self.count].iter().any(|s| s.is_some_and(|(_, _, lost)| !lost))
     }
 
     /// What each buffer holds: the frame's id and timestamp and whether it was reported lost.
@@ -266,27 +286,29 @@ impl ReferenceSlots {
     }
 
     /// The buffer the next frame predicts from (the newest one the client still has) and the
-    /// buffers it refreshes; a key frame refreshes all three and predicts from none.
+    /// buffers it refreshes; a key frame refreshes all of them and predicts from none.
     pub fn plan(&self, key: bool) -> SlotPlan {
         if key || !self.has_reference() {
-            return SlotPlan::KEY;
+            return SlotPlan { predict_from: 0, refresh: SlotRefresh(((1u16 << self.count) - 1) as u8) };
         }
-        let mut newest = 0u8;
-        for i in 0..3u8 {
-            if let Some((_, pts, false)) = self.slots[i as usize]
-                && self.slots[newest as usize].is_none_or(|(_, held, lost)| lost || pts > held)
+        let mut newest = 0;
+        for i in 0..self.count {
+            if let Some((_, pts, false)) = self.slots[i]
+                && self.slots[newest].is_none_or(|(_, held, lost)| lost || pts > held)
             {
                 newest = i;
             }
         }
         let predict_from = 1 << newest;
         let since_key = self.next_pts - self.key_pts;
-        let refresh = if predict_from != SlotRefresh::LAST {
+        let refresh = if self.count > 3 {
+            1 << (since_key % RING) | if since_key % RING == 0 { 1 << (RING + since_key / RING % RING) } else { 0 }
+        } else if predict_from != SlotRefresh::LAST {
             SlotRefresh::ALL
         } else {
             SlotRefresh::LAST
-                | if since_key % 16 == 8 { SlotRefresh::ALTREF } else { 0 }
-                | if since_key % 4 == 2 { SlotRefresh::GOLDEN } else { 0 }
+                | if since_key % ANCHOR_PERIOD == 0 { SlotRefresh::GOLDEN } else { 0 }
+                | if since_key % ANCHOR_PERIOD == ANCHOR_PERIOD / 2 { SlotRefresh::ALTREF } else { 0 }
         };
         SlotPlan { predict_from, refresh: SlotRefresh(refresh) }
     }
@@ -303,8 +325,8 @@ impl ReferenceSlots {
             }
             from => self.slots[from.trailing_zeros() as usize].map_or(Reference::None, |(id, _, _)| Reference::Frame(id)),
         };
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            if plan.refresh.refreshes(1 << i) {
+        for (i, slot) in self.slots[..self.count].iter_mut().enumerate() {
+            if plan.predict_from == 0 || plan.refresh.refreshes(1 << i) {
                 *slot = Some((frame_id, pts, false));
             }
         }
@@ -331,7 +353,7 @@ impl ReferenceSlots {
                 0
             }
         };
-        for slot in self.slots.iter_mut().flatten() {
+        for slot in self.slots[..self.count].iter_mut().flatten() {
             if slot.1 >= lost_pts {
                 slot.2 = true;
             }
@@ -432,24 +454,24 @@ mod tests {
         let key = s.plan(true);
         assert_eq!(key.predict_from, 0);
         assert_eq!(s.record(0, key), Reference::None);
-        for id in 1..=5u16 {
+        for id in 1..=30u16 {
             let plan = s.plan(false);
             assert_eq!(plan.predict_from, SlotRefresh::LAST, "frame {id}");
             assert_eq!(s.record(id, plan), Reference::Frame(id - 1));
         }
-        // Frames 4 and 5 are reported lost: LAST holds 5, GOLDEN holds 2, ALTREF holds the key.
-        assert_eq!(s.invalidate(4), Invalidation::Forget(4));
+        // Frames 25 to 30 are reported lost: LAST holds 30, GOLDEN 24, ALTREF 12.
+        assert_eq!(s.invalidate(25), Invalidation::Forget(25));
         let plan = s.plan(false);
         assert_eq!(plan.predict_from, SlotRefresh::GOLDEN);
         assert_eq!(plan.refresh, SlotRefresh(SlotRefresh::ALL), "a recovery frame re-anchors every buffer");
-        assert_eq!(s.record(6, plan), Reference::Frame(2));
-        assert_eq!(s.record(7, s.plan(false)), Reference::Frame(6));
+        assert_eq!(s.record(31, plan), Reference::Frame(24));
+        assert_eq!(s.record(32, s.plan(false)), Reference::Frame(31));
         // Losing the re-anchoring frame leaves nothing older than it.
-        assert_eq!(s.invalidate(6), Invalidation::KeyFrame);
+        assert_eq!(s.invalidate(31), Invalidation::KeyFrame);
         assert!(!s.has_reference());
-        assert_eq!(s.record(8, s.plan(false)), Reference::None);
+        assert_eq!(s.record(33, s.plan(false)), Reference::None);
         assert_eq!(s.invalidate(3), Invalidation::Ignored, "before the key frame");
-        assert_eq!(s.next_pts(), 9);
+        assert_eq!(s.next_pts(), 34);
     }
 
     #[test]
@@ -457,21 +479,69 @@ mod tests {
         let mut s = ReferenceSlots::new();
         s.record(0, s.plan(true));
         let mut refreshes = Vec::new();
-        for id in 1..=16u16 {
+        for id in 1..=48u16 {
             let plan = s.plan(false);
             refreshes.push(plan.refresh.0);
             s.record(id, plan);
         }
-        assert_eq!(refreshes[1], SlotRefresh::LAST | SlotRefresh::GOLDEN, "frame 2");
-        assert_eq!(refreshes[7], SlotRefresh::LAST | SlotRefresh::ALTREF, "frame 8");
-        assert_eq!(refreshes[15], SlotRefresh::LAST, "frame 16 refreshes no anchor");
-        assert!(refreshes.iter().enumerate().all(|(i, &r)| (i + 1) % 4 == 2 || (i + 1) % 16 == 8 || r == SlotRefresh::LAST));
-        // A loss of frames 13..16 takes the golden of frame 14 too; the altref of frame 8 is
-        // older than the loss, though no buffer holds frame 13 itself.
-        assert_eq!(s.invalidate(13), Invalidation::Forget(13));
+        for (i, &r) in refreshes.iter().enumerate() {
+            let frame = i + 1;
+            let want = SlotRefresh::LAST
+                | if frame % 24 == 0 { SlotRefresh::GOLDEN } else { 0 }
+                | if frame % 24 == 12 { SlotRefresh::ALTREF } else { 0 };
+            assert_eq!(r, want, "frame {frame}");
+        }
+        // A loss of frames 37 to 48 takes the golden of frame 48; the altref of frame 36 is
+        // older than it, though no buffer holds frame 37 itself.
+        assert_eq!(s.invalidate(37), Invalidation::Forget(37));
         assert_eq!(s.plan(false).predict_from, SlotRefresh::ALTREF);
-        assert_eq!(s.record(17, s.plan(false)), Reference::Frame(8));
+        assert_eq!(s.record(49, s.plan(false)), Reference::Frame(36));
         assert_eq!(s.invalidate(100), Invalidation::Ignored, "a frame never sent is nothing to forget");
+    }
+
+    #[test]
+    fn eight_buffers_keep_four_recent_frames_and_every_fourth() {
+        let mut s = ReferenceSlots::vp9();
+        let key = s.plan(true);
+        assert_eq!(key.refresh, SlotRefresh(0xff), "a key frame refreshes all eight");
+        s.record(0, key);
+        for id in 1..=19u16 {
+            let plan = s.plan(false);
+            let n = id as u8;
+            let want = 1 << (n % 4) | if n % 4 == 0 { 1 << (4 + n / 4 % 4) } else { 0 };
+            assert_eq!(plan.refresh.0, want, "frame {id}");
+            assert_eq!(s.record(id, plan), Reference::Frame(id - 1));
+        }
+        let held: Vec<u16> = (0..8).map(|i| s.slot(1 << i).unwrap().0).collect();
+        assert_eq!(held, [16, 17, 18, 19, 16, 4, 8, 12]);
+        // Frames 9 to 19 are reported lost: the anchor of frame 8 is the newest older than it.
+        assert_eq!(s.invalidate(9), Invalidation::Forget(9));
+        let plan = s.plan(false);
+        assert_eq!(plan.predict_from, 1 << 6);
+        assert_eq!(s.record(20, plan), Reference::Frame(8));
+        assert_eq!(s.record(21, s.plan(false)), Reference::Frame(20));
+    }
+
+    /// A loss up to twelve frames deep, at any point of the schedule, still finds a buffer
+    /// holding a frame older than it.
+    #[test]
+    fn a_loss_up_to_twelve_frames_deep_finds_an_anchor() {
+        for make in [ReferenceSlots::new as fn() -> ReferenceSlots, ReferenceSlots::vp9] {
+            for sent in 1..=60u16 {
+                for depth in 1..=sent.min(12) {
+                    let mut s = make();
+                    s.record(0, s.plan(true));
+                    for id in 1..=sent {
+                        let plan = s.plan(false);
+                        s.record(id, plan);
+                    }
+                    let lost = sent + 1 - depth;
+                    assert!(matches!(s.invalidate(lost), Invalidation::Forget(_)), "{} buffers, frame {lost} of {sent} lost", s.count);
+                    let plan = s.plan(false);
+                    assert!(s.slot(plan.predict_from).is_some_and(|(id, _, lost_too)| id < lost && !lost_too));
+                }
+            }
+        }
     }
 
     #[test]
