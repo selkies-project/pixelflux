@@ -423,9 +423,10 @@ ffmpeg -f h264 -framerate 60 -i unix:///tmp/pixelflux_record -c:v libx264 -prese
 
 `VirtualCamera` turns a client's webcam uplink into a V4L2 capture device for applications. Encoded frames of any
 browser codec — H.264, VP8, VP9, AV1, HEVC (WebCodecs or a WebRTC media track), and MJPEG (the canvas fallback) — are
-pushed in; a worker thread decodes them (OpenH264, libvpx, dav1d, libde265, TurboJPEG), fits them into the device's fixed format (raw
-I420 by default, NV12, or YUYV; or MJPEG, a compressed device that carries an MJPEG uplink's frames as received,
-decoding nothing, and re-encodes only frames that must be fitted), and publishes every frame to the configured sinks at once:
+pushed in; a worker thread decodes them (OpenH264, libvpx, dav1d, libde265, TurboJPEG), fits them into the device's
+fixed format (raw I420 by default, NV12, or YUYV; or MJPEG, a compressed device that carries an MJPEG uplink's frames
+as received, decoding nothing, and re-encodes only frames that must be fitted), and publishes every frame to the
+configured sinks at once:
 
 - a shared-memory ring served over a Unix socket to the Selkies V4L2 interposer (`LD_PRELOAD`, no privileges, no
   kernel module), which presents `/dev/videoN` to the application;
