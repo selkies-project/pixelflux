@@ -674,9 +674,10 @@ fn encode_sized(enc: &mut VaapiEncoder, width: i32, height: i32, t: u64, key: bo
 
 /// A driver that writes its own slice headers still takes each picture's number, order count,
 /// reconstruction surface, and reference from the session, so a session that tracks no
-/// references counts its frames all the same: both counts advance every frame, the
-/// reconstruction surfaces rotate with the previous frame's as the reference, and a forced key
-/// frame restarts the counts.
+/// references counts its frames all the same: both counts advance every frame, the previous
+/// frame's surface is the reference, and a forced key frame restarts the counts. Such a driver
+/// predicts from the previous frame alone, so the session declares a one-frame buffer and
+/// alternates two reconstruction surfaces.
 #[test]
 fn a_session_tracking_no_references_counts_its_frames() {
     for codec in [Codec::H264, Codec::H265] {
@@ -713,7 +714,8 @@ fn a_session_tracking_no_references_counts_its_frames() {
             assert_eq!(enc.last_reference(), Reference::Untracked);
         }
         let pool: std::collections::HashSet<_> = recon.iter().collect();
-        assert_eq!(pool.len(), REFERENCE_FRAMES as usize + 1, "{codec:?}: the whole reconstruction pool rotates");
+        assert_eq!(pool.len(), 2, "{codec:?}: two reconstruction surfaces alternate");
+        assert_eq!(enc.negotiated.dpb, 1, "{codec:?}: a one-frame buffer");
     }
 }
 

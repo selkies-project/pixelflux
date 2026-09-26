@@ -12,7 +12,9 @@
 //! reference lists. A frame a client lost is left out of the predictions the way NVENC and
 //! libx264 allow (`encoders/reference.rs`): H.264 and HEVC keep the decoded picture buffer
 //! the level admits and name the newest surviving frame in the slice header, VP9 and AV1
-//! address their eight buffer slots, and VP8 steers its three buffers.
+//! address their eight buffer slots, and VP8 steers its three buffers. A driver that writes its
+//! own slice headers predicts from the previous frame alone, so such a session declares a
+//! one-frame buffer.
 //!
 //! Pixels reach the codec on a VA surface -- a Wayland dmabuf imported in place, or a packed
 //! host frame uploaded -- and the video processor converts to the surface format on the GPU,
@@ -675,6 +677,7 @@ impl VaapiEncoder {
         if packed != 0 {
             attribs.push(VAConfigAttrib { type_: VAConfigAttribEncPackedHeaders, value: packed });
         }
+        let dpb = if arm.tracks_references(packed) { dpb } else { 1 };
         let quality_range = device.attribute(profile, entrypoint, VAConfigAttribEncQualityRange);
         let slice_caps = (
             device.attribute(profile, entrypoint, VAConfigAttribEncMaxSlices),
