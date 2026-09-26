@@ -3951,6 +3951,48 @@ mod gpu_tests {
         println!("API {maj}.{min}: the driver stayed inside every struct");
     }
 
+    /// On a real GPU whose driver caps the NVENC sessions a device runs at once, as it does on
+    /// consumer boards, the probe of a device with every session taken answers `SESSIONS_TAKEN`,
+    /// and once one frees it lists the codecs again. A device that takes 65 sessions at once has
+    /// no cap to reach and says so. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_device_out_of_sessions_says_so() {
+        let enc = NvencEncoder::new(&settings(256, 128, 60.0), ptr::null()).expect("NVENC init");
+        let mut sessions = Vec::new();
+        let capped = unsafe {
+            loop {
+                let mut open = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+                    version: sv(NvStruct::OpenSessionExParams),
+                    deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+                    device: enc.cuda_context as *mut c_void,
+                    apiVersion: neg_api(),
+                    ..Default::default()
+                };
+                let mut session = ptr::null_mut();
+                match (enc.nvenc_funcs.nvEncOpenEncodeSessionEx.unwrap())(&mut open, &mut session) {
+                    NVENCSTATUS::NV_ENC_SUCCESS if sessions.len() < 63 => sessions.push(session),
+                    NVENCSTATUS::NV_ENC_SUCCESS => {
+                        sessions.push(session);
+                        break false;
+                    }
+                    NVENCSTATUS::NV_ENC_ERR_OUT_OF_MEMORY => break true,
+                    other => panic!("session {} refused: {other:?}", sessions.len() + 2),
+                }
+            }
+        };
+        let taken = probe_codecs(0);
+        for session in sessions.drain(..) {
+            unsafe { (enc.nvenc_funcs.nvEncDestroyEncoder.unwrap())(session) };
+        }
+        if !capped {
+            println!("this device took 65 sessions at once: no cap to reach");
+            return;
+        }
+        assert_eq!(taken, Err(SESSIONS_TAKEN.to_string()), "every session taken");
+        assert!(probe_codecs(0).is_ok_and(|codecs| !codecs.is_empty()), "a freed session is listed again");
+    }
+
     /// On a real GPU, a live frame-rate drop keeps the level the decoded picture buffer needs: a
     /// 1080p session opened at 120 fps declares the eight frames its level admits there, and the
     /// drop to 60 fps, whose own level admits fewer, is taken at that level, so a CBR session
