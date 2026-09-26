@@ -364,35 +364,42 @@ fn neg_api() -> u32 {
     m | (n << 24)
 }
 
-/// `NV_ENC_RECONFIGURE_PARAMS` with room for the flag word of the layout below 12.2: the
-/// initialize params those SDKs embed run eight bytes longer, so a driver negotiated there reads
-/// `resetEncoder` and `forceIDR` eight bytes past where the pinned header puts them.
+/// A struct as long as the negotiated API's layout of it, which can run eight bytes past the
+/// pinned header's: `NV_ENC_INITIALIZE_PARAMS` below 12.2, and so the reconfigure params that
+/// embed it. The tail is zeroed and pixelflux's, so the driver reads and writes inside memory
+/// this owns.
 #[repr(C)]
-struct ReconfigureParams {
-    params: NV_ENC_RECONFIGURE_PARAMS,
-    flags_before_12_2: [u32; 2],
+struct Negotiated<T> {
+    value: T,
+    tail: [u32; 2],
 }
 
-impl ReconfigureParams {
-    /// Re-initialize with `init` at API `(maj, min)`, resetting the encoder and forcing an IDR
-    /// as asked.
-    fn new(init: NV_ENC_INITIALIZE_PARAMS, (maj, min): (u32, u32), reset: bool, force_idr: bool) -> Self {
-        let mut p = Self {
-            params: NV_ENC_RECONFIGURE_PARAMS {
-                version: nvenc_struct_ver(NvStruct::ReconfigureParams, maj, min),
-                reInitEncodeParams: init,
-                ..Default::default()
-            },
-            flags_before_12_2: [0; 2],
-        };
-        if (maj << 4) | min < 0xC2 {
-            p.flags_before_12_2[0] = reset as u32 | (force_idr as u32) << 1;
-        } else {
-            p.params.set_resetEncoder(reset as u32);
-            p.params.set_forceIDR(force_idr as u32);
-        }
-        p
+impl<T> Negotiated<T> {
+    fn new(value: T) -> Self {
+        Self { value, tail: [0; 2] }
     }
+}
+
+/// The reconfigure params re-initializing with `init` at API `(maj, min)`, resetting the encoder
+/// and forcing an IDR as asked; below 12.2 the driver reads the two flags from the tail.
+fn reconfigure_params(
+    init: NV_ENC_INITIALIZE_PARAMS,
+    (maj, min): (u32, u32),
+    reset: bool,
+    force_idr: bool,
+) -> Negotiated<NV_ENC_RECONFIGURE_PARAMS> {
+    let mut p = Negotiated::new(NV_ENC_RECONFIGURE_PARAMS {
+        version: nvenc_struct_ver(NvStruct::ReconfigureParams, maj, min),
+        reInitEncodeParams: init,
+        ..Default::default()
+    });
+    if (maj << 4) | min < 0xC2 {
+        p.tail[0] = reset as u32 | (force_idr as u32) << 1;
+    } else {
+        p.value.set_resetEncoder(reset as u32);
+        p.value.set_forceIDR(force_idr as u32);
+    }
+    p
 }
 
 /// Resolve the process-wide NVENC API version once, by probing the driver newest-first and
@@ -400,8 +407,8 @@ impl ReconfigureParams {
 ///
 /// The bundled nv-codec-headers are NVENC 13.0 (`pinned`), so a current driver negotiates 13.0
 /// natively while older drivers down-negotiate through 12.x / 11.x to the 10.0 floor (~R445). The
-/// compiled struct *layouts* are the 13.0 ones, which older drivers read alike but for the
-/// reconfigure flags (`ReconfigureParams`); only the version *words* change per negotiated version
+/// compiled struct *layouts* are the 13.0 ones, handed to older drivers with the tail their own
+/// layouts run longer (`Negotiated`); only the version *words* change per negotiated version
 /// (via the `NvStruct::rev` table), so each struct is stamped with the exact word the negotiated
 /// SDK defined. Steps:
 ///
@@ -1833,7 +1840,7 @@ impl NvencEncoder {
             };
 
             let init_fn = function_list.nvEncInitializeEncoder.unwrap();
-            let headroom_status = init_fn(encoder_session, &mut init_params);
+            let headroom_status = init_fn(encoder_session, &mut Negotiated::new(init_params).value);
             if headroom_status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
                     "[NVENC] Init with {}x{} resize headroom failed ({headroom_status:?}): {}",
@@ -1851,7 +1858,7 @@ impl NvencEncoder {
                 init_params.maxEncodeHeight = height;
                 init_params.encodeConfig = &mut config;
                 let exact_status = if reopened {
-                    init_fn(encoder_session, &mut init_params)
+                    init_fn(encoder_session, &mut Negotiated::new(init_params).value)
                 } else {
                     NVENCSTATUS::NV_ENC_ERR_NO_ENCODE_DEVICE
                 };
@@ -2502,8 +2509,8 @@ impl NvencEncoder {
     /// as asked.
     unsafe fn reconfigure(&mut self, reset: bool, force_idr: bool) -> NVENCSTATUS {
         self.init_params.encodeConfig = &mut self.encode_config;
-        let mut params = ReconfigureParams::new(self.init_params, nvenc_cur_ver(), reset, force_idr);
-        (self.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(self.encoder_session, &mut params.params)
+        let mut params = reconfigure_params(self.init_params, nvenc_cur_ver(), reset, force_idr);
+        (self.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(self.encoder_session, &mut params.value)
     }
 
     /// Reconfigure the live session's ConstQP when the quantizer the session quality index
@@ -3845,6 +3852,81 @@ mod gpu_tests {
         assert_eq!(key[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&key), (1280, 720));
         assert_eq!(h264_max_num_ref_frames(&key[VIDEO_HEADER_LEN..]), Some(REFERENCE_FRAMES), "720p declares eight");
+    }
+
+    /// Test helper: `value` placed so it ends where a page the process cannot touch begins, so a
+    /// driver reading or writing past it faults. The mapping lives as long as the process.
+    fn guarded<T>(value: T) -> &'static mut T {
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let map = libc::mmap(
+                ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(map, libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(map.cast::<u8>().add(page).cast(), page, libc::PROT_NONE), 0);
+            let at = map.cast::<u8>().add(page - std::mem::size_of::<T>()).cast::<T>();
+            at.write(value);
+            &mut *at
+        }
+    }
+
+    /// On a real GPU, at every API version a driver may be negotiated at, the driver stays inside
+    /// the structs it is handed: each is placed against a page the process cannot touch, where a
+    /// read or write past it faults, and every version runs in a process of its own, pinned there
+    /// with `PIXELFLUX_NVENC_MAX_API`. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_the_driver_stays_inside_the_structs_it_is_handed() {
+        const PINNED: &str = "PIXELFLUX_TEST_NVENC_PINNED";
+        if std::env::var_os(PINNED).is_none() {
+            let name = format!(
+                "{}::gpu_the_driver_stays_inside_the_structs_it_is_handed",
+                module_path!().split_once("::").unwrap().1
+            );
+            for api in ["10.0", "11.0", "11.1", "12.0", "12.1", "13.0"] {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([name.as_str(), "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+                    .env("PIXELFLUX_NVENC_MAX_API", api)
+                    .env(PINNED, "1")
+                    .output()
+                    .expect("the test binary runs");
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let report = stdout.lines().find(|l| l.contains("stayed inside")).unwrap_or_default();
+                println!("{report}");
+                assert!(out.status.success() && !report.is_empty(), "API {api}: {}\n{stdout}", out.status);
+            }
+            return;
+        }
+        let mut enc = NvencEncoder::new(&settings(1280, 720, 60.0), ptr::null()).expect("NVENC init");
+        unsafe {
+            let funcs = enc.nvenc_funcs;
+            let _ = (enc.cuda.cuCtxPushCurrent_v2)(enc.cuda_context);
+            let mut open = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+                version: sv(NvStruct::OpenSessionExParams),
+                deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+                device: enc.cuda_context as *mut c_void,
+                apiVersion: neg_api(),
+                ..Default::default()
+            };
+            let mut session = ptr::null_mut();
+            assert_eq!((funcs.nvEncOpenEncodeSessionEx.unwrap())(&mut open, &mut session), NVENCSTATUS::NV_ENC_SUCCESS);
+            enc.init_params.encodeConfig = &mut enc.encode_config;
+            let init = guarded(Negotiated::new(enc.init_params));
+            let status = (funcs.nvEncInitializeEncoder.unwrap())(session, &mut init.value);
+            (funcs.nvEncDestroyEncoder.unwrap())(session);
+            assert_eq!(status, NVENCSTATUS::NV_ENC_SUCCESS, "initialize");
+            let reconfigure = guarded(reconfigure_params(enc.init_params, nvenc_cur_ver(), true, true));
+            let status = (funcs.nvEncReconfigureEncoder.unwrap())(enc.encoder_session, &mut reconfigure.value);
+            assert_eq!(status, NVENCSTATUS::NV_ENC_SUCCESS, "reconfigure");
+            (enc.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+        let (maj, min) = nvenc_cur_ver();
+        println!("API {maj}.{min}: the driver stayed inside every struct");
     }
 
     /// On a real GPU, a live frame-rate drop keeps the level the decoded picture buffer needs: a
@@ -5325,13 +5407,22 @@ mod version_tests {
     #[test]
     fn reconfigure_flags_sit_where_each_version_reads_them() {
         for (maj, min, at) in [(10, 0, 1816), (11, 0, 1816), (11, 1, 1816), (12, 0, 1816), (12, 1, 1816), (12, 2, 1808), (13, 0, 1808)] {
-            let params = ReconfigureParams::new(NV_ENC_INITIALIZE_PARAMS::default(), (maj, min), true, true);
+            let params = reconfigure_params(NV_ENC_INITIALIZE_PARAMS::default(), (maj, min), true, true);
             let bytes = unsafe {
-                std::slice::from_raw_parts((&params as *const ReconfigureParams).cast::<u8>(), std::mem::size_of_val(&params))
+                std::slice::from_raw_parts((&params as *const Negotiated<_>).cast::<u8>(), std::mem::size_of_val(&params))
             };
             let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
             assert_eq!((word(1808), word(1816)), if at == 1816 { (0, 3) } else { (3, 0) }, "{maj}.{min}");
         }
+    }
+
+    /// The structs handed to the driver run as long as the longest layout a negotiable version
+    /// gives them: the initialize params 1808 bytes and the reconfigure params around them 1824
+    /// in the SDK 10.0 to 12.1 headers.
+    #[test]
+    fn negotiated_structs_hold_the_longest_layout() {
+        assert_eq!(std::mem::size_of::<Negotiated<NV_ENC_INITIALIZE_PARAMS>>(), 1808);
+        assert_eq!(std::mem::size_of::<Negotiated<NV_ENC_RECONFIGURE_PARAMS>>(), 1824);
     }
 
     /// `nvenc_struct_ver` must reproduce the exact `NV_ENC_*_VER` words each SDK defined, for
