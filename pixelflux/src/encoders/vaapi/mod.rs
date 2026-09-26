@@ -1228,16 +1228,19 @@ impl VaapiEncoder {
             self.rate_control(&mut out);
         }
         self.arm.picture(&self.negotiated, &frame, &mut out)?;
-        let coded = self.issue(&out)?;
+        let header_len = if self.omit_headers { 0 } else { VIDEO_HEADER_LEN };
+        let mut output = vec![0; header_len];
+        self.issue(&out, &mut output)?;
         self.fresh = false;
         self.sequence_start = false;
         self.surfaces_of.insert(pts, recon);
+        let coded = &output[header_len..];
         let frame_type = match self.codec {
-            Codec::H264 => h264_frame_type(&coded),
-            Codec::H265 => h265_frame_type(&coded),
-            Codec::Vp8 => frame_type_from_key(vp8_is_key(&coded)),
-            Codec::Vp9 => frame_type_from_key(vp9_is_key(&coded)),
-            _ => frame_type_from_key(av1_is_key(&coded)),
+            Codec::H264 => h264_frame_type(coded),
+            Codec::H265 => h265_frame_type(coded),
+            Codec::Vp8 => frame_type_from_key(vp8_is_key(coded)),
+            Codec::Vp9 => frame_type_from_key(vp9_is_key(coded)),
+            _ => frame_type_from_key(av1_is_key(coded)),
         };
         let is_key = frame_type != super::codec::FRAME_DELTA;
         self.last_reference = match &mut self.references {
@@ -1261,17 +1264,17 @@ impl VaapiEncoder {
             }
             _ => self.surfaces_of.retain(|&p, _| p + self.recon.len() as u64 > pts),
         }
-        let mut output = Vec::with_capacity(VIDEO_HEADER_LEN + coded.len());
         if !self.omit_headers {
-            push_video_header(&mut output, self.codec, frame_type, frame_id, 0, self.negotiated.width as u16, self.negotiated.height as u16, self.last_reference);
+            let mut header = Vec::with_capacity(VIDEO_HEADER_LEN);
+            push_video_header(&mut header, self.codec, frame_type, frame_id, 0, self.negotiated.width as u16, self.negotiated.height as u16, self.last_reference);
+            output[..VIDEO_HEADER_LEN].copy_from_slice(&header);
         }
-        output.extend_from_slice(&coded);
         Ok(output)
     }
 
-    /// Render `buffers` as one picture on the encode context, wait for it, and read the coded
-    /// bytes back.
-    fn issue(&mut self, buffers: &Buffers) -> Result<Vec<u8>, String> {
+    /// Render `buffers` as one picture on the encode context, wait for it, and append the
+    /// coded bytes to `out`.
+    fn issue(&mut self, buffers: &Buffers, out: &mut Vec<u8>) -> Result<(), String> {
         let api = self.device.api;
         let display = self.device.display;
         let mut ids = Vec::with_capacity(buffers.entries.len());
@@ -1308,16 +1311,16 @@ impl VaapiEncoder {
         }
         let mut list: *mut c_void = ptr::null_mut();
         self.device.check(unsafe { (api.vaMapBuffer)(display, self.coded, &mut list) }, "vaMapBuffer (coded)")?;
-        let mut out = Vec::new();
-        let mut segment = unsafe { (list as *const VACodedBufferSegment).as_ref() };
-        while let Some(s) = segment {
-            if !s.buf.is_null() {
-                out.extend_from_slice(unsafe { std::slice::from_raw_parts(s.buf as *const u8, s.size as usize) });
-            }
-            segment = unsafe { (s.next as *const VACodedBufferSegment).as_ref() };
+        let segments = || {
+            std::iter::successors(unsafe { (list as *const VACodedBufferSegment).as_ref() }, |s| unsafe { (s.next as *const VACodedBufferSegment).as_ref() })
+                .filter(|s| !s.buf.is_null())
+        };
+        out.reserve(segments().map(|s| s.size as usize).sum());
+        for s in segments() {
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(s.buf as *const u8, s.size as usize) });
         }
         unsafe { (api.vaUnmapBuffer)(display, self.coded) };
-        Ok(out)
+        Ok(())
     }
 }
 

@@ -891,3 +891,18 @@ fn a_session_that_fails_to_open_frees_its_surfaces() {
         assert!(leaked.is_empty(), "surfaces {leaked:?} outlive the session");
     });
 }
+
+/// A session asked for bare frames returns each frame's coded bytes alone, the bytes a framed
+/// session puts after its header.
+#[test]
+fn a_session_without_headers_returns_the_coded_bytes_alone() {
+    for codec in Codec::VIDEO {
+        mock::reset(Driver::generous());
+        let mut framed = session(codec, false);
+        let mut bare = open(codec, &RustCaptureSettings { omit_stripe_headers: true, ..settings(codec, false) }).unwrap();
+        for t in 0..3u64 {
+            let with_header = encode(&mut framed, t, t == 0);
+            assert_eq!(encode(&mut bare, t, t == 0), with_header[VIDEO_HEADER_LEN..], "{codec:?} frame {t}");
+        }
+    }
+}
