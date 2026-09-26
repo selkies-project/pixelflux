@@ -1115,7 +1115,7 @@ impl ChromaConvert {
 /// `codec` and `fullcolor` name the session's codec and negotiated chroma; `current_qp` tracks the
 /// live ConstQP so a paint-over reconfigure is skipped when unchanged. `encode_config` and
 /// `init_params` are retained so in-place reconfigure can resubmit them.
-/// `omit_stripe_headers` drops the 10-byte wire
+/// `omit_stripe_headers` drops the wire
 /// header, and `node_index` is the effective CUDA device this session is bound to — a reuse across
 /// captures that now targets a different device must rebuild rather than reconfigure.
 pub struct NvencEncoder {
@@ -3452,7 +3452,7 @@ mod gpu_tests {
         );
     }
 
-    /// Test helper: read the big-endian width/height (bytes 6-9) from a 10-byte wire header.
+    /// Test helper: read the big-endian width/height (bytes 6-9) from the wire header.
     fn wire_dims(pkt: &[u8]) -> (u16, u16) {
         (
             u16::from_be_bytes([pkt[6], pkt[7]]),
@@ -3481,7 +3481,7 @@ mod gpu_tests {
                 .encode_cpu_argb(&f720, 1280 * 4, i, 25, i == 0)
                 .expect("encode 720p");
             assert_eq!(wire_dims(&pkt), (1280, 720));
-            stream.extend_from_slice(&pkt[10..]);
+            stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
         }
 
         assert!(
@@ -3492,8 +3492,8 @@ mod gpu_tests {
             .encode_cpu_argb(&f720, 1280 * 4, 5, 25, false)
             .expect("encode after same-size reconfigure");
         assert_eq!(pkt[1] & 0x0f, FRAME_DELTA, "the stream continues without an IDR at unchanged dimensions");
-        assert!(pkt.len() > 10, "a locked bitstream carries the encoded picture");
-        stream.extend_from_slice(&pkt[10..]);
+        assert!(pkt.len() > VIDEO_HEADER_LEN, "a locked bitstream carries the encoded picture");
+        stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
 
         s.width = 1920;
         s.height = 1080;
@@ -3507,14 +3507,14 @@ mod gpu_tests {
         assert_eq!(pkt[0], 0x04);
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY, "first frame after a resize must be an IDR");
         assert_eq!(wire_dims(&pkt), (1920, 1080));
-        assert!(pkt.len() > 10, "a locked bitstream carries the encoded picture");
-        stream.extend_from_slice(&pkt[10..]);
+        assert!(pkt.len() > VIDEO_HEADER_LEN, "a locked bitstream carries the encoded picture");
+        stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
         for i in 7..10u64 {
             let pkt = enc
                 .encode_cpu_argb(&f1080, 1920 * 4, i, 25, false)
                 .expect("encode 1080p");
             assert_eq!(pkt[1] & 0x0f, FRAME_DELTA, "steady frames after the IDR are P frames");
-            stream.extend_from_slice(&pkt[10..]);
+            stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
         }
 
         s.width = 640;
@@ -3528,7 +3528,7 @@ mod gpu_tests {
             .expect("encode 480p");
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (640, 480));
-        stream.extend_from_slice(&pkt[10..]);
+        stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
 
         s.width = 4100;
         s.height = 2400;
@@ -3544,7 +3544,7 @@ mod gpu_tests {
         let pkt = enc
             .encode_cpu_argb(&f480, 640 * 4, 11, 25, false)
             .expect("session survives rejected reconfigures");
-        stream.extend_from_slice(&pkt[10..]);
+        stream.extend_from_slice(&pkt[VIDEO_HEADER_LEN..]);
 
         println!(
             "init={init_ms:.1}ms grow(720p->1080p)={grow_ms:.1}ms shrink(1080p->480p)={shrink_ms:.1}ms"
@@ -3586,7 +3586,10 @@ mod gpu_tests {
                 let (wire_codec, kind) = parse_video_type(pkt[1]).expect("video type byte");
                 assert_eq!(wire_codec, codec);
                 assert_eq!(kind, if i == 0 { FRAME_KEY } else { FRAME_DELTA }, "{codec:?} frame {i}");
-                let payload = &pkt[10..];
+                let payload = &pkt[VIDEO_HEADER_LEN..];
+                if codec != Codec::Av1 {
+                    assert!(payload.starts_with(&[0, 0, 0, 1]), "{codec:?} frame {i}: the bitstream starts right after the header");
+                }
                 let read = match codec {
                     Codec::H264 => h264_frame_type(payload),
                     Codec::H265 => h265_frame_type(payload),
@@ -3600,7 +3603,7 @@ mod gpu_tests {
             let key = enc.encode_cpu_argb(&frame(w, h, 99), w * 4, 6, 25, true).expect("forced key");
             assert_eq!(parse_video_type(key[1]), Some((codec, FRAME_KEY)));
             let mut fresh = VideoDecoder::new(codec).expect("decoder");
-            assert!(fresh.decode(&key[10..]).expect("decode"), "{codec:?}: a forced key frame must decode alone");
+            assert!(fresh.decode(&key[VIDEO_HEADER_LEN..]).expect("decode"), "{codec:?}: a forced key frame must decode alone");
 
             let mut full = s.clone();
             full.video_fullcolor = true;
@@ -4242,7 +4245,7 @@ mod gpu_tests {
         assert!(enc.csc.is_some(), "this GPU took no chroma convert");
         let pkt = enc.encode(&dmabuf, 0, 20, true).expect("dmabuf encode");
         let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
-        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture");
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture");
         let v = dec.frame().expect("decoded frame");
         let (mut su, mut sv) = (0.0f64, 0.0f64);
         let n = (v.chroma_height() * v.chroma_width()) as f64;
@@ -4536,7 +4539,7 @@ mod gpu_tests {
         let w = enc.width() as usize;
         let pkt = enc.encode_cpu_packed(bgra, w * 4, false, 0, 20, true).expect("packed encode");
         let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
-        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture from this access unit");
         let v = dec.frame().expect("decoded frame");
         let (mut su, mut sv) = (0.0f64, 0.0f64);
         let n = (v.chroma_height() * v.chroma_width()) as f64;
@@ -4700,7 +4703,7 @@ mod gpu_tests {
         (bo, dmabuf)
     }
 
-    /// Test helper: decode one H.264 access unit (the bytes behind the 10-byte wire header)
+    /// Test helper: decode one H.264 access unit (the bytes behind the wire header)
     /// with the crate's H.264 decoder and return the mean Y/Cb/Cr inside `rect` and outside it.
     fn decoded_means(
         dec: &mut crate::webcam::decode::VideoDecoder,
@@ -4708,7 +4711,7 @@ mod gpu_tests {
         rect: (i32, i32, i32, i32),
     ) -> ([f64; 3], [f64; 3]) {
         use crate::webcam::decode::Decoder;
-        assert!(dec.decode(&pkt[10..]).expect("decode"), "no picture from this access unit");
+        assert!(dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"), "no picture from this access unit");
         let v = dec.frame().expect("decoded frame");
         let (rx, ry, rw, rh) = rect;
         let inside = |x: usize, y: usize| {
@@ -4790,7 +4793,7 @@ mod gpu_tests {
                 assert_eq!(wire_dims(&pkt), (w as u16, h as u16));
                 let (block, bg) = decoded_means(&mut dec, &pkt, block_rect(w, h, *seed));
                 assert_painted(&format!("{label} frame {i}"), block, bg, 6.0);
-                out.push(pkt[10..].to_vec());
+                out.push(pkt[VIDEO_HEADER_LEN..].to_vec());
             }
             out
         };
