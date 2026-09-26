@@ -818,3 +818,21 @@ fn a_session_falls_back_to_the_full_entry_point_for_its_rate_control() {
     mock::reset(driver());
     assert!(session(Codec::H264, false).low_power(), "the constant-quantizer session stays on the low-power entry point");
 }
+
+/// HEVC Main 4:4:4 declares the constraint flags Table A.2 gives the profile: at most 8 bits,
+/// with neither the 4:2:2 nor the 4:2:0 constraint.
+#[test]
+fn hevc_main_444_declares_its_profile_constraints() {
+    mock::reset(Driver::generous());
+    let mut s = settings(Codec::H265, false);
+    s.video_fullcolor = true;
+    let mut enc = open(Codec::H265, &s).unwrap();
+    assert!(enc.is_fullcolor());
+    let first = encode(&mut enc, 0, true);
+    let rbsp = nal(&first[VIDEO_HEADER_LEN..], 33, true);
+    let mut r = Reader { bytes: &rbsp, pos: 8 };
+    assert_eq!((r.u(2), r.u(1), r.u(5)), (0, 1, 4), "profile space, tier, and Main 4:4:4");
+    r.pos += 32 + 4;
+    let flags: Vec<u32> = (0..9).map(|_| r.u(1)).collect();
+    assert_eq!(flags, [1, 1, 1, 0, 0, 0, 0, 0, 1], "max 12-bit, 10-bit, 8-bit, 4:2:2, 4:2:0, monochrome, intra, one picture, lower bit rate");
+}

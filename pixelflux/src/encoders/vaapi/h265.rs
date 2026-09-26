@@ -150,7 +150,7 @@ impl Arm {
             w.flag(true);
             w.flag(true);
             w.flag(true);
-            w.flag(true);
+            w.flag(!fullcolor);
             w.flag(!fullcolor);
             w.flag(false);
             w.flag(false);
