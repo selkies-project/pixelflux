@@ -1128,7 +1128,8 @@ impl VaapiEncoder {
 
     /// Convert `source` onto the encoder's surface: BT.709 primaries and transfer in, full
     /// range, the declared matrix out at limited range, chroma sited at the center of each
-    /// block, which is where the software convert puts it.
+    /// block, which is where the software convert puts it. The picture lands unscaled at the
+    /// origin of the aligned surface, whose margin past it the stream crops.
     fn convert(&mut self, source: VASurfaceID) -> Result<(), String> {
         let api = self.device.api;
         let display = self.device.display;
@@ -1137,7 +1138,7 @@ impl VaapiEncoder {
         let mut params: VAProcPipelineParameterBuffer = unsafe { std::mem::zeroed() };
         params.surface = source;
         params.surface_region = &region;
-        params.output_region = ptr::null();
+        params.output_region = &region;
         params.output_background_color = 0xff00_0000;
         params.pipeline_flags = 0;
         params.filter_flags = VA_FRAME_PICTURE;

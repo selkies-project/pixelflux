@@ -14,6 +14,9 @@ use std::ptr;
 
 use va_sys::*;
 
+/// A rectangle as `(x, y, width, height)`.
+pub(crate) type Rect = (i16, i16, u16, u16);
+
 /// What the stood-in driver offers and what it saw.
 #[derive(Default)]
 pub(crate) struct Driver {
@@ -42,6 +45,8 @@ pub(crate) struct Driver {
     pub images: Vec<VABufferID>,
     /// How many images were put onto surfaces.
     pub puts: u32,
+    /// The source and output rectangles of every video-processing buffer, None for a null one.
+    pub regions: Vec<(Option<Rect>, Option<Rect>)>,
     next_id: u32,
     in_picture: Option<(VAContextID, VASurfaceID, Vec<usize>)>,
     coded_out: Vec<u8>,
@@ -341,6 +346,11 @@ unsafe extern "C" fn create_buffer(_dpy: VADisplay, context: VAContextID, kind: 
         return VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus;
     }
     with(|d| unsafe {
+        if kind == VAProcPipelineParameterBufferType && !data.is_null() {
+            let p: VAProcPipelineParameterBuffer = ptr::read_unaligned(data as *const _);
+            let rect = |r: *const VARectangle| r.as_ref().map(|r| (r.x, r.y, r.width, r.height));
+            d.regions.push((rect(p.surface_region), rect(p.output_region)));
+        }
         let bytes = if data.is_null() { vec![0u8; (size * num) as usize] } else { std::slice::from_raw_parts(data as *const u8, (size * num) as usize).to_vec() };
         d.buffers.push((context, kind, bytes));
         *out = d.buffers.len() as u32 - 1 + 0x1000;

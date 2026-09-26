@@ -780,3 +780,18 @@ fn vp8_never_reconstructs_into_a_buffer_it_holds() {
         }
     }
 }
+
+/// The video processor writes the picture at its own size onto the aligned surface the
+/// encoder reads, rather than stretching it over the alignment rows the stream crops away.
+#[test]
+fn the_video_processor_writes_the_picture_unscaled() {
+    mock::reset(Driver::generous());
+    let (w, h) = (320, 232);
+    let mut enc = open(Codec::H264, &sized(Codec::H264, false, w, h, 30.0)).unwrap();
+    encode_sized(&mut enc, w, h, 0, true);
+    mock::with(|d| {
+        assert!(d.surfaces.iter().any(|s| s.3 == 240), "the surfaces align to whole macroblocks");
+        let whole = Some((0, 0, w as u16, h as u16));
+        assert_eq!(d.regions, [(whole, whole)], "the source and output rectangles");
+    });
+}
