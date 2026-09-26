@@ -23,13 +23,14 @@ pub enum Codec {
     H265 = 5,
 }
 
-/// Wire tag of a JPEG stripe: `u8 reserved`, `u16 frame id`, `u16 stripe Y`, JPEG data.
 use super::reference::{Reference, REFERENCE_FRAMES};
 
+/// Wire tag of a JPEG stripe: `u8 reserved`, `u16 frame id`, `u16 stripe Y`, JPEG data.
 pub const WIRE_JPEG: u8 = 0x03;
 /// Wire tag of an encoded video frame or stripe: a type byte whose low nibble is the
 /// frame kind and whose high nibble is the codec's [`Codec::wire_id`], then `u16 frame
-/// id`, `u16 stripe Y`, `u16 width`, `u16 height`, and the codec's own bitstream.
+/// id`, `u16 stripe Y`, `u16 width`, `u16 height`, `u16 reference` (the frame it predicts
+/// from, its own id where it names none), and the codec's own bitstream.
 pub const WIRE_VIDEO: u8 = 0x04;
 /// Frame kinds in the low nibble of the video type byte: a decode entry point, an
 /// intra-coded picture that is not one, and a predicted picture.
