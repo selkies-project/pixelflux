@@ -1372,13 +1372,17 @@ pub(crate) mod gpu_test_support {
     use crate::webcam::decode::{VideoDecoder, Decoder};
     use crate::RustCaptureSettings;
 
-    /// Full-frame capture settings for `codec` at CRF 25, streaming every frame.
+    /// Full-frame capture settings for `codec` at CRF 25, streaming every frame, on the render
+    /// node `auto_gpu` picks first.
     pub(crate) fn settings(codec: Codec) -> RustCaptureSettings {
         RustCaptureSettings {
             codec,
             target_fps: 60.0,
             video_crf: 25,
             video_streaming_mode: true,
+            encode_node_index: crate::auto_render_node("true")
+                .and_then(|node| crate::render_node_index(&node))
+                .unwrap_or(0),
             ..Default::default()
         }
     }
