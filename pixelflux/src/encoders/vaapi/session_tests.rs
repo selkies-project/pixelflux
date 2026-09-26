@@ -904,3 +904,29 @@ fn a_session_without_headers_returns_the_coded_bytes_alone() {
         }
     }
 }
+
+/// Where the driver writes its own SPS, as radeonsi does, `frame_num` wraps where that SPS says,
+/// so a loss covering the frame that carries `frame_num` 0 there is answered with a key frame
+/// rather than a prediction across the wrap.
+#[test]
+fn a_loss_across_the_wrap_of_the_drivers_frame_num_costs_a_key_frame() {
+    mock::reset(Driver::generous());
+    let mut enc = session(Codec::H264, false);
+    let radeonsi_key = [
+        &[0, 0, 0, 1, 0x67, 0x64, 0x0c, 0x2a, 0xac, 0x23, 0x28, 0x0f, 0x00, 0x44, 0xfc, 0xb3, 0x50, 0x10, 0x10, 0x14, 0x00, 0x00, 0x03][..],
+        &[0x00, 0x04, 0x00, 0x00, 0x03, 0x01, 0xe2, 0x3c, 0x22, 0x11, 0x96],
+        &[0, 0, 0, 1, 0x68, 0xee, 0x38, 0x30],
+        &[0, 0, 0, 1, 0x65, 0x88, 0x80, 0x43],
+    ]
+    .concat();
+    assert_eq!(h264_frame_num_range(&radeonsi_key), Some(128), "radeonsi's SPS: log2_max_frame_num_minus4 3");
+    mock::with(|d| d.coded = Some(radeonsi_key));
+    encode(&mut enc, 0, true);
+    mock::with(|d| d.coded = None);
+    for t in 1..130u64 {
+        encode(&mut enc, t, false);
+    }
+    assert!(enc.invalidate_reference(127));
+    let out = encode(&mut enc, 130, false);
+    assert_eq!(parse_video_type(out[1]), Some((Codec::H264, FRAME_KEY)), "frame 128 carried frame_num 0");
+}

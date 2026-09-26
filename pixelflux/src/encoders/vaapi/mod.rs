@@ -50,6 +50,7 @@ use super::codec::{
 };
 use super::reference::{Reference, ReferenceSlots, ReferenceWindow, SlotPlan, REFERENCE_FRAMES};
 use super::session::{check_host_frame, RateSettings};
+use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 
 /// The quality level asked of every session, or the driver's highest where its range ends
@@ -1244,6 +1245,13 @@ impl VaapiEncoder {
             _ => frame_type_from_key(av1_is_key(coded)),
         };
         let is_key = frame_type != super::codec::FRAME_DELTA;
+        if is_key
+            && self.codec == Codec::H264
+            && let Some(References::Window(w)) = &mut self.references
+            && let Some(range) = h264_frame_num_range(coded)
+        {
+            w.set_frame_num_range(range);
+        }
         self.last_reference = match &mut self.references {
             Some(References::Window(w)) => w.record(frame_id, is_key),
             Some(References::Slots(s)) => {
