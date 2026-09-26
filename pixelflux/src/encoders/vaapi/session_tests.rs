@@ -836,3 +836,44 @@ fn hevc_main_444_declares_its_profile_constraints() {
     let flags: Vec<u32> = (0..9).map(|_| r.u(1)).collect();
     assert_eq!(flags, [1, 1, 1, 0, 0, 0, 0, 0, 1], "max 12-bit, 10-bit, 8-bit, 4:2:2, 4:2:0, monochrome, intra, one picture, lower bit rate");
 }
+
+/// A frame-rate change re-declares the stream at the level its new rate asks for, never below
+/// the one the decoded picture buffer was sized for at open: a lower level admits fewer
+/// reference frames than the buffer the stream keeps.
+#[test]
+fn a_rate_change_keeps_the_level_the_buffer_needs() {
+    let (w, h) = (1920, 1080);
+    for codec in [Codec::H264, Codec::H265] {
+        mock::reset(Driver::generous());
+        let mut enc = open(codec, &sized(codec, false, w, h, 120.0)).unwrap();
+        encode_sized(&mut enc, w, h, 0, true);
+        enc.reconfigure_rate(&sized(codec, false, w, h, 60.0)).unwrap();
+        let out = encode_sized(&mut enc, w, h, 1, false);
+        assert_eq!(parse_video_type(out[1]), Some((codec, FRAME_KEY)), "{codec:?}: the new rate opens a sequence");
+        let stream = &out[VIDEO_HEADER_LEN..];
+        if codec == Codec::H264 {
+            let level = nal(stream, 7, false)[2] as u32;
+            let refs = h264_max_num_ref_frames(stream).unwrap();
+            assert!(crate::encoders::codec::h264_dpb_frames(level, w as u32, h as u32) >= refs, "level_idc {level} admits {refs} reference frames");
+        } else {
+            let rbsp = nal(stream, 33, true);
+            let mut r = Reader { bytes: &rbsp, pos: 8 + 88 };
+            let level = r.u(8);
+            r.ue();
+            assert_eq!(r.ue(), 1, "chroma_format_idc");
+            r.ue();
+            r.ue();
+            if r.u(1) == 1 {
+                (0..4).for_each(|_| {
+                    r.ue();
+                });
+            }
+            r.ue();
+            r.ue();
+            r.ue();
+            assert_eq!(r.u(1), 0, "sps_sub_layer_ordering_info_present_flag");
+            let buffered = r.ue() + 1;
+            assert!(crate::encoders::codec::h265_dpb_frames(level, w as u32, h as u32) + 1 >= buffered, "general_level_idc {level} admits {buffered} buffered pictures");
+        }
+    }
+}

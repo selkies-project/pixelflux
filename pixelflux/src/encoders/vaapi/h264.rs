@@ -66,15 +66,15 @@ impl Arm {
         self.slices
     }
 
-    /// The stream's sequence: the level the ladder names at this geometry and rate, the
-    /// picture size in macroblocks with the cropping that trims it, and the SPS and PPS the
-    /// key frames carry.
+    /// The stream's sequence: the level the ladder names at this geometry and rate, never
+    /// below the one the decoded picture buffer was sized for, the picture size in macroblocks
+    /// with the cropping that trims it, and the SPS and PPS the key frames carry.
     pub(super) fn configure(&mut self, n: &Negotiated, surface_width: u32, surface_height: u32, slices: (u32, u32)) {
         self.mb_width = surface_width / 16;
         self.mb_height = surface_height / 16;
         self.slices = slices;
         self.dpb = n.dpb;
-        self.level_idc = h264_level(n.width, n.height, n.fps, n.bits_per_second as u64);
+        self.level_idc = h264_level(n.width, n.height, n.fps, n.bits_per_second as u64).max(n.dpb_level);
         let profile_idc = if self.profile == VAProfileH264High {
             100
         } else if self.profile == VAProfileH264Main {

@@ -380,6 +380,9 @@ pub(super) struct Negotiated {
     pub bits_per_second: u32,
     /// The reference frames the decoded picture buffer holds.
     pub dpb: u32,
+    /// The level the decoded picture buffer was sized for, the lowest an H.264 or HEVC
+    /// sequence declares.
+    pub dpb_level: u32,
     pub fullcolor: bool,
     /// The quantizer bounds of a constant-rate session in the codec's own domain, 0 for none.
     pub min_qp: u32,
@@ -640,9 +643,14 @@ impl VaapiEncoder {
             return Err("this VA-API driver takes no reference frames".into());
         }
         let level_bitrate = bits_per_second as u64;
+        let dpb_level = match codec {
+            Codec::H264 => super::codec::h264_level(width, height, fps, level_bitrate),
+            Codec::H265 => super::codec::h265_level(width, height, fps, level_bitrate, true),
+            _ => 0,
+        };
         let dpb = match codec {
-            Codec::H264 => super::codec::h264_dpb_frames(super::codec::h264_level(width, height, fps, level_bitrate), width, height),
-            Codec::H265 => super::codec::h265_dpb_frames(super::codec::h265_level(width, height, fps, level_bitrate, true), width, height),
+            Codec::H264 => super::codec::h264_dpb_frames(dpb_level, width, height),
+            Codec::H265 => super::codec::h265_dpb_frames(dpb_level, width, height),
             _ => REFERENCE_FRAMES,
         };
         let mut arm = match codec {
@@ -695,6 +703,7 @@ impl VaapiEncoder {
                 fps,
                 bits_per_second,
                 dpb,
+                dpb_level,
                 fullcolor,
                 min_qp: codec.quantizer_bound(rate.min_qp),
                 max_qp: codec.quantizer_bound(rate.max_qp),

@@ -164,15 +164,16 @@ impl Arm {
         w.u(8, self.level_idc as u64);
     }
 
-    /// The stream's sequence: level and tier from the ladder, the picture in coding tree
-    /// blocks, and the VPS, SPS, and PPS the key frames carry.
+    /// The stream's sequence: level and tier from the ladder, the level never below the one
+    /// the decoded picture buffer was sized for, the picture in coding tree blocks, and the
+    /// VPS, SPS, and PPS the key frames carry.
     pub(super) fn configure(&mut self, n: &Negotiated, surface_width: u32, surface_height: u32, slices: (u32, u32)) {
         let t = self.tools;
         self.ctb_width = surface_width.div_ceil(t.ctu_size);
         self.ctb_height = surface_height.div_ceil(t.ctu_size);
         self.slices = slices;
         self.dpb = n.dpb;
-        self.level_idc = h265_level(n.width, n.height, n.fps, n.bits_per_second as u64, true);
+        self.level_idc = h265_level(n.width, n.height, n.fps, n.bits_per_second as u64, true).max(n.dpb_level);
         self.tier = h265_tier(self.level_idc);
         self.pic_init_qp = if n.rc_mode == VA_RC_CQP { PIC_INIT_QP_CQP } else { PIC_INIT_QP_CBR };
         self.cu_qp_delta = n.rc_mode != VA_RC_CQP && t.cu_qp_delta;
