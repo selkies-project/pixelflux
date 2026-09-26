@@ -99,15 +99,12 @@ impl HevcEncoder {
         Ok(())
     }
 
-    /// Apply a rate or frame-rate change: live where the library takes one, else by re-opening.
+    /// Re-open the encoder when a rate or frame-rate setting changed: neither library's rate
+    /// control takes a new target while it runs.
     pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
         let Some(rate) = self.rate.changed(settings) else { return Ok(()) };
-        let fps_changed = rate.fps != self.rate.fps;
         self.rate = rate;
-        if fps_changed || !self.backend.reconfigure_rate(rate) {
-            self.reopen()?;
-        }
-        Ok(())
+        self.reopen()
     }
 
     /// Encode one packed host frame at the quality index `crf`, as a key frame when `force_idr`.
@@ -120,10 +117,7 @@ impl HevcEncoder {
         crf: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
-        if !self.rate.cbr
-            && let Some(q) = self.quality.update(Codec::H265.quantizer(crf as i32))
-            && !self.backend.reconfigure_quality(q)
-        {
+        if !self.rate.cbr && self.quality.update(Codec::H265.quantizer(crf as i32)).is_some() {
             self.reopen()?;
         }
         if force_idr && !self.fresh && !Backend::KEY_ON_REQUEST {
@@ -297,28 +291,6 @@ mod x265 {
             Ok(me)
         }
 
-        /// Push the live parameters back into the running encoder; false where it refuses,
-        /// and the session re-opens.
-        fn reconfigure(&mut self, options: &[(&str, String)]) -> bool {
-            unsafe {
-                let api = &*self.api;
-                (api.encoder_parameters.unwrap())(self.encoder, self.params);
-                if options.iter().any(|(name, value)| self.set(name, value).is_err()) {
-                    return false;
-                }
-                (api.encoder_reconfig.unwrap())(self.encoder, self.params) == 0
-            }
-        }
-
-        pub fn reconfigure_quality(&mut self, q: u32) -> bool {
-            self.reconfigure(&[("crf", q.to_string())])
-        }
-
-        pub fn reconfigure_rate(&mut self, rate: RateSettings) -> bool {
-            let options = Self::rate_options(rate, 0);
-            self.reconfigure(&options[..3])
-        }
-
         #[allow(clippy::too_many_arguments)]
         pub fn encode(
             &mut self,
@@ -464,14 +436,6 @@ mod kvazaar {
                 return Err("kvazaar refused the session".into());
             }
             Ok(me)
-        }
-
-        pub fn reconfigure_quality(&mut self, _q: u32) -> bool {
-            false
-        }
-
-        pub fn reconfigure_rate(&mut self, _rate: RateSettings) -> bool {
-            false
         }
 
         #[allow(clippy::too_many_arguments)]

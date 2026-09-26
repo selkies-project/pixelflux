@@ -221,7 +221,7 @@ fn survives_in_child(f: impl FnOnce()) -> bool {
 
 /// Damps visible quality "blinking": the number of consecutive frames a QP *increase* (a
 /// quality drop under sustained motion) must be requested before a fixed-QP encoder commits
-/// it. Moving the quantizer costs a codec re-open (kvazaar, SVT-AV1) or a full encoder
+/// it. Moving the quantizer costs a codec re-open (x265, kvazaar, SVT-AV1) or a full encoder
 /// rebuild (OpenH264), and either forces a key frame, so acting on every transient increase —
 /// and then reversing it as motion settles — would make the picture pulse. Quality
 /// *increases* (a lower QP, e.g. a paint-over refresh) apply at once and never wait. Shared so
@@ -1050,6 +1050,12 @@ mod software_tests {
         dec.decode(&packet[VIDEO_HEADER_LEN..]).unwrap_or_else(|e| panic!("decode: {e:?}"))
     }
 
+    /// Whether the session takes a new bitrate without a key frame, as libvpx does a new
+    /// quantizer too.
+    fn takes_a_live_rate(enc: &FrameEncoder) -> bool {
+        enc.backend_name() == "libvpx"
+    }
+
     /// Every codec's frames carry its own wire id and kind, decode back to the source picture,
     /// and a key frame forced mid-stream starts a fresh decoder on its own.
     #[test]
@@ -1206,8 +1212,8 @@ mod software_tests {
 
     /// A quality increase applies at once and keeps the stream decodable, a decrease waits out
     /// the hysteresis where a change costs a re-open, and a frame-rate change keeps the stream
-    /// decodable too. A library that takes the change live spends no key frame on it (libvpx,
-    /// x265); one that has to re-open starts the fresh encoder with one (kvazaar, SVT-AV1).
+    /// decodable too. A library that takes the change live spends no key frame on it; one that
+    /// has to re-open starts the fresh encoder with one.
     #[test]
     fn live_quality_and_rate_changes_keep_the_stream_decodable() {
         for codec in lockstep_codecs() {
@@ -1218,7 +1224,7 @@ mod software_tests {
             let coarse = enc.encode_host(&frame(0), W * 4, false, 0, 40, true).unwrap();
             assert!(decode_one(&mut dec, &coarse));
             let fine = enc.encode_host(&frame(1), W * 4, false, 1, 15, false).unwrap();
-            let live = matches!(enc.backend_name(), "libvpx" | "x265");
+            let live = enc.backend_name() == "libvpx";
             let kind = if live { FRAME_DELTA } else { FRAME_KEY };
             assert_eq!(parse_video_type(fine[1]), Some((codec, kind)), "{codec:?}: a quality change {}", if live { "is live" } else { "re-opens with a key frame" });
             assert!(decode_one(&mut dec, &fine));
@@ -1232,6 +1238,68 @@ mod software_tests {
             assert_eq!(parse_video_type(after[1]), Some((codec, kind)), "{codec:?}: a frame-rate change");
             assert!(decode_one(&mut dec, &after));
             assert!(luma_psnr(&dec.frame().unwrap(), &frame(3)) > 28.0);
+        }
+    }
+
+    /// A finer quantizer reaches a running constant-quality session, live where the library takes
+    /// one, and the frames after it spend more.
+    #[test]
+    fn a_quality_change_reaches_a_running_session() {
+        for codec in lockstep_codecs() {
+            let mut s = settings(codec);
+            s.video_crf = 40;
+            let mut enc = session(codec, &s, false);
+            let (mut spent, mut changed) = ([0usize; 2], None);
+            for t in 0..12usize {
+                let crf = if t < 6 { 40 } else { 15 };
+                let out = enc.encode_host(&frame(t), W * 4, false, t as u64, crf, t == 0).unwrap();
+                if t == 6 {
+                    changed = parse_video_type(out[1]);
+                }
+                if (1..6).contains(&t) {
+                    spent[0] += out.len();
+                } else if t >= 7 {
+                    spent[1] += out.len();
+                }
+            }
+            assert!(spent[1] * 2 > spent[0] * 3, "{codec:?}: bytes over five deltas before and after {spent:?}");
+            let kind = if enc.backend_name() == "libvpx" { FRAME_DELTA } else { FRAME_KEY };
+            assert_eq!(changed, Some((codec, kind)), "{codec:?}: the frame after the change");
+        }
+    }
+
+    /// A new bitrate reaches a running constant-rate session, live where the library takes one,
+    /// and the stream stays decodable across it.
+    #[test]
+    fn a_bitrate_change_reaches_a_running_session() {
+        for codec in lockstep_codecs() {
+            let mut s = settings(codec);
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = 1500;
+            let mut enc = session(codec, &s, false);
+            let mut dec = VideoDecoder::new(codec).expect("decoder");
+            let (mut spent, mut changed) = ([0usize; 2], None);
+            for t in 0..60usize {
+                if t == 30 {
+                    s.video_bitrate_kbps = 4500;
+                    enc.reconfigure_rate(&s).expect("rate reconfigure");
+                }
+                let out = enc.encode_host(&noise(t), W * 4, false, t as u64, 25, t == 0).unwrap();
+                if t == 30 {
+                    changed = parse_video_type(out[1]);
+                }
+                if out.len() > VIDEO_HEADER_LEN {
+                    assert!(decode_one(&mut dec, &out), "{codec:?} frame {t}");
+                }
+                if (15..30).contains(&t) {
+                    spent[0] += out.len();
+                } else if t >= 45 {
+                    spent[1] += out.len();
+                }
+            }
+            assert!(spent[1] > spent[0] * 2, "{codec:?}: bytes over fifteen frames before and after {spent:?}");
+            let kind = if takes_a_live_rate(&enc) { FRAME_DELTA } else { FRAME_KEY };
+            assert_eq!(changed, Some((codec, kind)), "{codec:?}: the frame after the change");
         }
     }
 
