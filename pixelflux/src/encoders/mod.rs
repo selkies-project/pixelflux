@@ -35,7 +35,7 @@ pub mod session;
 /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
 /// change detection.
 pub mod software;
-/// The colour an H.264 stream declares: read from a sequence parameter set, and written into
+/// The color an H.264 stream declares: read from a sequence parameter set, and written into
 /// one for a device that converts without saying what it converted with.
 pub mod sps;
 /// Software AV1 through SVT-AV1.
@@ -506,7 +506,7 @@ impl FrameEncoder {
     }
 
     /// The data one call returned, cut at the units it carries, each with its own frame's id and
-    /// reference: whole and labelled `encoded` from a session that hands back the frame it
+    /// reference: whole and labeled `encoded` from a session that hands back the frame it
     /// encoded, one unit per earlier frame from one that hands them back late (Tegra), so what a
     /// consumer reports lost is the unit it dropped and nothing else.
     pub fn delivered_units(&self, data: Vec<u8>, encoded: u16) -> Vec<(Vec<u8>, u16, reference::Reference)> {

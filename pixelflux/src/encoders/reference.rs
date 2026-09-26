@@ -194,12 +194,12 @@ impl ReferenceWindow {
 ///
 /// A codec with three named buffers cannot hold the last eight frames the way a decoded picture
 /// buffer does, so the buffers are spent on anchors of different ages: every frame lands in LAST,
-/// every fourth in GOLDEN, and every sixteenth in ALTREF, on schedules that never meet, so a loss
-/// a few frames deep still finds an anchor older than it. A frame predicts from the newest buffer whose frame the client still
-/// has, LAST when the anchors are as new, and a frame coded from an anchor rather than LAST
-/// refreshes all three, since it is the newest picture both sides hold. The frame ids wrap; the
-/// timestamps are the session's own count of encoded frames and do not, and the recent ones are
-/// kept so a lost frame no buffer holds still dates the buffers coded after it.
+/// every fourth in GOLDEN, and every sixteenth in ALTREF, on schedules that never meet, so a loss a
+/// few frames deep still finds an anchor older than it. A frame predicts from the newest buffer
+/// whose frame the client still has, LAST when the anchors are as new, and a frame coded from an
+/// anchor rather than LAST refreshes all three, since it is the newest picture both sides hold. The
+/// frame ids wrap; the timestamps are the session's own count of encoded frames and do not, and the
+/// recent ones are kept so a lost frame no buffer holds still dates the buffers coded after it.
 pub struct ReferenceSlots {
     slots: [Option<(u16, u64, bool)>; 3],
     recent: VecDeque<(u16, u64)>,
