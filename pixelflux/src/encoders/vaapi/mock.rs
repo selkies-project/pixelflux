@@ -30,6 +30,8 @@ pub(crate) struct Driver {
     pub surface_fourccs: Vec<u32>,
     /// Whether `vaDeriveImage` answers.
     pub derive: bool,
+    /// Whether `vaCreateImage` refuses.
+    pub image_fails: bool,
     /// The pipeline color standards the video processor lists.
     pub color_standards: Vec<VAProcColorStandardType>,
     pub configs: Vec<(VAProfile, VAEntrypoint, Vec<VAConfigAttrib>)>,
@@ -49,6 +51,8 @@ pub(crate) struct Driver {
     pub puts: u32,
     /// The source and output rectangles of every video-processing buffer, None for a null one.
     pub regions: Vec<(Option<Rect>, Option<Rect>)>,
+    /// Every surface destroyed.
+    pub destroyed: Vec<VASurfaceID>,
     next_id: u32,
     in_picture: Option<(VAContextID, VASurfaceID, Vec<usize>)>,
     coded_out: Vec<u8>,
@@ -336,7 +340,8 @@ unsafe extern "C" fn create_surfaces(_dpy: VADisplay, rt_format: c_uint, width: 
     })
 }
 
-unsafe extern "C" fn destroy_surfaces(_dpy: VADisplay, _list: *mut VASurfaceID, _count: c_int) -> VAStatus {
+unsafe extern "C" fn destroy_surfaces(_dpy: VADisplay, list: *mut VASurfaceID, count: c_int) -> VAStatus {
+    with(|d| d.destroyed.extend((0..count as usize).map(|i| unsafe { *list.add(i) })));
     VA_STATUS_SUCCESS as VAStatus
 }
 
@@ -447,6 +452,9 @@ fn image(width: c_int, height: c_int, fourcc: u32) -> VAImage {
 }
 
 unsafe extern "C" fn create_image(_dpy: VADisplay, format: *mut VAImageFormat, width: c_int, height: c_int, out: *mut VAImage) -> VAStatus {
+    if with(|d| d.image_fails) {
+        return VA_STATUS_ERROR_OPERATION_FAILED as VAStatus;
+    }
     unsafe { *out = image(width, height, (*format).fourcc) };
     VA_STATUS_SUCCESS as VAStatus
 }

@@ -880,18 +880,16 @@ impl VaapiEncoder {
                 unsafe { (api.vaDestroyImage)(device.display, derived.image_id) };
                 same
             };
-            let image = if derive {
-                None
-            } else {
+            let host = self.host.insert(HostUpload { surface, fourcc, derive, image: None });
+            if !derive {
                 let mut format = image_format(device, fourcc).ok_or_else(|| format!("this VA-API driver has no {} image format", fourcc_name(fourcc)))?;
                 let mut image: VAImage = unsafe { std::mem::zeroed() };
                 device.check(
                     unsafe { (api.vaCreateImage)(device.display, &mut format, self.negotiated.width as c_int, self.negotiated.height as c_int, &mut image) },
                     "vaCreateImage",
                 )?;
-                Some(image)
-            };
-            self.host = Some(HostUpload { surface, fourcc, derive, image });
+                host.image = Some(image);
+            }
         }
         Ok(())
     }

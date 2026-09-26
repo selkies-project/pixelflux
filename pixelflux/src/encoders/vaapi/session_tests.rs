@@ -877,3 +877,17 @@ fn a_rate_change_keeps_the_level_the_buffer_needs() {
         }
     }
 }
+
+/// A session whose host upload cannot be set up leaves no surface behind.
+#[test]
+fn a_session_that_fails_to_open_frees_its_surfaces() {
+    let mut copying = Driver::generous();
+    copying.derive = false;
+    copying.image_fails = true;
+    mock::reset(copying);
+    assert!(open(Codec::H264, &settings(Codec::H264, false)).is_err());
+    mock::with(|d| {
+        let leaked: Vec<VASurfaceID> = d.surfaces.iter().map(|s| s.0).filter(|id| !d.destroyed.contains(id)).collect();
+        assert!(leaked.is_empty(), "surfaces {leaked:?} outlive the session");
+    });
+}
