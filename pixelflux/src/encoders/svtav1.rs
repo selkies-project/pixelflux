@@ -19,7 +19,7 @@
 
 use std::ffi::CString;
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 
 use codec_sys::svtav1::*;
 
@@ -46,11 +46,15 @@ const KEYFRAME_BY_REOPEN: bool = SVT_AV1_VERSION_MAJOR < 2;
 /// packet that never comes; a session released before its first frame feeds it one.
 const FEED_BEFORE_RELEASE: bool = SVT_AV1_VERSION_MAJOR < 1 || (SVT_AV1_VERSION_MAJOR == 1 && SVT_AV1_VERSION_MINOR < 5);
 
-/// Held while a handle is created or released and while the probe forks: before 4.0 the
-/// library rebuilds a process-wide processor table in every handle it creates and frees it in
-/// every one it releases, and from 4.1 handle setup takes process-wide locks that a child
-/// forked meanwhile inherits held.
-pub(crate) static LIFECYCLE: Mutex<()> = Mutex::new(());
+/// The handles alive, held while one is created or released and while the probe forks: before
+/// 4.0 the library rebuilds a process-wide processor table in every handle it creates and frees
+/// it in every one it releases, and from 4.1 handle setup takes process-wide locks that a child
+/// forked meanwhile inherits held. The probe forks only while no handle is alive, since a live
+/// session's worker threads hold that state as well.
+pub(crate) static LIFECYCLE: Mutex<usize> = Mutex::new(0);
+
+/// Notified at each handle released, for a probe waiting for none to be alive.
+pub(crate) static RELEASED: Condvar = Condvar::new();
 
 /// One SVT-AV1 session for one capture.
 pub struct SvtAv1Encoder {
@@ -136,11 +140,12 @@ impl SvtAv1Encoder {
     /// Stand the encoder up with the live settings. The first frame it codes is a key frame.
     fn open(&mut self) -> Result<(), String> {
         self.close();
-        let _lifecycle = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut live = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
         let code = unsafe { init_handle(&mut self.handle, &mut *self.config) };
         if code != EB_ErrorNone || self.handle.is_null() {
             return Err(error("SVT-AV1 handed out no encoder handle", code));
         }
+        *live += 1;
         let rate = self.rate;
         let bps = rate.bps();
         let tracks = HAS_EVENTS && rate.cbr;
@@ -251,9 +256,11 @@ impl SvtAv1Encoder {
                     }
                 }
             }
-            let _lifecycle = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live = LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
             svt_av1_enc_deinit(self.handle);
             svt_av1_enc_deinit_handle(self.handle);
+            *live -= 1;
+            RELEASED.notify_all();
         }
         self.handle = ptr::null_mut();
     }

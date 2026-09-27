@@ -211,14 +211,17 @@ fn encodes_in_child(codec: Codec) -> bool {
 /// Whether a forked child outlives `f`: a fatal signal in it is the finding, an exit is not, and
 /// neither reaches the caller. The child has a minute, and one that neither returns nor dies
 /// in it has stalled, which is as final. What it prints goes nowhere, so a library that
-/// announces itself on open speaks for a session and not for the probe. The fork waits out any
-/// SVT-AV1 handle another thread is creating or releasing (`svtav1::LIFECYCLE`), whose
-/// process-wide state the child would otherwise inherit half-built. One a sandbox refuses to
-/// fork counts as alive.
+/// announces itself on open speaks for a session and not for the probe. The fork waits until
+/// no SVT-AV1 handle is alive (`svtav1::LIFECYCLE`), as at the import-time probe: one being
+/// created, released, or run holds process-wide state the child would inherit half-built or
+/// locked. One a sandbox refuses to fork counts as alive.
 fn survives_in_child(f: impl FnOnce()) -> bool {
-    let lifecycle = svtav1::LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut live = svtav1::LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    while *live > 0 {
+        live = svtav1::RELEASED.wait(live).unwrap_or_else(|e| e.into_inner());
+    }
     let pid = unsafe { libc::fork() };
-    drop(lifecycle);
+    drop(live);
     match pid {
         0 => {
             unsafe {
