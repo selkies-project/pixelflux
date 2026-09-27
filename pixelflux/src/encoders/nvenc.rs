@@ -3382,6 +3382,17 @@ mod gpu_tests {
         }
     }
 
+    /// Test helper: a session for checks that hand it a fresh buffer every frame, which it pins
+    /// none of: a registration outlives the buffer it page-locked, and a later buffer at an
+    /// overlapping address then fails to upload, or uploads the pages of the freed one, where a
+    /// capture's persistent shm is released on every reshape.
+    fn host_session(s: &RustCaptureSettings) -> Result<NvencEncoder, String> {
+        NvencEncoder::new(s, ptr::null()).map(|mut enc| {
+            enc.pin_uploads = false;
+            enc
+        })
+    }
+
     /// Test helper: a `w×h` BGRA frame filled with a hashed gradient (offset by `seed`) so
     /// the content has structure and encodes are non-trivial.
     fn frame(w: usize, h: usize, seed: u8) -> Vec<u8> {
@@ -3515,7 +3526,7 @@ mod gpu_tests {
     fn gpu_resolution_reconfigure_roundtrip() {
         let mut s = settings(1280, 720, 60.0);
         let t0 = std::time::Instant::now();
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let init_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let mut stream: Vec<u8> = Vec::new();
@@ -3615,7 +3626,7 @@ mod gpu_tests {
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
-            let mut enc = match NvencEncoder::new(&s, ptr::null()) {
+            let mut enc = match host_session(&s) {
                 Ok(enc) => enc,
                 Err(e) => {
                     println!("{codec:?}: {e}");
@@ -3653,7 +3664,7 @@ mod gpu_tests {
 
             let mut full = s.clone();
             full.video_fullcolor = true;
-            let enc = NvencEncoder::new(&full, ptr::null()).expect("4:4:4 request");
+            let enc = host_session(&full).expect("4:4:4 request");
             if codec.fullcolor() {
                 println!("{codec:?} 4:4:4: {}", enc.is_fullcolor());
             } else {
@@ -3697,7 +3708,7 @@ mod gpu_tests {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
             s.omit_stripe_headers = true;
-            let mut enc = match NvencEncoder::new(&s, ptr::null()) {
+            let mut enc = match host_session(&s) {
                 Ok(enc) => enc,
                 Err(e) => {
                     println!("{codec:?}: {e}");
@@ -3778,7 +3789,7 @@ mod gpu_tests {
         let (w, h) = (1280usize, 720usize);
         let mut s = settings(w as i32, h as i32, 60.0);
         s.omit_stripe_headers = true;
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("H.264 session");
+        let mut enc = host_session(&s).expect("H.264 session");
         let encode = |enc: &mut NvencEncoder, i: usize| {
             let out = enc.encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0).expect("encode");
             (out, enc.last_reference())
@@ -3818,7 +3829,7 @@ mod gpu_tests {
         let mut s = settings(1280, 720, 60.0);
         s.video_cbr_mode = true;
         s.video_bitrate_kbps = 4000;
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let f720 = frame(1280, 720, 10);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f720, 1280 * 4, i, 25, i == 0)
@@ -3847,7 +3858,7 @@ mod gpu_tests {
         use crate::encoders::sps::h264_max_num_ref_frames;
         use crate::encoders::{select_frame_encoder, FrameEncoder, FrameSource};
         let mut s = settings(1920, 1080, 60.0);
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let key = enc.encode_cpu_argb(&frame(1920, 1080, 10), 1920 * 4, 0, 25, true).expect("encode 1080p");
         assert_eq!(h264_max_num_ref_frames(&key[VIDEO_HEADER_LEN..]), Some(4), "1080p at level 4.2 admits four");
         enc.dpb = REFERENCE_FRAMES;
@@ -3913,7 +3924,7 @@ mod gpu_tests {
             }
             return;
         }
-        let mut enc = NvencEncoder::new(&settings(1280, 720, 60.0), ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&settings(1280, 720, 60.0)).expect("NVENC init");
         unsafe {
             let funcs = enc.nvenc_funcs;
             let _ = (enc.cuda.cuCtxPushCurrent_v2)(enc.cuda_context);
@@ -3961,6 +3972,32 @@ mod gpu_tests {
         println!("API {maj}.{min}: the driver stayed inside every struct");
     }
 
+    /// A source a capture keeps and repaints, as its shm segment is, is page-locked once and
+    /// read as it is at each upload, and after `release_pinned_hosts`, as a reshape calls it, a
+    /// new one is: each decoded frame shows the picture just painted, not an earlier one.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_pinned_uploads_read_the_source_as_it_is_now() {
+        use crate::webcam::decode::VideoDecoder;
+        let (w, h) = (1280usize, 720usize);
+        let mut enc = NvencEncoder::new(&settings(w as i32, h as i32, 60.0), ptr::null()).expect("NVENC init");
+        assert!(enc.pin_uploads, "the production default pins");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
+        for (source, frames) in [(0, 0..4usize), (1, 4..8usize)] {
+            if source == 1 {
+                enc.release_pinned_hosts();
+            }
+            let mut shm = vec![0u8; w * h * 4];
+            for i in frames {
+                shm.copy_from_slice(&moving_frame(w, h, i));
+                let pkt = enc.encode_cpu_packed(&shm, w * 4, false, i as u64, 25, i == 0).expect("encode");
+                let psnr = luma_psnr(&mut dec, &pkt, &moving_frame(w, h, i), w, h);
+                assert!(psnr > 30.0, "source {source}, frame {i}: {psnr:.1} dB against the picture just painted");
+            }
+        }
+    }
+
     /// On a real GPU whose driver caps the NVENC sessions a device runs at once, as it does on
     /// consumer boards, the probe of a device with every session taken answers `SESSIONS_TAKEN`,
     /// and once one frees it lists the codecs again. A device that takes 65 sessions at once has
@@ -3969,7 +4006,7 @@ mod gpu_tests {
     #[test]
     #[ignore]
     fn gpu_a_device_out_of_sessions_says_so() {
-        let enc = NvencEncoder::new(&settings(256, 128, 60.0), ptr::null()).expect("NVENC init");
+        let enc = host_session(&settings(256, 128, 60.0)).expect("NVENC init");
         let mut sessions = Vec::new();
         let refused = unsafe {
             loop {
@@ -4016,7 +4053,7 @@ mod gpu_tests {
             s.codec = codec;
             s.video_cbr_mode = true;
             s.video_bitrate_kbps = 8000;
-            let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+            let mut enc = host_session(&s).expect("NVENC init");
             let level = enc.declared_level();
             let frames: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(1920, 1080, i)).collect();
             let kbit = |enc: &mut NvencEncoder, range: std::ops::Range<u64>| {
@@ -4044,7 +4081,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_frame_rate_rise_raises_the_level_at_a_key_frame() {
         let mut s = settings(1920, 1080, 60.0);
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let f = frame(1920, 1080, 30);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f, 1920 * 4, i, 25, i == 0).expect("encode");
@@ -4069,7 +4106,7 @@ mod gpu_tests {
         let mut s = settings(w as i32, h as i32, 60.0);
         s.video_cbr_mode = true;
         s.video_bitrate_kbps = 8000;
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let rate = |enc: &NvencEncoder| {
             let rc = enc.encode_config.rcParams;
             (rc.averageBitRate, rc.vbvBufferSize, rc.vbvInitialDelay)
@@ -4116,7 +4153,7 @@ mod gpu_tests {
             for codec in [Codec::H264, Codec::H265] {
                 let mut s = settings(w as i32, h as i32, 60.0);
                 s.codec = codec;
-                let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+                let mut enc = host_session(&s).expect("NVENC init");
                 for i in 0..4u64 {
                     let pkt = enc
                         .encode_cpu_argb(&frame(w, h, 20 + i as u8), w * 4, i, 25, i == 0)
@@ -4345,7 +4382,7 @@ mod gpu_tests {
         // Above the Main-tier MaxBR of every 5.x level (40 Mbit/s at 5.1, 60 at 5.2).
         s.video_bitrate_kbps = 100_000;
 
-        let high = NvencEncoder::new(&s, ptr::null());
+        let high = host_session(&s);
         match &high {
             Ok(enc) => unsafe {
                 let c = enc.encode_config.encodeCodecConfig.hevcConfig;
@@ -4395,7 +4432,7 @@ mod gpu_tests {
             s.codec = codec;
             s.video_cbr_mode = true;
             s.video_bitrate_kbps = kbps;
-            let mut enc = NvencEncoder::new(&s, ptr::null())
+            let mut enc = host_session(&s)
                 .unwrap_or_else(|e| panic!("{codec:?} at {kbps} kbps must open on level {level}: {e}"));
             assert_eq!(enc.declared_level(), level, "{codec:?} level at {kbps} kbps");
             s.video_bitrate_kbps = 200_000;
@@ -4420,7 +4457,7 @@ mod gpu_tests {
         let mut s = settings(1920, 1080, 60.0);
         s.video_cbr_mode = true;
         s.video_bitrate_kbps = 8000;
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         kind(&mut enc, 0, 25);
         for (n, kbps) in [(1, 6000), (2, 8000), (3, 6000)] {
             s.video_bitrate_kbps = kbps;
@@ -4430,7 +4467,7 @@ mod gpu_tests {
         s.video_bitrate_kbps = 200_000;
         assert!(enc.reconfigure_rate(&s));
         assert_eq!(kind(&mut enc, 4, 25), FRAME_KEY, "{:?}: the raised level reaches the stream at a key frame", nvenc_cur_ver());
-        let mut enc = NvencEncoder::new(&settings(1920, 1080, 60.0), ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&settings(1920, 1080, 60.0)).expect("NVENC init");
         for n in 0..6u64 {
             let want = if n == 0 { FRAME_KEY } else { FRAME_DELTA };
             assert_eq!(kind(&mut enc, n, if n % 2 == 0 { 25 } else { 18 }), want, "{:?}: paint-over frame {n}", nvenc_cur_ver());
@@ -4458,7 +4495,7 @@ mod gpu_tests {
             println!("VRAM probe skipped: nvidia-smi answered nothing");
             return;
         };
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("init");
+        let mut enc = host_session(&s).expect("init");
         let f = frame(1920, 1080, 5);
         for i in 0..3u64 {
             enc.encode_cpu_argb(&f, 1920 * 4, i, 25, i == 0).expect("encode");
@@ -4484,7 +4521,7 @@ mod gpu_tests {
         for fullcolor in [false, true] {
             let mut s = settings(1280, 720, 60.0);
             s.video_fullcolor = fullcolor;
-            let enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+            let enc = host_session(&s).expect("NVENC init");
             // encodeCodecConfig is a union; a successful init leaves the H.264 arm live.
             let h264 = unsafe { &enc.encode_config.encodeCodecConfig.h264Config };
             let vui = &h264.h264VUIParameters;
@@ -4584,7 +4621,7 @@ mod gpu_tests {
         let (w, h) = (256usize, 256usize);
         let (blue, yellow) = ([0.0, 0.0, 255.0], [255.0, 255.0, 0.0]);
         let st = settings(w as i32, h as i32, 60.0);
-        let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&st).expect("NVENC init");
         assert!(enc.csc.is_some(), "this GPU took no chroma convert");
         let rows = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, false));
         let cols = encode_and_measure(&mut enc, &color_pair(w, h, blue, yellow, true));
@@ -4610,7 +4647,7 @@ mod gpu_tests {
         );
 
         let full = RustCaptureSettings { video_fullcolor: true, ..st };
-        let enc444 = NvencEncoder::new(&full, ptr::null()).expect("NVENC init");
+        let enc444 = host_session(&full).expect("NVENC init");
         if enc444.is_fullcolor() {
             assert!(enc444.csc.is_none(), "a 4:4:4 session has no chroma to site and takes no convert");
         }
@@ -4637,7 +4674,7 @@ mod gpu_tests {
                 video_fullcolor: fullcolor,
                 ..settings(w as i32, h as i32, 60.0)
             };
-            let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            let mut enc = host_session(&st).expect("NVENC init");
             if fullcolor && !enc.is_fullcolor() {
                 println!("[chart] this GPU carries no 4:4:4 {codec:?}");
                 continue;
@@ -4722,7 +4759,7 @@ mod gpu_tests {
         use crate::webcam::decode::VideoDecoder;
         let (w, h) = (256usize, 128usize);
         let st = settings(w as i32, h as i32, 60.0);
-        let mut enc = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&st).expect("NVENC init");
         let paint = [32u8, 192, 64];
         let poison = [240u8, 16, 200];
         let (external, external_pitch) = unsafe {
@@ -4835,10 +4872,10 @@ mod gpu_tests {
         for (w, h) in [(1920usize, 1080usize), (3840, 2160)] {
             let st = settings(w as i32, h as i32, 60.0);
             let bgra = crate::encoders::chroma_siting::bgra(w, h);
-            let mut kernel = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            let mut kernel = host_session(&st).expect("NVENC init");
             assert!(kernel.csc.is_some());
             let with = bench_frames(&mut kernel, &bgra);
-            let mut hardware = NvencEncoder::new(&st, ptr::null()).expect("NVENC init");
+            let mut hardware = host_session(&st).expect("NVENC init");
             unsafe {
                 let cu = hardware.cuda.clone();
                 (cu.cuCtxPushCurrent_v2)(hardware.cuda_context);
@@ -4880,7 +4917,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_init_above_default_headroom() {
         let s = settings(2160, 4096, 30.0);
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init portrait 4K");
+        let mut enc = host_session(&s).expect("NVENC init portrait 4K");
         assert_eq!(enc.init_params.maxEncodeWidth, 4096);
         assert_eq!(enc.init_params.maxEncodeHeight, 4096);
         let f = frame(2160, 4096, 20);
@@ -5141,7 +5178,7 @@ mod gpu_tests {
         };
         let bgra = paint(false);
         let rgba = paint(true);
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let mut dec = VideoDecoder::new(Codec::H264).expect("H.264 decoder");
         let stride = (w * 4) as usize;
         // Byte order reaches the chroma convert as its own argument and the hardware conversion
@@ -5274,7 +5311,7 @@ mod gpu_tests {
         let s = settings(w as i32, h as i32, 60.0);
         let frames: Vec<Vec<u8>> = (0..4u8).map(|k| frame(w as usize, h as usize, 10 + 40 * k)).collect();
         let stride = (w * 4) as usize;
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
 
         enc.reconfigure_resolution(&s).expect("reconfigure");
         enc.encode_cpu_packed(&frames[0], stride, false, 0, 25, true).expect("warm-up");
@@ -5330,7 +5367,7 @@ mod gpu_tests {
     #[ignore]
     fn gpu_bench_lock_strategies() {
         let s = settings(1920, 1080, 60.0);
-        let mut enc = NvencEncoder::new(&s, ptr::null()).expect("NVENC init");
+        let mut enc = host_session(&s).expect("NVENC init");
         let frames = [frame(1920, 1080, 10), frame(1920, 1080, 90)];
         let n = 240usize;
         let strategies = [
