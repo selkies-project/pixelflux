@@ -46,7 +46,7 @@ impl Reference {
 /// What an invalidation asks of the encoder.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Invalidation {
-    /// The frame predates the last key frame or was never a reference: nothing to do.
+    /// The frame predates the last key frame, was already removed, or was never a reference.
     Ignored,
     /// Forget the frame carrying this timestamp and every frame after it.
     Forget(u64),
@@ -79,7 +79,7 @@ pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
     anchors: Vec<Option<(u16, u64, bool)>>,
-    recent: VecDeque<(u16, u64)>,
+    recent: VecDeque<(u16, u64, bool)>,
     next_pts: u64,
     age: KeyAge,
     key_pts: u64,
@@ -270,20 +270,45 @@ impl ReferenceWindow {
                 }
             }
         }
-        if self.anchored() {
-            self.recent.push_back((frame_id, pts));
-            if self.recent.len() > RECENT_FRAMES {
-                self.recent.pop_front();
-            }
+        self.recent.push_back((frame_id, pts, false));
+        if self.recent.len() > RECENT_FRAMES {
+            self.recent.pop_front();
         }
         reference
     }
 
-    /// Leave `frame_id` and every frame encoded after it out of the references.
+    /// Leave `frame_id` and every frame encoded after it out of the references. A report for
+    /// a picture already removed by an earlier invalidation leaves the recovered chain intact.
+    /// The bounded history dates those reports across capture-id gaps and wrap; a loss older
+    /// than the history keeps the conservative key-frame fallback.
     pub fn invalidate(&mut self, frame_id: u16) -> Invalidation {
-        if self.anchored() {
-            return self.invalidate_anchored(frame_id);
+        if self
+            .recent
+            .iter()
+            .rev()
+            .find(|f| f.0 == frame_id)
+            .is_some_and(|f| f.2)
+        {
+            return Invalidation::Ignored;
         }
+        let action = if self.anchored() {
+            self.invalidate_anchored(frame_id)
+        } else {
+            self.invalidate_recent(frame_id)
+        };
+        let cut = match action {
+            Invalidation::Forget(pts) => pts,
+            Invalidation::KeyFrame => self.key_pts,
+            Invalidation::Ignored => return action,
+        };
+        for f in self.recent.iter_mut().filter(|f| f.1 >= cut) {
+            f.2 = true;
+        }
+        action
+    }
+
+    /// Invalidate a session with only recent references.
+    fn invalidate_recent(&mut self, frame_id: u16) -> Invalidation {
         let Some(&(oldest, _, _)) = self.frames.front() else {
             return Invalidation::Ignored;
         };
@@ -334,7 +359,7 @@ impl ReferenceWindow {
             None => {
                 // Older than every frame remembered, so everything held predicts through it; a
                 // frame before the key frame, or one never sent, was never a reference.
-                let Some(&(oldest, _)) = self.recent.front() else {
+                let Some(&(oldest, _, _)) = self.recent.front() else {
                     return Invalidation::Ignored;
                 };
                 if !self
@@ -1081,5 +1106,126 @@ mod tests {
         assert_eq!(Reference::Untracked.frame_id(), -2);
         assert_eq!(Reference::None.frame_id(), -1);
         assert_eq!(Reference::Frame(7).frame_id(), 7);
+    }
+
+    /// Different reports from one invalidated interval must not discard its repaired chain.
+    #[test]
+    fn covered_losses_preserve_recovered_references() {
+        for (anchors, lost, last, recovered, later, fresh, earlier) in [
+            (0, 6u16, 7u16, 14u16, 7u16, 13u16, 5u16),
+            (1, 80, 87, 98, 81, 97, 40),
+            (2, 26, 31, 50, 27, 49, 20),
+        ] {
+            for report in [later, fresh, earlier] {
+                let mut w = if anchors == 0 {
+                    ReferenceWindow::new(4)
+                } else {
+                    ReferenceWindow::with_anchors(8, anchors)
+                };
+                for id in 0..=last {
+                    let key = id == 0;
+                    w.record_marked(id, key, w.plan_anchor(key));
+                }
+                assert!(matches!(w.invalidate(lost), Invalidation::Forget(_)));
+                for id in last + 1..=recovered {
+                    w.record_marked(id, false, w.plan_anchor(false));
+                }
+                let valid = w.newest_valid();
+                let action = w.invalidate(report);
+                if report == later {
+                    assert_eq!(action, Invalidation::Ignored, "{anchors} anchors");
+                    assert_eq!(w.newest_valid(), valid);
+                    assert_eq!(
+                        w.record_marked(recovered + 1, false, w.plan_anchor(false)),
+                        Reference::Frame(recovered)
+                    );
+                } else {
+                    assert_ne!(action, Invalidation::Ignored, "loss {report} is new");
+                }
+            }
+        }
+    }
+
+    /// Separate recovery intervals remain independent, including the frames between them.
+    #[test]
+    fn covered_loss_intervals_do_not_hide_intervening_losses() {
+        let mut w = ReferenceWindow::new(4);
+        for id in 0..=7 {
+            w.record(id, id == 0);
+        }
+        assert_eq!(w.invalidate(6), Invalidation::Forget(6));
+        for id in 8..=13 {
+            w.record(id, false);
+        }
+        assert_eq!(w.invalidate(12), Invalidation::Forget(12));
+        for id in 14..=18 {
+            w.record(id, false);
+        }
+        for id in [6, 7, 12, 13] {
+            assert_eq!(w.invalidate(id), Invalidation::Ignored);
+            assert_eq!(w.newest_valid(), Some((18, 18)));
+        }
+        assert_eq!(w.invalidate(10), Invalidation::KeyFrame);
+        assert_eq!(w.invalidate(13), Invalidation::Ignored);
+        assert!(!w.has_reference(), "a required key frame stays required");
+    }
+
+    /// The record dates encoded frames rather than assuming consecutive capture ids.
+    #[test]
+    fn covered_loss_history_handles_sparse_wrapping_ids_and_expiry() {
+        let id = |n: u32| (65520 + n * 3) as u16;
+        let mut w = ReferenceWindow::with_anchors(4, 1);
+        for n in 0..=87 {
+            w.record_marked(id(n), n == 0, w.plan_anchor(n == 0));
+        }
+        assert_eq!(w.invalidate(id(80)), Invalidation::Forget(80));
+        for n in 88..=98 {
+            w.record_marked(id(n), false, w.plan_anchor(false));
+        }
+        assert_eq!(w.invalidate(id(81)), Invalidation::Ignored);
+        assert_eq!(w.newest_valid(), Some((id(98), 98)));
+        assert_eq!(w.invalidate(id(81) + 1), Invalidation::Ignored);
+        for n in 99..=160 {
+            w.record_marked(id(n), false, w.plan_anchor(false));
+        }
+        assert_eq!(w.invalidate(id(81)), Invalidation::KeyFrame);
+    }
+
+    /// Key frames and capture resets must not inherit a prior loss for a reused id.
+    #[test]
+    fn covered_loss_history_does_not_outlive_a_reused_frame_id() {
+        for reset in [false, true] {
+            let mut w = ReferenceWindow::new(4);
+            for id in 0..=7 {
+                w.record(id, id == 0);
+            }
+            assert_eq!(w.invalidate(6), Invalidation::Forget(6));
+            w.record(8, false);
+            if reset {
+                w.reset();
+            }
+            w.record(6, true);
+            assert_eq!(w.invalidate(6), Invalidation::Forget(9));
+            assert!(!w.has_reference());
+        }
+    }
+
+    /// A covered report before a frame_num wrap is harmless, but a newly lost wrap is not.
+    #[test]
+    fn covered_loss_keeps_the_h264_wrap_guard() {
+        let mut w = ReferenceWindow::with_anchors(8, 1);
+        w.set_frame_num_range(16);
+        for id in 0..=14 {
+            w.record_marked(id, id == 0, w.plan_anchor(id == 0));
+        }
+        assert_eq!(w.invalidate(13), Invalidation::Forget(13));
+        for id in 15..=17 {
+            w.record_marked(id, false, w.plan_anchor(false));
+        }
+        w.set_capacity(4);
+        assert_eq!(w.invalidate(14), Invalidation::Ignored);
+        assert_eq!(w.newest_valid(), Some((17, 17)));
+        assert_eq!(w.invalidate(15), Invalidation::KeyFrame);
+        assert!(!w.has_reference());
     }
 }
