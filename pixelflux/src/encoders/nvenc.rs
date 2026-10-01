@@ -744,6 +744,37 @@ fn nvenc_rate_ceiling(codec: Codec) -> u32 {
     }
 }
 
+/// The split-frame mode a `codec` session asks for at `width` x `height` on a device of `engines`
+/// NVENC engines under the negotiated `api`, as `gpu_bench_tuning_on_content` measured it. AV1
+/// splits across the engines whatever the picture: a 1080p frame encodes in 1.36 ms rather than
+/// 2.07 on an RTX 4090, a 1440p one in 2.27 rather than 3.58, and both code as well or better,
+/// where the driver's own choice splits only from 4K. HEVC splits from a 4K picture, which the
+/// driver's choice splits on Ada but not on Pascal: a GTX 1080 encodes the 2160p frame in 10.3 ms
+/// rather than 16.1, more than 5% of the 81 ms such a session measures glass to glass, for 2.5 dB
+/// of PSNR on scrolling text. Below 4K a split saves HEVC about a millisecond for up to 2.3 dB,
+/// so the driver decides there, and H.264 never splits. Before API 12.1 the field's bits are
+/// another flag's, so an older session leaves them clear.
+fn split_mode(
+    codec: Codec,
+    width: u32,
+    height: u32,
+    engines: Option<i32>,
+    api: (u32, u32),
+) -> NV_ENC_SPLIT_ENCODE_MODE {
+    let forced = api >= (12, 1)
+        && engines.is_some_and(|n| n > 1)
+        && match codec {
+            Codec::Av1 => true,
+            Codec::H265 => width as u64 * height as u64 >= 3840 * 2160,
+            _ => false,
+        };
+    if forced {
+        NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE
+    } else {
+        NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE
+    }
+}
+
 /// The CBR target of a session at `settings`, in bits per second, held to the codec's
 /// `nvenc_rate_ceiling`.
 fn cbr_bps(settings: &RustCaptureSettings) -> u32 {
@@ -1022,7 +1053,11 @@ const BITSTREAM_BUFFERS: usize = 1;
 /// a CBR target by five to twelve percent; adaptive quantization moves neither time nor
 /// quality measurably. The quarter-resolution first pass needs the 1.5-frame VBV `vbv_bits`
 /// gives it: on a one-frame buffer its miss on a scene cut runs an 8 Mbit/s H.264 session at
-/// 13.7 Mbit/s (`gpu_bench_cbr_rate_control`).
+/// 13.7 Mbit/s (`gpu_bench_cbr_rate_control`). P3 holds on real content as well
+/// (`gpu_bench_tuning_on_content`, scrolling text and a panned texture at 1080p to 2160p): on a
+/// GTX 1080 and an RTX 4090 P1 encodes 0.5 to 2.4 ms sooner and P2 less, at most about 5% of the
+/// glass to glass latency a session of that size measures (25, 41, and 81 ms over WebSockets),
+/// and both code the text worse, by up to 0.8 dB in H.264 and 2.4 dB in AV1.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NvencTuning {
     pub preset: GUID,
@@ -1044,6 +1079,13 @@ pub(crate) struct NvencTuning {
     /// `gpu_hardware_conversion_matches_the_declared_matrix` measures.
     #[cfg(test)]
     pub hardware_csc: bool,
+    /// The L0 references of an H.264 or HEVC frame, AV1's forward references: the preset's
+    /// choice in production, where one reference saves no time, set to measure.
+    #[cfg(test)]
+    pub ref_l0: Option<NV_ENC_NUM_REF_FRAMES>,
+    /// A split-frame mode in place of `split_mode`'s, to measure.
+    #[cfg(test)]
+    pub split: Option<NV_ENC_SPLIT_ENCODE_MODE>,
 }
 
 impl Default for NvencTuning {
@@ -1057,6 +1099,10 @@ impl Default for NvencTuning {
             slices: SLICES_PER_FRAME,
             #[cfg(test)]
             hardware_csc: false,
+            #[cfg(test)]
+            ref_l0: None,
+            #[cfg(test)]
+            split: None,
         }
     }
 }
@@ -1381,6 +1427,8 @@ pub struct NvencEncoder {
     /// The decoded picture buffer the session declares, in frames, which a resize lowers where
     /// the new level admits fewer and never raises.
     dpb: u32,
+    /// The device's NVENC engines, which `split_mode` reads at every geometry.
+    engines: Option<i32>,
     /// The frames the decoder holds, so a lost one can be left out of the predictions and each
     /// frame can name what it predicts from; None where the device cannot invalidate a
     /// reference, and nothing is tracked.
@@ -2057,6 +2105,23 @@ impl NvencEncoder {
             );
             let anchors = anchor_count(codec, nvenc_cur_ver().0, invalidation, ltr, dpb);
             Self::configure_codec(&mut config, codec, is_444, level, dpb, anchors, &tuning);
+            #[cfg(test)]
+            if let Some(refs) = tuning.ref_l0 {
+                match codec {
+                    Codec::H265 => config.encodeCodecConfig.hevcConfig.numRefL0 = refs,
+                    Codec::Av1 => config.encodeCodecConfig.av1Config.numFwdRefs = refs,
+                    _ => config.encodeCodecConfig.h264Config.numRefL0 = refs,
+                }
+            }
+            let engines = query_cap(
+                &function_list,
+                encoder_session,
+                codec_guid,
+                NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES,
+            );
+            let split = split_mode(codec, width, height, engines, nvenc_cur_ver());
+            #[cfg(test)]
+            let split = tuning.split.unwrap_or(split);
 
             let mut init_params = NV_ENC_INITIALIZE_PARAMS {
                 version: sv(NvStruct::InitializeParams),
@@ -2075,6 +2140,7 @@ impl NvencEncoder {
                 maxEncodeHeight: nvenc_headroom(height, HEADROOM_HEIGHT, caps_hmax),
                 ..Default::default()
             };
+            init_params.set_splitEncodeMode(split as u32);
 
             let init_fn = function_list.nvEncInitializeEncoder.unwrap();
             let headroom_status = init_fn(encoder_session, &mut Negotiated::new(init_params).value);
@@ -2246,6 +2312,7 @@ impl NvencEncoder {
                 direct_dmabuf: std::env::var("PIXELFLUX_NVENC_DIRECT").as_deref() != Ok("0"),
                 csc,
                 dpb,
+                engines,
                 references: invalidation.then(|| {
                     if anchors > 0 {
                         ReferenceWindow::with_anchors(window_frames(codec, dpb, true), anchors)
@@ -2466,6 +2533,21 @@ impl NvencEncoder {
         }
     }
 
+    /// How the session splits a frame across the device's encode engines (`split_mode`), for the
+    /// line that says which device encodes.
+    pub fn split_summary(&self) -> String {
+        let forced = self.init_params.splitEncodeMode()
+            == NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+        match self.engines {
+            Some(n) if n > 1 && forced => format!("split across {n} engines"),
+            Some(n) if n > 1 && self.codec != Codec::H264 => {
+                format!("split as the driver picks, {n} engines")
+            }
+            Some(n) => format!("{n} engine{}", if n == 1 { "" } else { "s" }),
+            None => "engines unreported".into(),
+        }
+    }
+
     /// The codec the session emits.
     /// The name CUDA gives the GPU this session encodes on.
     pub fn device_name(&self) -> &str {
@@ -2631,6 +2713,13 @@ impl NvencEncoder {
             self.init_params.darHeight = new_h;
             self.init_params.frameRateNum = rate.num;
             self.init_params.frameRateDen = rate.den;
+            self.init_params.set_splitEncodeMode(split_mode(
+                self.codec,
+                new_w,
+                new_h,
+                self.engines,
+                nvenc_cur_ver(),
+            ) as u32);
             if self.reconfigure(true, true) != NVENCSTATUS::NV_ENC_SUCCESS {
                 (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
                 return Err("NvEncReconfigureEncoder rejected the resolution change".into());
@@ -4699,10 +4788,9 @@ mod gpu_tests {
     #[ignore]
     fn gpu_predicts_past_a_loss_deeper_than_the_recent_frames() {
         use crate::encoders::reference::Reference;
-        let (w, h) = (1920usize, 1080usize);
         // (codec, frames sent after the key frame, first frame lost, the anchor predicted from, an
         // older anchor the device must not have taken, CBR lowered from 20 to 8 Mbit/s as the lost
-        // frame is encoded)
+        // frame is encoded), at 1080p and, for the frames `split_mode` splits, at 4K
         let cases = [
             (Codec::H264, 60u16, 50u16, Some(48u16), Some(0u16), false),
             (Codec::H264, 60, 57, Some(48), Some(0), false),
@@ -4723,8 +4811,15 @@ mod gpu_tests {
             (Codec::H265, 58, 37, Some(36), Some(24), false),
             (Codec::H265, 40, 20, None, None, false),
         ];
+        let split = [
+            (Codec::Av1, 60u16, 50u16, Some(48u16), Some(0u16), false),
+            (Codec::H265, 30, 28, Some(27), Some(26), false),
+            (Codec::H265, 40, 30, Some(24), Some(12), false),
+        ];
         let fmt = |v: Option<f64>| v.map_or("no picture".to_string(), |x| format!("{x:.3}"));
-        for (codec, sent, lost, from, older, retarget) in cases {
+        let sized = (cases.into_iter().map(|c| (1920usize, 1080usize, c)))
+            .chain(split.into_iter().map(|c| (3840, 2160, c)));
+        for (w, h, (codec, sent, lost, from, older, retarget)) in sized {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
             s.omit_stripe_headers = true;
@@ -4785,7 +4880,7 @@ mod gpu_tests {
                 .filter(|&i| i < lost as usize || i == next)
                 .collect();
             println!(
-                "{codec:?}: frame {lost} of {sent} lost, frame {next} predicts from {reference:?}, {} B against {normal} B",
+                "{codec:?} {w}x{h}: frame {lost} of {sent} lost, frame {next} predicts from {reference:?}, {} B against {normal} B",
                 frames[next].len()
             );
             // The frame after an anchor is marked predicts from the anchor itself.
@@ -5948,6 +6043,63 @@ mod gpu_tests {
         }
     }
 
+    /// On a real GPU of two or more engines under API 12.1 or later, an AV1 session splits its
+    /// frames at 1080p and an HEVC one only while a resize holds it at 4K, and the split frames
+    /// decode to the picture painted; on one engine nothing splits. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_split_frame_follows_the_codec_and_picture() {
+        use crate::webcam::decode::VideoDecoder;
+        let forced = NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+        for codec in [Codec::H265, Codec::Av1] {
+            let mut s = settings(1920, 1080, 60.0);
+            s.codec = codec;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) if e.contains("engine") => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+                Err(e) => panic!("{codec:?}: {e}"),
+            };
+            if !enc.engines.is_some_and(|n| n > 1) || nvenc_cur_ver() < (12, 1) {
+                println!(
+                    "{codec:?}: {}, API {:?}",
+                    enc.split_summary(),
+                    nvenc_cur_ver()
+                );
+                assert_ne!(enc.init_params.splitEncodeMode(), forced);
+                continue;
+            }
+            for (n, (w, h)) in [(1920usize, 1080usize), (3840, 2160), (1920, 1080)]
+                .into_iter()
+                .enumerate()
+            {
+                if n > 0 {
+                    s.width = w as i32;
+                    s.height = h as i32;
+                    assert!(enc.reconfigure_resolution(&s).expect("resize"));
+                }
+                assert_eq!(
+                    enc.init_params.splitEncodeMode() == forced,
+                    codec == Codec::Av1 || w * h >= 3840 * 2160,
+                    "{codec:?} at {w}x{h}: {}",
+                    enc.split_summary()
+                );
+                let mut dec = VideoDecoder::new(codec).expect("decoder");
+                for i in 0..6usize {
+                    let f = moving_frame(w, h, i);
+                    let pkt = enc
+                        .encode_cpu_packed(&f, w * 4, false, (n * 10 + i) as u64, 25, i == 0)
+                        .expect("encode");
+                    let psnr = luma_psnr(&mut dec, &pkt, &f, w, h);
+                    assert!(psnr > 30.0, "{codec:?} {w}x{h} frame {i}: {psnr:.1} dB");
+                }
+                println!("{codec:?} {w}x{h}: {}", enc.split_summary());
+            }
+        }
+    }
+
     /// On a real GPU, a 1080p60 CBR session whose target lies past the ceiling of the level the
     /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50, AV1's
     /// headroom 5.1 at the 26.7 NVENC holds it to) opens on the level the rate raises it to,
@@ -7036,6 +7188,185 @@ mod gpu_tests {
         }
     }
 
+    /// On a real GPU: the production tuning against the presets P1 and P2, one L0 reference, and
+    /// each split-frame mode, on real content, per codec at 1080p, 1440p, and 2160p at CBR 8, 14,
+    /// and 30 Mbit/s: a page of text scrolling four rows a frame and a texture panned six and
+    /// three pixels. Per row the encode time at the median and the 99th percentile, the bitrate
+    /// against the target, and the luma PSNR. `NVENC_BENCH_HEIGHTS` (1080,1440,2160) and
+    /// `NVENC_BENCH_CODECS` (H264,H265,Av1) pick rows, `NVENC_BENCH_FRAMES` their length. Prints
+    /// all; ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_bench_tuning_on_content() {
+        use crate::webcam::decode::VideoDecoder;
+        let n: usize = std::env::var("NVENC_BENCH_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        let glyph = |c: u32, gx: usize, gy: usize| {
+            let s = c.wrapping_mul(2654435761) >> 7;
+            (s & 1 == 1 && gx == 1)
+                || (s & 2 == 2 && gx == 5)
+                || (s & 4 == 4 && gy == 1)
+                || (s & 8 == 8 && gy == 6)
+                || (s & 16 == 16 && gy == 11)
+                || (s & 32 == 32 && gx * 2 == gy)
+        };
+        let only = |var: &str, item: String| {
+            std::env::var(var).map_or(true, |v| v.split(',').any(|x| x == item))
+        };
+        use NV_ENC_SPLIT_ENCODE_MODE as Split;
+        for (w, h, kbps) in [
+            (1920usize, 1080usize, 8000),
+            (2560, 1440, 14000),
+            (3840, 2160, 30000),
+        ] {
+            if !only("NVENC_BENCH_HEIGHTS", h.to_string()) {
+                continue;
+            }
+            let mut page = vec![255u8; w * 2 * h * 4];
+            for y in 0..2 * h {
+                let (cy, gy) = (y / 18, y % 18);
+                if cy % 9 == 8 || gy >= 13 {
+                    continue;
+                }
+                for x in 0..w {
+                    let (cx, gx) = (x / 10, x % 10);
+                    let c = (cx as u32).wrapping_mul(31).wrapping_add(cy as u32 * 977);
+                    if gx < 7 && (cx + cy * 3) % 13 != 0 && glyph(c, gx, gy) {
+                        page[(y * w + x) * 4..(y * w + x) * 4 + 3].copy_from_slice(&[40, 30, 20]);
+                    }
+                }
+            }
+            let (tw, th) = (w * 2, h * 2);
+            let mut tex = vec![0u8; tw * th * 4];
+            for y in 0..th {
+                for x in 0..tw {
+                    let (fx, fy) = (x as f32, y as f32);
+                    let v = 128.0
+                        + 50.0 * (fx / 97.0).sin() * (fy / 61.0).cos()
+                        + 30.0 * (fx / 13.0 + fy / 29.0).sin()
+                        + ((x as u32).wrapping_mul(2654435761) ^ (y as u32).wrapping_mul(40503))
+                            as f32
+                            / u32::MAX as f32
+                            * 24.0;
+                    let i = (y * tw + x) * 4;
+                    tex[i] = v as u8;
+                    tex[i + 1] = (v * 0.8) as u8;
+                    tex[i + 2] = (255.0 - v) as u8;
+                }
+            }
+            let mut bufs = [vec![0u8; w * h * 4], vec![0u8; w * h * 4]];
+            let draw = |scene: usize, t: usize, out: &mut Vec<u8>| {
+                for y in 0..h {
+                    let row = &mut out[y * w * 4..(y + 1) * w * 4];
+                    if scene == 0 {
+                        let src = (y + t * 4) % (2 * h);
+                        row.copy_from_slice(&page[src * w * 4..(src + 1) * w * 4]);
+                    } else {
+                        let (ox, oy) = ((t * 6) % w, (y + t * 3) % h);
+                        row.copy_from_slice(&tex[(oy * tw + ox) * 4..(oy * tw + ox + w) * 4]);
+                    }
+                }
+            };
+            for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+                if !only("NVENC_BENCH_CODECS", format!("{codec:?}")) {
+                    continue;
+                }
+                let mut rows: Vec<(String, NvencTuning)> = vec![
+                    ("production".into(), NvencTuning::default()),
+                    (
+                        "P1".into(),
+                        NvencTuning {
+                            preset: NV_ENC_PRESET_P1_GUID,
+                            ..NvencTuning::default()
+                        },
+                    ),
+                    (
+                        "P2".into(),
+                        NvencTuning {
+                            preset: NV_ENC_PRESET_P2_GUID,
+                            ..NvencTuning::default()
+                        },
+                    ),
+                    (
+                        "P3 L0=1".into(),
+                        NvencTuning {
+                            ref_l0: Some(NV_ENC_NUM_REF_FRAMES::NV_ENC_NUM_REF_FRAMES_1),
+                            ..NvencTuning::default()
+                        },
+                    ),
+                ];
+                if codec != Codec::H264 {
+                    for (name, split) in [
+                        ("split off", Split::NV_ENC_SPLIT_DISABLE_MODE),
+                        ("split driver's", Split::NV_ENC_SPLIT_AUTO_MODE),
+                        ("split forced", Split::NV_ENC_SPLIT_AUTO_FORCED_MODE),
+                        ("split two", Split::NV_ENC_SPLIT_TWO_FORCED_MODE),
+                    ] {
+                        rows.push((
+                            format!("P3 {name}"),
+                            NvencTuning {
+                                split: Some(split),
+                                ..NvencTuning::default()
+                            },
+                        ));
+                    }
+                }
+                for (scene, scene_name) in [(0usize, "text"), (1, "pan")] {
+                    for (label, tuning) in &rows {
+                        let mut s = settings(w as i32, h as i32, 60.0);
+                        s.codec = codec;
+                        s.video_cbr_mode = true;
+                        s.video_bitrate_kbps = kbps;
+                        let mut enc = match NvencEncoder::new_tuned(&s, ptr::null(), *tuning) {
+                            Ok(enc) => enc,
+                            Err(e) => {
+                                println!("{codec:?} {w}x{h} {label}: {e}");
+                                continue;
+                            }
+                        };
+                        let engines = unsafe {
+                            query_cap(
+                                &enc.nvenc_funcs,
+                                enc.encoder_session,
+                                codec_guid(codec).unwrap(),
+                                NV_ENC_CAPS::NV_ENC_CAPS_NUM_ENCODER_ENGINES,
+                            )
+                        };
+                        let mut dec = VideoDecoder::new(codec).unwrap();
+                        let (mut times, mut bytes, mut psnr) =
+                            (Vec::with_capacity(n), 0usize, 0f64);
+                        for t in 0..n + 5 {
+                            let k = t % 2;
+                            draw(scene, t, &mut bufs[k]);
+                            let t0 = std::time::Instant::now();
+                            let out = enc
+                                .encode_cpu_packed(&bufs[k], w * 4, false, t as u64, 25, t == 0)
+                                .expect("encode");
+                            let ms = t0.elapsed().as_secs_f64() * 1e3;
+                            let p = luma_psnr(&mut dec, &out, &bufs[k], w, h);
+                            if t >= 5 {
+                                times.push(ms);
+                                bytes += out.len();
+                                psnr += p;
+                            }
+                        }
+                        times.sort_by(|a, b| a.total_cmp(b));
+                        println!(
+                            "TUNING {codec:?} {w}x{h} {scene_name} {label} (engines {engines:?}): encode {:.2} ms p50 {:.2} p99, {:.2} Mbit/s against {:.1}, PSNR {:.2} dB",
+                            times[n / 2],
+                            times[(n * 99) / 100],
+                            bytes as f64 * 8.0 * 60.0 / n as f64 / 1e6,
+                            kbps as f64 / 1000.0,
+                            psnr / n as f64
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// On a real GPU with a render node: per-frame wall and CPU cost of the dmabuf path with the
     /// in-place registration (when the driver maps the import pitch-linear) against the per-frame
     /// copy, 1080p, two painted buffers alternating. Prints both; ignored by default.
@@ -7582,6 +7913,32 @@ mod decision_tests {
                 nvenc_level(Codec::Av1, 1920, 1080, 60, bps, true),
                 level,
                 "AV1 at {bps} bit/s"
+            );
+        }
+    }
+
+    /// A frame splits across the engines for AV1 at any picture and for HEVC from 4K, never for
+    /// H.264, on one engine, or before API 12.1, whose bits there are another flag's.
+    #[test]
+    fn split_mode_follows_the_codec_and_picture() {
+        use NV_ENC_SPLIT_ENCODE_MODE::{
+            NV_ENC_SPLIT_AUTO_FORCED_MODE as Forced, NV_ENC_SPLIT_AUTO_MODE as Driver,
+        };
+        for (codec, w, h, engines, api, want) in [
+            (Codec::Av1, 1280, 720, Some(2), (13, 0), Forced),
+            (Codec::Av1, 3840, 2160, Some(3), (12, 1), Forced),
+            (Codec::Av1, 1920, 1080, Some(1), (13, 0), Driver),
+            (Codec::Av1, 1920, 1080, None, (13, 0), Driver),
+            (Codec::H265, 2560, 1440, Some(2), (13, 0), Driver),
+            (Codec::H265, 3840, 2160, Some(2), (13, 0), Forced),
+            (Codec::H265, 2160, 3840, Some(2), (13, 0), Forced),
+            (Codec::H265, 3840, 2160, Some(2), (12, 0), Driver),
+            (Codec::H264, 3840, 2160, Some(2), (13, 0), Driver),
+        ] {
+            assert_eq!(
+                split_mode(codec, w, h, engines, api),
+                want,
+                "{codec:?} {w}x{h} on {engines:?} engines, API {api:?}"
             );
         }
     }

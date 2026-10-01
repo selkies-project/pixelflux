@@ -1449,11 +1449,12 @@ fn select_for_codec(
             match NvencEncoder::new(settings, egl_display) {
                 Ok(enc) => {
                     println!(
-                        "[{tag}] Encoder: NVENC {} {} on {} (render node {node}, {} driver).",
+                        "[{tag}] Encoder: NVENC {} {} on {} (render node {node}, {} driver), {}.",
                         codec.display(),
                         chroma_name(enc.is_fullcolor()),
                         enc.device_name(),
-                        driver_name(&driver)
+                        driver_name(&driver),
+                        enc.split_summary()
                     );
                     crate::report::hardware_encoder(enc.device_name(), driver_name(&driver), node);
                     return Some(FrameEncoder::Nvenc(enc));
