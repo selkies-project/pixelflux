@@ -728,9 +728,41 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     }
 }
 
-/// The CBR target of a session at `settings`, in bits per second.
+/// The share of an AV1 level's Annex A MaxBitrate NVENC lets a session declare at it, as a
+/// fraction: two thirds, in either tier.
+const NVENC_AV1_RATE: (u64, u64) = (2, 3);
+
+/// The highest CBR target an NVENC session of `codec` opens at, its top level's bitrate ceiling:
+/// H.264 6.2's 1 Gbit/s, HEVC 6.2's 800 Mbit/s at the High tier production sessions declare,
+/// and `NVENC_AV1_RATE` of AV1 6.3's Main-tier 160 Mbit/s. No level admits a rate past it, so
+/// the driver would refuse the session, or the change, as an invalid level.
+fn nvenc_rate_ceiling(codec: Codec) -> u32 {
+    match codec {
+        Codec::Av1 => (160_000_000 * NVENC_AV1_RATE.0 / NVENC_AV1_RATE.1) as u32,
+        Codec::H265 => 800_000_000,
+        _ => 1_000_000_000,
+    }
+}
+
+/// The CBR target of a session at `settings`, in bits per second, held to the codec's
+/// `nvenc_rate_ceiling`.
 fn cbr_bps(settings: &RustCaptureSettings) -> u32 {
-    (settings.video_bitrate_kbps.max(0) as u32).saturating_mul(1000)
+    (settings.video_bitrate_kbps.max(0) as u32)
+        .saturating_mul(1000)
+        .min(nvenc_rate_ceiling(settings.codec))
+}
+
+/// Say so where `cbr_bps` held the target `settings` asks for to the codec's ceiling.
+fn log_held_rate(settings: &RustCaptureSettings, bps: u32) {
+    let asked = settings.video_bitrate_kbps.max(0) as u64 * 1000;
+    if (bps as u64) < asked {
+        eprintln!(
+            "[NVENC] {} opens at {} kbps at most, its top level's ceiling: {} kbps is held there",
+            settings.codec.display(),
+            bps / 1000,
+            asked / 1000
+        );
+    }
 }
 
 /// The VBV of a CBR session at `bps`, from the session's frame rate, key-frame interval, and
@@ -1439,9 +1471,12 @@ impl Drop for NvencEncoder {
 /// take that level whatever the picture. The driver holds every codec's level to its bitrate
 /// ceiling as well, refusing a CBR target past it as an invalid level, so a declared rate
 /// raises the level to the first that admits it; `hevc_high_tier` names the HEVC tier the
-/// session declares, whose ceiling is the one that applies. An HEVC picture is counted in
-/// whole 32-pixel coding tree blocks, NVENC's, as the driver counts it: 1280x720 at 144 fps
-/// is inside 4.1 by its own samples, and the driver refuses it as 4.1.
+/// session declares, whose ceiling is the one that applies. An AV1 level holds two thirds of
+/// its Annex A MaxBitrate, `NVENC_AV1_RATE` (5.1 26.7 Mbit/s rather than 40, on an RTX 4090
+/// with driver 595.71.05, whatever the frame rate or buffer), so an AV1 rate is weighed at
+/// one and a half times itself. An HEVC picture is counted in whole 32-pixel coding tree
+/// blocks, NVENC's, as the driver counts it: 1280x720 at 144 fps is inside 4.1 by its own
+/// samples, and the driver refuses it as 4.1.
 fn nvenc_level(
     codec: Codec,
     width: u32,
@@ -1456,7 +1491,7 @@ fn nvenc_level(
             width.max(HEADROOM_WIDTH),
             height.max(HEADROOM_HEIGHT),
             fps,
-            bitrate_bps,
+            (bitrate_bps * NVENC_AV1_RATE.1).div_ceil(NVENC_AV1_RATE.0),
         ),
         Codec::H265 => h265_level(
             width.next_multiple_of(32),
@@ -1965,6 +2000,7 @@ impl NvencEncoder {
             config.profileGUID = profile_guid(codec, is_444);
             if settings.video_cbr_mode {
                 let bps = cbr_bps(settings);
+                log_held_rate(settings, bps);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
                 config.rcParams.multiPass = tuning.multipass;
                 set_cbr_rate(&mut config.rcParams, bps, cbr_vbv(settings, bps));
@@ -2917,6 +2953,7 @@ impl NvencEncoder {
                 let vbv = cbr_vbv(settings, bps);
                 let rc = &mut self.encode_config.rcParams;
                 if rc.averageBitRate != bps || rc.maxBitRate != bps || rc.vbvBufferSize != vbv {
+                    log_held_rate(settings, bps);
                     set_cbr_rate(rc, bps, vbv);
                     changed = true;
                     let fps = self
@@ -5912,20 +5949,30 @@ mod gpu_tests {
     }
 
     /// On a real GPU, a 1080p60 CBR session whose target lies past the ceiling of the level the
-    /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50) opens on the
-    /// level the rate raises it to, and a live raise past the ceiling is taken rather than
-    /// refused. Ignored by default.
+    /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50, AV1's
+    /// headroom 5.1 at the 26.7 NVENC holds it to) opens on the level the rate raises it to,
+    /// and a live raise past the ceiling, to 200 Mbit/s, which AV1 holds at 106.7, is taken
+    /// rather than refused. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_cbr_targets_past_the_picture_level_open() {
-        for (codec, kbps, level) in [(Codec::H264, 100_000, 50), (Codec::H265, 60_000, 150)] {
+        for (codec, kbps, level) in [
+            (Codec::H264, 100_000, 50),
+            (Codec::H265, 60_000, 150),
+            (Codec::Av1, 30_000, 14),
+        ] {
             let mut s = settings(1920, 1080, 60.0);
             s.codec = codec;
             s.video_cbr_mode = true;
             s.video_bitrate_kbps = kbps;
-            let mut enc = host_session(&s).unwrap_or_else(|e| {
-                panic!("{codec:?} at {kbps} kbps must open on level {level}: {e}")
-            });
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) if e.contains("engine") => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+                Err(e) => panic!("{codec:?} at {kbps} kbps must open on level {level}: {e}"),
+            };
             assert_eq!(
                 enc.declared_level(),
                 level,
@@ -7521,9 +7568,54 @@ mod decision_tests {
             nvenc_level(Codec::H265, 1920, 1080, 60, 60_000_000, false),
             156
         );
+        // NVENC holds an AV1 level to two thirds of its Annex A MaxBitrate: 5.1 to 26.7 Mbit/s,
+        // 5.2 to 40, 6.1 to 66.7, 6.2 to 106.7.
+        for (bps, level) in [
+            (26_666_666, 13),
+            (26_666_667, 14),
+            (40_000_000, 14),
+            (45_000_000, 17),
+            (66_666_667, 18),
+            (106_666_666, 18),
+        ] {
+            assert_eq!(
+                nvenc_level(Codec::Av1, 1920, 1080, 60, bps, true),
+                level,
+                "AV1 at {bps} bit/s"
+            );
+        }
+    }
+
+    /// A CBR target past every level's ceiling is held to the top one, which the driver opens,
+    /// and one inside it passes as asked.
+    #[test]
+    fn cbr_targets_hold_to_the_top_level() {
+        for (codec, kbps, bps) in [
+            (Codec::Av1, 8_000, 8_000_000),
+            (Codec::Av1, 106_666, 106_666_000),
+            (Codec::Av1, 200_000, 106_666_666),
+            (Codec::H265, 800_000, 800_000_000),
+            (Codec::H265, 1_000_000, 800_000_000),
+            (Codec::H264, 1_000_000, 1_000_000_000),
+            (Codec::H264, 5_000_000, 1_000_000_000),
+        ] {
+            let s = RustCaptureSettings {
+                codec,
+                video_bitrate_kbps: kbps,
+                ..Default::default()
+            };
+            assert_eq!(cbr_bps(&s), bps, "{codec:?} at {kbps} kbps");
+        }
         assert_eq!(
-            nvenc_level(Codec::Av1, 1920, 1080, 60, 45_000_000, true),
-            14
+            nvenc_level(
+                Codec::Av1,
+                1920,
+                1080,
+                240,
+                nvenc_rate_ceiling(Codec::Av1) as u64,
+                true
+            ),
+            18
         );
     }
 
