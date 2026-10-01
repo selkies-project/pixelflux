@@ -558,7 +558,8 @@ fn h264_names_the_newest_surviving_frame_in_its_slice_header() {
         assert_eq!(r.ue(), 3, "end of the modification");
         assert_eq!(r.u(1), 0, "adaptive_ref_pic_marking_mode_flag");
         assert_eq!(r.ue(), 0, "cabac_init_idc");
-        assert_eq!(r.se(), 25 - 26, "slice_qp_delta");
+        let qp = Codec::H264.hardware_quantizer(Hardware::Vaapi, 25) as i32;
+        assert_eq!(r.se(), qp - 26, "slice_qp_delta");
     });
     encode(&mut enc, 9, false);
     assert_eq!(enc.last_reference(), Reference::Frame(8));
@@ -990,7 +991,8 @@ fn a_rate_change_restarts_the_sequence_and_a_quality_change_does_not() {
         r.u(1);
         r.u(1);
         r.ue();
-        assert_eq!(r.se(), 40 - 26, "the new quantizer reaches the slice");
+        let qp = Codec::H264.hardware_quantizer(Hardware::Vaapi, 40) as i32;
+        assert_eq!(r.se(), qp - 26, "the new quantizer reaches the slice");
     });
 }
 

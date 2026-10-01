@@ -47,8 +47,8 @@ use smithay::backend::allocator::{Buffer, dmabuf::Dmabuf};
 use va_sys::*;
 
 use super::codec::{
-    Codec, VIDEO_HEADER_LEN, av1_is_key, frame_type_from_key, h264_frame_type, h265_frame_type,
-    push_video_header, vp8_is_key, vp9_is_key,
+    Codec, Hardware, VIDEO_HEADER_LEN, av1_is_key, frame_type_from_key, h264_frame_type,
+    h265_frame_type, push_video_header, vp8_is_key, vp9_is_key,
 };
 use super::frame_rate::FrameRate;
 use super::reference::{REFERENCE_FRAMES, Reference, ReferenceSlots, ReferenceWindow, SlotPlan};
@@ -1033,8 +1033,8 @@ impl VaapiEncoder {
                 dpb,
                 dpb_level,
                 fullcolor,
-                min_qp: codec.quantizer_bound(rate.min_qp),
-                max_qp: codec.quantizer_bound(rate.max_qp),
+                min_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.min_qp),
+                max_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.max_qp),
             },
             fourcc,
             rt_format,
@@ -1052,7 +1052,7 @@ impl VaapiEncoder {
             surfaces_of: HashMap::new(),
             last_reference: Reference::Untracked,
             rate,
-            qp: codec.quantizer(settings.video_crf),
+            qp: codec.hardware_quantizer(Hardware::Vaapi, settings.video_crf),
             held: None,
             frame_cap: false,
             quality_level: None,
@@ -1406,8 +1406,12 @@ impl VaapiEncoder {
         } else {
             0
         };
-        self.negotiated.min_qp = self.codec.quantizer_bound(rate.min_qp);
-        self.negotiated.max_qp = self.codec.quantizer_bound(rate.max_qp);
+        self.negotiated.min_qp = self
+            .codec
+            .hardware_quantizer_bound(Hardware::Vaapi, rate.min_qp);
+        self.negotiated.max_qp = self
+            .codec
+            .hardware_quantizer_bound(Hardware::Vaapi, rate.max_qp);
         match &mut self.arm {
             Arm::H264(a) => a.configure(
                 &self.negotiated,
@@ -1445,7 +1449,7 @@ impl VaapiEncoder {
     /// screen to by itself (51 against 61 dB at 8 Mbit/s), so `FrameEncoder::holds_quantizer`
     /// says no there.
     pub fn hold_quantizer(&mut self, crf: u32) {
-        self.held = Some(self.codec.quantizer(crf as i32));
+        self.held = Some(self.codec.hardware_quantizer(Hardware::Vaapi, crf as i32));
     }
 
     /// The rate control of a sequence: the target, buffer, and frame rate a constant-rate
@@ -1771,7 +1775,7 @@ impl VaapiEncoder {
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         if !self.rate.cbr {
-            self.qp = self.codec.quantizer(crf as i32);
+            self.qp = self.codec.hardware_quantizer(Hardware::Vaapi, crf as i32);
         }
         let held_qp = self.held.take();
         self.convert(source)?;

@@ -36,8 +36,8 @@ use libloading::{Library, Symbol};
 use smithay::backend::allocator::{Buffer, Fourcc, dmabuf::Dmabuf};
 
 use super::codec::{
-    Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, VIDEO_HEADER_LEN, av1_level, h264_dpb_frames,
-    h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
+    Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, Hardware, VIDEO_HEADER_LEN, av1_level,
+    h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
 };
 use super::frame_rate::FrameRate;
 use super::reference::{ANCHORS, Invalidation, Reference, ReferenceWindow};
@@ -1961,14 +1961,14 @@ impl NvencEncoder {
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
                 config.rcParams.multiPass = tuning.multipass;
                 set_cbr_rate(&mut config.rcParams, bps, cbr_vbv(settings, bps));
-                let lo = codec.nvenc_quantizer_bound(settings.video_min_qp);
+                let lo = codec.hardware_quantizer_bound(Hardware::Nvenc, settings.video_min_qp);
                 if lo > 0 {
                     config.rcParams.set_enableMinQP(1);
                     config.rcParams.minQP.qpInterP = lo;
                     config.rcParams.minQP.qpInterB = lo;
                     config.rcParams.minQP.qpIntra = lo;
                 }
-                let hi = codec.nvenc_quantizer_bound(settings.video_max_qp);
+                let hi = codec.hardware_quantizer_bound(Hardware::Nvenc, settings.video_max_qp);
                 if hi > 0 {
                     config.rcParams.set_enableMaxQP(1);
                     config.rcParams.maxQP.qpInterP = hi;
@@ -1976,7 +1976,7 @@ impl NvencEncoder {
                     config.rcParams.maxQP.qpIntra = hi;
                 }
             } else {
-                let q = codec.nvenc_quantizer(settings.video_crf);
+                let q = codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
                 config.rcParams.constQP.qpInterP = q;
                 config.rcParams.constQP.qpInterB = q;
@@ -2173,7 +2173,7 @@ impl NvencEncoder {
                 fullcolor: is_444,
                 width,
                 height,
-                current_qp: codec.nvenc_quantizer(settings.video_crf),
+                current_qp: codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf),
                 held_qp: None,
                 held_band: None,
                 hold_refused: false,
@@ -2553,7 +2553,9 @@ impl NvencEncoder {
                     cbr_vbv(settings, bps),
                 );
             } else {
-                let qp = self.codec.nvenc_quantizer(settings.video_crf);
+                let qp = self
+                    .codec
+                    .hardware_quantizer(Hardware::Nvenc, settings.video_crf);
                 self.encode_config.rcParams.constQP.qpInterP = qp;
                 self.encode_config.rcParams.constQP.qpInterB = qp;
                 self.encode_config.rcParams.constQP.qpIntra = qp;
@@ -2798,7 +2800,7 @@ impl NvencEncoder {
         {
             return false;
         }
-        let target_qp = self.codec.nvenc_quantizer(crf as i32);
+        let target_qp = self.codec.hardware_quantizer(Hardware::Nvenc, crf as i32);
         if self.current_qp != target_qp {
             self.encode_config.rcParams.constQP.qpInterP = target_qp;
             self.encode_config.rcParams.constQP.qpInterB = target_qp;
@@ -3026,8 +3028,8 @@ impl NvencEncoder {
         let held_qp = self.held_qp.take();
         let band = self.held_band.take();
         let held = held_qp.and_then(|crf| {
-            let q = self.codec.nvenc_quantizer(crf as i32);
-            let rest = self.codec.nvenc_quantizer(51);
+            let q = self.codec.hardware_quantizer(Hardware::Nvenc, crf as i32);
+            let rest = self.codec.hardware_quantizer(Hardware::Nvenc, 51);
             match band {
                 Some(share) if rest > q => {
                     fill_band_map(
@@ -3067,7 +3069,11 @@ impl NvencEncoder {
         };
         if let Some(coarser) = retry
             && self
-                .hold_rate(self.codec.nvenc_quantizer(coarser as i32), false)
+                .hold_rate(
+                    self.codec
+                        .hardware_quantizer(Hardware::Nvenc, coarser as i32),
+                    false,
+                )
                 .is_some()
         {
             pic_params.inputTimeStamp = self
@@ -3136,8 +3142,7 @@ impl NvencEncoder {
         if !held {
             self.last_quality = match lock_params.frameAvgQP {
                 0 => None,
-                q if self.codec == Codec::Av1 => Some(self.codec.nvenc_quality_index(q)),
-                q => Some(q),
+                q => Some(self.codec.hardware_quality_index(Hardware::Nvenc, q)),
             };
             self.last_bytes = Some(data_size);
         } else {

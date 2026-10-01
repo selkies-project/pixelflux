@@ -23,6 +23,14 @@ pub enum Codec {
     H265 = 5,
 }
 
+/// The hardware encoder family a session's quantizer curve is read for
+/// (`Codec::hardware_quantizer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hardware {
+    Nvenc,
+    Vaapi,
+}
+
 use super::reference::{REFERENCE_FRAMES, Reference};
 
 /// Wire tag of a JPEG stripe: `u8 reserved`, `u16 frame id`, `u16 stripe Y`, JPEG data.
@@ -168,10 +176,9 @@ impl Codec {
     /// libvpx speed 16, VP9 at speed 8 with screen tuning, AV1 at SVT-AV1 preset 11 in its
     /// real-time mode — interpolated in between. Each table ends at the codec's maximum
     /// quantizer at index 51, since past its last matched point the encoder cannot degrade
-    /// as far as x264 does and there is nothing left to match. A VA-API session reads the
-    /// same tables, which no VA-API encoder has been measured against. An AV1 index of zero
-    /// is refused by NVENC and is lossless on the others, so its floor is one; the SVT-AV1
-    /// session floors its level at three, below which its real-time mode faults.
+    /// as far as x264 does and there is nothing left to match. A hardware session reads
+    /// `hardware_quantizer`. An AV1 index of zero is lossless, so its floor is one; the
+    /// SVT-AV1 session floors its level at three, below which its real-time mode faults.
     pub fn quantizer(self, crf: i32) -> u32 {
         let crf = crf.clamp(0, 51) as u32;
         match self {
@@ -189,22 +196,31 @@ impl Codec {
         if qp <= 0 { 0 } else { self.quantizer(qp) }
     }
 
-    /// `quantizer` for an NVENC session, whose AV1 engine has its own curve: the quantizer
-    /// whose SSIM matches H.264's at the same index, measured on Ada and interpolated
-    /// between those points. One table serves every generation because SSIM is where they
-    /// agree, within ten steps at the five indices sampled on Blackwell, where a VMAF match
-    /// parts them by up to thirty-four. NVENC refuses an AV1 index of zero, so the floor
-    /// stays one.
-    pub fn nvenc_quantizer(self, crf: i32) -> u32 {
-        match self {
-            Codec::Av1 => interpolate(&AV1_NVENC_QINDEX, crf.clamp(0, 51) as u32).max(1),
-            _ => self.quantizer(crf),
+    /// `quantizer` for a hardware session, matched to libx264 the same way. H.264 is measured on
+    /// NVENC (Pascal and Ada) and on AMD's VA-API, which agree within a step, each coding a
+    /// quantizer about three finer than the index to match x264; AMD's VA-API H.265 follows
+    /// the same curve within a step, where NVENC's H.265 is within two steps of the index from
+    /// 22 up and keeps it. AV1 is measured on NVENC (Ada), and a VA-API AV1 session reads the
+    /// same curve, unmeasured on VA-API hardware. VP8 and VP9 keep the software tables. NVENC
+    /// refuses an AV1 index of zero, so the floor stays one.
+    pub fn hardware_quantizer(self, hw: Hardware, crf: i32) -> u32 {
+        let crf = crf.clamp(0, 51) as u32;
+        match (self, hw) {
+            (Codec::H264, _) | (Codec::H265, Hardware::Vaapi) => {
+                interpolate(&H26X_HARDWARE_QP, crf)
+            }
+            (Codec::Av1, _) => interpolate(&AV1_HARDWARE_QINDEX, crf).max(1),
+            _ => self.quantizer(crf as i32),
         }
     }
 
-    /// `quantizer_bound` for an NVENC session.
-    pub fn nvenc_quantizer_bound(self, qp: i32) -> u32 {
-        if qp <= 0 { 0 } else { self.nvenc_quantizer(qp) }
+    /// `quantizer_bound` for a hardware session.
+    pub fn hardware_quantizer_bound(self, hw: Hardware, qp: i32) -> u32 {
+        if qp <= 0 {
+            0
+        } else {
+            self.hardware_quantizer(hw, qp)
+        }
     }
 
     /// The session quality index whose quantizer (`quantizer`) is nearest `q`, a quantizer of
@@ -214,9 +230,9 @@ impl Codec {
         nearest_index(q, |crf| self.quantizer(crf))
     }
 
-    /// `quality_index` for an NVENC session.
-    pub fn nvenc_quality_index(self, q: u32) -> u32 {
-        nearest_index(q, |crf| self.nvenc_quantizer(crf))
+    /// `quality_index` for a hardware session.
+    pub fn hardware_quality_index(self, hw: Hardware, q: u32) -> u32 {
+        nearest_index(q, |crf| self.hardware_quantizer(hw, crf))
     }
 }
 
@@ -266,21 +282,34 @@ const AV1_QINDEX: [(u32, u32); 10] = [
     (45, 253),
     (51, 255),
 ];
-/// Session quality index → NVENC AV1 `base_q_idx` breakpoints.
-const AV1_NVENC_QINDEX: [(u32, u32); 13] = [
+/// Session quality index → hardware H.264 QP breakpoints, and VA-API H.265's.
+const H26X_HARDWARE_QP: [(u32, u32); 11] = [
+    (0, 0),
+    (10, 9),
+    (15, 14),
+    (20, 17),
+    (25, 22),
+    (30, 27),
+    (35, 32),
+    (40, 37),
+    (45, 43),
+    (50, 47),
+    (51, 48),
+];
+/// Session quality index → hardware AV1 `base_q_idx` breakpoints.
+const AV1_HARDWARE_QINDEX: [(u32, u32); 12] = [
     (0, 1),
-    (10, 1),
-    (15, 4),
-    (20, 31),
-    (22, 44),
-    (25, 65),
-    (28, 109),
-    (30, 126),
-    (35, 156),
-    (40, 182),
-    (45, 210),
-    (50, 251),
-    (51, 255),
+    (5, 20),
+    (10, 26),
+    (15, 44),
+    (20, 66),
+    (25, 105),
+    (30, 135),
+    (35, 163),
+    (40, 195),
+    (45, 219),
+    (50, 241),
+    (51, 244),
 ];
 
 /// Piecewise-linear lookup of `x` in ascending `(x, y)` breakpoints, clamped at both ends.
@@ -827,7 +856,8 @@ mod tests {
     }
 
     /// The quantizer maps are monotonic, span their domain, clamp the index, and keep AV1
-    /// off the zero NVENC refuses; H.26x takes the index as it is.
+    /// off the zero NVENC refuses; H.26x takes the index as it is in software, and hardware
+    /// H.264, and VA-API's H.265, a quantizer about three finer.
     #[test]
     fn quantizer_maps_are_monotonic_and_bounded() {
         for codec in Codec::VIDEO {
@@ -835,7 +865,11 @@ mod tests {
             for crf in 0..=51 {
                 let q = codec.quantizer(crf);
                 assert!(q >= last, "{codec:?} crf {crf}: {q} < {last}");
-                assert!(codec.nvenc_quantizer(crf) >= codec.nvenc_quantizer(crf.max(1) - 1));
+                for hw in [Hardware::Nvenc, Hardware::Vaapi] {
+                    let h = codec.hardware_quantizer(hw, crf);
+                    assert!(h >= codec.hardware_quantizer(hw, crf.max(1) - 1));
+                    assert!(h <= codec.quantizer_max());
+                }
                 assert!(q <= codec.quantizer_max());
                 last = q;
             }
@@ -848,6 +882,18 @@ mod tests {
         assert_eq!(Codec::H264.quantizer(25), 25);
         assert_eq!(Codec::H265.quantizer(25), 25);
         assert_eq!(Codec::Av1.quantizer(0), 1);
+        assert_eq!(Codec::H264.hardware_quantizer(Hardware::Nvenc, 25), 22);
+        assert_eq!(Codec::H264.hardware_quantizer(Hardware::Vaapi, 25), 22);
+        assert_eq!(Codec::H265.hardware_quantizer(Hardware::Nvenc, 25), 25);
+        assert_eq!(Codec::H265.hardware_quantizer(Hardware::Vaapi, 25), 22);
+        assert_eq!(Codec::Av1.hardware_quantizer(Hardware::Vaapi, 25), 105);
+        assert_eq!(Codec::Av1.hardware_quantizer(Hardware::Nvenc, 0), 1);
+        assert_eq!(
+            Codec::Vp9.hardware_quantizer(Hardware::Vaapi, 25),
+            Codec::Vp9.quantizer(25)
+        );
+        assert_eq!(Codec::H264.hardware_quantizer_bound(Hardware::Nvenc, 0), 0);
+        assert_eq!(Codec::H264.hardware_quality_index(Hardware::Nvenc, 22), 25);
         assert_eq!(interpolate(&[(0, 0), (10, 100)], 5), 50);
         assert_eq!(interpolate(&[(0, 0), (10, 100)], 3), 30);
     }
