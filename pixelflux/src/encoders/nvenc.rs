@@ -756,8 +756,9 @@ fn set_cbr_rate(rc: &mut NV_ENC_RC_PARAMS, bps: u32, vbv: u32) {
 }
 
 /// Fill `map`, the QP delta map of a `width` x `height` picture of `codec` (one entry a 16x16
-/// macroblock for H.264, a 32x32 coding tree block for HEVC, in raster order), with `delta` over
-/// the blocks the share of the picture `from..to` covers, rounded outward, and 0 elsewhere.
+/// macroblock for H.264, a 32x32 coding tree block for HEVC, a 64x64 superblock for AV1, in
+/// raster order), with `delta` over the blocks the share of the picture `from..to` covers,
+/// rounded outward, and 0 elsewhere.
 fn fill_band_map(
     map: &mut Vec<i8>,
     codec: Codec,
@@ -766,13 +767,17 @@ fn fill_band_map(
     (from, to): (f64, f64),
     delta: i32,
 ) {
-    let block = if codec == Codec::H264 { 16 } else { 32 };
+    let block = match codec {
+        Codec::H264 => 16,
+        Codec::H265 => 32,
+        _ => 64,
+    };
     let blocks = (width.div_ceil(block) * height.div_ceil(block)) as usize;
     let first = ((from.clamp(0.0, 1.0) * blocks as f64).floor() as usize).min(blocks);
     let last = ((to.clamp(0.0, 1.0) * blocks as f64).ceil() as usize).clamp(first, blocks);
     map.clear();
     map.resize(blocks, 0);
-    map[first..last].fill(delta.clamp(-51, 0) as i8);
+    map[first..last].fill(delta.clamp(-(codec.quantizer_max().min(128) as i32), 0) as i8);
 }
 
 /// The driver's message for the last failure on `session`, or a stand-in when it has none: NVENC
@@ -2837,18 +2842,20 @@ impl NvencEncoder {
     /// session that comes out past `HELD_KEY_BUDGET_S` of the target is coded again, as a key
     /// frame, at the coarser quantizer `held_key_retry` picks. `band`, the share of the picture
     /// from and to in raster order, confines `crf` to the blocks it covers (`band_size`), the rest
-    /// of the frame held at the coarsest quantizer: a still region is left as it is at any
-    /// quantizer, and a change the frame carries before its damage is known (X11 under Turbo
-    /// hashes a frame beside its encode) costs what the rate control's own frame would.
+    /// of the frame held at the coarsest quantizer, or for AV1 at the coarsest the delta map's
+    /// 128 steps reach above the band: a still region is left as it is at any quantizer, and a
+    /// change the frame carries before its damage is known (X11 under Turbo hashes a frame
+    /// beside its encode) costs what the rate control's own frame would.
     pub fn hold_quantizer(&mut self, crf: u32, band: Option<(f64, f64)>) {
         self.held_qp = Some(crf);
         self.held_band = band.filter(|_| self.band_size().is_some());
     }
 
-    /// The bytes of the last held frame (0 before one), where the session holds a band: H.264 and
-    /// HEVC, whose QP delta map is one entry a macroblock or a 32x32 coding tree block.
+    /// The bytes of the last held frame (0 before one), where the session holds a band: H.264,
+    /// HEVC and AV1, whose QP delta map is one entry a macroblock, a 32x32 coding tree block, or a
+    /// 64x64 superblock.
     pub fn band_size(&self) -> Option<usize> {
-        matches!(self.codec, Codec::H264 | Codec::H265).then_some(self.held_bytes)
+        matches!(self.codec, Codec::H264 | Codec::H265 | Codec::Av1).then_some(self.held_bytes)
     }
 
     /// Put the session on constant quantizer `q` for the picture about to be submitted, `mapped`
@@ -3031,7 +3038,10 @@ impl NvencEncoder {
         let band = self.held_band.take();
         let held = held_qp.and_then(|crf| {
             let q = self.codec.hardware_quantizer(Hardware::Nvenc, crf as i32);
-            let rest = self.codec.hardware_quantizer(Hardware::Nvenc, 51);
+            let rest = self
+                .codec
+                .quantizer_max()
+                .min(q + i8::MIN.unsigned_abs() as u32);
             match band {
                 Some(share) if rest > q => {
                     fill_band_map(
@@ -3957,6 +3967,12 @@ mod tests {
         assert!(
             map[1020..1530].iter().all(|&d| d == -51),
             "the delta is bounded to the quantizer range"
+        );
+        fill_band_map(&mut map, Codec::Av1, 1920, 1080, (0.0, 1.0), -211);
+        assert_eq!(map.len(), 30 * 17);
+        assert!(
+            map.iter().all(|&d| d == -128),
+            "an AV1 delta is bounded to what the map holds"
         );
         let covered = |a: f64, b: f64| {
             let mut m = Vec::new();

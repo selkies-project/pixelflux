@@ -1075,8 +1075,8 @@ impl FrameEncoder {
     }
 
     /// The bytes of the last frame held at a quantizer (0 before one), where the session holds a
-    /// band of a frame at it (`hold_quantizer`): NVENC's H.264 and HEVC sessions, through a QP
-    /// delta map.
+    /// band of a frame at it (`hold_quantizer`): NVENC's H.264, HEVC and AV1 sessions, through a
+    /// QP delta map.
     pub fn band_size(&self) -> Option<usize> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.band_size(),
