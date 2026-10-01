@@ -16,9 +16,9 @@
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
 //! moving `JUMP` rows at once: a window opening on a clean still screen), `TARGET_DB` (the PSNR
-//! whose time to reach it is reported), and `ROWS` (a file for every frame's figures). Each run
-//! reports its largest frame and the worst wait a frame meets behind the ones before it on a
-//! 12, 20, 50, and 100 Mbit/s link.
+//! whose time to reach it is reported), `SSIM` (1 measures SSIM on every frame, not only from the
+//! stop), and `ROWS` (a file for every frame's figures). Each run reports its largest frame and
+//! the worst wait a frame meets behind the ones before it on a 12, 20, 50, and 100 Mbit/s link.
 //!
 //! `cargo test --release --lib cleanup_bench::cleanup_bench -- --exact --ignored --nocapture
 //! --test-threads=1`, and `cleanup_bench::cleanup_hold_experiment` the same way.
@@ -117,10 +117,11 @@ impl Canvas {
         Self { w, h, bgra }
     }
 
-    /// The screen at scroll offset `scroll` rows, with a title bar and, when `caret`, a caret.
-    fn frame(&self, sh: usize, scroll: usize, caret: bool) -> Vec<u8> {
+    /// Draw into `f` the screen at scroll offset `scroll` rows, with a title bar and, when
+    /// `caret`, a caret. The callers reuse one buffer, as a capture does: an NVENC session
+    /// page-locks a host source once, by its address.
+    fn frame(&self, f: &mut [u8], sh: usize, scroll: usize, caret: bool) {
         let row = self.w * 4;
-        let mut f = vec![0u8; row * sh];
         for y in 0..sh {
             let src = (y + scroll) % self.h;
             f[y * row..(y + 1) * row].copy_from_slice(&self.bgra[src * row..(src + 1) * row]);
@@ -144,7 +145,6 @@ impl Canvas {
                 }
             }
         }
-        f
     }
 }
 
@@ -265,6 +265,7 @@ fn cleanup_bench() {
     let resume: usize = env("RESUME", 0);
     let caret_period: usize = env("CARET", 0);
     let target_db: f64 = env("TARGET_DB", 0.0);
+    let ssim_all = env("SSIM", 0) == 1;
     let canvas = Canvas::for_bench(w, h);
     let mut p = X11Pipeline::new(settings.clone());
     let codec = p.codec();
@@ -303,6 +304,7 @@ fn cleanup_bench() {
     let mut records: Vec<(i64, usize, String, f64, f64, f64)> = Vec::new();
     let mut sent: Vec<(f64, usize)> = Vec::new();
     let rows_path = std::env::var("PF_BENCH_ROWS").ok();
+    let mut frame = vec![0u8; w * 4 * h];
     for t in 0..total {
         let scroll = if t < motion {
             t * 4
@@ -314,7 +316,7 @@ fn cleanup_bench() {
             motion * 4 + jump + (t + 1 - stop - still) * 4
         };
         let caret = caret_period > 0 && t >= stop && ((t - stop) / caret_period).is_multiple_of(2);
-        let frame = canvas.frame(h, scroll, caret);
+        canvas.frame(&mut frame, h, scroll, caret);
         let start = Instant::now();
         let out = p.process(&frame, w * 4);
         let ms = start.elapsed().as_secs_f64() * 1e3;
@@ -384,7 +386,7 @@ fn cleanup_bench() {
         if measure {
             let src = source_luma(&frame, codec);
             last_psnr = psnr(&shown, &src);
-            last_ssim = if rel >= -1 {
+            last_ssim = if ssim_all || rel >= -1 {
                 ssim(&shown, &src, w, h)
             } else {
                 0.0
@@ -617,12 +619,13 @@ fn cleanup_hold_experiment() {
         let (mut session, name) = Session::open(&settings);
         let mut dec = VideoDecoder::new(codec).expect("decoder");
         let mut n = 0u64;
+        let mut frame = vec![0u8; w * 4 * h];
         let mut step = |session: &mut Session,
                         dec: &mut VideoDecoder,
                         scroll: usize,
                         key: bool,
                         held: Option<u32>| {
-            let frame = canvas.frame(h, scroll, false);
+            canvas.frame(&mut frame, h, scroll, false);
             let t = Instant::now();
             let (bytes, k) = session.encode(&frame, w, n, crf, key || n == 0, held);
             let ms = t.elapsed().as_secs_f64() * 1e3;
