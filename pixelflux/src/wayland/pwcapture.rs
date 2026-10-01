@@ -193,6 +193,7 @@ struct Shared {
     state: AtomicI32,
     errored: AtomicBool,
     frames: AtomicU64,
+    stamps: Mutex<Stamps>,
     cursor_pos: AtomicI64,
     cursor_hash: AtomicU64,
     /// The pods handed to `pw_stream_update_params`, alive for the stream's life.
@@ -548,6 +549,76 @@ unsafe fn read_damage(buf: &SpaBuffer, width: i32, height: i32) -> Vec<Rectangle
     damage
 }
 
+/// How many frame periods before its arrival a compositor's stamp may lie and still be taken
+/// as the frame's capture instant (`Stamps`).
+const STAMP_MAX_AGE_PERIODS: i64 = 4;
+
+/// Why a portal frame's capture instant is its arrival rather than the compositor's stamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StampRefusal {
+    Missing,
+    Ahead,
+    Stale,
+    Repeated,
+}
+
+impl StampRefusal {
+    fn says(self) -> &'static str {
+        match self {
+            StampRefusal::Missing => "missing",
+            StampRefusal::Ahead => "ahead of the frame's arrival",
+            StampRefusal::Stale => "older than four frame periods at arrival",
+            StampRefusal::Repeated => "no later than the last frame's",
+        }
+    }
+}
+
+/// The capture instant of each portal frame, which the encoded frame carries as `capture_ns`
+/// into the RTP timestamp, abs-capture-time and pipeline_ms: the compositor's header stamp
+/// where it reads as a `CLOCK_MONOTONIC` instant of this frame, else the frame's arrival. A
+/// stamp is taken when it is no later than the arrival, at most `STAMP_MAX_AGE_PERIODS`
+/// frame periods before it, and later than the last instant given, so a stamp reused from an
+/// earlier frame, one on another clock's scale, or one ahead of now moves neither. Which source
+/// each refusal falls back to is logged the first time it happens on a stream.
+#[derive(Default)]
+struct Stamps {
+    last: i64,
+    refusals_seen: u8,
+}
+
+impl Stamps {
+    fn instant(
+        &mut self,
+        pts: Option<i64>,
+        arrival: i64,
+        period_ns: i64,
+    ) -> (i64, Option<StampRefusal>) {
+        let refusal = match pts {
+            None => Some(StampRefusal::Missing),
+            Some(pts) if pts > arrival => Some(StampRefusal::Ahead),
+            Some(pts) if arrival - pts > STAMP_MAX_AGE_PERIODS * period_ns => {
+                Some(StampRefusal::Stale)
+            }
+            Some(pts) if pts <= self.last => Some(StampRefusal::Repeated),
+            Some(_) => None,
+        };
+        let at = match (pts, refusal) {
+            (Some(pts), None) => pts,
+            _ => arrival.max(self.last + 1),
+        };
+        self.last = at;
+        (at, refusal)
+    }
+
+    /// Whether this refusal is the first of its kind on the stream.
+    fn first(&mut self, refusal: StampRefusal) -> bool {
+        let bit = 1 << refusal as u8;
+        let first = self.refusals_seen & bit == 0;
+        self.refusals_seen |= bit;
+        first
+    }
+}
+
 /// The compositor's stamp from the buffer's header meta, when it carries one.
 fn header_pts(buf: &SpaBuffer) -> Option<i64> {
     (0..buf.n_metas as usize)
@@ -653,6 +724,14 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
     let buf = unsafe { &*(*newest).buffer };
     let idx = unsafe { (*newest).user_data } as usize;
     let generation = shared.generation.load(Ordering::Acquire);
+    let pts = header_pts(buf);
+    let arrival = now_ns();
+    let period_ns = 1_000_000_000_000 / shared.cfg.lock().unwrap().fps_milli.max(1000) as i64;
+    let (stamp_ns, refusal) = shared
+        .stamps
+        .lock()
+        .unwrap()
+        .instant(pts, arrival, period_ns);
     let frame = {
         let mut buffers = shared.buffers.lock().unwrap();
         let Some(slot) = buffers.get_mut(idx).filter(|s| s.pw == newest) else {
@@ -683,27 +762,41 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             width: n.width,
             height: n.height,
             damage: unsafe { read_damage(buf, n.width, n.height) },
-            stamp_ns: header_pts(buf).unwrap_or_else(now_ns),
+            stamp_ns,
         }
     };
     let count = shared.frames.fetch_add(1, Ordering::Relaxed);
-    let age_ms = (now_ns() - frame.stamp_ns) as f64 / 1e6;
+    let age_ms = (arrival - stamp_ns) as f64 / 1e6;
     if count == 0 {
         eprintln!(
-            "[HostCapture] output {}: first portal frame {}x{}, {} damage rect(s){}",
+            "[HostCapture] output {}: first portal frame {}x{}, {} damage rect(s), {}",
             shared.sink.index,
             n.width,
             n.height,
             frame.damage.len(),
-            header_pts(buf)
-                .map(|_| format!(", {age_ms:.1} ms after the compositor stamped it"))
-                .unwrap_or_default()
+            match refusal {
+                None => format!("{age_ms:.1} ms after the compositor stamped it"),
+                Some(why) => format!(
+                    "stamped at arrival: the compositor's stamp is {}",
+                    why.says()
+                ),
+            }
+        );
+    }
+    if let Some(why) = refusal.filter(|why| count > 0 && shared.stamps.lock().unwrap().first(*why))
+    {
+        eprintln!(
+            "[HostCapture] output {}: frame {count} stamped at arrival: the compositor's stamp is {}",
+            shared.sink.index,
+            why.says()
         );
     }
     if trace() {
         eprintln!(
-            "[HostTrace] output {} frame {count} process +{age_ms:.2}ms",
-            shared.sink.index
+            "[HostTrace] output {} frame {count} process +{age_ms:.2}ms pts {} arrival {arrival}{}",
+            shared.sink.index,
+            pts.map_or("none".to_string(), |pts| pts.to_string()),
+            refusal.map_or(String::new(), |why| format!(" refused: {}", why.says()))
         );
     }
     if !shared.sink.send(frame) {
@@ -749,6 +842,7 @@ impl PwStream {
             state: AtomicI32::new(0),
             errored: AtomicBool::new(false),
             frames: AtomicU64::new(0),
+            stamps: Mutex::new(Stamps::default()),
             cursor_pos: AtomicI64::new(i64::MIN),
             cursor_hash: AtomicU64::new(0),
             params: Mutex::new(Vec::new()),
@@ -910,6 +1004,77 @@ impl Drop for PwStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PERIOD: i64 = 16_683_333;
+    const NOW: i64 = 5_000_000_000_000;
+
+    /// A stamp a little before its frame's arrival, later than the last, is the capture
+    /// instant; each refusal falls back to the arrival, which still advances past the last.
+    #[test]
+    fn a_compositor_stamp_is_taken_only_where_it_is_plausible() {
+        let mut stamps = Stamps::default();
+        assert_eq!(
+            stamps.instant(Some(NOW - 3_000_000), NOW, PERIOD),
+            (NOW - 3_000_000, None)
+        );
+        let next = NOW + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(NOW - 3_000_000), next, PERIOD),
+            (next, Some(StampRefusal::Repeated)),
+            "a stamp reused from the previous frame"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(next + 1), next, PERIOD),
+            (next, Some(StampRefusal::Ahead)),
+            "a stamp ahead of the arrival"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(next - 5 * PERIOD), next, PERIOD),
+            (next, Some(StampRefusal::Stale)),
+            "a stamp five frame periods old"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(1_759_000_000_000_000_000), next, PERIOD),
+            (next, Some(StampRefusal::Ahead)),
+            "a CLOCK_REALTIME stamp"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(40_000_000), next, PERIOD),
+            (next, Some(StampRefusal::Stale)),
+            "a stamp counted from the stream's start"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(None, next, PERIOD),
+            (next, Some(StampRefusal::Missing)),
+            "no stamp (the header meta absent, or zero)"
+        );
+        let next = next + PERIOD;
+        assert_eq!(
+            stamps.instant(Some(next - 2_000_000), next, PERIOD),
+            (next - 2_000_000, None)
+        );
+    }
+
+    /// A stamp that is plausible on its own but earlier than an arrival given to the frame
+    /// before is refused too, so the instants never go back.
+    #[test]
+    fn the_instants_never_go_back() {
+        let mut stamps = Stamps::default();
+        let (first, why) = stamps.instant(None, NOW, PERIOD);
+        assert_eq!((first, why), (NOW, Some(StampRefusal::Missing)));
+        let (second, why) = stamps.instant(Some(NOW - 1_000_000), NOW + 1_000_000, PERIOD);
+        assert_eq!(why, Some(StampRefusal::Repeated));
+        assert!(second > first);
+        let mut seen = Stamps::default();
+        assert!(seen.first(StampRefusal::Repeated));
+        assert!(!seen.first(StampRefusal::Repeated));
+        assert!(seen.first(StampRefusal::Stale));
+    }
 
     fn cfg(zero_copy: bool) -> StreamConfig {
         StreamConfig {
