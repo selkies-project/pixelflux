@@ -329,6 +329,11 @@ capture.inject_mouse_button(btn=272, state=1)
 # Inject Scroll (Vertical/Horizontal)
 capture.inject_mouse_scroll(x=0.0, y=10.0)
 
+# Inject a touchpad's scroll: a finger's travel in physical pixels, fractional and with no
+# wheel steps, then the lift, which a toolkit starts its kinetic scroll on
+capture.inject_finger_scroll(dx=0.0, dy=24.5)
+capture.inject_finger_scroll_end()
+
 # Inject Keyboard Key
 # scancode: Linux raw keycode (e.g., 17 for 'w')
 # state: 1 = Pressed, 0 = Released

@@ -1019,6 +1019,8 @@ pub struct HostSession {
     sizes: Arc<Mutex<Vec<(i32, i32)>>>,
     layouts: Arc<Mutex<LayoutLedger>>,
     alive: Arc<AtomicBool>,
+    /// A finger's scroll the uinput wheels have not taken yet, in pixels (`pointer_scroll`).
+    scroll_carry: Mutex<(f64, f64)>,
 }
 
 impl HostSession {
@@ -1261,6 +1263,7 @@ impl HostSession {
             sizes,
             layouts,
             alive,
+            scroll_carry: Mutex::new((0.0, 0.0)),
         })
     }
 
@@ -1893,6 +1896,88 @@ impl HostSession {
             }
             vp.axis_source(wl_pointer::AxisSource::Wheel);
         }
+        vp.frame();
+        let _ = self.conn.flush();
+    }
+}
+
+/// Pixels of a finger's scroll per wheel notch where only notches exist (the uinput wheels):
+/// the size Selkies' page takes for a touchpad's notch.
+const SCROLL_PX_PER_NOTCH: f64 = 100.0;
+
+/// The whole notches in `carry + delta` pixels, the fraction left in `carry`.
+fn scroll_notches(carry: &mut f64, delta: f64) -> i32 {
+    *carry += delta;
+    let notches = (*carry / SCROLL_PX_PER_NOTCH).trunc();
+    *carry -= notches * SCROLL_PX_PER_NOTCH;
+    notches as i32
+}
+
+impl HostSession {
+    /// A finger's scroll by (dx, dy) pixels on the host: smooth, as a finger source ended by
+    /// `pointer_scroll_end`, through libei, the portal or the virtual pointer, and in whole
+    /// wheel notches with the remainder carried on uinput, whose wheels have no other.
+    pub fn pointer_scroll(&self, dx: f64, dy: f64) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().pointer_axis(dx, dy, false);
+            return;
+        }
+        let Some(vp) = &self.vptr else {
+            if let Some(u) = &self.uinput {
+                let mut carry = self.scroll_carry.lock().unwrap();
+                // A wheel counts up where the axis counts down, so the vertical step is negated.
+                let (wheel, hwheel) = (
+                    scroll_notches(&mut carry.1, dy),
+                    scroll_notches(&mut carry.0, dx),
+                );
+                if wheel != 0 {
+                    let _ = u
+                        .pointer
+                        .emit(crate::uinput::EV_REL, crate::uinput::REL_WHEEL, -wheel);
+                }
+                if hwheel != 0 {
+                    let _ =
+                        u.pointer
+                            .emit(crate::uinput::EV_REL, crate::uinput::REL_HWHEEL, hwheel);
+                }
+            } else {
+                self.with_portal(|p| p.pointer_axis(dx, dy, false));
+            }
+            return;
+        };
+        vp.axis_source(wl_pointer::AxisSource::Finger);
+        for (axis, value) in [
+            (wl_pointer::Axis::VerticalScroll, dy),
+            (wl_pointer::Axis::HorizontalScroll, dx),
+        ] {
+            if value != 0.0 {
+                vp.axis(0, axis, value);
+            }
+        }
+        vp.frame();
+        let _ = self.conn.flush();
+    }
+
+    /// The finger lifted: the stop each smooth rung takes; uinput drops what it carried.
+    pub fn pointer_scroll_end(&self) {
+        if let Some(live) = self.portal_ei() {
+            live.ei.as_ref().unwrap().pointer_axis(0.0, 0.0, true);
+            return;
+        }
+        let Some(vp) = &self.vptr else {
+            if self.uinput.is_some() {
+                *self.scroll_carry.lock().unwrap() = (0.0, 0.0);
+            } else {
+                self.with_portal(|p| p.pointer_axis(0.0, 0.0, true));
+            }
+            return;
+        };
+        vp.axis_source(wl_pointer::AxisSource::Finger);
+        vp.axis_stop(0, wl_pointer::Axis::VerticalScroll);
+        vp.axis_stop(0, wl_pointer::Axis::HorizontalScroll);
         vp.frame();
         let _ = self.conn.flush();
     }
@@ -3594,6 +3679,17 @@ fn drain_ctl(
 
 #[cfg(test)]
 mod tests {
+    /// A finger's travel turns into whole notches with the fraction carried, both ways.
+    #[test]
+    fn a_finger_scroll_turns_into_whole_notches_with_the_rest_carried() {
+        let mut carry = 0.0;
+        assert_eq!(super::scroll_notches(&mut carry, 60.0), 0);
+        assert_eq!(super::scroll_notches(&mut carry, 60.0), 1);
+        assert!((carry - 20.0).abs() < 1e-9);
+        assert_eq!(super::scroll_notches(&mut carry, -260.0), -2);
+        assert!((carry + 40.0).abs() < 1e-9);
+    }
+
     use super::*;
 
     fn us_host_keyboard() -> HostKeyboardState {

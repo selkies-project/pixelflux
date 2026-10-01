@@ -773,6 +773,15 @@ pub enum ThreadCommand {
         x: f64,
         y: f64,
     },
+    /// A finger's scroll by (dx, dy) physical pixels, as a touchpad delivers it: no discrete
+    /// steps, ended by `PointerScrollEnd`.
+    PointerScroll {
+        dx: f64,
+        dy: f64,
+    },
+    /// The finger lifted: an axis stop, which a toolkit takes as the start of its kinetic
+    /// scroll.
+    PointerScrollEnd,
     UpdateCursorConfig {
         render_on_framebuffer: bool,
     },
@@ -5501,6 +5510,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     | ThreadCommand::PointerRelativeMotion { .. }
                     | ThreadCommand::PointerButton { .. }
                     | ThreadCommand::PointerAxis { .. }
+                    | ThreadCommand::PointerScroll { .. }
+                    | ThreadCommand::PointerScrollEnd
             );
             if matches!(
                 cmd,
@@ -6108,6 +6119,44 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         pointer.axis(state, frame);
                         pointer.frame(state);
                     }
+                }
+            }
+            ThreadCommand::PointerScroll { dx, dy } => {
+                if let Some(host) = state.host.as_ref() {
+                    host.pointer_scroll(dx, dy);
+                    return;
+                }
+                let time = wayland_time();
+                state.refocus_pointer();
+                if let Some(pointer) = state.seat.get_pointer()
+                    && (dx != 0.0 || dy != 0.0)
+                {
+                    let (_, _, scale) =
+                        state.layout_logical_to_physical_scaled(pointer.current_location());
+                    let mut frame = AxisFrame::new(time).source(AxisSource::Finger);
+                    if dx != 0.0 {
+                        frame = frame.value(Axis::Horizontal, dx / scale);
+                    }
+                    if dy != 0.0 {
+                        frame = frame.value(Axis::Vertical, dy / scale);
+                    }
+                    pointer.axis(state, frame);
+                    pointer.frame(state);
+                }
+            }
+            ThreadCommand::PointerScrollEnd => {
+                if let Some(host) = state.host.as_ref() {
+                    host.pointer_scroll_end();
+                    return;
+                }
+                let time = wayland_time();
+                if let Some(pointer) = state.seat.get_pointer() {
+                    let frame = AxisFrame::new(time)
+                        .source(AxisSource::Finger)
+                        .stop(Axis::Horizontal)
+                        .stop(Axis::Vertical);
+                    pointer.axis(state, frame);
+                    pointer.frame(state);
                 }
             }
             ThreadCommand::UpdateCursorConfig {
@@ -7150,6 +7199,30 @@ impl WaylandBackend {
                     e
                 ))
             })?;
+        Ok(())
+    }
+
+    /// Scroll by a finger's travel of (dx, dy) physical pixels, the way a touchpad does:
+    /// fractional, with no wheel steps, until `inject_finger_scroll_end`.
+    fn inject_finger_scroll(&self, dx: f64, dy: f64) -> PyResult<()> {
+        self.send(ThreadCommand::PointerScroll { dx, dy })
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to inject finger scroll: {}",
+                    e
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// End a finger's scroll: the axis stop a toolkit starts its kinetic scroll on.
+    fn inject_finger_scroll_end(&self) -> PyResult<()> {
+        self.send(ThreadCommand::PointerScrollEnd).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to end finger scroll: {}",
+                e
+            ))
+        })?;
         Ok(())
     }
 
@@ -8931,6 +9004,17 @@ impl ScreenCapture {
     fn inject_mouse_scroll(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py)
             .map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_scroll(x, y))
+    }
+    /// `WaylandBackend.inject_finger_scroll`; nothing without a running compositor.
+    fn inject_finger_scroll(&self, py: Python<'_>, dx: f64, dy: f64) -> PyResult<()> {
+        wayland_backend_running(py).map_or(Ok(()), |be| {
+            be.bind(py).borrow().inject_finger_scroll(dx, dy)
+        })
+    }
+    /// `WaylandBackend.inject_finger_scroll_end`; nothing without a running compositor.
+    fn inject_finger_scroll_end(&self, py: Python<'_>) -> PyResult<()> {
+        wayland_backend_running(py)
+            .map_or(Ok(()), |be| be.bind(py).borrow().inject_finger_scroll_end())
     }
     /// Where the Wayland compositor's pointer is, as `(x, y, scale, motion)`
     /// (`WaylandBackend.pointer_location`), or None without a running compositor, before its
