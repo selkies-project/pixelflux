@@ -146,7 +146,7 @@ use crate::encoders::FrameEncoder;
 use crate::encoders::overlay::OverlayState;
 use crate::{RustCaptureSettings, StripeState};
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
 static SERIAL_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -440,6 +440,79 @@ pub fn window_output_id(window: &Window) -> u32 {
 /// encoded image or the reason it could not be produced.
 pub type ScreenshotRequest = (u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>);
 
+/// Where the seat's pointer is, as `PointerShare::read` returns it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerAt {
+    /// Physical union-layout coordinates, the space absolute motion is injected in.
+    pub x: f64,
+    pub y: f64,
+    /// The fractional scale of the output the pointer is on: a relative move, applied in
+    /// logical pixels, travels this many physical pixels per pixel.
+    pub scale: f64,
+    /// The last numbered motion command the compositor has applied (`WaylandBackend`).
+    pub motion: u64,
+}
+
+/// The seat's pointer for Python to read without a round trip to the compositor thread:
+/// written once per event-loop pass from wherever it moved (an injected move, a client's
+/// warp, an output going away) under a sequence count, so a read never pairs one pass's
+/// position with another's motion number and the compositor never waits on a reader.
+#[derive(Default)]
+pub struct PointerShare {
+    /// Odd while a pass writes, zero before the first.
+    version: AtomicU64,
+    /// x and y as two `f32`s, x in the low half.
+    position: AtomicU64,
+    scale: AtomicU64,
+    motion: AtomicU64,
+}
+
+impl PointerShare {
+    /// Called from the compositor thread alone.
+    pub fn publish(&self, at: PointerAt) {
+        let position = (at.x as f32).to_bits() as u64 | ((at.y as f32).to_bits() as u64) << 32;
+        let scale = at.scale.to_bits();
+        let version = self.version.load(Ordering::Relaxed);
+        if version != 0
+            && self.position.load(Ordering::Relaxed) == position
+            && self.scale.load(Ordering::Relaxed) == scale
+            && self.motion.load(Ordering::Relaxed) == at.motion
+        {
+            return;
+        }
+        self.version.store(version + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.position.store(position, Ordering::Relaxed);
+        self.scale.store(scale, Ordering::Relaxed);
+        self.motion.store(at.motion, Ordering::Relaxed);
+        self.version.store(version + 2, Ordering::Release);
+    }
+
+    pub fn read(&self) -> Option<PointerAt> {
+        loop {
+            let version = self.version.load(Ordering::Acquire);
+            if version == 0 {
+                return None;
+            }
+            if version & 1 == 0 {
+                let position = self.position.load(Ordering::Relaxed);
+                let scale = self.scale.load(Ordering::Relaxed);
+                let motion = self.motion.load(Ordering::Relaxed);
+                fence(Ordering::Acquire);
+                if self.version.load(Ordering::Relaxed) == version {
+                    return Some(PointerAt {
+                        x: f32::from_bits(position as u32) as f64,
+                        y: f32::from_bits((position >> 32) as u32) as f64,
+                        scale: f64::from_bits(scale),
+                        motion,
+                    });
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// Central context threaded through every Smithay handler; owns the Wayland globals, the
 /// GBM/EGL (or pixman) renderer state, and the capture/encode pipeline state.
 ///
@@ -602,6 +675,10 @@ pub struct AppState {
     /// spacing and is clamped before it enters the average.
     pub pointer_motion_at: Option<Instant>,
     pub input_interval: Option<Duration>,
+    /// Where the pointer is, published each event-loop pass for the backend's `pointer_location`.
+    pub pointer_share: Arc<PointerShare>,
+    /// The highest motion number among the motion commands applied (`PointerAt::motion`).
+    pub motion_applied: u64,
     /// Whether the frame timer is armed at the long idle interval: input
     /// arriving then must not wait that deadline out, so the wake handler
     /// sends the idle frame callbacks itself (frame-paced via
@@ -1261,14 +1338,24 @@ impl AppState {
     /// Logical layout point -> physical union-layout coordinates (inverse of
     /// `layout_physical_to_logical` for in-bounds points; primary-relative otherwise).
     pub(crate) fn layout_logical_to_physical(&self, p: Point<f64, Logical>) -> (f64, f64) {
+        let (x, y, _) = self.layout_logical_to_physical_scaled(p);
+        (x, y)
+    }
+
+    /// `layout_logical_to_physical`, with the scale of the output it mapped through.
+    pub(crate) fn layout_logical_to_physical_scaled(
+        &self,
+        p: Point<f64, Logical>,
+    ) -> (f64, f64, f64) {
         let idx = self.node_idx_under(p).unwrap_or(0);
         let Some(node) = self.output_nodes.get(idx) else {
-            return (p.x, p.y);
+            return (p.x, p.y, 1.0);
         };
         let scale = node.output.current_scale().fractional_scale();
         (
             node.pos.0 as f64 + (p.x - node.pos.0 as f64) * scale,
             node.pos.1 as f64 + (p.y - node.pos.1 as f64) * scale,
+            scale,
         )
     }
 
@@ -3173,5 +3260,56 @@ mod clipboard_flavor_tests {
     #[test]
     fn an_unreadable_copy_stages_nothing() {
         assert!(offer(&["application/x-private"]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pointer_share_tests {
+    use super::{PointerAt, PointerShare};
+    use std::sync::Arc;
+
+    fn at(x: f64, y: f64, motion: u64) -> PointerAt {
+        PointerAt {
+            x,
+            y,
+            scale: 1.5,
+            motion,
+        }
+    }
+
+    /// Nothing reads as a position before the compositor's first pass, and a pass's fields
+    /// read back together, at the precision a pixel position needs.
+    #[test]
+    fn a_published_position_reads_back_whole() {
+        let share = PointerShare::default();
+        assert_eq!(share.read(), None);
+        share.publish(at(1920.5, 33.25, 7));
+        assert_eq!(share.read(), Some(at(1920.5, 33.25, 7)));
+        share.publish(at(-12.0, 7679.75, 9));
+        assert_eq!(share.read(), Some(at(-12.0, 7679.75, 9)));
+    }
+
+    /// A reader racing the writer never sees one pass's position with another's motion
+    /// number: every pass writes a position derived from its number.
+    #[test]
+    fn a_read_racing_the_writer_is_one_pass() {
+        let share = Arc::new(PointerShare::default());
+        let writer = {
+            let share = share.clone();
+            std::thread::spawn(move || {
+                for n in 1..200_000u64 {
+                    share.publish(at(n as f64, (n % 4096) as f64, n));
+                }
+            })
+        };
+        let mut seen = 0;
+        while !writer.is_finished() || seen == 0 {
+            if let Some(p) = share.read() {
+                assert_eq!(p.x, p.motion as f32 as f64);
+                assert_eq!(p.y, (p.motion % 4096) as f64);
+                seen += 1;
+            }
+        }
+        writer.join().unwrap();
     }
 }

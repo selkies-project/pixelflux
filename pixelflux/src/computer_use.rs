@@ -271,7 +271,9 @@ impl CuBackend for CuWaylandBackend {
     }
 
     fn mouse_move(&self, x: f64, y: f64) {
-        let _ = self.tx.send(ThreadCommand::PointerMotion { x, y });
+        let _ = self
+            .tx
+            .send(ThreadCommand::PointerMotion { x, y, motion: 0 });
     }
 
     fn button(&self, btn: CuButton, pressed: bool) {

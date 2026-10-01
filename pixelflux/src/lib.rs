@@ -750,13 +750,17 @@ pub enum ThreadCommand {
     Barrier {
         reply: std::sync::mpsc::Sender<()>,
     },
+    /// `motion` numbers the move for `pointer_location` (`WaylandBackend`); zero leaves it
+    /// unnumbered.
     PointerMotion {
         x: f64,
         y: f64,
+        motion: u64,
     },
     PointerRelativeMotion {
         dx: f64,
         dy: f64,
+        motion: u64,
     },
     /// `btn` is an evdev `BTN_` code by contract (e.g. 272 = BTN_LEFT, 273 = BTN_RIGHT,
     /// 274 = BTN_MIDDLE, 0x113 = BTN_SIDE / 0x114 = BTN_EXTRA for back/forward) and is passed
@@ -5007,6 +5011,7 @@ struct WaylandThreadConfig {
     explicit_dri_node: String,
     auto_gpu_selected: bool,
     cursor_size: i32,
+    pointer_share: Arc<crate::wayland::frontend::PointerShare>,
 }
 
 /// Bring the hardware renderer up on a DRM render node: the GBM device, the EGL display and
@@ -5140,6 +5145,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         explicit_dri_node,
         auto_gpu_selected,
         cursor_size,
+        pointer_share,
     } = cfg;
     let width: i32 = if initial_width > 0 {
         initial_width
@@ -5387,6 +5393,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         command_rx: None,
         last_input_at: None,
         pointer_motion_at: None,
+        pointer_share,
+        motion_applied: 0,
         input_interval: None,
         frame_idle_long: false,
         last_idle_service_at: None,
@@ -5902,7 +5910,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 }
                 let _ = reply.send(keymap_str);
             }
-            ThreadCommand::PointerMotion { x, y } => {
+            ThreadCommand::PointerMotion { x, y, motion } => {
+                state.motion_applied = state.motion_applied.max(motion);
                 if let Some(host) = state.host.as_ref() {
                     host.pointer_motion_abs(x, y);
                     return;
@@ -5948,7 +5957,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     state.activate_constraint_under(&pointer, &under, p);
                 }
             }
-            ThreadCommand::PointerRelativeMotion { dx, dy } => {
+            ThreadCommand::PointerRelativeMotion { dx, dy, motion } => {
+                state.motion_applied = state.motion_applied.max(motion);
                 if let Some(host) = state.host.as_ref() {
                     host.pointer_motion_rel(dx, dy);
                     return;
@@ -6464,6 +6474,19 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let _ = event_loop.run(None, &mut state, |state| {
         state.process_pending_clipboard_read();
         state.flush_pending_cursor();
+        if state.host.is_none()
+            && let Some(pointer) = state.seat.get_pointer()
+        {
+            let (x, y, scale) = state.layout_logical_to_physical_scaled(pointer.current_location());
+            state
+                .pointer_share
+                .publish(crate::wayland::frontend::PointerAt {
+                    x,
+                    y,
+                    scale,
+                    motion: state.motion_applied,
+                });
+        }
         let _ = state.dh.flush_clients();
     });
 }
@@ -6588,6 +6611,10 @@ impl StripeFrame {
 #[pyclass]
 struct WaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+    /// The compositor's pointer, as its thread last published it (`pointer_location`).
+    pointer: Arc<crate::wayland::frontend::PointerShare>,
+    /// The number the last motion sent was given.
+    motions: AtomicU64,
     /// Wakes the calloop after each command send: the command channel itself is drained in
     /// place by the compositor thread (render tick and wake handler), not registered as its
     /// own source, so input never waits behind an in-flight render tick's timer wakeup.
@@ -6620,6 +6647,8 @@ impl WaylandBackend {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
         let (wake_tx, wake_rx) = smithay::reexports::calloop::channel::channel();
         let cu_tx = tx.clone();
+        let pointer = Arc::new(crate::wayland::frontend::PointerShare::default());
+        let pointer_share = pointer.clone();
         thread::spawn(move || {
             crate::boost_thread_priority(-15);
             run_wayland_thread(WaylandThreadConfig {
@@ -6631,9 +6660,29 @@ impl WaylandBackend {
                 explicit_dri_node: dri_node,
                 auto_gpu_selected,
                 cursor_size,
+                pointer_share,
             });
         });
-        WaylandBackend { tx, wake_tx }
+        WaylandBackend {
+            tx,
+            wake_tx,
+            pointer,
+            motions: AtomicU64::new(0),
+        }
+    }
+
+    /// Where the compositor's pointer is as of its thread's last pass, as `(x, y, scale,
+    /// motion)`: physical union-layout coordinates (where `inject_mouse_move` puts it), the
+    /// scale of the output under it, by which a relative move's pixels travel physically,
+    /// and the number of the last move applied (what `inject_mouse_move` and
+    /// `inject_relative_mouse_move` return), so a caller can tell which of its moves the
+    /// position includes. An app's warp is included too, since the position is read back
+    /// rather than summed from what was injected. None before the first pass and under host
+    /// capture, whose pointer is the host's. Never waits on the compositor.
+    fn pointer_location(&self) -> Option<(f64, f64, f64, u64)> {
+        self.pointer
+            .read()
+            .map(|at| (at.x, at.y, at.scale, at.motion))
     }
 
     /// Begin a capture with the given frame callback and settings. The target display is
@@ -7051,30 +7100,35 @@ impl WaylandBackend {
         }
     }
 
-    fn inject_mouse_move(&self, x: f64, y: f64) -> PyResult<()> {
-        self.send(ThreadCommand::PointerMotion { x, y })
+    /// Move the pointer to a point in physical union-layout coordinates. Returns the
+    /// move's number (`pointer_location`).
+    fn inject_mouse_move(&self, x: f64, y: f64) -> PyResult<u64> {
+        let motion = self.motions.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(ThreadCommand::PointerMotion { x, y, motion })
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                     "Failed to inject motion: {}",
                     e
                 ))
             })?;
-        Ok(())
+        Ok(motion)
     }
 
     /// Move the pointer by a delta. On the seat this is an absolute move plus a
     /// `zwp_relative_pointer_v1` event; a nested KWin session, which forwards no
     /// delta from its host seat, receives it through its `org_kde_kwin_fake_input`
-    /// device on the app compositor socket named by `set_app_wayland_display`.
-    fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> PyResult<()> {
-        self.send(ThreadCommand::PointerRelativeMotion { dx, dy })
+    /// device on the app compositor socket named by `set_app_wayland_display`. Returns the
+    /// move's number (`pointer_location`).
+    fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> PyResult<u64> {
+        let motion = self.motions.fetch_add(1, Ordering::Relaxed) + 1;
+        self.send(ThreadCommand::PointerRelativeMotion { dx, dy, motion })
             .map_err(|e| {
                 PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
                     "Failed to inject relative motion: {}",
                     e
                 ))
             })?;
-        Ok(())
+        Ok(motion)
     }
 
     fn inject_mouse_button(&self, btn: u32, state: u32) -> PyResult<()> {
@@ -8849,13 +8903,24 @@ impl ScreenCapture {
             Ok::<(), String>(())
         });
     }
-    fn inject_mouse_move(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
-        wayland_backend_running(py)
-            .map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_move(x, y))
+    /// The move's number (`pointer_location`), or None without a running compositor.
+    fn inject_mouse_move(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<Option<u64>> {
+        wayland_backend_running(py).map_or(Ok(None), |be| {
+            be.bind(py).borrow().inject_mouse_move(x, y).map(Some)
+        })
     }
-    fn inject_relative_mouse_move(&self, py: Python<'_>, dx: f64, dy: f64) -> PyResult<()> {
-        wayland_backend_running(py).map_or(Ok(()), |be| {
-            be.bind(py).borrow().inject_relative_mouse_move(dx, dy)
+    /// The move's number (`pointer_location`), or None without a running compositor.
+    fn inject_relative_mouse_move(
+        &self,
+        py: Python<'_>,
+        dx: f64,
+        dy: f64,
+    ) -> PyResult<Option<u64>> {
+        wayland_backend_running(py).map_or(Ok(None), |be| {
+            be.bind(py)
+                .borrow()
+                .inject_relative_mouse_move(dx, dy)
+                .map(Some)
         })
     }
     fn inject_mouse_button(&self, py: Python<'_>, btn: u32, state: u32) -> PyResult<()> {
@@ -8866,6 +8931,12 @@ impl ScreenCapture {
     fn inject_mouse_scroll(&self, py: Python<'_>, x: f64, y: f64) -> PyResult<()> {
         wayland_backend_running(py)
             .map_or(Ok(()), |be| be.bind(py).borrow().inject_mouse_scroll(x, y))
+    }
+    /// Where the Wayland compositor's pointer is, as `(x, y, scale, motion)`
+    /// (`WaylandBackend.pointer_location`), or None without a running compositor, before its
+    /// first pass, or under host capture. An X11 session reads its pointer from the X server.
+    fn pointer_location(&self, py: Python<'_>) -> Option<(f64, f64, f64, u64)> {
+        wayland_backend_running(py).and_then(|be| be.bind(py).borrow().pointer_location())
     }
     /// Toggle compositing the cursor into captured frames (the alternative to the
     /// out-of-band cursor callback): the X11 grab re-reads the flag per frame, Wayland

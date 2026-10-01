@@ -314,8 +314,13 @@ In Wayland mode, `pixelflux` acts as the compositor. You cannot use external too
 capture = ScreenCapture()
 capture.start_capture(my_callback, settings)
 
-# Inject Mouse Motion (Absolute coordinates)
-capture.inject_mouse_move(x=500.0, y=300.0)
+# Inject Mouse Motion (Absolute coordinates); returns the move's number
+motion = capture.inject_mouse_move(x=500.0, y=300.0)
+
+# Where the pointer is, read back without a round trip to the compositor:
+# (x, y, scale, last applied move number), or None before its first pass and
+# under host capture; the position includes the move once `last applied` reaches its number
+x, y, scale, applied = capture.pointer_location()
 
 # Inject Mouse Button (evdev button codes: 272=Left, 273=Right, 274=Middle)
 # State: 1 = Pressed, 0 = Released
