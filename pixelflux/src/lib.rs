@@ -8372,17 +8372,23 @@ impl ScreenCapture {
     /// Cumulative counters of this capture since it started, or None without one: `frames`
     /// and `bytes` delivered, and the nanoseconds those frames spent encoding (`encode_ns`)
     /// and from capture to the end of the encode (`pipeline_ns`). A caller differences two
-    /// reads; a restart begins again from zero.
+    /// reads; a restart begins again from zero. Beside them, the extremes since the previous
+    /// read, which each read starts again: `pipeline_min_ns` and `pipeline_max_ns`, zero where
+    /// no frame was timed, and `frame_max_bytes`, the largest frame.
     fn stream_stats(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let Some(report) = self.report() else {
             return Ok(None);
         };
         let totals = report.totals();
+        let peaks = report.take_peaks();
         let d = pyo3::types::PyDict::new(py);
         d.set_item("frames", totals.frames)?;
         d.set_item("bytes", totals.bytes)?;
         d.set_item("encode_ns", totals.encode_ns)?;
         d.set_item("pipeline_ns", totals.pipeline_ns)?;
+        d.set_item("pipeline_min_ns", peaks.pipeline_min_ns)?;
+        d.set_item("pipeline_max_ns", peaks.pipeline_max_ns)?;
+        d.set_item("frame_max_bytes", peaks.frame_max_bytes)?;
         Ok(Some(d.into_any().unbind()))
     }
 

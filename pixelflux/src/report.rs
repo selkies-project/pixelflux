@@ -15,7 +15,10 @@
 //! every site. A decision made with no report bound, as in a test or a probe, records nothing.
 //!
 //! Counters are relaxed atomics tallied once per delivered frame and read only when the
-//! caller asks, so a capture nobody inspects pays for a few additions and nothing else.
+//! caller asks, so a capture nobody inspects pays for a few additions and nothing else. The
+//! extremes of a window (the fastest and slowest frame from capture to the end of its encode,
+//! and the largest frame) are kept the same way and swapped back on each read, so a reader
+//! that asks once a second learns that second's.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -58,14 +61,41 @@ pub struct StreamTotals {
     pub pipeline_ns: u64,
 }
 
+/// The extremes of the frames delivered since the previous read: the least and the most time
+/// from capture to the end of the encode, zero where no frame was timed, and the largest frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamPeaks {
+    pub pipeline_min_ns: u64,
+    pub pipeline_max_ns: u64,
+    pub frame_max_bytes: u64,
+}
+
 /// One capture's description and counters.
-#[derive(Default)]
 pub struct StreamReport {
     info: Mutex<StreamInfo>,
     frames: AtomicU64,
     bytes: AtomicU64,
     encode_ns: AtomicU64,
     pipeline_ns: AtomicU64,
+    /// `u64::MAX` while the window holds no timed frame.
+    pipeline_min_ns: AtomicU64,
+    pipeline_max_ns: AtomicU64,
+    frame_max_bytes: AtomicU64,
+}
+
+impl Default for StreamReport {
+    fn default() -> Self {
+        Self {
+            info: Mutex::default(),
+            frames: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            encode_ns: AtomicU64::new(0),
+            pipeline_ns: AtomicU64::new(0),
+            pipeline_min_ns: AtomicU64::new(u64::MAX),
+            pipeline_max_ns: AtomicU64::new(0),
+            frame_max_bytes: AtomicU64::new(0),
+        }
+    }
 }
 
 impl StreamReport {
@@ -88,6 +118,16 @@ impl StreamReport {
         }
     }
 
+    /// The extremes since the previous call, which starts the next window.
+    pub fn take_peaks(&self) -> StreamPeaks {
+        let min = self.pipeline_min_ns.swap(u64::MAX, Ordering::Relaxed);
+        StreamPeaks {
+            pipeline_min_ns: if min == u64::MAX { 0 } else { min },
+            pipeline_max_ns: self.pipeline_max_ns.swap(0, Ordering::Relaxed),
+            frame_max_bytes: self.frame_max_bytes.swap(0, Ordering::Relaxed),
+        }
+    }
+
     /// Count one delivered frame: its bytes over every stripe, the time its encode took, and
     /// the time from capture to the end of the encode.
     pub fn tally(&self, stripes: &[EncodedStripe]) {
@@ -96,11 +136,15 @@ impl StreamReport {
         let timing = first.timing;
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.frame_max_bytes
+            .fetch_max(bytes as u64, Ordering::Relaxed);
         if timing.encode_end_ns > 0 {
             let encode = (timing.encode_end_ns - timing.encode_start_ns).max(0) as u64;
             let pipeline = (timing.encode_end_ns - timing.capture_ns).max(0) as u64;
             self.encode_ns.fetch_add(encode, Ordering::Relaxed);
             self.pipeline_ns.fetch_add(pipeline, Ordering::Relaxed);
+            self.pipeline_min_ns.fetch_min(pipeline, Ordering::Relaxed);
+            self.pipeline_max_ns.fetch_max(pipeline, Ordering::Relaxed);
         }
     }
 
@@ -309,6 +353,55 @@ mod tests {
         }
         assert!(!host.info().zero_copy);
         assert!(!host.info().zero_copy_available);
+    }
+
+    /// A read takes the window's extremes and starts the next one: the fastest and slowest
+    /// frame from capture to encoded, and the largest, over every stripe of it; a window with
+    /// no timed frame reads zero for both times.
+    #[test]
+    fn peaks_cover_one_window_and_restart_on_read() {
+        use crate::encoders::codec::Codec;
+        use crate::encoders::reference::Reference;
+        use crate::encoders::software::FrameTiming;
+        let stripe = |bytes: usize, capture: i64, end: i64| EncodedStripe {
+            data: Arc::new(vec![0; bytes]),
+            codec: Codec::H264,
+            stripe_y_start: 0,
+            stripe_height: 16,
+            frame_id: 0,
+            timing: FrameTiming {
+                capture_ns: capture,
+                encode_start_ns: end - 1_000_000,
+                encode_end_ns: end,
+            },
+            reference: Reference::Untracked,
+        };
+        let report = StreamReport::new("x11");
+        report.tally(&[stripe(1000, 10_000_000, 14_000_000)]);
+        report.tally(&[
+            stripe(700, 20_000_000, 29_000_000),
+            stripe(800, 20_000_000, 29_000_000),
+        ]);
+        report.tally(&[stripe(300, 30_000_000, 36_000_000)]);
+        let peaks = report.take_peaks();
+        assert_eq!(
+            peaks,
+            StreamPeaks {
+                pipeline_min_ns: 4_000_000,
+                pipeline_max_ns: 9_000_000,
+                frame_max_bytes: 1500,
+            }
+        );
+        assert_eq!(report.totals().pipeline_ns, 19_000_000);
+        assert_eq!(report.take_peaks(), StreamPeaks::default());
+        report.tally(&[stripe(200, 0, 0)]);
+        assert_eq!(
+            report.take_peaks(),
+            StreamPeaks {
+                frame_max_bytes: 200,
+                ..StreamPeaks::default()
+            }
+        );
     }
 
     /// Scopes nest, so a capture start on a thread already serving another restores it.
