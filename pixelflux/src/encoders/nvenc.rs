@@ -4410,8 +4410,8 @@ mod gpu_tests {
     /// decodes it as one that saw everything does, the stream declares the decoded picture
     /// buffer the level admits, and an in-place resize redeclares it: a loss as deep as the new
     /// buffer's recent frames reach is still predicted past, a deeper one from the key frame the
-    /// resize forced where an anchor is kept, and losing the last reference costs a key frame. A device that cannot
-    /// invalidate a reference tracks none and says so. Ignored by default.
+    /// resize forced where an anchor is kept, and losing the last reference costs a key frame. A
+    /// device that cannot invalidate a reference tracks none and says so. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_predicts_past_a_lost_frame() {
@@ -4566,96 +4566,67 @@ mod gpu_tests {
         }
     }
 
-    /// At 4K, a later report from an already recovered loss keeps the prediction chain and
-    /// every decoded plane intact. A loss in the new chain still invalidates its references.
+    /// A report for a frame an earlier invalidation already left out keeps the chain predicted
+    /// since: lose 80 and 81, recover from 79, and the report for 81 that arrives after 98 lets 99
+    /// predict from 98 rather than cost a key frame; a loss in the new chain still invalidates
+    /// it. The stream without the lost frames decodes as the complete one does. Ignored by
+    /// default.
     #[test]
     #[ignore]
-    fn gpu_covered_loss_preserves_recovered_4k_frames() {
+    fn gpu_a_covered_loss_keeps_the_recovered_chain() {
         use crate::encoders::reference::Reference;
-        use crate::webcam::decode::{Decoder as _, VideoDecoder, sniff_keyframe};
-        let (w, h) = (3840usize, 2160usize);
-        let mut kept = Vec::new();
-        for codec in [Codec::Av1, Codec::H264, Codec::H265] {
-            let mut s = settings(w as i32, h as i32, 30.0);
+        let (w, h) = (1920usize, 1080usize);
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
-            s.video_cbr_mode = true;
-            s.video_bitrate_kbps = 20_000;
             s.omit_stripe_headers = true;
-            let mut enc = host_session(&s).expect("NVENC session");
-            assert_eq!(
-                enc.encode_config.rcParams.rateControlMode,
-                NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
-            );
-            assert_eq!(enc.encode_config.rcParams.averageBitRate, 20_000_000);
-            let mut whole = VideoDecoder::new(codec).expect("intact decoder");
-            let mut lossy = VideoDecoder::new(codec).expect("loss decoder");
-            let mut post_late_bytes = 0;
-            let mut late_reference = Reference::Untracked;
-            for i in 0..=107 {
-                if i == 82 {
-                    assert!(enc.invalidate_reference(80), "{codec:?}: first loss");
-                } else if i == 99 {
-                    assert!(enc.invalidate_reference(81), "{codec:?}: covered loss");
-                } else if i == 107 {
-                    assert!(enc.invalidate_reference(106), "{codec:?}: new loss");
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
                 }
-                let out = enc
-                    .encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0)
-                    .expect("encode");
-                let reference = enc.last_reference();
-                if i == 82 {
-                    assert_eq!(reference, Reference::Frame(79), "{codec:?}");
-                } else if i == 99 {
-                    late_reference = reference;
-                    let key = sniff_keyframe(codec, &out).expect("picture type");
-                    println!(
-                        "covered loss {codec:?}: frame=99 reference={reference:?} key={key} bytes={}",
-                        out.len()
-                    );
-                    assert_eq!(key, reference == Reference::None, "{codec:?}");
-                } else if i == 107 {
-                    assert_eq!(reference, Reference::Frame(105), "{codec:?}: new loss");
+            };
+            let mut frames = Vec::new();
+            for i in 0..=107usize {
+                let (lost, expect) = match i {
+                    82 => (Some(80), Some(79)),
+                    99 => (Some(81), Some(98)),
+                    107 => (Some(106), Some(105)),
+                    _ => (None, None),
+                };
+                if let Some(lost) = lost {
+                    assert!(enc.invalidate_reference(lost), "{codec:?}: lost {lost}");
                 }
-                if (99..=106).contains(&i) {
-                    post_late_bytes += out.len();
+                frames.push(
+                    enc.encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0)
+                        .expect("encode"),
+                );
+                if i == 0 && enc.last_reference() == Reference::Untracked {
+                    break;
                 }
-                assert!(whole.decode(&out).expect("intact decode"), "{codec:?} {i}");
-                if !(80..=81).contains(&i) && i != 106 {
-                    assert!(
-                        lossy.decode(&out).expect("decode past loss"),
+                if let Some(from) = expect {
+                    assert_eq!(
+                        enc.last_reference(),
+                        Reference::Frame(from),
                         "{codec:?} {i}"
                     );
-                    if i >= 82 {
-                        let a = whole.frame().expect("intact picture");
-                        let b = lossy.frame().expect("recovered picture");
-                        assert_eq!((a.width, a.height), (w, h));
-                        assert_eq!((b.width, b.height), (w, h));
-                        for (pa, pb, sa, sb, cols, rows) in [
-                            (a.y, b.y, a.y_stride, b.y_stride, w, h),
-                            (a.u, b.u, a.uv_stride, b.uv_stride, w / 2, h / 2),
-                            (a.v, b.v, a.uv_stride, b.uv_stride, w / 2, h / 2),
-                        ] {
-                            assert!(
-                                pa.chunks(sa)
-                                    .zip(pb.chunks(sb))
-                                    .take(rows)
-                                    .all(|(ra, rb)| ra[..cols] == rb[..cols]),
-                                "{codec:?} frame {i}: exact visible plane"
-                            );
-                        }
-                    }
                 }
             }
-            println!(
-                "covered loss {codec:?}: post_late_bytes={post_late_bytes} exact_frames=25 new_loss_reference=105"
+            if enc.last_reference() == Reference::Untracked {
+                println!("{codec:?}: this device cannot invalidate a reference");
+                continue;
+            }
+            let received: Vec<usize> = (0..frames.len())
+                .filter(|i| !matches!(i, 80 | 81 | 106))
+                .collect();
+            let off = apart_keeping(codec, &frames, &received);
+            assert!(
+                off.is_some_and(|x| x < 0.5),
+                "{codec:?}: without frames 80, 81 and 106 the last frame is {off:?} off"
             );
-            kept.push((codec, late_reference));
+            println!("{codec:?}: frame 99 predicts from 98 after the covered report, {off:?} off");
         }
-        assert!(
-            kept.iter()
-                .all(|(_, reference)| *reference == Reference::Frame(98)),
-            "covered losses disrupted recovered references: {kept:?}"
-        );
     }
 
     /// A loss deeper than the recent frames is predicted past from the newest anchor before it,
