@@ -1123,14 +1123,14 @@ where
         // client the hash waits for the GPU, half a millisecond a frame on the path to the
         // client. As on the XShm path, a new frame coded whole at a cleanup's quality is hashed
         // first instead, and one that moved is coded as motion is; a held band codes the rest of
-        // its frame at the coarsest quantizer, so a change there costs one coarse frame. Turbo
-        // without the paint-over reads no extent.
+        // its frame at the coarsest quantizer, so a change there costs one coarse frame. Only the
+        // paint-over's cleanup reads the extent, so without it nothing is hashed.
         let lags = gpu.settings.video_streaming_mode && gpu.settings.use_paint_over_quality;
         let damage = if lags {
             std::mem::replace(&mut lagged, Damage::None)
         } else if !frame.is_new {
             Damage::None
-        } else if gpu.settings.video_streaming_mode {
+        } else if gpu.settings.video_streaming_mode || !gpu.settings.use_paint_over_quality {
             hashes.clear();
             Damage::Unknown
         } else {
