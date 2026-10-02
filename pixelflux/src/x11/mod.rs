@@ -986,14 +986,18 @@ fn encode_loop<F>(
 }
 
 /// The rate the X server's fake vblank runs at while this process captures it: the fastest live
-/// capture's frame rate (1 to 1000, what the server takes), published as the root window's
-/// `_FAKE_SCREEN_FPS` (CARDINAL) and deleted when the last capture ends. The Selkies Xvfb paces the
-/// clients that wait on Present by it, keeping the rate it started at as a floor, so a vsynced
-/// application presents as fast as it is streamed; any other server holds it as inert data.
+/// capture's frame rate, published on the root window as `_FAKE_SCREEN_MILLIHZ` (CARDINAL,
+/// millihertz, 1000 to 1000000) and, rounded to whole frames for servers that read only that,
+/// `_FAKE_SCREEN_FPS` (1 to 1000), both deleted when the last capture ends. The Selkies Xvfb paces
+/// the clients that wait on Present by it, keeping the rate it started at as a floor unless the
+/// published one is at most 0.1% slower (59.94 under 60), so a vsynced application presents as
+/// fast as it is streamed; any other server holds it as inert data.
 struct VblankRate {
     captures: Vec<Arc<Controls>>,
+    /// Millihertz last published, 0 for none.
     published: u32,
-    conn: Option<(RustConnection, Window, Atom)>,
+    /// The connection, the root window, and the millihertz and frames-per-second atoms.
+    conn: Option<(RustConnection, Window, Atom, Atom)>,
 }
 
 static VBLANK_RATE: Mutex<VblankRate> = Mutex::new(VblankRate {
@@ -1008,9 +1012,9 @@ impl VblankRate {
             .captures
             .iter()
             .map(|c| {
-                f64::from_bits(c.fps_bits.load(Ordering::Relaxed))
+                (f64::from_bits(c.fps_bits.load(Ordering::Relaxed)) * 1000.0)
                     .round()
-                    .clamp(1.0, 1000.0) as u32
+                    .clamp(1000.0, 1_000_000.0) as u32
             })
             .max()
             .unwrap_or(0);
@@ -1020,31 +1024,44 @@ impl VblankRate {
         if self.conn.is_none() {
             self.conn = x11rb::connect(None).ok().and_then(|(conn, screen)| {
                 let root = conn.setup().roots[screen].root;
-                let atom = conn
-                    .intern_atom(false, b"_FAKE_SCREEN_FPS")
-                    .ok()?
-                    .reply()
-                    .ok()?
-                    .atom;
-                Some((conn, root, atom))
+                let atom =
+                    |name: &[u8]| Some(conn.intern_atom(false, name).ok()?.reply().ok()?.atom);
+                let millihz = atom(b"_FAKE_SCREEN_MILLIHZ")?;
+                let fps = atom(b"_FAKE_SCREEN_FPS")?;
+                Some((conn, root, millihz, fps))
             });
         }
-        let sent = self.conn.as_ref().is_some_and(|(conn, root, atom)| {
-            let queued = if want > 0 {
-                conn.change_property32(PropMode::REPLACE, *root, *atom, AtomEnum::CARDINAL, &[want])
-                    .is_ok()
-            } else {
-                conn.delete_property(*root, *atom).is_ok()
-            };
-            // A round trip, not a flush: a server may drop what is still queued when a client
-            // closes, and the connection closes right after the last capture's delete.
-            queued
-                && conn
-                    .get_input_focus()
-                    .ok()
-                    .and_then(|c| c.reply().ok())
-                    .is_some()
-        });
+        let sent = self
+            .conn
+            .as_ref()
+            .is_some_and(|(conn, root, millihz, fps)| {
+                let queued = if want > 0 {
+                    [(*millihz, want), (*fps, (want + 500) / 1000)]
+                        .iter()
+                        .all(|&(atom, value)| {
+                            conn.change_property32(
+                                PropMode::REPLACE,
+                                *root,
+                                atom,
+                                AtomEnum::CARDINAL,
+                                &[value],
+                            )
+                            .is_ok()
+                        })
+                } else {
+                    [*millihz, *fps]
+                        .iter()
+                        .all(|&atom| conn.delete_property(*root, atom).is_ok())
+                };
+                // A round trip, not a flush: a server may drop what is still queued when a client
+                // closes, and the connection closes right after the last capture's delete.
+                queued
+                    && conn
+                        .get_input_focus()
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .is_some()
+            });
         self.published = if sent { want } else { 0 };
         if !sent || want == 0 {
             self.conn = None;
@@ -2021,11 +2038,19 @@ mod vblank_tests {
         }))
     }
 
-    fn published() -> Option<u32> {
+    /// The root window's `_FAKE_SCREEN_FPS` and `_FAKE_SCREEN_MILLIHZ`.
+    fn published() -> (Option<u32>, Option<u32>) {
+        (
+            property(b"_FAKE_SCREEN_FPS"),
+            property(b"_FAKE_SCREEN_MILLIHZ"),
+        )
+    }
+
+    fn property(name: &[u8]) -> Option<u32> {
         let (conn, screen) = x11rb::connect(None).expect("connect");
         let root = conn.setup().roots[screen].root;
         let atom = conn
-            .intern_atom(false, b"_FAKE_SCREEN_FPS")
+            .intern_atom(false, name)
             .expect("intern")
             .reply()
             .expect("atom")
@@ -2038,8 +2063,8 @@ mod vblank_tests {
         reply.value32().and_then(|mut v| v.next())
     }
 
-    /// The fastest running capture sets the rate, a change of rate follows, and the last capture to
-    /// end takes the property away.
+    /// The fastest running capture sets the rate, a change of rate follows, a fractional one to the
+    /// millihertz, and the last capture to end takes the properties away.
     #[test]
     #[ignore]
     fn x11_vblank_rate_follows_the_fastest_capture() {
@@ -2047,13 +2072,17 @@ mod vblank_tests {
         let slow = capture_at(90.0);
         let fast_claim = VblankClaim::new(&fast);
         let slow_claim = VblankClaim::new(&slow);
-        assert_eq!(published(), Some(144));
+        assert_eq!(published(), (Some(144), Some(144_000)));
         drop(fast_claim);
-        assert_eq!(published(), Some(90));
+        assert_eq!(published(), (Some(90), Some(90_000)));
         slow.fps_bits.store(119.6f64.to_bits(), Ordering::Relaxed);
         follow_frame_rate();
-        assert_eq!(published(), Some(120));
+        assert_eq!(published(), (Some(120), Some(119_600)));
+        slow.fps_bits
+            .store((60000.0f64 / 1001.0).to_bits(), Ordering::Relaxed);
+        follow_frame_rate();
+        assert_eq!(published(), (Some(60), Some(59_940)));
         drop(slow_claim);
-        assert_eq!(published(), None);
+        assert_eq!(published(), (None, None));
     }
 }

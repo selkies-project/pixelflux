@@ -117,11 +117,13 @@ encoded at 10-12 ms instead of 28. The GPU serves its contexts in the order they
 that holds where the encoder's context is older than the client's; a capture started while the
 game already runs keeps the two draws, as it would with the `GetImage`.
 
-Whichever path runs, an X11 capture publishes its frame rate on the root window as
-`_FAKE_SCREEN_FPS` (CARDINAL), the fastest running capture's, and deletes it when the last one ends.
-A server that fakes its vblank reads it: the Selkies build of XLibre's Xvfb runs the vblank at that
-rate, never below the one it started with, so an application that waits on Present for vsync
-presents as fast as it is streamed. Any other server keeps the property as inert data.
+Whichever path runs, an X11 capture publishes its frame rate on the root window, the fastest
+running capture's, as `_FAKE_SCREEN_MILLIHZ` (CARDINAL, millihertz) and rounded to whole frames as
+`_FAKE_SCREEN_FPS`, and deletes both when the last one ends. A server that fakes its vblank reads
+them: the Selkies build of XLibre's Xvfb runs the vblank at that rate, never below the one it
+started with unless the published one is at most 0.1% slower (59.94 under 60), so an application
+that waits on Present for vsync presents as fast as it is streamed. Any other server keeps the
+properties as inert data.
 
 `pixelflux` supports both an X11 and a **Wayland** backend (the latter built on [Smithay](https://github.com/Smithay/smithay)), selected per capture by the `use_wayland` attribute on `CaptureSettings`:
 
