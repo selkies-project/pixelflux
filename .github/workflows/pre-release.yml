@@ -8,32 +8,42 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      # One job per (arch, libc): an extra interpreter rebuilds only the PyO3
-      # layer and the extension, so splitting them would duplicate before-all
-      # for far less than it costs.
-      matrix:
-        platform: [manylinux, musllinux]
-        target:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.target.runner }}
+  # The wheels cibuildwheel builds here, every interpreter it offers floored by
+  # python_requires, each with the runner of its arch.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      wheels: ${{ steps.plan.outputs.wheels }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build wheels (${{ matrix.platform }}_${{ matrix.target.arch }})
+      - id: plan
+        # The cibuildwheel the build step's action runs.
+        run: |
+          for arch in x86_64 aarch64; do
+            pipx run --spec cibuildwheel==4.2.1 cibuildwheel --print-build-identifiers --platform linux --archs "$arch"
+          done | python3 -c 'import json, sys; runners = {"x86_64": "ubuntu-latest", "aarch64": "ubuntu-24.04-arm"}; print("wheels=" + json.dumps([{"id": i, "runner": runners[i.split("linux_", 1)[1]]} for i in sys.stdin.read().split()]))' >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      # One job per wheel: in one job the interpreters build one after another,
+      # and that ladder, not each job's before-all, set the wall clock.
+      matrix:
+        wheel: ${{ fromJSON(needs.plan.outputs.wheels) }}
+    runs-on: ${{ matrix.wheel.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the wheel (${{ matrix.wheel.id }})
         uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
         env:
-          # Every interpreter cibuildwheel offers, floored by python_requires.
-          CIBW_BUILD: "*-${{ matrix.platform }}_${{ matrix.target.arch }}"
+          CIBW_BUILD: ${{ matrix.wheel.id }}
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.target.arch }}-${{ matrix.platform }}
+          name: wheels-${{ matrix.wheel.id }}
           path: wheelhouse/*.whl
           # A wheel is a deflated zip already, so the archive this is wrapped in
           # cannot compress it further: leveling off spends no CPU re-deflating
