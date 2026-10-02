@@ -110,61 +110,14 @@ jobs:
           fi
           echo "path=${path}" >> "$GITHUB_OUTPUT"
 
-  # The wheels cibuildwheel builds here, every interpreter it offers floored by
-  # python_requires, each with the runner of its arch.
-  plan:
-    needs: check
-    runs-on: ubuntu-latest
-    outputs:
-      wheels: ${{ steps.plan.outputs.wheels }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - id: plan
-        # The cibuildwheel the build step's action runs.
-        run: |
-          for arch in x86_64 aarch64; do
-            pipx run --spec cibuildwheel==4.2.1 cibuildwheel --print-build-identifiers --platform linux --archs "$arch"
-          done | python3 -c 'import json, sys; runners = {"x86_64": "ubuntu-latest", "aarch64": "ubuntu-24.04-arm"}; print("wheels=" + json.dumps([{"id": i, "runner": runners[i.split("linux_", 1)[1]]} for i in sys.stdin.read().split()]))' >> "$GITHUB_OUTPUT"
-
   build:
-    needs: [check, plan]
-    strategy:
-      fail-fast: false
-      # One job per wheel: in one job the interpreters build one after another,
-      # and that ladder, not each job's before-all, set the wall clock.
-      matrix:
-        wheel: ${{ fromJSON(needs.plan.outputs.wheels) }}
-    runs-on: ${{ matrix.wheel.runner }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
-
-      - name: Version the crate as the tag
-        # The wheel takes its version from the crate, whose manifest spells a
-        # pre-release the semver way; the lock names the crate's own version
-        # too, and the build runs --locked.
-        run: |
-          crate="$(echo "${RELEASE_TAG}" | sed -E 's/rc([0-9]+)$/-rc.\1/; s/a([0-9]+)$/-alpha.\1/; s/b([0-9]+)$/-beta.\1/; s/\.post([0-9]+)$/-post.\1/; s/\.dev([0-9]+)$/-dev.\1/')"
-          sed -i "0,/^version = /s|^version = .*|version = \"${crate}\"|" pixelflux/Cargo.toml
-          sed -i "/^name = \"pixelflux\"$/{n;s|^version = .*|version = \"${crate}\"|}" pixelflux/Cargo.lock
-          grep -q "^version = \"${crate}\"$" pixelflux/Cargo.toml
-          grep -A1 "^name = \"pixelflux\"$" pixelflux/Cargo.lock | grep -q "^version = \"${crate}\"$"
-
-      - name: Build the wheel (${{ matrix.wheel.id }})
-        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
-        env:
-          CIBW_BUILD: ${{ matrix.wheel.id }}
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: wheels-${{ matrix.wheel.id }}
-          path: wheelhouse/*.whl
-          # A wheel is a deflated zip already, so the archive this is wrapped in
-          # cannot compress it further: leveling off spends no CPU re-deflating
-          # it for a size that does not move.
-          compression-level: 0
+    needs: check
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/wheels.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
 
   release:
     needs: [check, build]
