@@ -11,7 +11,9 @@
 //! identically either way. Keeping the decision logic here, source-agnostic, is what guarantees it.
 
 use crate::RustCaptureSettings;
-use crate::encoders::software::{EncodedStripe, StripeState, encode_cpu, invalidate_reference};
+use crate::encoders::software::{
+    EncodedStripe, StripeState, encode_cpu, invalidate_reference, stripes_held_still,
+};
 use crate::encoders::{self, Codec, FrameEncoder, FrameSource};
 use smithay::utils::{Physical, Rectangle};
 use std::sync::Arc;
@@ -431,6 +433,14 @@ pub struct HwFrameDecision {
 }
 
 impl HwFrameDecision {
+    /// The quality the whole frame is coded at in place of the session's `normal` one: a
+    /// quantizer held for it, or a constant quality's paint-over one.
+    fn cleanup_quality(&self, normal: u32) -> Option<u32> {
+        self.hold_qp
+            .filter(|_| self.hold_band.is_none())
+            .or((self.target_qp != normal).then_some(self.target_qp))
+    }
+
     /// Tell `encoder` what the decision asks of the frame it is about to code: the quantizer
     /// it is held at and whether its reconstruction is measured.
     pub fn prepare(&self, encoder: &mut FrameEncoder) {
@@ -950,9 +960,10 @@ pub struct X11Pipeline {
     /// rebuild; together they drive `recover_hw`.
     hw_error_streak: u32,
     hw_rebuilt: bool,
-    /// The quantizer the last full frame was decided to be held at, and the one it was held at.
+    /// The cleanup quality (`HwFrameDecision::cleanup_quality`) and key frame the last full frame
+    /// was decided on, and the ones it was coded with.
     #[cfg(test)]
-    hold: (Option<u32>, Option<u32>),
+    hold: [(Option<u32>, bool); 2],
 }
 
 impl X11Pipeline {
@@ -981,7 +992,7 @@ impl X11Pipeline {
             hw_error_streak: 0,
             hw_rebuilt: false,
             #[cfg(test)]
-            hold: (None, None),
+            hold: [(None, false); 2],
         };
         pipeline.record_stream();
         pipeline
@@ -1189,8 +1200,9 @@ impl X11Pipeline {
     /// its cleanup reads the damage, so there the frame's hash runs beside its encode
     /// (`hash_beside`) and the cleanup reads the frame before's (`turbo_dirty`; the striped path
     /// as the rows it maps onto its stripes): the hash, a millisecond and a half at 1080p and six
-    /// at 4K, stays off the path to the client. With the paint-over off nothing reads it, and
-    /// Turbo hashes nothing.
+    /// at 4K, stays off the path to the client. A frame the cleanup codes at its own quality is
+    /// hashed before its encode instead, so a change landing on it is coded at the session's.
+    /// With the paint-over off nothing reads it, and Turbo hashes nothing.
     ///
     /// # Arguments
     ///
@@ -1231,19 +1243,20 @@ impl X11Pipeline {
                 requested,
                 quality,
             );
-            // A Turbo frame is decided on the hash of the one before, so a frame held whole could
-            // carry a change it was not decided for, coded at the held quantizer. Such a frame is
-            // hashed before it is encoded instead of beside it, and one that moved goes to the
-            // rate control. A held band needs none of this: the rest of its frame is held at the
-            // coarsest quantizer.
+            // A Turbo frame is decided on the hash of the one before, so a frame coded whole at
+            // a cleanup's quality could carry a change it was not decided for, coded at that
+            // quality. Such a frame is hashed before it is encoded instead of beside it, and one
+            // that moved is coded as motion is: at the session's quality, and a key frame only
+            // where one is due. A held band needs none of this: the rest of its frame is held at
+            // the coarsest quantizer.
+            let normal = self.settings.video_crf as u32;
             #[cfg(test)]
-            let decided = d.hold_qp;
+            let decided = (d.cleanup_quality(normal), d.force_idr);
             let mut hashed = None;
             if turbo
                 && self.settings.use_paint_over_quality
                 && d.send
-                && d.hold_qp.is_some()
-                && d.hold_band.is_none()
+                && d.cleanup_quality(normal).is_some()
             {
                 let dirty = hash_bands(
                     &mut self.bands,
@@ -1255,12 +1268,14 @@ impl X11Pipeline {
                 );
                 if band_damage(&dirty).is_motion() {
                     d.hold_qp = None;
+                    d.target_qp = normal;
+                    d.force_idr = requested || periodic_idr_due(&self.settings, self.frame_counter);
                 }
                 hashed = Some(dirty);
             }
             #[cfg(test)]
             {
-                self.hold = (decided, d.hold_qp);
+                self.hold = [decided, (d.cleanup_quality(normal), d.force_idr)];
             }
             let fc = self.frame_counter as u64;
             if d.send || self.hw.as_ref().unwrap().holds_frame() {
@@ -1345,7 +1360,32 @@ impl X11Pipeline {
                 || (self.settings.codec.is_video()
                     && periodic_idr_due(&self.settings, self.frame_counter));
             if self.settings.codec.is_video() && self.settings.video_streaming_mode {
-                let rects = band_rects(&self.turbo_dirty, width, height);
+                // As a full frame above: a frame that codes a stripe at the paint-over quality
+                // while it holds still is hashed before it is encoded, and decided on its own
+                // change as well as the one before.
+                let hashed = (self.settings.use_paint_over_quality
+                    && stripes_held_still(&self.stripes, &self.settings))
+                .then(|| {
+                    hash_bands(
+                        &mut self.bands,
+                        argb,
+                        stride,
+                        height as usize,
+                        threshold,
+                        duration,
+                    )
+                });
+                let rects = match &hashed {
+                    Some(dirty) => {
+                        let seen: Vec<bool> = dirty
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &d)| d || self.turbo_dirty.get(i).is_none_or(|&b| b))
+                            .collect();
+                        band_rects(&seen, width, height)
+                    }
+                    None => band_rects(&self.turbo_dirty, width, height),
+                };
                 let (stripes, carrying, settings) = (
                     &mut self.stripes,
                     &mut self.stripes_carrying,
@@ -1366,7 +1406,10 @@ impl X11Pipeline {
                         force_idr_all,
                     )
                 };
-                if self.settings.use_paint_over_quality {
+                if let Some(dirty) = hashed {
+                    self.turbo_dirty = dirty;
+                    encode()
+                } else if self.settings.use_paint_over_quality {
                     let (out, dirty) = hash_beside(
                         &mut self.bands,
                         argb,
@@ -2598,10 +2641,55 @@ mod tests {
         );
     }
 
+    /// A noise screen of 640x384 at `seed`: a rate control codes it still coarser than a cleanup's
+    /// quantizer.
+    fn noise(seed: u8) -> Vec<u8> {
+        (0..640 * 4 * 384)
+            .map(|i| {
+                (i as u32)
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(seed as u32 * 97) as u8
+            })
+            .collect()
+    }
+
+    /// The probes (`X11Pipeline::hold`) of a Turbo session's first still frame coded at a
+    /// cleanup's quality, as a key frame where `key`, and of the same frame in a second session
+    /// where the screen moves on it.
+    fn cleanup_frame_that_moved(
+        s: &RustCaptureSettings,
+        key: bool,
+    ) -> [[(Option<u32>, bool); 2]; 2] {
+        let still = noise(42);
+        let lead = |p: &mut X11Pipeline| {
+            for i in 0..3u8 {
+                p.process(&noise(i), 640 * 4);
+            }
+        };
+        let mut p = X11Pipeline::new(s.clone());
+        lead(&mut p);
+        let at = (0..300)
+            .find(|_| {
+                p.process(&still, 640 * 4);
+                p.hold[0].0.is_some() && p.hold[0].1 == key
+            })
+            .expect("a still screen is cleaned up");
+        let mut q = X11Pipeline::new(s.clone());
+        lead(&mut q);
+        for _ in 0..at {
+            q.process(&still, 640 * 4);
+        }
+        assert!(
+            !q.process(&noise(9), 640 * 4).is_empty(),
+            "the moved frame is sent"
+        );
+        [p.hold, q.hold]
+    }
+
     /// A Turbo frame is decided on the hash of the frame before it, so a change can land on a
     /// frame decided to be held whole at the cleanup's quantizer (SVT-AV1's held frames, from the
     /// release that takes a new target with a picture). That frame is hashed before it is
-    /// encoded and goes to the rate control.
+    /// encoded and goes to the rate control, a refresh or a key frame alike.
     #[test]
     fn a_turbo_frame_decided_held_that_moved_goes_to_the_rate_control() {
         let s = RustCaptureSettings {
@@ -2619,55 +2707,130 @@ mod tests {
             target_fps: 60.0,
             ..Default::default()
         };
-        let stride = 640 * 4;
-        // Noise, so the rate control codes the still screen coarser than the cleanup's quantizer.
-        let screen = |seed: u8| -> Vec<u8> {
-            (0..stride * 384)
-                .map(|i| {
-                    (i as u32)
-                        .wrapping_mul(2654435761)
-                        .wrapping_add(seed as u32 * 97) as u8
-                })
-                .collect()
-        };
-        let still = screen(42);
-        let lead = |p: &mut X11Pipeline| {
-            for i in 0..3u8 {
-                p.process(&screen(i), stride);
-            }
-        };
-        let mut p = X11Pipeline::new(s.clone());
+        let p = X11Pipeline::new(s.clone());
         assert!(p.hw.is_some(), "AV1 runs as a full-frame session");
         if !codec_sys::svtav1::HAS_EVENTS {
             assert!(!EncoderQuality::of(p.hw.as_ref().unwrap()).holds);
             return;
         }
-        lead(&mut p);
-        let at = (0..300)
-            .find(|_| {
-                p.process(&still, stride);
-                p.hold.0.is_some()
-            })
-            .expect("a still screen is cleaned up by a held frame");
-        assert_eq!(
-            p.hold.1, p.hold.0,
-            "a frame that stood still keeps its hold"
-        );
-
-        let mut q = X11Pipeline::new(s);
-        lead(&mut q);
-        for _ in 0..at {
-            q.process(&still, stride);
+        for key in [false, true] {
+            let [still, moved] = cleanup_frame_that_moved(&s, key);
+            assert_eq!(
+                still[1], still[0],
+                "a frame that stood still keeps its hold"
+            );
+            assert!(moved[0].0.is_some() && moved[0].1 == key, "{moved:?}");
+            assert_eq!(
+                moved[1],
+                (None, false),
+                "a held frame that moved is coded under the rate control"
+            );
         }
+    }
+
+    /// The same at a constant quality, whose cleanup moves the session's quality to the
+    /// paint-over one while the screen stays clean (`decide_constant_quality`): a frame that
+    /// moved is coded at the session's own.
+    #[test]
+    fn a_turbo_frame_at_the_paint_over_quality_that_moved_is_coded_at_the_session_quality() {
+        let s = RustCaptureSettings {
+            width: 640,
+            height: 384,
+            codec: Codec::Vp9,
+            use_cpu: true,
+            video_cbr_mode: false,
+            video_crf: 25,
+            video_paintover_crf: 18,
+            paint_over_trigger_frames: 15,
+            use_paint_over_quality: true,
+            video_streaming_mode: true,
+            target_fps: 60.0,
+            ..Default::default()
+        };
         assert!(
-            !q.process(&screen(9), stride).is_empty(),
-            "the moved frame is sent"
+            X11Pipeline::new(s.clone()).hw.is_some(),
+            "VP9 runs as a full-frame session"
         );
-        assert!(
-            q.hold.0.is_some() && q.hold.1.is_none(),
-            "a held frame that moved is coded under the rate control: {:?}",
-            q.hold
-        );
+        for key in [false, true] {
+            let [still, moved] = cleanup_frame_that_moved(&s, key);
+            assert_eq!(
+                still,
+                [(Some(18), key); 2],
+                "a frame that stood still keeps it"
+            );
+            assert_eq!(
+                moved,
+                [(Some(18), key), (None, false)],
+                "a frame that moved does not"
+            );
+        }
+    }
+
+    /// The striped path decides each stripe's cleanup inside its encode (`encode_cpu`), so a
+    /// Turbo frame that codes a stripe of a constant-quality session at the paint-over quality
+    /// while it holds still (`software::stripes_held_still`) is hashed before it is encoded: a
+    /// change landing on its refresh, on a frame after it, or on its key frame is coded at the
+    /// session's quality, as without Turbo.
+    #[test]
+    fn a_turbo_stripe_at_the_paint_over_quality_codes_a_change_at_the_session_quality() {
+        use crate::encoders::codec::{FRAME_KEY, parse_video_type};
+        let session = |turbo: bool| {
+            let mut p = X11Pipeline::new(RustCaptureSettings {
+                width: 640,
+                height: 384,
+                codec: Codec::H264,
+                use_cpu: true,
+                video_fullframe: true,
+                video_cbr_mode: false,
+                video_crf: 25,
+                video_paintover_crf: 18,
+                paint_over_trigger_frames: 15,
+                use_paint_over_quality: true,
+                video_streaming_mode: turbo,
+                target_fps: 60.0,
+                ..Default::default()
+            });
+            assert!(p.hw.is_none(), "software H.264 runs striped");
+            for i in 0..12u8 {
+                p.process(&noise(i), 640 * 4);
+            }
+            p
+        };
+        let mut p = session(true);
+        let (mut held, mut key) = (None, None);
+        for i in 0..300 {
+            if held.is_none() && stripes_held_still(&p.stripes, &p.settings) {
+                held = Some(i);
+            }
+            let out = p.process(&noise(42), 640 * 4);
+            let keyed = out
+                .iter()
+                .any(|e| parse_video_type(e.data[1]).is_some_and(|(_, k)| k == FRAME_KEY));
+            if held.is_some() && keyed {
+                key = Some(i);
+                break;
+            }
+        }
+        let held = held.expect("a still stripe is cleaned up");
+        let key = key.expect("a large change is cleaned up by a key frame");
+        for at in [held, held + 15, key] {
+            let jump = |turbo: bool| -> usize {
+                let mut p = session(turbo);
+                for _ in 0..at {
+                    p.process(&noise(42), 640 * 4);
+                }
+                p.process(&noise(9), 640 * 4)
+                    .iter()
+                    .map(|e| e.data.len())
+                    .sum()
+            };
+            let (turbo, plain) = (jump(true), jump(false));
+            assert!(
+                turbo as f64 <= plain as f64 * 1.2,
+                "a change {at} frames still is coded at the session's quality: {turbo} bytes \
+                 against {plain}"
+            );
+        }
     }
 
     /// The software path carries a 4:4:4 request exactly when the build's encoder does —

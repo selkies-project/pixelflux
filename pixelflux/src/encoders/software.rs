@@ -1245,6 +1245,25 @@ pub fn stripes_hold_quantizer(settings: &RustCaptureSettings) -> bool {
     cfg!(feature = "gpl") || !settings.video_cbr_mode
 }
 
+/// Whether a frame that holds still codes a stripe at the paint-over quality instead of the
+/// session's (`encode_cpu`): at a constant quality, a stripe whose cleanup falls due, whose burst
+/// is held, or which keeps the quality it was cleaned up at. A constant rate holds none there.
+pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSettings) -> bool {
+    !settings.video_cbr_mode
+        && settings.use_paint_over_quality
+        && settings.video_paintover_crf < settings.video_crf
+        && stripes.iter().any(|st| {
+            st.clean_quality
+                || (st.burst_held && st.h264_burst_frames_remaining > 0)
+                || crate::pipeline::cleanup_pending(
+                    st,
+                    settings.paint_over_trigger_frames,
+                    true,
+                    true,
+                )
+        })
+}
+
 /// The software encoder's per-frame entry point: split the frame into horizontal stripes,
 /// decide per stripe whether it needs sending, and encode only those as JPEG or H.264 (libx264
 /// or OpenH264, by build) across the rayon pool.
