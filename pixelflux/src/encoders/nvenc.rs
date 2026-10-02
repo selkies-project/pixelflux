@@ -778,8 +778,12 @@ fn nvenc_rate_ceiling(codec: Codec) -> u32 {
 /// driver's choice splits on Ada but not on Pascal: a GTX 1080 encodes the 2160p frame in 10.3 ms
 /// rather than 16.1, more than 5% of the 81 ms such a session measures glass to glass, for 2.5 dB
 /// of PSNR on scrolling text. Below 4K a split saves HEVC about a millisecond for up to 2.3 dB,
-/// so the driver decides there, and H.264 never splits. Before API 12.1 the field's bits are
-/// another flag's, so an older session leaves them clear.
+/// so the driver decides there, and H.264 never splits. The forced mode cuts two strips on three
+/// engines as on two, so AV1 asks for three there: an L40S encodes a 1080p frame in 1.45 ms
+/// rather than 1.62 and a 2160p one in 4.2 rather than 5.3, coding better in five of six rows
+/// (up to 1.5 dB on text) and 0.5 dB worse in one, where HEVC's third strip saves nothing at 4K
+/// and costs 0.1 to 0.2 dB. Before API 12.1 the field's bits are another flag's, so an older
+/// session leaves them clear.
 fn split_mode(
     codec: Codec,
     width: u32,
@@ -794,10 +798,10 @@ fn split_mode(
             Codec::H265 => width as u64 * height as u64 >= 3840 * 2160,
             _ => false,
         };
-    if forced {
-        NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE
-    } else {
-        NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE
+    match (forced, codec, engines) {
+        (true, Codec::Av1, Some(3)) => NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE,
+        (true, ..) => NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE,
+        _ => NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_MODE,
     }
 }
 
@@ -2819,8 +2823,12 @@ impl NvencEncoder {
     /// How the session splits a frame across the device's encode engines (`split_mode`), for the
     /// line that says which device encodes.
     pub fn split_summary(&self) -> String {
-        let forced = self.init_params.splitEncodeMode()
-            == NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+        let forced = [
+            NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE,
+            NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_THREE_FORCED_MODE,
+        ]
+        .map(|m| m as u32)
+        .contains(&self.init_params.splitEncodeMode());
         match self.engines {
             Some(n) if n > 1 && forced => format!("split across {n} engines"),
             Some(n) if n > 1 && self.codec != Codec::H264 => {
@@ -6525,13 +6533,14 @@ mod gpu_tests {
     }
 
     /// On a real GPU of two or more engines under API 12.1 or later, an AV1 session splits its
-    /// frames at 1080p and an HEVC one only while a resize holds it at 4K, and the split frames
-    /// decode to the picture painted; on one engine nothing splits. Ignored by default.
+    /// frames at 1080p, in three strips on three engines, and an HEVC one only while a resize
+    /// holds it at 4K, and the split frames decode to the picture painted; on one engine
+    /// nothing splits. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_split_frame_follows_the_codec_and_picture() {
         use crate::webcam::decode::VideoDecoder;
-        let forced = NV_ENC_SPLIT_ENCODE_MODE::NV_ENC_SPLIT_AUTO_FORCED_MODE as u32;
+        use NV_ENC_SPLIT_ENCODE_MODE as Split;
         for codec in [Codec::H265, Codec::Av1] {
             let mut s = settings(1920, 1080, 60.0);
             s.codec = codec;
@@ -6549,7 +6558,10 @@ mod gpu_tests {
                     enc.split_summary(),
                     nvenc_cur_ver()
                 );
-                assert_ne!(enc.init_params.splitEncodeMode(), forced);
+                assert_eq!(
+                    enc.init_params.splitEncodeMode(),
+                    Split::NV_ENC_SPLIT_AUTO_MODE as u32
+                );
                 continue;
             }
             for (n, (w, h)) in [(1920usize, 1080usize), (3840, 2160), (1920, 1080)]
@@ -6561,9 +6573,15 @@ mod gpu_tests {
                     s.height = h as i32;
                     assert!(enc.reconfigure_resolution(&s).expect("resize"));
                 }
+                let want = match codec {
+                    Codec::Av1 if enc.engines == Some(3) => Split::NV_ENC_SPLIT_THREE_FORCED_MODE,
+                    Codec::Av1 => Split::NV_ENC_SPLIT_AUTO_FORCED_MODE,
+                    _ if w * h >= 3840 * 2160 => Split::NV_ENC_SPLIT_AUTO_FORCED_MODE,
+                    _ => Split::NV_ENC_SPLIT_AUTO_MODE,
+                };
                 assert_eq!(
-                    enc.init_params.splitEncodeMode() == forced,
-                    codec == Codec::Av1 || w * h >= 3840 * 2160,
+                    enc.init_params.splitEncodeMode(),
+                    want as u32,
                     "{codec:?} at {w}x{h}: {}",
                     enc.split_summary()
                 );
@@ -7947,6 +7965,7 @@ mod gpu_tests {
                         ("split driver's", Split::NV_ENC_SPLIT_AUTO_MODE),
                         ("split forced", Split::NV_ENC_SPLIT_AUTO_FORCED_MODE),
                         ("split two", Split::NV_ENC_SPLIT_TWO_FORCED_MODE),
+                        ("split three", Split::NV_ENC_SPLIT_THREE_FORCED_MODE),
                     ] {
                         rows.push((
                             format!("P3 {name}"),
@@ -8561,16 +8580,23 @@ mod decision_tests {
         }
     }
 
-    /// A frame splits across the engines for AV1 at any picture and for HEVC from 4K, never for
-    /// H.264, on one engine, or before API 12.1, whose bits there are another flag's.
+    /// A frame splits across the engines for AV1 at any picture, in three strips on three, and
+    /// for HEVC from 4K, never for H.264, on one engine, or before API 12.1, whose bits there are
+    /// another flag's.
     #[test]
     fn split_mode_follows_the_codec_and_picture() {
         use NV_ENC_SPLIT_ENCODE_MODE::{
             NV_ENC_SPLIT_AUTO_FORCED_MODE as Forced, NV_ENC_SPLIT_AUTO_MODE as Driver,
+            NV_ENC_SPLIT_THREE_FORCED_MODE as Three,
         };
         for (codec, w, h, engines, api, want) in [
             (Codec::Av1, 1280, 720, Some(2), (13, 0), Forced),
-            (Codec::Av1, 3840, 2160, Some(3), (12, 1), Forced),
+            (Codec::Av1, 3840, 2160, Some(3), (12, 1), Three),
+            (Codec::Av1, 1920, 1080, Some(3), (13, 0), Three),
+            (Codec::Av1, 1920, 1080, Some(4), (13, 0), Forced),
+            (Codec::Av1, 1920, 1080, Some(3), (12, 0), Driver),
+            (Codec::H265, 3840, 2160, Some(3), (13, 0), Forced),
+            (Codec::H265, 1920, 1080, Some(3), (13, 0), Driver),
             (Codec::Av1, 1920, 1080, Some(1), (13, 0), Driver),
             (Codec::Av1, 1920, 1080, None, (13, 0), Driver),
             (Codec::H265, 2560, 1440, Some(2), (13, 0), Driver),
