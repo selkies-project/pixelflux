@@ -5,41 +5,51 @@
  */
 
 //! What the full-frame software sessions share: the planar picture a packed host frame is
-//! converted into, the constant quantizer that follows the session quality index, the
+//! converted into, at 8 or 10 bits, the constant quantizer that follows the session quality index, the
 //! rate-control settings a live change is compared against, and the frames an encoder has
 //! been handed but not yet answered.
 
 use std::collections::VecDeque;
 
 use super::frame_rate::FrameRate;
-use super::software::convert_to_yuv_mt;
+use super::software::{convert_to_yuv_mt, convert_to_yuv10_mt};
 use super::{QP_HYSTERESIS_LIMIT, vbv_bits};
 use crate::RustCaptureSettings;
 
-/// A planar 8-bit picture, 4:2:0 or 4:4:4, with tightly packed rows.
+/// A planar picture, 4:2:0 or 4:4:4, with tightly packed rows: 8-bit samples in `y`, `u`, and
+/// `v`, or 10-bit ones in `y16`, `u16`, and `v16`, the planes of the other depth staying empty.
 pub struct Planes {
     pub width: usize,
     pub height: usize,
     pub i444: bool,
+    pub bit_depth: u32,
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    pub y16: Vec<u16>,
+    pub u16: Vec<u16>,
+    pub v16: Vec<u16>,
 }
 
 impl Planes {
-    pub fn new(width: usize, height: usize, i444: bool) -> Self {
+    pub fn new(width: usize, height: usize, i444: bool, bit_depth: u32) -> Self {
         let (cw, ch) = if i444 {
             (width, height)
         } else {
             (width.div_ceil(2), height.div_ceil(2))
         };
+        let (narrow, wide) = if bit_depth > 8 { (0, 1) } else { (1, 0) };
         Self {
             width,
             height,
             i444,
-            y: vec![0; width * height],
-            u: vec![0; cw * ch],
-            v: vec![0; cw * ch],
+            bit_depth,
+            y: vec![0; width * height * narrow],
+            u: vec![0; cw * ch * narrow],
+            v: vec![0; cw * ch * narrow],
+            y16: vec![0; width * height * wide],
+            u16: vec![0; cw * ch * wide],
+            v16: vec![0; cw * ch * wide],
         }
     }
 
@@ -51,9 +61,39 @@ impl Planes {
         }
     }
 
+    /// The planes as a library reads them, whichever depth they hold.
+    pub fn pointers(&mut self) -> [*mut u8; 3] {
+        if self.bit_depth > 8 {
+            [
+                self.y16.as_mut_ptr().cast(),
+                self.u16.as_mut_ptr().cast(),
+                self.v16.as_mut_ptr().cast(),
+            ]
+        } else {
+            [
+                self.y.as_mut_ptr(),
+                self.u.as_mut_ptr(),
+                self.v.as_mut_ptr(),
+            ]
+        }
+    }
+
+    /// The bytes a sample takes.
+    pub fn sample_bytes(&self) -> usize {
+        if self.bit_depth > 8 { 2 } else { 1 }
+    }
+
+    /// The bytes all three planes hold.
+    pub fn byte_len(&self) -> usize {
+        self.y.len()
+            + self.u.len()
+            + self.v.len()
+            + 2 * (self.y16.len() + self.u16.len() + self.v16.len())
+    }
+
     /// Convert a packed host frame (`stride` bytes per row, R,G,B,A when `rgba`, else B,G,R,A)
     /// into the planes across `threads` bands, with the BT.709 matrix at `full_range`, or BT.601
-    /// where `bt601` names a codec whose bitstream can carry no other.
+    /// where `bt601` names a codec whose bitstream can carry no other, which has no 10 bits.
     pub fn convert(
         &mut self,
         pixels: &[u8],
@@ -64,6 +104,24 @@ impl Planes {
         threads: usize,
     ) -> Result<(), String> {
         let cw = self.chroma_width();
+        if self.bit_depth > 8 {
+            check_host_frame(pixels, stride, self.width, self.height)?;
+            convert_to_yuv10_mt(
+                pixels,
+                stride,
+                self.width,
+                self.height,
+                rgba,
+                self.i444,
+                full_range,
+                &mut self.y16,
+                &mut self.u16,
+                &mut self.v16,
+                (self.width, cw),
+                threads,
+            );
+            return Ok(());
+        }
         convert_into(
             pixels,
             stride,
@@ -375,7 +433,7 @@ mod tests {
             check_host_frame(&[0; 16 * 4 * 4], 60, 16, 4).is_err(),
             "a stride shorter than a row"
         );
-        let mut planes = Planes::new(4, 2, false);
+        let mut planes = Planes::new(4, 2, false, 8);
         assert_eq!((planes.u.len(), planes.chroma_width()), (2, 2));
         assert!(
             planes
@@ -383,7 +441,7 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            Planes::new(4, 2, true)
+            Planes::new(4, 2, true, 8)
                 .convert(&[0; 4 * 4], 16, false, true, false, 1)
                 .is_err()
         );

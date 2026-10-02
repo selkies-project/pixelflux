@@ -252,6 +252,37 @@ fn push_layer_elements<R>(
     }
 }
 
+/// The buffer a display is rendered into and a hardware encoder reads in place: one plane, for
+/// rendering. Intel's video processor, converting to 4:2:0, reads a linear surface at a pitch
+/// rounded up to 64 bytes whatever pitch its import declares, and Mesa gives a linear buffer
+/// allocated for rendering alone the pitch of its width, so a width that is no multiple of 16
+/// reaches the encoder sheared. A buffer the display engine may scan out carries that engine's aligned pitch, so a
+/// linear allocation whose pitch is not a multiple of 64 is made again for scanout as well, and
+/// that one is kept only where it came out aligned.
+pub(crate) fn alloc_render_target<T: std::os::fd::AsFd>(
+    gbm: &RawGbmDevice<T>,
+    width: u32,
+    height: u32,
+    format: GbmFormat,
+) -> std::io::Result<BufferObject<()>> {
+    let aligned = |bo: &BufferObject<()>| {
+        Into::<u64>::into(bo.modifier()) != 0 || bo.stride().is_multiple_of(64)
+    };
+    let bo = gbm.create_buffer_object::<()>(width, height, format, BufferObjectFlags::RENDERING)?;
+    if aligned(&bo) {
+        return Ok(bo);
+    }
+    match gbm.create_buffer_object::<()>(
+        width,
+        height,
+        format,
+        BufferObjectFlags::RENDERING | BufferObjectFlags::SCANOUT,
+    ) {
+        Ok(scanout) if aligned(&scanout) => Ok(scanout),
+        _ => Ok(bo),
+    }
+}
+
 /// Export the offscreen GBM render target as a Dmabuf so the very same GPU pixels can be both
 /// rendered into and encoded with no intervening copy — the linchpin of the zero-copy capture path.
 /// The returned dmabuf is the one handle the GLES renderer binds as its framebuffer AND a hardware
@@ -306,6 +337,9 @@ pub struct RustCaptureSettings {
     pub video_paintover_crf: i32,
     pub video_paintover_burst_frames: i32,
     pub video_fullcolor: bool,
+    /// Bits per sample asked of the encoder, 8 or 10; a session that cannot carry 10 stays at
+    /// 8 (`encoders::session_bit_depth` says which it runs).
+    pub video_bit_depth: i32,
     pub video_fullframe: bool,
     pub video_streaming_mode: bool,
     pub capture_cursor: bool,
@@ -418,6 +452,7 @@ impl Default for RustCaptureSettings {
             video_paintover_crf: 18,
             video_paintover_burst_frames: 5,
             video_fullcolor: false,
+            video_bit_depth: 8,
             video_fullframe: false,
             video_streaming_mode: false,
             capture_cursor: false,
@@ -527,6 +562,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .getattr("video_paintover_burst_frames")?
             .extract()?,
         video_fullcolor: settings.getattr("video_fullcolor")?.extract()?,
+        video_bit_depth: settings
+            .getattr("video_bit_depth")
+            .ok()
+            .and_then(|v| v.extract::<i32>().ok())
+            .unwrap_or(8),
         video_fullframe: settings.getattr("video_fullframe")?.extract()?,
         video_streaming_mode: settings.getattr("video_streaming_mode")?.extract()?,
         capture_cursor: settings.getattr("capture_cursor")?.extract()?,
@@ -1471,9 +1511,7 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
             if decision.send || encoder.holds_frame() {
                 let w = width as u32;
                 let force_idr = decision.force_idr;
-                if let Some(q) = decision.hold_qp {
-                    encoder.hold_quantizer(q, decision.hold_band);
-                }
+                decision.prepare(encoder);
                 // The readback rows go to the encoder as they are — BGRA from the pixman
                 // framebuffer or a host frame, RGBA from a GLES readback: a hardware session
                 // converts on the GPU and a software one on its own threads, so no color
@@ -1689,6 +1727,7 @@ pub(crate) fn log_stream_settings(
     log_stream_settings_of(
         tag, settings, n_stripes, backend, fixed_rate, holds, fullcolor, full_range,
     );
+    report::bit_depth(encoders::session_bit_depth(video_encoder, settings));
 }
 
 /// The "Stream settings active" line for a backend named outright, `(name, hardware)`, where
@@ -2364,11 +2403,11 @@ fn start_capture_on_display(
             if state.use_gpu
                 && let Some(gbm) = state.gbm_device.as_mut()
             {
-                match gbm.create_buffer_object(
+                match alloc_render_target(
+                    gbm,
                     settings.width as u32,
                     settings.height as u32,
                     GbmFormat::Argb8888,
-                    BufferObjectFlags::RENDERING,
                 ) {
                     Ok(bo) => {
                         let dmabuf = create_dmabuf_from_bo(&bo);
@@ -2469,11 +2508,11 @@ fn start_capture_on_display(
         if have != Some((settings.width, settings.height))
             && let Some(gbm) = state.gbm_device.as_mut()
         {
-            match gbm.create_buffer_object(
+            match alloc_render_target(
+                gbm,
                 settings.width as u32,
                 settings.height as u32,
                 GbmFormat::Argb8888,
-                BufferObjectFlags::RENDERING,
             ) {
                 Ok(bo) => {
                     let dmabuf = create_dmabuf_from_bo(&bo);
@@ -2483,6 +2522,7 @@ fn start_capture_on_display(
                         settings.scale,
                         Transform::Normal,
                     );
+                    node.content_tracker = None;
                     node.view_size = (settings.width, settings.height);
                     node.view_scale = settings.scale;
                     node.frame_buffer = vec![
@@ -3149,6 +3189,7 @@ fn render_node_tick(
     {
         node.damage_tracker =
             OutputDamageTracker::new((width, height), output_scale_val, Transform::Normal);
+        node.content_tracker = None;
         node.view_size = (width, height);
         node.view_scale = output_scale_val;
     }
@@ -3946,6 +3987,14 @@ fn render_node_tick(
                 } else {
                     buf_age
                 };
+                let changed = node
+                    .content_tracker
+                    .get_or_insert_with(|| {
+                        OutputDamageTracker::from_mode_source(node.damage_tracker.mode().clone())
+                    })
+                    .damage_output(1, &elements)
+                    .ok()
+                    .map(|(damage, _)| damage.cloned().unwrap_or_default());
                 match node.damage_tracker.render_output(
                     renderer,
                     &mut frame,
@@ -3960,6 +4009,9 @@ fn render_node_tick(
                         }
                         if let Some(damage) = result.damage {
                             damage_rects = damage.clone();
+                        }
+                        if let Some(changed) = changed.filter(|_| render_age > 1) {
+                            damage_rects = changed;
                         }
                     }
                     Err(e) => eprintln!("Render error: {:?}", e),
@@ -4161,9 +4213,7 @@ fn render_node_tick(
                             .clone()
                             .or_else(|| node.offscreen_buffer.as_ref().map(|(_, d)| d.clone()));
                         let encode_start_ns = wayland::host::now_ns();
-                        if let Some(q) = decision.hold_qp {
-                            encoder.hold_quantizer(q, decision.hold_band);
-                        }
+                        decision.prepare(encoder);
                         let result = match enc_dmabuf {
                             Some(ref dmabuf) => encoder.encode_dmabuf(
                                 dmabuf,
@@ -4474,12 +4524,7 @@ fn create_output_on(
         let Some(gbm) = state.gbm_device.as_mut() else {
             return false;
         };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 offscreen = Some((bo, dmabuf));
@@ -4508,6 +4553,7 @@ fn create_output_on(
         view_scale: 0.0,
         pos: (x, y),
         damage_tracker,
+        content_tracker: None,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
         offscreen_buffer: offscreen,
         undrawn_ticks: 0,
@@ -4850,12 +4896,7 @@ fn resize_output_on(state: &mut AppState, id: u32, width: i32, height: i32, scal
         let Some(gbm) = state.gbm_device.as_mut() else {
             return false;
         };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 new_offscreen = Some((bo, dmabuf));
@@ -4964,12 +5005,7 @@ fn create_view_on(
         let Some(gbm) = state.gbm_device.as_mut() else {
             return false;
         };
-        match gbm.create_buffer_object(
-            width as u32,
-            height as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::RENDERING,
-        ) {
+        match alloc_render_target(gbm, width as u32, height as u32, GbmFormat::Argb8888) {
             Ok(bo) => {
                 let dmabuf = create_dmabuf_from_bo(&bo);
                 offscreen = Some((bo, dmabuf));
@@ -4997,6 +5033,7 @@ fn create_view_on(
         view_scale: 0.0,
         pos: origin,
         damage_tracker,
+        content_tracker: None,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
         offscreen_buffer: offscreen,
         undrawn_ticks: 0,
@@ -5237,14 +5274,13 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 dmabuf_state.create_global::<AppState>(&dh, formats)
             });
 
-            let bo = gbm_allocator
-                .create_buffer_object(
-                    width as u32,
-                    height as u32,
-                    GbmFormat::Argb8888,
-                    BufferObjectFlags::RENDERING,
-                )
-                .map_err(|_| "Failed to allocate GBM buffer")?;
+            let bo = alloc_render_target(
+                &gbm_allocator,
+                width as u32,
+                height as u32,
+                GbmFormat::Argb8888,
+            )
+            .map_err(|_| "Failed to allocate GBM buffer")?;
 
             let dmabuf = create_dmabuf_from_bo(&bo);
             offscreen_buffer = Some((bo, dmabuf));
@@ -5462,6 +5498,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         view_scale: 0.0,
         pos: (0, 0),
         damage_tracker,
+        content_tracker: None,
         frame_buffer: vec![0u8; (width.max(0) as usize) * (height.max(0) as usize) * 4],
         offscreen_buffer,
         undrawn_ticks: 0,
@@ -7515,6 +7552,11 @@ struct CaptureSettings {
     video_paintover_burst_frames: i32,
     #[pyo3(get, set)]
     video_fullcolor: bool,
+    /// Bits per sample, 8 or 10: 10 where an encoder of the codec carries it (VA-API and the
+    /// software encoders for H.265, VP9, and AV1, x264 for H.264), in software where the
+    /// engine does not, and 8 elsewhere.
+    #[pyo3(get, set)]
+    video_bit_depth: i32,
     /// H.264 only: encode whole frames instead of stripes. Other video codecs are always
     /// full-frame, and so is a hardware H.264 session.
     #[pyo3(get, set)]
@@ -7602,6 +7644,7 @@ impl CaptureSettings {
             video_paintover_crf: 18,
             video_paintover_burst_frames: 5,
             video_fullcolor: false,
+            video_bit_depth: 8,
             video_fullframe: false,
             video_streaming_mode: false,
             capture_cursor: false,
@@ -8477,6 +8520,7 @@ impl ScreenCapture {
         d.set_item("encoder_reason", &info.encoder_reason)?;
         d.set_item("codec", info.codec)?;
         d.set_item("fullcolor", info.fullcolor)?;
+        d.set_item("bit_depth", info.bit_depth)?;
         d.set_item("full_range", info.full_range)?;
         d.set_item("striped", info.stripes > 1)?;
         d.set_item("gpu", &info.gpu)?;
@@ -9523,7 +9567,7 @@ fn hardware_encoders(
     auto_gpu: &str,
 ) -> PyResult<Py<PyAny>> {
     let d = pyo3::types::PyDict::new(py);
-    for (codec, backend, _) in probe_hardware(py, encode_node_index, auto_gpu) {
+    for (codec, backend, ..) in probe_hardware(py, encode_node_index, auto_gpu) {
         d.set_item(codec.name(), backend)?;
     }
     Ok(d.into_any().unbind())
@@ -9537,9 +9581,23 @@ fn hardware_encoders(
 fn hardware_fullcolor(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> Vec<&'static str> {
     probe_hardware(py, encode_node_index, auto_gpu)
         .into_iter()
-        .filter(|&(_, _, fullcolor)| fullcolor)
+        .filter(|&(_, _, formats)| formats.fullcolor)
         .map(|(codec, ..)| codec.name())
         .collect()
+}
+
+/// Every format the GPU behind an encode node encodes, by codec name: `"420-8"` for each codec
+/// of `hardware_encoders`, and beside it `"444-8"`, `"420-10"`, and `"444-10"` where the
+/// engine takes a `video_fullcolor` or 10-bit `video_bit_depth` session as asked, read from
+/// the same probe. Arguments as `hardware_encoders`.
+#[pyfunction]
+#[pyo3(signature = (encode_node_index = -2, auto_gpu = ""))]
+fn hardware_formats(py: Python<'_>, encode_node_index: i32, auto_gpu: &str) -> PyResult<Py<PyAny>> {
+    let d = pyo3::types::PyDict::new(py);
+    for (codec, _, formats) in probe_hardware(py, encode_node_index, auto_gpu) {
+        d.set_item(codec.name(), formats.names())?;
+    }
+    Ok(d.into_any().unbind())
 }
 
 /// The hardware table of the node `encode_node_index` and `auto_gpu` resolve to, as a capture
@@ -9710,8 +9768,18 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .map(|codec| codec.name())
         .collect();
     m.add("SOFTWARE_FULLCOLOR", fullcolor)?;
+    // The formats each of those software encoders codes its codec in, named as
+    // `hardware_formats` names an engine's.
+    let formats = pyo3::types::PyDict::new(m.py());
+    for codec in Codec::VIDEO {
+        if encoders::software_encoder(codec).is_some() {
+            formats.set_item(codec.name(), encoders::software_formats(codec).names())?;
+        }
+    }
+    m.add("SOFTWARE_FORMATS", formats)?;
     m.add_function(wrap_pyfunction!(hardware_encoders, m)?)?;
     m.add_function(wrap_pyfunction!(hardware_fullcolor, m)?)?;
+    m.add_function(wrap_pyfunction!(hardware_formats, m)?)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
     m.add_function(wrap_pyfunction!(ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;

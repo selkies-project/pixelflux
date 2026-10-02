@@ -116,7 +116,16 @@ impl SvtAv1Encoder {
             handle: ptr::null_mut(),
             config: Box::new(unsafe { std::mem::zeroed() }),
             input: Box::new(unsafe { std::mem::zeroed() }),
-            planes: Planes::new(width, height, false),
+            planes: Planes::new(
+                width,
+                height,
+                false,
+                if settings.video_bit_depth >= 10 {
+                    10
+                } else {
+                    8
+                },
+            ),
             threads: encode_threads(),
             quality: Quality::new(Codec::Av1.quantizer(settings.video_crf)),
             rate: RateSettings::new(settings),
@@ -170,7 +179,7 @@ impl SvtAv1Encoder {
             cfg.source_height = self.planes.height as u32;
             cfg.frame_rate_numerator = rate.fps.num;
             cfg.frame_rate_denominator = rate.fps.den;
-            cfg.encoder_bit_depth = 8;
+            cfg.encoder_bit_depth = self.planes.bit_depth;
             cfg.encoder_color_format = EB_YUV420;
             cfg.color_primaries = EB_CICP_CP_BT_709;
             cfg.transfer_characteristics = 1;
@@ -228,14 +237,14 @@ impl SvtAv1Encoder {
         *header = unsafe { std::mem::zeroed() };
         header.size = std::mem::size_of::<EbBufferHeaderType>() as u32;
         header.p_buffer = io as *mut EbSvtIOFormat as *mut u8;
-        io.luma = self.planes.y.as_mut_ptr();
-        io.cb = self.planes.u.as_mut_ptr();
-        io.cr = self.planes.v.as_mut_ptr();
+        let [y, u, v] = self.planes.pointers();
+        io.luma = y;
+        io.cb = u;
+        io.cr = v;
         io.y_stride = self.planes.width as u32;
         io.cb_stride = self.planes.chroma_width() as u32;
         io.cr_stride = self.planes.chroma_width() as u32;
-        header.n_alloc_len =
-            (self.planes.y.len() + self.planes.u.len() + self.planes.v.len()) as u32;
+        header.n_alloc_len = self.planes.byte_len() as u32;
         self.fresh = true;
         self.events = Events::default();
         self.references = tracks.then(ReferenceSlots::new);
@@ -294,6 +303,11 @@ impl SvtAv1Encoder {
 
     pub fn is_fullcolor(&self) -> bool {
         false
+    }
+
+    /// The bits per sample the session codes.
+    pub fn bit_depth(&self) -> u32 {
+        self.planes.bit_depth
     }
 
     pub fn is_full_range(&self) -> bool {

@@ -53,6 +53,8 @@ pub(super) struct Arm {
     tiles: Tiles,
     sequence: VAEncSequenceParameterBufferAV1,
     sequence_header: Vec<u8>,
+    /// The bit `base_q_idx` stands at in the last frame header OBU written.
+    qindex_offset: u32,
 }
 
 /// How many bits `value` needs, at least one.
@@ -107,6 +109,7 @@ impl Arm {
             tiles: Tiles::default(),
             sequence: unsafe { std::mem::zeroed() },
             sequence_header: Vec::new(),
+            qindex_offset: 0,
         }
     }
 
@@ -211,7 +214,7 @@ impl Arm {
         w.flag(false);
         w.flag(cbr);
         w.flag(false);
-        w.flag(false);
+        w.flag(n.bit_depth == 10);
         w.flag(false);
         w.flag(true);
         w.u(8, 1);
@@ -234,6 +237,7 @@ impl Arm {
         unsafe {
             let f = &mut s.seq_fields.bits;
             f.set_enable_order_hint(1);
+            f.set_bit_depth_minus8(n.bit_depth - 8);
             if cbr {
                 f.set_enable_cdef(1);
             }
@@ -250,6 +254,43 @@ impl Arm {
             let bits = 8 * self.sequence_header.len() as u32;
             out.push_packed(VAEncPackedHeaderSequence, &self.sequence_header, bits);
         }
+    }
+
+    /// The `base_q_idx` the driver's rate control wrote into the frame header of the coded
+    /// temporal unit `tu`, at the offset the session named for it; None where the unit carries
+    /// no frame header laid out as the session wrote it.
+    pub(super) fn coded_qindex(&self, tu: &[u8]) -> Option<u32> {
+        let mut pos = 0usize;
+        while pos < tu.len() {
+            let header = tu[pos];
+            if header & 0x06 != 0x02 {
+                return None;
+            }
+            let (mut size, mut shift, mut i) = (0usize, 0u32, pos + 1);
+            loop {
+                let byte = *tu.get(i)?;
+                i += 1;
+                size |= ((byte & 0x7f) as usize) << shift;
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                if shift > 28 {
+                    return None;
+                }
+            }
+            if matches!((header >> 3) & 0x0f, 3 | 6) {
+                if self.qindex_offset == 0 || i - pos != 1 + self.obu_size_bytes as usize {
+                    return None;
+                }
+                let bit = pos * 8 + self.qindex_offset as usize;
+                let (byte, lead) = (bit / 8, bit % 8);
+                let pair = ((*tu.get(byte)? as u32) << 8) | *tu.get(byte + 1)? as u32;
+                return Some((pair >> (8 - lead)) & 0xff);
+            }
+            pos = i + size;
+        }
+        None
     }
 
     /// The picture: its slot, references, order hint, the frame header OBU with the
@@ -412,6 +453,7 @@ impl Arm {
                 255
             } as u8;
             pic.bit_offset_qindex = qindex_offset;
+            self.qindex_offset = qindex_offset;
             pic.bit_offset_loopfilter_params = loopfilter_offset;
             pic.bit_offset_cdef_params = cdef_offset;
             pic.size_in_bits_cdef_params = cdef_size;

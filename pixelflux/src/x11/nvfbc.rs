@@ -802,6 +802,12 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
     if !crate::driver_selects_nvenc(&driver) {
         return declined(&format!("the encode node's driver is {driver}"));
     }
+    if crate::encoders::ten_bit_is_softwares(settings) {
+        return declined(&format!(
+            "NVENC encodes no 10-bit {}, which the software encoder does",
+            settings.codec.display()
+        ));
+    }
     if let Some(reason) = foreign_libxcb() {
         return declined(&reason);
     }
@@ -887,6 +893,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         encoder.is_fullcolor(),
         false,
     );
+    crate::report::bit_depth(encoder.bit_depth());
     Some(GpuCapture {
         nvfbc,
         encoder,
@@ -1101,6 +1108,8 @@ where
                 holds: true,
                 reopens: false,
                 band: gpu.encoder.band_size(),
+                measures: false,
+                psnr: None,
             },
         );
         let mut delivered = false;

@@ -52,7 +52,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use gbm::{BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
+use gbm::{Device as GbmDevice, Format as GbmFormat};
 use smithay::backend::allocator::Buffer as _;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::input::keyboard::xkb;
@@ -2649,7 +2649,7 @@ fn alloc_gpu_slot(
     let qh = queue.handle();
     let format = fourcc_to_gbm(fourcc);
     let bo = if modifiers.is_empty() {
-        dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
+        crate::alloc_render_target(dev, w as u32, h as u32, format)
     } else {
         // Without the flags argument, which implies the rendering use asked for either
         // way: the entry point taking flags is Mesa 21.1 and later, and an extension
@@ -2660,9 +2660,7 @@ fn alloc_gpu_slot(
             format,
             modifiers.iter().map(|&m| gbm::Modifier::from(m)),
         )
-        .or_else(|_| {
-            dev.create_buffer_object::<()>(w as u32, h as u32, format, BufferObjectFlags::RENDERING)
-        })
+        .or_else(|_| crate::alloc_render_target(dev, w as u32, h as u32, format))
     }
     .map_err(|e| format!("GBM allocation {w}x{h}: {e:?}"))?;
     let dmabuf = crate::create_dmabuf_from_bo(&bo);

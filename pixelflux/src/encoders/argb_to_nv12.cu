@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-// ARGB/ABGR -> NV12, BT.709 at limited range. NVENC's own conversion follows the matrix a
+// ARGB/ABGR -> NV12, and to P010 and planar 4:4:4 at 10 bits, BT.709 at limited range. NVENC's own conversion follows the matrix a
 // session declares but weights the two columns of a 4:2:0 block 3:1 instead of averaging them,
 // which is what these kernels replace.
 
@@ -91,4 +91,135 @@ extern "C" __global__ void argb_tex_to_nv12(
         }
     }
     chroma8(sr * 0.25f, sg * 0.25f, sb * 0.25f, &uv[0], &uv[1]);
+}
+
+// The 10-bit converts: the same matrix and siting from the 8-bit RGB straight to 10-bit samples,
+// which NVENC's own upconversion of an 8-bit surface cannot recover. Samples are 16 bits wide
+// with the ten in the high bits, as NVENC's 10-bit surface formats hold them.
+
+__device__ __forceinline__ unsigned short sample10(float v)
+{
+    return (unsigned short)(__float2int_rn(fminf(fmaxf(v, 0.0f), 1023.0f)) << 6);
+}
+
+__device__ __forceinline__ unsigned short luma10(float r, float g, float b)
+{
+    return sample10(64.0f + luma(r, g, b) * (876.0f / 255.0f));
+}
+
+__device__ __forceinline__ void chroma10(float r, float g, float b, unsigned short* cb, unsigned short* cr)
+{
+    float y = luma(r, g, b);
+    *cb = sample10(512.0f + (b - y) * (896.0f / 255.0f) / (2.0f * (1.0f - 0.0722f)));
+    *cr = sample10(512.0f + (r - y) * (896.0f / 255.0f) / (2.0f * (1.0f - 0.2126f)));
+}
+
+// A pixel of the linear surface or of the texture over an array-typed import.
+struct Linear {
+    const unsigned char* src;
+    int pitch;
+    int swap_rb;
+    __device__ __forceinline__ void operator()(int x, int y, float* r, float* g, float* b) const
+    {
+        unpack(src + (long)pitch * y + (long)x * 4, swap_rb, r, g, b);
+    }
+};
+
+struct Texture {
+    cudaTextureObject_t tex;
+    int swap_rb;
+    __device__ __forceinline__ void operator()(int x, int y, float* r, float* g, float* b) const
+    {
+        uchar4 px = tex2D<uchar4>(tex, x, y);
+        *b = swap_rb ? px.z : px.x;
+        *g = px.y;
+        *r = swap_rb ? px.x : px.z;
+    }
+};
+
+// One 2x2 block into P010: a luma plane and an interleaved chroma plane of the block averages.
+template <class Read>
+__device__ __forceinline__ void block_p010(Read read, unsigned char* dst, int dst_pitch, int width, int height)
+{
+    int cx = blockIdx.x * blockDim.x + threadIdx.x;
+    int cy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cx * 2 >= width || cy * 2 >= height) return;
+
+    float sr = 0.0f, sg = 0.0f, sb = 0.0f;
+    unsigned short* uv = (unsigned short*)(dst + (long)dst_pitch * height + (long)dst_pitch * cy) + cx * 2;
+    for (int dy = 0; dy < 2; ++dy) {
+        int y = min(cy * 2 + dy, height - 1);
+        unsigned short* luma_row = (unsigned short*)(dst + (long)dst_pitch * y);
+        for (int dx = 0; dx < 2; ++dx) {
+            int x = min(cx * 2 + dx, width - 1);
+            float r, g, b;
+            read(x, y, &r, &g, &b);
+            sr += r; sg += g; sb += b;
+            luma_row[x] = luma10(r, g, b);
+        }
+    }
+    chroma10(sr * 0.25f, sg * 0.25f, sb * 0.25f, &uv[0], &uv[1]);
+}
+
+// One 2x2 block into planar 4:4:4: the Y, Cb, and Cr planes one after another, a sample a pixel.
+template <class Read>
+__device__ __forceinline__ void block_yuv444p10(Read read, unsigned char* dst, int dst_pitch, int width, int height)
+{
+    int cx = blockIdx.x * blockDim.x + threadIdx.x;
+    int cy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (cx * 2 >= width || cy * 2 >= height) return;
+
+    long plane = (long)dst_pitch * height;
+    for (int dy = 0; dy < 2; ++dy) {
+        int y = cy * 2 + dy;
+        if (y >= height) break;
+        unsigned short* row = (unsigned short*)(dst + (long)dst_pitch * y);
+        for (int dx = 0; dx < 2; ++dx) {
+            int x = cx * 2 + dx;
+            if (x >= width) break;
+            float r, g, b;
+            read(x, y, &r, &g, &b);
+            unsigned short cb, cr;
+            chroma10(r, g, b, &cb, &cr);
+            row[x] = luma10(r, g, b);
+            ((unsigned short*)((unsigned char*)row + plane))[x] = cb;
+            ((unsigned short*)((unsigned char*)row + 2 * plane))[x] = cr;
+        }
+    }
+}
+
+extern "C" __global__ void argb_to_p010(
+    const unsigned char* __restrict__ src, int src_pitch,
+    unsigned char* __restrict__ dst, int dst_pitch,
+    int width, int height, int swap_rb)
+{
+    Linear read = { src, src_pitch, swap_rb };
+    block_p010(read, dst, dst_pitch, width, height);
+}
+
+extern "C" __global__ void argb_tex_to_p010(
+    cudaTextureObject_t src,
+    unsigned char* __restrict__ dst, int dst_pitch,
+    int width, int height, int swap_rb)
+{
+    Texture read = { src, swap_rb };
+    block_p010(read, dst, dst_pitch, width, height);
+}
+
+extern "C" __global__ void argb_to_yuv444p10(
+    const unsigned char* __restrict__ src, int src_pitch,
+    unsigned char* __restrict__ dst, int dst_pitch,
+    int width, int height, int swap_rb)
+{
+    Linear read = { src, src_pitch, swap_rb };
+    block_yuv444p10(read, dst, dst_pitch, width, height);
+}
+
+extern "C" __global__ void argb_tex_to_yuv444p10(
+    cudaTextureObject_t src,
+    unsigned char* __restrict__ dst, int dst_pitch,
+    int width, int height, int swap_rb)
+{
+    Texture read = { src, swap_rb };
+    block_yuv444p10(read, dst, dst_pitch, width, height);
 }

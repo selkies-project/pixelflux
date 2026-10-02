@@ -77,9 +77,37 @@ pub struct SoftwareEncoder {
 }
 
 /// The codecs a render node encodes in hardware, each with the backend's name.
-/// Each video codec an engine on a node encodes, the backend's name, and whether the engine
-/// takes a `video_fullcolor` session as 4:4:4 rather than 4:2:0.
-pub type HardwareEncoders = Vec<(Codec, &'static str, bool)>;
+/// The formats past 8-bit 4:2:0 an engine encodes a codec in: 4:4:4 for a `video_fullcolor`
+/// session, and 10 bits for a `video_bit_depth` one at 4:2:0 and at 4:4:4.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Formats {
+    pub fullcolor: bool,
+    pub ten_bit: [bool; 2],
+}
+
+impl Formats {
+    /// Each format as `chroma-depth`, 8-bit 4:2:0 first.
+    pub fn names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for (fullcolor, chroma) in [(false, "420"), (true, "444")] {
+            for (ten_bit, depth) in [(false, 8), (true, 10)] {
+                let carried = match (fullcolor, ten_bit) {
+                    (false, false) => true,
+                    (true, false) => self.fullcolor,
+                    (_, true) => self.ten_bit[fullcolor as usize],
+                };
+                if carried {
+                    names.push(format!("{chroma}-{depth}"));
+                }
+            }
+        }
+        names
+    }
+}
+
+/// Each video codec an engine on a node encodes, the backend's name, and the formats it
+/// encodes the codec in.
+pub type HardwareEncoders = Vec<(Codec, &'static str, Formats)>;
 
 /// The hardware backend that serves each video codec on an encode node, as the name a
 /// session logs it in lower case (`"nvenc"`, `"vaapi"`, or `"tegra"`), probed once per node and
@@ -115,7 +143,7 @@ fn probe_node(encode_node_index: i32) -> ProbeAnswer {
     if tegra::available() {
         let served: HardwareEncoders = tegra::served()
             .into_iter()
-            .map(|c| (c, "tegra", false))
+            .map(|c| (c, "tegra", Formats::default()))
             .collect();
         let names: Vec<&str> = served.iter().map(|(c, ..)| c.display()).collect();
         println!(
@@ -134,7 +162,7 @@ fn probe_node(encode_node_index: i32) -> ProbeAnswer {
     let answer = match codecs {
         Ok(codecs) => Ok(codecs
             .into_iter()
-            .map(|(codec, fullcolor)| (codec, backend, fullcolor))
+            .map(|(codec, formats): vaapi::Served| (codec, backend, formats))
             .collect()),
         Err(e) => {
             eprintln!("[pixelflux] No hardware encoder on render node {node} ({backend}): {e}");
@@ -146,7 +174,10 @@ fn probe_node(encode_node_index: i32) -> ProbeAnswer {
         // answer is the same whichever index was asked about. It is cached under the key all
         // the same, so a caller asking twice is answered from the same probe.
         let codecs = v4l2m2m::served();
-        let served: HardwareEncoders = codecs.iter().map(|&c| (c, "v4l2m2m", false)).collect();
+        let served: HardwareEncoders = codecs
+            .iter()
+            .map(|&c| (c, "v4l2m2m", Formats::default()))
+            .collect();
         let names: Vec<&str> = codecs.iter().map(|c| c.display()).collect();
         println!(
             "[pixelflux] A stateful V4L2 M2M encoder serves {}.",
@@ -180,6 +211,34 @@ pub fn software_fullcolor(codec: Codec) -> bool {
                 || (codec == Codec::Vp9 && enc.library == "libvpx" && vpx::encodes_444())
         }
         None => false,
+    }
+}
+
+/// Whether the software encoder of a codec carries a 10-bit `video_bit_depth` request, at
+/// whichever chroma it codes: x264 (High 10, and High 4:4:4 Predictive), x265 where the build
+/// links its 10-bit encoder, libvpx's VP9 (profiles 2 and 3) where it was built with high bit
+/// depth, and SVT-AV1 do; OpenH264, kvazaar, and VP8 encode such a request at 8 bits.
+pub fn software_ten_bit(codec: Codec) -> bool {
+    match software_encoder(codec) {
+        Some(enc) => match (codec, enc.library) {
+            #[cfg(feature = "gpl")]
+            (Codec::H264, "x264") => software::H264EncoderWrapper::ten_bit(),
+            (Codec::H265, "x265") => hevc::ten_bit(),
+            (Codec::Vp9, "libvpx") => vpx::encodes_ten_bit(),
+            (Codec::Av1, _) => true,
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// The formats the software encoder of a codec codes it in.
+pub fn software_formats(codec: Codec) -> Formats {
+    let ten_bit = software_ten_bit(codec);
+    let fullcolor = software_fullcolor(codec);
+    Formats {
+        fullcolor,
+        ten_bit: [ten_bit, ten_bit && fullcolor],
     }
 }
 
@@ -991,6 +1050,19 @@ impl FrameEncoder {
         each!(self, enc => enc.is_fullcolor())
     }
 
+    /// The bits per sample the session negotiated: 10 on a VA-API session that opened a
+    /// 10-bit profile and on a software one whose library codes them, 8 everywhere else.
+    pub fn bit_depth(&self) -> u32 {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.bit_depth(),
+            FrameEncoder::Vaapi(enc) => enc.bit_depth(),
+            FrameEncoder::Vpx(enc) => enc.bit_depth(),
+            FrameEncoder::Hevc(enc) => enc.bit_depth(),
+            FrameEncoder::Av1(enc) => enc.bit_depth(),
+            _ => 8,
+        }
+    }
+
     /// Whether the session signals full range: a software 4:4:4 of x264's kind, and the V4L2
     /// M2M sessions whose firmware converts at full range and offers no way to ask for another.
     pub fn is_full_range(&self) -> bool {
@@ -1058,6 +1130,7 @@ impl FrameEncoder {
     pub fn last_quality(&self) -> Option<u32> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_quality(),
+            FrameEncoder::Vaapi(enc) => enc.last_quality(),
             FrameEncoder::Vpx(enc) => enc.last_quality(),
             FrameEncoder::Hevc(enc) => enc.last_quality(),
             FrameEncoder::Av1(enc) => enc.last_quality(),
@@ -1066,12 +1139,44 @@ impl FrameEncoder {
     }
 
     /// The bytes of the last frame the rate control coded, held frames aside, where the session
-    /// reports them with its quantizer (NVENC): with `last_quality`, what tells a constant-rate
+    /// reports them (NVENC, VA-API, x265 and kvazaar, libvpx's VP9): what tells a constant-rate
     /// cleanup that runs through the rate control whether it has converged on a still screen
-    /// (`pipeline::decide_hw_fullframe`).
+    /// (`pipeline::decide_hw_fullframe`), with `last_quality` where the session reports that
+    /// too.
     pub fn last_size(&self) -> Option<usize> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_size(),
+            FrameEncoder::Vaapi(enc) => enc.last_size(),
+            FrameEncoder::Vpx(enc) => enc.last_size(),
+            FrameEncoder::Hevc(enc) => enc.last_size(),
+            _ => None,
+        }
+    }
+
+    /// Have the next frame's reconstruction measured against its source, where the session
+    /// can (`last_psnr`).
+    pub fn measure(&mut self) {
+        if let FrameEncoder::Vaapi(enc) = self {
+            enc.measure();
+        }
+    }
+
+    /// Whether `measure` has the session measure a frame: VA-API, which reads its
+    /// reconstruction back, where the driver's surfaces let it.
+    pub fn measures(&self) -> bool {
+        match self {
+            FrameEncoder::Vaapi(enc) => enc.measures(),
+            _ => false,
+        }
+    }
+
+    /// The luma PSNR of the last frame measured (`measure`), where the session reads its
+    /// reconstruction back: VA-API. What a constant-rate cleanup through the rate control
+    /// ends on where it has one, since a picture that stopped improving needs no more frames
+    /// whatever quantizer the driver reports.
+    pub fn last_psnr(&self) -> Option<f32> {
+        match self {
+            FrameEncoder::Vaapi(enc) => enc.last_psnr(),
             _ => None,
         }
     }
@@ -1087,15 +1192,17 @@ impl FrameEncoder {
     }
 
     /// Whether `hold_quantizer` holds a frame at the quantizer asked for under the session's rate
-    /// control: NVENC, libvpx, and SVT-AV1 at a constant rate (where the release takes a new
-    /// target with a picture) do; x265 and VA-API only at a constant quantizer (their
-    /// `holds_quantizer` and `hold_quantizer` say why not at a constant rate); kvazaar, Tegra,
+    /// control: NVENC, libvpx's VP8, and SVT-AV1 at a constant rate (where the release takes a
+    /// new target with a picture) do; x265, VA-API, and libvpx's VP9 only at a constant
+    /// quantizer (their `holds_quantizer` and `hold_quantizer` say why not at a constant rate,
+    /// VP9's that its rate control refines a still screen within the rate); kvazaar, Tegra,
     /// and a stateful V4L2 device take no quantizer from the caller. The cleanup of a
     /// constant-quality session moves the session's quality instead of holding a frame
     /// (`pipeline::decide_constant_quality`), so this is read at a constant rate.
     pub fn holds_quantizer(&self) -> bool {
         match self {
-            FrameEncoder::Nvenc(_) | FrameEncoder::Vpx(_) => true,
+            FrameEncoder::Nvenc(_) => true,
+            FrameEncoder::Vpx(enc) => enc.holds_quantizer(),
             FrameEncoder::Vaapi(enc) => !enc.is_cbr(),
             FrameEncoder::Hevc(enc) => enc.holds_quantizer(),
             FrameEncoder::Av1(enc) => enc.holds_quantizer(),
@@ -1379,6 +1486,31 @@ fn fallback_codecs(requested: Codec, hardware: &[Codec], fullframe: bool) -> Vec
     codecs
 }
 
+/// Whether a 10-bit request is the software encoder's to serve: the node's engine encodes the
+/// codec without 10 bits at the chroma it would run, and the build's software encoder codes
+/// them, so the session takes the software path as a 4:4:4 the engine lacks does rather than
+/// streaming 8 bits on hardware.
+fn hardware_lacks_ten_bit(served: &HardwareEncoders, settings: &RustCaptureSettings) -> bool {
+    let codec = settings.codec;
+    if settings.video_bit_depth < 10 || !software_ten_bit(codec) {
+        return false;
+    }
+    served
+        .iter()
+        .find(|&&(c, ..)| c == codec)
+        .is_some_and(|&(_, _, formats)| {
+            let fullcolor = settings.video_fullcolor && codec.fullcolor() && formats.fullcolor;
+            !formats.ten_bit[fullcolor as usize]
+        })
+}
+
+/// `hardware_lacks_ten_bit` for the encode node `settings` names, for a capture path that opens
+/// its engine's session itself (NvFBC).
+pub(crate) fn ten_bit_is_softwares(settings: &RustCaptureSettings) -> bool {
+    probe_node(settings.encode_node_index.max(0))
+        .is_ok_and(|served| hardware_lacks_ten_bit(&served, settings))
+}
+
 /// The ladder for the one codec `settings` names; `None` where no backend of it opened, and for
 /// H.264 on host frames, whose software path the caller encodes itself.
 fn select_for_codec(
@@ -1439,15 +1571,19 @@ fn select_for_codec(
                 codec.display()
             )),
             Ok(served)
-                if !served
-                    .iter()
-                    .any(|&(c, backend, _)| c == codec && matches!(backend, "nvenc" | "vaapi")) =>
+                if !served.iter().any(|&(c, backend, ..)| {
+                    c == codec && matches!(backend, "nvenc" | "vaapi")
+                }) =>
             {
                 Some(format!(
                     "render node {node} has no {} engine",
                     codec.display()
                 ))
             }
+            Ok(served) if hardware_lacks_ten_bit(&served, settings) => Some(format!(
+                "render node {node} encodes no 10-bit {}, which the software encoder does",
+                codec.display()
+            )),
             _ => None,
         };
         if let Some(reason) = settled {
@@ -1479,9 +1615,10 @@ fn select_for_codec(
             match NvencEncoder::new(settings, egl_display) {
                 Ok(enc) => {
                     println!(
-                        "[{tag}] Encoder: NVENC {} {} on {} (render node {node}, {} driver), {}.",
+                        "[{tag}] Encoder: NVENC {} {} {}-bit on {} (render node {node}, {} driver), {}.",
                         codec.display(),
                         chroma_name(enc.is_fullcolor()),
+                        enc.bit_depth(),
                         enc.device_name(),
                         driver_name(&driver),
                         enc.split_summary()
@@ -1509,9 +1646,10 @@ fn select_for_codec(
             match vaapi::VaapiEncoder::new(settings, codec, input) {
                 Ok(enc) => {
                     println!(
-                        "[{tag}] Encoder: VAAPI {} {} on {} surfaces (render node {node}, {} driver).",
+                        "[{tag}] Encoder: VAAPI {} {} {}-bit on {} surfaces (render node {node}, {} driver).",
                         codec.display(),
                         chroma_name(enc.is_fullcolor()),
+                        enc.bit_depth(),
                         enc.surface_format_name(),
                         driver_name(&driver)
                     );
@@ -1566,9 +1704,11 @@ fn software_fallback(
     let codec = settings.codec;
     if codec == Codec::H264 {
         println!(
-            "[{tag}] Encoder: software {} ({}).",
+            "[{tag}] Encoder: software {} ({}) {} {}-bit.",
             codec.display(),
-            software_library(Codec::H264)
+            software_library(Codec::H264),
+            chroma_name(session_fullcolor(None, settings)),
+            session_bit_depth(None, settings)
         );
         return None;
     }
@@ -1583,9 +1723,11 @@ fn software_fallback(
     match session {
         Ok(enc) => {
             println!(
-                "[{tag}] Encoder: software {} ({}).",
+                "[{tag}] Encoder: software {} ({}) {} {}-bit.",
                 codec.display(),
-                enc.backend_name()
+                enc.backend_name(),
+                chroma_name(enc.is_fullcolor()),
+                enc.bit_depth()
             );
             Some(enc)
         }
@@ -2315,6 +2457,38 @@ mod software_tests {
         }
     }
 
+    /// 10 bits are coded only where the software encoder codes them, at either chroma it
+    /// carries, and the session says which it runs.
+    #[test]
+    fn ten_bit_follows_the_software_encoder() {
+        for codec in lockstep_codecs() {
+            for fullcolor in [false, true] {
+                let mut s = settings(codec);
+                s.video_bit_depth = 10;
+                s.video_fullcolor = fullcolor;
+                let mut enc = session(codec, &s, false);
+                let want = if software_ten_bit(codec) { 10 } else { 8 };
+                assert_eq!(enc.bit_depth(), want, "{codec:?}");
+                assert_eq!(
+                    enc.is_fullcolor(),
+                    fullcolor && software_fullcolor(codec),
+                    "{codec:?}"
+                );
+                assert_eq!(
+                    software_formats(codec).ten_bit,
+                    [want == 10, want == 10 && software_fullcolor(codec)],
+                    "{codec:?}"
+                );
+                for t in 0..3 {
+                    let out = enc
+                        .encode_host(&frame(t), W * 4, false, t as u64, 25, t == 0)
+                        .unwrap();
+                    assert!(t > 0 || out.len() > VIDEO_HEADER_LEN, "{codec:?} key frame");
+                }
+            }
+        }
+    }
+
     /// Four colors whose 2x2 average is gray, tiled: a decoded block's chroma comes out
     /// neutral only where the session sited chroma at the center of the block, and saturated
     /// wherever it kept one pixel, row, or column of it — the color a browser then shows along
@@ -2594,6 +2768,16 @@ pub fn session_fullcolor(encoder: Option<&FrameEncoder>, settings: &RustCaptureS
     }
 }
 
+/// The bits per sample a session carries, which is not always what was asked for: a
+/// full-frame session's own answer, and for the striped path (`None`) what its H.264 encoder
+/// opens at.
+pub fn session_bit_depth(encoder: Option<&FrameEncoder>, settings: &RustCaptureSettings) -> u32 {
+    match encoder {
+        Some(enc) => enc.bit_depth(),
+        None => software::stripe_bit_depth(settings),
+    }
+}
+
 /// Whether a session signals full range: a software 4:4:4 session of x264's kind, which the
 /// striped path (`None`) is whenever it carries 4:4:4, or a device that converted in fixed
 /// function at a range it chose. The one answer every description of a session reads, so no
@@ -2624,7 +2808,7 @@ mod hardware_encoder_tests {
         assert!(
             served
                 .iter()
-                .all(|(_, backend, _)| matches!(*backend, "nvenc" | "vaapi"))
+                .all(|(_, backend, ..)| matches!(*backend, "nvenc" | "vaapi"))
         );
         assert_eq!(hardware_encoders(0), served);
     }

@@ -936,7 +936,7 @@ fn codec_guid(codec: Codec) -> Option<GUID> {
 /// driver, no device, or a session that would not open, each of which a real session would
 /// fail on too. The CUDA and NVENC libraries stay loaded like a session's, since the driver
 /// does not promise to survive `libcuda` being unloaded after `cuInit`.
-pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>, String> {
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, super::Formats)>, String> {
     let cuda = std::mem::ManuallyDrop::new(NvencEncoder::load_cuda()?);
     let nvenc_lib = std::mem::ManuallyDrop::new(NvencEncoder::load_nvenc()?);
     nvenc_negotiate(&nvenc_lib);
@@ -989,12 +989,33 @@ fn session_refusal(status: NVENCSTATUS) -> String {
     }
 }
 
+/// Whether a session of `codec` codes 10 bits: HEVC and AV1 where the device reports it, from
+/// the API that names a session's input and output depths (12.2). The session converts its
+/// 8-bit RGB to 10-bit samples itself (`ConvertLayout`). H.264 stays 8-bit, which only the
+/// newest engines code at 10.
+unsafe fn codes_ten_bit(
+    function_list: &NV_ENCODE_API_FUNCTION_LIST,
+    session: *mut c_void,
+    codec: Codec,
+    guid: GUID,
+) -> bool {
+    let (major, minor) = nvenc_cur_ver();
+    matches!(codec, Codec::H265 | Codec::Av1)
+        && (major << 4) | minor >= 0xC2
+        && query_cap(
+            function_list,
+            session,
+            guid,
+            NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE,
+        ) == Some(1)
+}
+
 /// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes
-/// and whether each in 4:4:4, and close it.
+/// and the formats past 8-bit 4:2:0 it encodes each in, and close it.
 unsafe fn probe_session_codecs(
     nvenc_lib: &NvencLibrary,
     cu_context: CUcontext,
-) -> Result<Vec<(Codec, bool)>, String> {
+) -> Result<Vec<(Codec, super::Formats)>, String> {
     let mut function_list = NV_ENCODE_API_FUNCTION_LIST {
         version: sv(NvStruct::FunctionList),
         ..Default::default()
@@ -1032,7 +1053,14 @@ unsafe fn probe_session_codecs(
                     guid,
                     NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
                 ) == Some(1);
-            Some((codec, fullcolor))
+            let ten_bit = codes_ten_bit(&function_list, session, codec, guid);
+            Some((
+                codec,
+                super::Formats {
+                    fullcolor,
+                    ten_bit: [ten_bit, ten_bit && fullcolor],
+                },
+            ))
         })
         .collect();
     destroy_fn(session);
@@ -1124,13 +1152,15 @@ impl Default for NvencTuning {
     }
 }
 
-/// The profile of a session: the 4:2:0 profile of the codec, or its 4:4:4 one where the codec
-/// has it.
-fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
+/// The profile of a session: the 4:2:0 profile of the codec at its depth, or its 4:4:4 one
+/// where the codec has it. HEVC's range extensions carry 4:4:4 at either depth, and AV1's main
+/// profile both depths.
+fn profile_guid(codec: Codec, fullcolor: bool, bit_depth: u32) -> GUID {
     match (codec, fullcolor) {
         (Codec::H264, true) => NV_ENC_H264_PROFILE_HIGH_444_GUID,
         (Codec::H264, false) => NV_ENC_H264_PROFILE_HIGH_GUID,
         (Codec::H265, true) => NV_ENC_HEVC_PROFILE_FREXT_GUID,
+        (Codec::H265, false) if bit_depth > 8 => NV_ENC_HEVC_PROFILE_MAIN10_GUID,
         (Codec::H265, false) => NV_ENC_HEVC_PROFILE_MAIN_GUID,
         _ => NV_ENC_AV1_PROFILE_MAIN_GUID,
     }
@@ -1148,19 +1178,73 @@ fn profile_guid(codec: Codec, fullcolor: bool) -> GUID {
 /// They read the session's packed ARGB surface, or a texture over an array-typed dmabuf import,
 /// and write the NV12 surface NVENC then encodes, averaging each block's RGB before the matrix
 /// as the host convert does.
+/// The surface a `ChromaConvert` writes for NVENC: NV12 for an 8-bit 4:2:0 session, and for a
+/// 10-bit one P010 or planar 4:4:4, whose samples the kernel computes from the 8-bit RGB at
+/// 10 bits. NVENC upconverts an 8-bit surface itself, but from samples already rounded to
+/// eight: a 4:4:4 HEVC session coded that way measured 41.6 dB against its 8-bit 45.5 at one
+/// quantizer on an RTX 3060, its luma half a level low.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvertLayout {
+    Nv12,
+    P010,
+    Yuv444P10,
+}
+
+impl ConvertLayout {
+    /// The layout a session of this chroma and depth converts into; None for 8-bit 4:4:4,
+    /// which subsamples nothing and keeps NVENC's own conversion.
+    fn of(fullcolor: bool, bit_depth: u32) -> Option<Self> {
+        match (fullcolor, bit_depth > 8) {
+            (false, false) => Some(Self::Nv12),
+            (false, true) => Some(Self::P010),
+            (true, true) => Some(Self::Yuv444P10),
+            (true, false) => None,
+        }
+    }
+
+    /// The kernels reading a linear surface and a texture.
+    fn kernels(self) -> (&'static CStr, &'static CStr) {
+        match self {
+            Self::Nv12 => (c"argb_to_nv12", c"argb_tex_to_nv12"),
+            Self::P010 => (c"argb_to_p010", c"argb_tex_to_p010"),
+            Self::Yuv444P10 => (c"argb_to_yuv444p10", c"argb_tex_to_yuv444p10"),
+        }
+    }
+
+    /// The bytes a row and the rows a `width`x`height` picture take: a luma plane and half as
+    /// many rows of interleaved chroma, or three whole planes.
+    fn extent(self, width: u32, height: u32) -> (usize, usize) {
+        let (width, height) = (width as usize, height as usize);
+        match self {
+            Self::Nv12 => (width, height + height.div_ceil(2)),
+            Self::P010 => (2 * width, height + height.div_ceil(2)),
+            Self::Yuv444P10 => (2 * width, 3 * height),
+        }
+    }
+
+    fn format(self) -> NV_ENC_BUFFER_FORMAT {
+        match self {
+            Self::Nv12 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+            Self::P010 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV420_10BIT,
+            Self::Yuv444P10 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_YUV444_10BIT,
+        }
+    }
+}
+
 struct ChromaConvert {
     module: CUmodule,
     kernel: CUfunction,
     kernel_tex: CUfunction,
-    nv12: CUdeviceptr,
+    layout: ConvertLayout,
+    surface: CUdeviceptr,
     pitch: usize,
     registered: NV_ENC_REGISTERED_PTR,
     mapped: NV_ENC_INPUT_PTR,
 }
 
 impl ChromaConvert {
-    /// JIT the module, allocate the `width`x`height` NV12 surface, and register it with the
-    /// session. `None` where any step refuses: the session then encodes the packed RGB itself,
+    /// JIT the module, allocate the `width`x`height` surface of `layout`, and register it with
+    /// the session. `None` where any step refuses: the session then encodes the packed RGB itself,
     /// which sites chroma at the left of each block but converts with the matrix the session
     /// declares all the same.
     unsafe fn new(
@@ -1169,6 +1253,7 @@ impl ChromaConvert {
         session: *mut c_void,
         width: u32,
         height: u32,
+        layout: ConvertLayout,
     ) -> Option<Self> {
         let mut ptx = ARGB_TO_NV12_PTX.to_vec();
         ptx.push(0);
@@ -1180,26 +1265,23 @@ impl ChromaConvert {
         }
         let mut kernel: CUfunction = ptr::null_mut();
         let mut kernel_tex: CUfunction = ptr::null_mut();
-        if (cuda.cuModuleGetFunction)(&mut kernel, module, c"argb_to_nv12".as_ptr())
+        let (linear, texture) = layout.kernels();
+        if (cuda.cuModuleGetFunction)(&mut kernel, module, linear.as_ptr())
             != CUresult::CUDA_SUCCESS
-            || (cuda.cuModuleGetFunction)(&mut kernel_tex, module, c"argb_tex_to_nv12".as_ptr())
+            || (cuda.cuModuleGetFunction)(&mut kernel_tex, module, texture.as_ptr())
                 != CUresult::CUDA_SUCCESS
         {
             (cuda.cuModuleUnload)(module);
             return None;
         }
         let (mut nv12, mut pitch): (CUdeviceptr, usize) = (0, 0);
-        // NV12 is the luma plane followed by the interleaved chroma plane at the same pitch,
-        // which is the one allocation NVENC reads both halves of. The chroma rows round up, so
-        // the kernel's last row is inside the allocation even at an odd height, which the
-        // capture paths do not produce for a video codec but nothing here relies on.
-        if (cuda.cuMemAllocPitch_v2)(
-            &mut nv12,
-            &mut pitch,
-            width as usize,
-            (height + height.div_ceil(2)) as usize,
-            4,
-        ) != CUresult::CUDA_SUCCESS
+        // The planes follow one another at the same pitch, which is the one allocation NVENC
+        // reads all of. The chroma rows of a 4:2:0 layout round up, so the kernel's last row
+        // is inside the allocation even at an odd height, which the capture paths do not
+        // produce for a video codec but nothing here relies on.
+        let (row_bytes, rows) = layout.extent(width, height);
+        if (cuda.cuMemAllocPitch_v2)(&mut nv12, &mut pitch, row_bytes, rows, 4)
+            != CUresult::CUDA_SUCCESS
         {
             (cuda.cuModuleUnload)(module);
             return None;
@@ -1211,7 +1293,7 @@ impl ChromaConvert {
             height,
             resourceToRegister: nv12 as *mut c_void,
             pitch: pitch as u32,
-            bufferFormat: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12,
+            bufferFormat: layout.format(),
             bufferUsage: NV_ENC_BUFFER_USAGE::NV_ENC_INPUT_IMAGE,
             ..Default::default()
         };
@@ -1237,14 +1319,20 @@ impl ChromaConvert {
             module,
             kernel,
             kernel_tex,
-            nv12,
+            layout,
+            surface: nv12,
             pitch,
             registered: reg.registeredResource,
             mapped: map.mappedResource,
         })
     }
 
-    /// Convert the `width`x`height` packed surface at `src`/`src_pitch` into the NV12 surface,
+    /// The registered surface and its format, as NVENC is handed them.
+    fn input(&self) -> (NV_ENC_INPUT_PTR, NV_ENC_BUFFER_FORMAT) {
+        (self.mapped, self.layout.format())
+    }
+
+    /// Convert the `width`x`height` packed surface at `src`/`src_pitch` into the surface,
     /// on the default stream so it is ordered behind the upload and ahead of the encode.
     /// `swap_rb` marks an RGBA byte order rather than BGRA.
     unsafe fn run(
@@ -1257,7 +1345,7 @@ impl ChromaConvert {
         swap_rb: bool,
     ) -> Result<(), String> {
         let (mut src, mut sp) = (src, src_pitch as i32);
-        let (mut dst, mut dp) = (self.nv12, self.pitch as i32);
+        let (mut dst, mut dp) = (self.surface, self.pitch as i32);
         let (mut w, mut h, mut swap) = (width as i32, height as i32, i32::from(swap_rb));
         let mut params: [*mut c_void; 7] = [
             &mut src as *mut _ as *mut c_void,
@@ -1282,7 +1370,7 @@ impl ChromaConvert {
         swap_rb: bool,
     ) -> Result<(), String> {
         let mut tex = tex;
-        let (mut dst, mut dp) = (self.nv12, self.pitch as i32);
+        let (mut dst, mut dp) = (self.surface, self.pitch as i32);
         let (mut w, mut h, mut swap) = (width as i32, height as i32, i32::from(swap_rb));
         let mut params: [*mut c_void; 6] = [
             &mut tex as *mut _ as *mut c_void,
@@ -1357,7 +1445,7 @@ impl ChromaConvert {
     ) {
         (funcs.nvEncUnmapInputResource.unwrap())(session, self.mapped);
         (funcs.nvEncUnregisterResource.unwrap())(session, self.registered);
-        (cuda.cuMemFree_v2)(self.nv12);
+        (cuda.cuMemFree_v2)(self.surface);
         (cuda.cuModuleUnload)(self.module);
     }
 }
@@ -1396,6 +1484,8 @@ pub struct NvencEncoder {
     egl_display: EGLDisplay,
     codec: Codec,
     fullcolor: bool,
+    /// The bits per sample the session codes.
+    bit_depth: u32,
     width: u32,
     height: u32,
     current_qp: u32,
@@ -2046,6 +2136,13 @@ impl NvencEncoder {
             }
 
             let is_444 = caps.fullcolor;
+            let bit_depth = if settings.video_bit_depth >= 10
+                && codes_ten_bit(&function_list, encoder_session, codec, codec_guid)
+            {
+                10
+            } else {
+                8
+            };
             let invalidation = query_cap(
                 &function_list,
                 encoder_session,
@@ -2080,7 +2177,7 @@ impl NvencEncoder {
 
             config = preset_config.presetCfg;
             config.version = sv(NvStruct::Config);
-            config.profileGUID = profile_guid(codec, is_444);
+            config.profileGUID = profile_guid(codec, is_444, bit_depth);
             if settings.video_cbr_mode {
                 let bps = cbr_bps(settings);
                 log_held_rate(settings, bps);
@@ -2139,7 +2236,16 @@ impl NvencEncoder {
                 NV_ENC_CAPS::NV_ENC_CAPS_NUM_MAX_LTR_FRAMES,
             );
             let anchors = anchor_count(codec, nvenc_cur_ver().0, invalidation, ltr, dpb);
-            Self::configure_codec(&mut config, codec, is_444, level, dpb, anchors, &tuning);
+            Self::configure_codec(
+                &mut config,
+                codec,
+                is_444,
+                bit_depth,
+                level,
+                dpb,
+                anchors,
+                &tuning,
+            );
             #[cfg(test)]
             if let Some(refs) = tuning.ref_l0 {
                 match codec {
@@ -2290,16 +2396,41 @@ impl NvencEncoder {
                 bitstream_buffers.push(bitstream_params.bitstreamBuffer);
             }
 
-            // 4:4:4 subsamples nothing, so only a 4:2:0 session needs the kernel's siting; a
-            // driver that refuses it keeps NVENC's own conversion, which follows the declared
-            // matrix either way.
+            // 8-bit 4:4:4 subsamples nothing and needs no kernel; a driver that refuses the
+            // 4:2:0 one keeps NVENC's own conversion, which follows the declared matrix either
+            // way. A 10-bit session was initialized for the 10-bit surface only the kernel
+            // writes.
+            let layout = ConvertLayout::of(is_444, bit_depth);
             #[cfg(test)]
-            let is_444 = is_444 || tuning.hardware_csc;
-            let csc = if is_444 {
-                None
-            } else {
-                ChromaConvert::new(&cuda, &function_list, encoder_session, width, height)
-            };
+            let layout = layout.filter(|_| !tuning.hardware_csc);
+            let csc = layout.and_then(|layout| {
+                ChromaConvert::new(
+                    &cuda,
+                    &function_list,
+                    encoder_session,
+                    width,
+                    height,
+                    layout,
+                )
+            });
+            if bit_depth > 8 && csc.is_none() {
+                for buffer in &bitstream_buffers {
+                    (function_list.nvEncDestroyBitstreamBuffer.unwrap())(encoder_session, *buffer);
+                }
+                (function_list.nvEncUnmapInputResource.unwrap())(
+                    encoder_session,
+                    map_params.mappedResource,
+                );
+                (function_list.nvEncUnregisterResource.unwrap())(
+                    encoder_session,
+                    reg_res.registeredResource,
+                );
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                (cuda.cuMemFree_v2)(input_device_ptr);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err("the driver took no 10-bit convert kernel".into());
+            }
             crate::log::debug!(
                 "[NVENC] {} initialized (4:4:4 mode: {}, chroma convert: {}).",
                 codec.display(),
@@ -2315,6 +2446,7 @@ impl NvencEncoder {
                 egl_display: egl_display as EGLDisplay,
                 codec,
                 fullcolor: is_444,
+                bit_depth,
                 width,
                 height,
                 current_qp: codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf),
@@ -2408,15 +2540,22 @@ impl NvencEncoder {
     /// (40 Mbit/s at 5.1) is one a 4K desktop session reaches, where a Main-tier open is refused
     /// and a live rate change past it is declined. The tier is a signaled cap, not a coding
     /// tool; it does change the codec string a client derives from the SPS (`H153` for `L153`).
+    #[allow(clippy::too_many_arguments)]
     fn configure_codec(
         config: &mut NV_ENC_CONFIG,
         codec: Codec,
         fullcolor: bool,
+        bit_depth: u32,
         level: u32,
         dpb: u32,
         anchors: usize,
         tuning: &NvencTuning,
     ) {
+        let depth = if bit_depth > 8 {
+            NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_10
+        } else {
+            NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8
+        };
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
         let transfer = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         let matrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
@@ -2449,8 +2588,8 @@ impl NvencEncoder {
                     c.sliceModeData = tuning.slices;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
-                    c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
-                    c.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.inputBitDepth = depth;
+                    c.outputBitDepth = depth;
                     c.set_repeatSPSPPS(1);
                     c.set_outputAUD(0);
                     vui(&mut c.hevcVUIParameters);
@@ -2461,8 +2600,8 @@ impl NvencEncoder {
                     c.tier = 0;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(1);
-                    c.inputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
-                    c.outputBitDepth = NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8;
+                    c.inputBitDepth = depth;
+                    c.outputBitDepth = depth;
                     c.maxNumRefFramesInDPB = dpb;
                     if anchors > 0 {
                         c.set_enableLTR(1);
@@ -2604,6 +2743,11 @@ impl NvencEncoder {
         self.fullcolor
     }
 
+    /// The bits per sample the session codes.
+    pub fn bit_depth(&self) -> u32 {
+        self.bit_depth
+    }
+
     /// Follow a capture restart on the live session, folding in the current rate / QP / fps,
     /// without tearing it down.
     ///
@@ -2649,6 +2793,11 @@ impl NvencEncoder {
         }
         if (settings.video_fullcolor && self.codec.fullcolor()) != self.fullcolor {
             return Err("chroma format changed".into());
+        }
+        if (settings.video_bit_depth >= 10) != (self.bit_depth > 8)
+            && matches!(self.codec, Codec::H265 | Codec::Av1)
+        {
+            return Err("bit depth changed".into());
         }
         if settings.video_cbr_mode != is_cbr {
             return Err("rate-control mode changed".into());
@@ -2817,14 +2966,19 @@ impl NvencEncoder {
             self.input_pitch = input_pitch;
             self.registered_input_resource = reg_res.registeredResource;
             self.mapped_input_buffer = map_params.mappedResource;
-            if !self.fullcolor {
+            if let Some(layout) = ConvertLayout::of(self.fullcolor, self.bit_depth) {
                 self.csc = ChromaConvert::new(
                     &self.cuda,
                     &self.nvenc_funcs,
                     self.encoder_session,
                     new_w,
                     new_h,
+                    layout,
                 );
+                if self.bit_depth > 8 && self.csc.is_none() {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err("the driver took no 10-bit convert kernel".into());
+                }
             }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
@@ -3681,7 +3835,7 @@ impl NvencEncoder {
                 DmaBufInput::Direct { .. } => self.convert_texture(tex, swap),
             };
             let (mapped, format) = match converted {
-                Ok(Some(nv12)) => (nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
+                Ok(Some(converted)) => converted,
                 Ok(None) => (mapped, format),
                 Err(e) => {
                     (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
@@ -3869,7 +4023,7 @@ impl NvencEncoder {
 
             let (mapped, submitted) =
                 match self.convert_packed(self.input_device_ptr, self.input_pitch, rgba_input) {
-                    Ok(Some(nv12)) => (nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12),
+                    Ok(Some(converted)) => converted,
                     Ok(None) => (self.mapped_input_buffer, self.input_format),
                     Err(e) => {
                         (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
@@ -3885,24 +4039,28 @@ impl NvencEncoder {
         }
     }
 
-    /// Run the chroma convert over an array-typed import through `tex`, answering the NV12 input
+    /// Run the chroma convert over an array-typed import through `tex`, answering the input
     /// NVENC should be handed. `None` where the session has no convert, or where the driver gave
-    /// no texture for the import and NVENC's own conversion stands in.
+    /// no texture for the import and NVENC's own conversion stands in, which a 10-bit session,
+    /// initialized for the convert's surface, has none of.
     unsafe fn convert_texture(
         &self,
         tex: CUtexObject,
         rgba_input: bool,
-    ) -> Result<Option<NV_ENC_INPUT_PTR>, String> {
+    ) -> Result<Option<(NV_ENC_INPUT_PTR, NV_ENC_BUFFER_FORMAT)>, String> {
         match self.csc.as_ref() {
             Some(csc) if tex != 0 => {
                 csc.run_texture(&self.cuda, tex, self.width, self.height, rgba_input)?;
-                Ok(Some(csc.mapped))
+                Ok(Some(csc.input()))
+            }
+            _ if self.bit_depth > 8 => {
+                Err("the driver gave no texture for the import a 10-bit session converts".into())
             }
             _ => Ok(None),
         }
     }
 
-    /// Run the chroma convert over a packed surface, answering the NV12 input NVENC should be
+    /// Run the chroma convert over a packed surface, answering the input NVENC should be
     /// handed, or `None` where the session has no convert and encodes the packed surface itself.
     /// The caller holds the CUDA context current.
     unsafe fn convert_packed(
@@ -3910,7 +4068,7 @@ impl NvencEncoder {
         src: CUdeviceptr,
         src_pitch: usize,
         rgba_input: bool,
-    ) -> Result<Option<NV_ENC_INPUT_PTR>, String> {
+    ) -> Result<Option<(NV_ENC_INPUT_PTR, NV_ENC_BUFFER_FORMAT)>, String> {
         match self.csc.as_ref() {
             Some(csc) => {
                 csc.run(
@@ -3921,7 +4079,7 @@ impl NvencEncoder {
                     self.height,
                     rgba_input,
                 )?;
-                Ok(Some(csc.mapped))
+                Ok(Some(csc.input()))
             }
             None => Ok(None),
         }
@@ -4088,7 +4246,7 @@ impl NvencEncoder {
                 NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB
             };
             let submitted = match self.convert_packed(device_ptr, pitch, rgba) {
-                Ok(Some(nv12)) => Ok((nv12, NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_NV12)),
+                Ok(Some(converted)) => Ok(converted),
                 Ok(None) => self
                     .register_external_input(device_ptr, pitch, format)
                     .map(|m| (m, format)),
@@ -4130,6 +4288,7 @@ mod tests {
                     &mut config,
                     codec,
                     fullcolor,
+                    8,
                     nvenc_level(codec, 1280, 720, 60, 0, true),
                     1,
                     0,
@@ -4193,6 +4352,7 @@ mod tests {
                 &mut config,
                 Codec::Av1,
                 false,
+                8,
                 13,
                 AV1_REFERENCES,
                 anchors,
@@ -4677,6 +4837,58 @@ mod gpu_tests {
                 println!("{codec:?} 4:4:4: {}", enc.is_fullcolor());
             } else {
                 assert!(!enc.is_fullcolor(), "{codec:?} never carries 4:4:4");
+            }
+        }
+    }
+
+    /// On a real GPU: a 10-bit request is coded at 10 bits in each format the probe lists them
+    /// for and at 8 in every other, through the convert that writes the 10-bit surface, and an
+    /// in-place resize keeps it. The decoders here take 8-bit streams alone, so a 10-bit key
+    /// frame is one they refuse for its depth. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_ten_bit_follows_the_device() {
+        use crate::webcam::decode::{Decoder, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        for (codec, formats) in probe_codecs(0).expect("probe") {
+            for fullcolor in [false, codec.fullcolor()] {
+                let mut s = settings(w as i32, h as i32, 60.0);
+                s.codec = codec;
+                s.video_fullcolor = fullcolor;
+                s.video_bit_depth = 10;
+                let mut enc = host_session(&s).expect("session");
+                let carried = formats.ten_bit[(fullcolor && formats.fullcolor) as usize];
+                println!("{codec:?} 4:4:4 {fullcolor}: {}-bit", enc.bit_depth());
+                assert_eq!(enc.bit_depth(), if carried { 10 } else { 8 }, "{codec:?}");
+                assert_eq!(
+                    enc.csc.as_ref().map(|c| c.layout),
+                    ConvertLayout::of(enc.is_fullcolor(), enc.bit_depth()),
+                    "{codec:?}"
+                );
+                let key = enc
+                    .encode_cpu_argb(&frame(w, h, 1), w * 4, 0, 25, true)
+                    .expect("key frame");
+                let decoded = VideoDecoder::new(codec)
+                    .expect("decoder")
+                    .decode(&key[VIDEO_HEADER_LEN..]);
+                if carried {
+                    let refusal = format!("{:?}", decoded.expect_err("an 8-bit decoder"));
+                    assert!(refusal.contains("bit depth"), "{codec:?}: {refusal}");
+                } else if !enc.is_fullcolor() {
+                    assert!(decoded.expect("decode"), "{codec:?}");
+                }
+                s.width = 1920;
+                s.height = 1080;
+                enc.reconfigure_resolution(&s).expect("resize");
+                assert_eq!(enc.bit_depth(), if carried { 10 } else { 8 });
+                enc.encode_cpu_argb(&frame(1920, 1080, 2), 1920 * 4, 1, 25, false)
+                    .expect("a frame after the resize");
+                s.video_bit_depth = 8;
+                assert_eq!(
+                    enc.reconfigure_resolution(&s).is_err(),
+                    carried,
+                    "{codec:?}: a depth change rebuilds the session"
+                );
             }
         }
     }
@@ -7145,6 +7357,57 @@ mod gpu_tests {
         if let Ok(dir) = std::env::var("NVENC_TEST_DUMP_DIR") {
             std::fs::write(format!("{dir}/dmabuf-direct.h264"), direct.concat()).unwrap();
             std::fs::write(format!("{dir}/dmabuf-copy.h264"), copied.concat()).unwrap();
+        }
+    }
+
+    /// On a real GPU with a render node: a 10-bit HEVC session takes dmabufs through the convert
+    /// at either chroma, registered in place and through the copy arm, and the two arms code
+    /// the same stream. Skips a device that lists no 10-bit HEVC. `NVENC_TEST_DUMP_DIR` keeps
+    /// the streams for a decoder that takes them. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_dmabuf_ten_bit_arms_agree() {
+        let (w, h) = (1920u32, 1080u32);
+        let (gbm, mut renderer) = gpu_render();
+        let egl_display = renderer.egl_context().display().get_display_handle().handle;
+        let bufs: Vec<_> = (1..=2u32)
+            .map(|seed| painted_dmabuf(&gbm, &mut renderer, w, h, seed))
+            .collect();
+        for fullcolor in [false, true] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = Codec::H265;
+            s.video_fullcolor = fullcolor;
+            s.video_bit_depth = 10;
+            let mut streams = Vec::new();
+            for direct in [true, false] {
+                let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+                if enc.bit_depth() != 10 {
+                    println!("this device codes no 10-bit HEVC");
+                    return;
+                }
+                enc.direct_dmabuf = direct;
+                let stream: Vec<u8> = (0..6u64)
+                    .flat_map(|i| {
+                        let (_, dmabuf) = &bufs[(i % 2) as usize];
+                        let pkt = enc.encode(dmabuf, i, 25, i == 0).expect("dmabuf encode");
+                        pkt[VIDEO_HEADER_LEN..].to_vec()
+                    })
+                    .collect();
+                println!(
+                    "4:4:4 {fullcolor} direct {direct}: mapped {}, {} bytes",
+                    mapped_kind(&enc),
+                    stream.len()
+                );
+                if let Ok(dir) = std::env::var("NVENC_TEST_DUMP_DIR") {
+                    std::fs::write(
+                        format!("{dir}/dmabuf-10bit-{fullcolor}-{direct}.h265"),
+                        &stream,
+                    )
+                    .unwrap();
+                }
+                streams.push(stream);
+            }
+            assert_eq!(streams[0], streams[1], "4:4:4 {fullcolor}: the arms differ");
         }
     }
 

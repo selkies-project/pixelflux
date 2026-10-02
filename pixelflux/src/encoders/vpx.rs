@@ -52,6 +52,14 @@ pub fn encodes_444() -> bool {
     (unsafe { vpx_codec_version() }) >= (1 << 16) | (13 << 8)
 }
 
+/// Whether the loaded libvpx was built with VP9's high bit depth, which its 10-bit profiles
+/// need.
+pub fn encodes_ten_bit() -> bool {
+    (unsafe { vpx_codec_get_caps(vpx_codec_vp9_cx()) })
+        & VPX_CODEC_CAP_HIGHBITDEPTH as vpx_codec_caps_t
+        != 0
+}
+
 /// One libvpx session for one capture.
 pub struct VpxEncoder {
     codec: Codec,
@@ -71,6 +79,8 @@ pub struct VpxEncoder {
     held: Option<u32>,
     /// The quality index the rate control last coded a frame at, held frames aside.
     last_quality: Option<u32>,
+    /// The bytes of the last frame the rate control coded, held frames aside.
+    last_bytes: Option<usize>,
     /// The size and quality index of the last held key frame of a constant-rate session
     /// (`super::held_key_start`).
     held_key: Option<(usize, u32)>,
@@ -109,6 +119,7 @@ impl VpxEncoder {
         }
         let _ = rgba;
         let fullcolor = codec == Codec::Vp9 && settings.video_fullcolor && encodes_444();
+        let ten_bit = codec == Codec::Vp9 && settings.video_bit_depth >= 10 && encodes_ten_bit();
         let threads = encode_threads() as u32;
         let rate = RateSettings::new(settings);
         let quality = Quality::new(codec.quantizer(settings.video_crf));
@@ -133,9 +144,9 @@ impl VpxEncoder {
         cfg.g_lag_in_frames = 0;
         cfg.g_pass = VPX_RC_ONE_PASS;
         cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-        cfg.g_profile = if fullcolor { 1 } else { 0 };
-        cfg.g_bit_depth = 8;
-        cfg.g_input_bit_depth = 8;
+        cfg.g_profile = fullcolor as u32 + 2 * ten_bit as u32;
+        cfg.g_bit_depth = if ten_bit { VPX_BITS_10 } else { VPX_BITS_8 };
+        cfg.g_input_bit_depth = if ten_bit { 10 } else { 8 };
         cfg.rc_dropframe_thresh = 0;
         cfg.rc_2pass_vbr_bias_pct = 50;
         cfg.rc_2pass_vbr_minsection_pct = 100;
@@ -156,6 +167,7 @@ impl VpxEncoder {
                 settings.width.max(1) as usize,
                 settings.height.max(1) as usize,
                 fullcolor,
+                if ten_bit { 10 } else { 8 },
             ),
             threads,
             quality,
@@ -171,6 +183,7 @@ impl VpxEncoder {
             plan: SlotPlan::KEY,
             held: None,
             last_quality: None,
+            last_bytes: None,
             held_key: None,
         };
         let q = me.quality.current;
@@ -180,7 +193,11 @@ impl VpxEncoder {
                 &mut me.ctx,
                 iface,
                 &me.cfg,
-                0,
+                if ten_bit {
+                    VPX_CODEC_USE_HIGHBITDEPTH as vpx_codec_flags_t
+                } else {
+                    0
+                },
                 VPX_ENCODER_ABI_VERSION as c_int,
             )
         };
@@ -306,9 +323,14 @@ impl VpxEncoder {
         "libvpx"
     }
 
-    /// Whether the session carries 4:4:4 (VP9 profile 1).
+    /// Whether the session carries 4:4:4 (VP9 profile 1, or 3 at 10 bits).
     pub fn is_fullcolor(&self) -> bool {
         self.planes.i444
+    }
+
+    /// The bits per sample the session codes: 10 in VP9 profiles 2 and 3.
+    pub fn bit_depth(&self) -> u32 {
+        self.planes.bit_depth
     }
 
     /// VP9 keeps the limited range of its 4:2:0 in profile 1, so the decoder hint a client
@@ -332,6 +354,22 @@ impl VpxEncoder {
     /// The quality index the rate control last coded a frame at, held frames aside.
     pub fn last_quality(&self) -> Option<u32> {
         self.last_quality
+    }
+
+    /// The bytes of the last frame the rate control coded, held frames aside, where a
+    /// constant-rate cleanup runs through that rate control (`holds_quantizer`).
+    pub fn last_size(&self) -> Option<usize> {
+        self.last_bytes.filter(|_| !self.holds_quantizer())
+    }
+
+    /// Whether the cleanup of a still screen holds a frame at its quantizer: at a constant
+    /// quantizer, and at a constant rate for VP8, whose rate control leaves a still screen as
+    /// it is (a screen of text at 2 Mbit/s at 1080p stayed at 33.6 dB, where the held
+    /// refresh reached 42.8). VP9's refines one, so its constant-rate cleanup runs through
+    /// the rate control instead: 43.6 dB in 2.5 s with no frame over 75 kB, where the held
+    /// refresh was one of 347 kB.
+    pub fn holds_quantizer(&self) -> bool {
+        !self.rate.cbr || self.codec == Codec::Vp8
     }
 
     /// Encode the next frame at the quantizer the quality index `crf` selects, whatever the rate
@@ -410,6 +448,8 @@ impl VpxEncoder {
             self.last_quality = quality;
             self.program_rate(self.rate, self.quality.current);
             self.reconfigure()?;
+        } else if let Ok(coded) = &result {
+            self.last_bytes = Some(coded.len());
         }
         result
     }
@@ -493,11 +533,13 @@ impl VpxEncoder {
         }
 
         let mut img: vpx_image = unsafe { std::mem::zeroed() };
-        let fmt = if self.planes.i444 {
-            VPX_IMG_FMT_I444
-        } else {
-            VPX_IMG_FMT_I420
+        let fmt = match (self.planes.i444, self.planes.bit_depth > 8) {
+            (true, true) => VPX_IMG_FMT_I44416,
+            (true, false) => VPX_IMG_FMT_I444,
+            (false, true) => VPX_IMG_FMT_I42016,
+            (false, false) => VPX_IMG_FMT_I420,
         };
+        let [y, u, v] = self.planes.pointers();
         unsafe {
             vpx_img_wrap(
                 &mut img,
@@ -505,15 +547,17 @@ impl VpxEncoder {
                 self.planes.width as u32,
                 self.planes.height as u32,
                 1,
-                self.planes.y.as_mut_ptr(),
+                y,
             );
         }
-        img.planes[0] = self.planes.y.as_mut_ptr();
-        img.planes[1] = self.planes.u.as_mut_ptr();
-        img.planes[2] = self.planes.v.as_mut_ptr();
-        img.stride[0] = self.planes.width as c_int;
-        img.stride[1] = self.planes.chroma_width() as c_int;
-        img.stride[2] = self.planes.chroma_width() as c_int;
+        let bytes = self.planes.sample_bytes();
+        img.planes[0] = y;
+        img.planes[1] = u;
+        img.planes[2] = v;
+        img.stride[0] = (self.planes.width * bytes) as c_int;
+        img.stride[1] = (self.planes.chroma_width() * bytes) as c_int;
+        img.stride[2] = (self.planes.chroma_width() * bytes) as c_int;
+        img.bit_depth = self.planes.bit_depth;
         img.range = VPX_CR_STUDIO_RANGE;
         self.pending.push(pts, frame_number as u16);
         let res = unsafe {
@@ -839,6 +883,31 @@ mod tests {
             enc.encode_host(&frame(41), W * 4, false, 41, 25, false)
                 .expect("encode");
             assert_eq!(enc.last_reference(), Reference::Frame(40), "{codec:?}");
+        }
+    }
+
+    /// The quantizer index read back from a VP9 frame's header is the one libvpx says it coded
+    /// the frame at, for a key frame and a predicted one of every profile the build codes.
+    #[test]
+    fn a_vp9_header_names_its_quantizer_index() {
+        use crate::encoders::codec::vp9_base_q_idx;
+        let depths: &[i32] = if encodes_ten_bit() { &[8, 10] } else { &[8] };
+        for (&depth, fullcolor) in depths.iter().flat_map(|d| [(d, false), (d, true)]) {
+            let mut s = settings(Codec::Vp9);
+            s.video_bit_depth = depth;
+            s.video_fullcolor = fullcolor;
+            let mut enc = VpxEncoder::new(&s, Codec::Vp9, fullcolor).expect("session");
+            for (n, crf, key) in [(0, 40, true), (1, 15, false), (2, 28, false)] {
+                let coded = enc
+                    .encode_host(&frame(n), W * 4, false, n as u64, crf, key)
+                    .unwrap();
+                let read = vp9_base_q_idx(&coded[VIDEO_HEADER_LEN..]);
+                assert_eq!(
+                    read.map(|q| Codec::Vp9.quality_index(q)),
+                    enc.last_quality(),
+                    "{depth}-bit fullcolor {fullcolor} frame {n}: {read:?}"
+                );
+            }
         }
     }
 

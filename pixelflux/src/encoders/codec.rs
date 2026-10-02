@@ -148,6 +148,13 @@ impl Codec {
         matches!(self, Codec::H264 | Codec::H265 | Codec::Vp9)
     }
 
+    /// Whether the codec has a 10-bit profile a session here can ask for (H.265 Main 10 and
+    /// its 4:4:4, VP9 profiles 2 and 3, AV1); whether a given backend does is negotiated by
+    /// that backend.
+    pub fn high_bit_depth(self) -> bool {
+        matches!(self, Codec::H265 | Codec::Vp9 | Codec::Av1)
+    }
+
     /// Whether a forced key frame of this codec repeats the stream's parameter sets, so
     /// a joining decoder can start there. Every backend is configured to, so the answer
     /// is the same for all of them.
@@ -630,6 +637,107 @@ pub fn vp9_is_key(frame: &[u8]) -> bool {
         (b & 0x08, b & 0x04)
     };
     show_existing == 0 && frame_type == 0
+}
+
+/// The `base_q_idx` of a VP9 frame, read from its uncompressed header past the color
+/// configuration, the frame size, the references, and the loop filter; None for a shown
+/// existing frame or a header cut short.
+pub fn vp9_base_q_idx(frame: &[u8]) -> Option<u32> {
+    let mut pos = 0usize;
+    let mut bits = |n: usize| -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            let byte = *frame.get(pos / 8)?;
+            value = (value << 1) | ((byte >> (7 - pos % 8)) & 1) as u32;
+            pos += 1;
+        }
+        Some(value)
+    };
+    if bits(2)? != 2 {
+        return None;
+    }
+    let profile = bits(1)? | (bits(1)? << 1);
+    if profile == 3 {
+        bits(1)?;
+    }
+    if bits(1)? == 1 {
+        return None;
+    }
+    let key = bits(1)? == 0;
+    let show_frame = bits(1)? == 1;
+    let error_resilient = bits(1)? == 1;
+    let color_config = |bits: &mut dyn FnMut(usize) -> Option<u32>| -> Option<()> {
+        if profile >= 2 {
+            bits(1)?;
+        }
+        if bits(3)? != 7 {
+            bits(1)?;
+            if profile & 1 == 1 {
+                bits(3)?;
+            }
+        } else if profile & 1 == 1 {
+            bits(1)?;
+        }
+        Some(())
+    };
+    let sizes = |bits: &mut dyn FnMut(usize) -> Option<u32>| -> Option<()> {
+        bits(32)?;
+        if bits(1)? == 1 {
+            bits(32)?;
+        }
+        Some(())
+    };
+    if key {
+        bits(24)?;
+        color_config(&mut bits)?;
+        sizes(&mut bits)?;
+    } else {
+        let intra_only = !show_frame && bits(1)? == 1;
+        if !error_resilient {
+            bits(2)?;
+        }
+        if intra_only {
+            bits(24)?;
+            if profile > 0 {
+                color_config(&mut bits)?;
+            }
+            bits(8)?;
+            sizes(&mut bits)?;
+        } else {
+            bits(8)?;
+            bits(12)?;
+            let mut found = false;
+            for _ in 0..3 {
+                if bits(1)? == 1 {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                bits(32)?;
+            }
+            if bits(1)? == 1 {
+                bits(32)?;
+            }
+            bits(1)?;
+            if bits(1)? == 0 {
+                bits(2)?;
+            }
+        }
+    }
+    if !error_resilient {
+        bits(2)?;
+    }
+    bits(2)?;
+    bits(9)?;
+    if bits(1)? == 1 && bits(1)? == 1 {
+        for _ in 0..6 {
+            if bits(1)? == 1 {
+                bits(7)?;
+            }
+        }
+    }
+    bits(8)
 }
 
 /// Whether an AV1 temporal unit opens with a key frame: the first frame header or frame

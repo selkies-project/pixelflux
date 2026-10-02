@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as GbmFormat};
+use gbm::{BufferObject, Device as RawGbmDevice, Format as GbmFormat};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::egl::EGLDisplay;
@@ -474,12 +474,7 @@ impl GpuCapture {
     fn alloc_bo(&mut self, w: u16, h: u16) -> Result<BufferObject<()>, String> {
         loop {
             let bo = if self.x.modifiers.is_empty() {
-                self.gbm.create_buffer_object::<()>(
-                    w as u32,
-                    h as u32,
-                    GbmFormat::Argb8888,
-                    BufferObjectFlags::RENDERING,
-                )
+                crate::alloc_render_target(&self.gbm, w as u32, h as u32, GbmFormat::Argb8888)
             } else {
                 // The entry point without the flags argument, which implies exactly the
                 // rendering use this asks for: the one that takes flags arrived in Mesa 21.1
@@ -1229,9 +1224,7 @@ where
                 }
             };
             let dmabuf = gpu.buffers[idx].dmabuf.clone();
-            if let Some(q) = decision.hold_qp {
-                gpu.enc().hold_quantizer(q, decision.hold_band);
-            }
+            decision.prepare(gpu.enc());
             let encode_start_ns = crate::wayland::host::now_ns();
             let result = if after_blit {
                 gpu.enc().encode_dmabuf_after_blit(

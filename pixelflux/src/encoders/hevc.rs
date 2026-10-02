@@ -35,9 +35,17 @@ pub struct HevcEncoder {
     held: Option<u32>,
     /// The quantizer the rate control last coded a frame at, held frames aside.
     last_quality: Option<u32>,
+    /// The bytes of that frame.
+    last_bytes: Option<usize>,
 }
 
 unsafe impl Send for HevcEncoder {}
+
+/// Whether the build's software HEVC encoder codes 10 bits: x265 where it was built with its
+/// 10-bit encoder linked in.
+pub fn ten_bit() -> bool {
+    Backend::ten_bit()
+}
 
 /// What a backend answered for one submitted picture, with the quantizer it was coded at.
 struct Coded {
@@ -51,15 +59,28 @@ impl HevcEncoder {
     pub fn new(settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
         let _ = rgba;
         let fullcolor = settings.video_fullcolor && Backend::FULLCOLOR;
+        let bit_depth = if settings.video_bit_depth >= 10 && Backend::ten_bit() {
+            10
+        } else {
+            8
+        };
         let threads = encode_threads();
         let rate = RateSettings::new(settings);
         let quality = Quality::new(Codec::H265.quantizer(settings.video_crf));
         let width = settings.width.max(1) as usize;
         let height = settings.height.max(1) as usize;
-        let backend = Backend::open(width, height, threads, fullcolor, rate, quality.current)?;
+        let backend = Backend::open(
+            width,
+            height,
+            threads,
+            fullcolor,
+            bit_depth,
+            rate,
+            quality.current,
+        )?;
         Ok(Self {
             backend,
-            planes: Planes::new(width, height, fullcolor),
+            planes: Planes::new(width, height, fullcolor, bit_depth),
             threads,
             quality,
             rate,
@@ -69,6 +90,7 @@ impl HevcEncoder {
             pending: Pending::default(),
             held: None,
             last_quality: None,
+            last_bytes: None,
         })
     }
 
@@ -83,6 +105,11 @@ impl HevcEncoder {
 
     pub fn is_fullcolor(&self) -> bool {
         self.planes.i444
+    }
+
+    /// The bits per sample the session codes.
+    pub fn bit_depth(&self) -> u32 {
+        self.planes.bit_depth
     }
 
     /// The software 4:4:4 of x264's kind signals full range.
@@ -110,6 +137,11 @@ impl HevcEncoder {
         self.last_quality
     }
 
+    /// The bytes of the last frame the rate control coded, held frames aside.
+    pub fn last_size(&self) -> Option<usize> {
+        self.last_bytes
+    }
+
     /// The library keeps its reference lists to itself: refused, so the caller codes a key frame.
     pub fn invalidate_reference(&mut self, _frame_id: u16) -> bool {
         false
@@ -122,6 +154,7 @@ impl HevcEncoder {
             self.planes.height,
             self.threads,
             self.planes.i444,
+            self.planes.bit_depth,
             self.rate,
             self.quality.current,
         )?;
@@ -195,6 +228,7 @@ impl HevcEncoder {
         };
         if held.is_none() {
             self.last_quality = Some(coded.qp);
+            self.last_bytes = Some(coded.bytes.len());
         }
         let id = self.pending.take(coded.pts).unwrap_or(frame_number as u16);
         let mut output = Vec::with_capacity(VIDEO_HEADER_LEN + coded.bytes.len());
@@ -262,6 +296,13 @@ mod x265 {
     impl Backend {
         pub const LIBRARY: &'static str = "x265";
         pub const FULLCOLOR: bool = true;
+
+        /// Whether the linked x265 carries a 10-bit encoder beside its 8-bit one, which is
+        /// a property of how the library was built.
+        pub fn ten_bit() -> bool {
+            !unsafe { x265_api_get(10) }.is_null()
+        }
+
         pub const KEY_ON_REQUEST: bool = true;
         pub const HOLDS_QUANTIZER: bool = true;
 
@@ -313,12 +354,13 @@ mod x265 {
             height: usize,
             threads: i32,
             i444: bool,
+            bit_depth: u32,
             rate: RateSettings,
             q: u32,
         ) -> Result<Self, String> {
-            let api = unsafe { x265_api_get(8) };
+            let api = unsafe { x265_api_get(bit_depth as c_int) };
             if api.is_null() {
-                return Err("x265 carries no 8-bit encoder".into());
+                return Err(format!("x265 carries no {bit_depth}-bit encoder"));
             }
             let params = unsafe { ((*api).param_alloc.unwrap())() };
             if params.is_null() {
@@ -370,11 +412,19 @@ mod x265 {
             for (name, value) in &options {
                 me.set(name, value)?;
             }
-            if i444 {
-                let profile = c"main444-8";
-                if unsafe { ((*api).param_apply_profile.unwrap())(params, profile.as_ptr()) } < 0 {
-                    return Err("x265 refused the main444-8 profile".into());
-                }
+            let profile = match (i444, bit_depth) {
+                (true, 10) => Some(c"main444-10"),
+                (true, _) => Some(c"main444-8"),
+                (false, 10) => Some(c"main10"),
+                (false, _) => None,
+            };
+            if let Some(profile) = profile
+                && unsafe { ((*api).param_apply_profile.unwrap())(params, profile.as_ptr()) } < 0
+            {
+                return Err(format!(
+                    "x265 refused the {} profile",
+                    profile.to_string_lossy()
+                ));
             }
             me.encoder = unsafe { ((*api).encoder_open.unwrap())(params) };
             if me.encoder.is_null() {
@@ -407,14 +457,16 @@ mod x265 {
                 }
             }
             // Written per index: x265 4 declares a fourth plane for alpha, x265 3 does not.
-            pic.planes[0] = planes.y.as_mut_ptr().cast();
-            pic.planes[1] = planes.u.as_mut_ptr().cast();
-            pic.planes[2] = planes.v.as_mut_ptr().cast();
-            pic.stride[0] = planes.width as c_int;
-            pic.stride[1] = planes.chroma_width() as c_int;
-            pic.stride[2] = planes.chroma_width() as c_int;
+            let [y, u, v] = planes.pointers();
+            pic.planes[0] = y.cast();
+            pic.planes[1] = u.cast();
+            pic.planes[2] = v.cast();
+            let bytes = planes.sample_bytes();
+            pic.stride[0] = (planes.width * bytes) as c_int;
+            pic.stride[1] = (planes.chroma_width() * bytes) as c_int;
+            pic.stride[2] = (planes.chroma_width() * bytes) as c_int;
             pic.pts = pts as i64;
-            pic.bitDepth = 8;
+            pic.bitDepth = planes.bit_depth as c_int;
             pic.sliceType = if key {
                 X265_TYPE_IDR as c_int
             } else {
@@ -487,6 +539,11 @@ mod kvazaar {
     impl Backend {
         pub const LIBRARY: &'static str = "kvazaar";
         pub const FULLCOLOR: bool = false;
+
+        /// kvazaar's sample depth is fixed when it is built, and the build here is 8-bit.
+        pub fn ten_bit() -> bool {
+            false
+        }
         pub const KEY_ON_REQUEST: bool = false;
         pub const HOLDS_QUANTIZER: bool = false;
 
@@ -516,10 +573,11 @@ mod kvazaar {
             height: usize,
             threads: i32,
             i444: bool,
+            bit_depth: u32,
             rate: RateSettings,
             q: u32,
         ) -> Result<Self, String> {
-            let _ = i444;
+            let _ = (i444, bit_depth);
             if !width.is_multiple_of(8) || !height.is_multiple_of(8) {
                 return Err(format!(
                     "kvazaar takes only pictures a multiple of eight, not {width}x{height}"

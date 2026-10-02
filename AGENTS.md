@@ -114,7 +114,14 @@ names the frame a picture predicts from; a 4:4:4 session tries the surface forma
 driver allocates and its video processor renders, read through libva's `VAProfileNone`
 configuration, until one survives the surface pool, the convert, and the codec open (Intel's iHD
 allocates planar 444P but its VPP writes 4:4:4 only packed, as XYUV, and its HEVC 4:4:4 entry point
-takes only what the VPP writes); `vaapi/mock.rs` stands in for a driver so the session's every buffer is checked
+takes only what the VPP writes), and `video_bit_depth` is negotiated the same
+way, by the profile the driver lists for the format (HEVC Main 10 and Main 4:4:4 10 on `p010` and `y410`
+surfaces, VP9 profiles 2 and 3, AV1's main profile at 10 bits), a session staying at 8 bits where the driver
+lists none and no software encoder codes them either. Where one does (`encoders::software_ten_bit`: x264,
+x265 with its 10-bit encoder linked in, libvpx built with high bit depth, SVT-AV1), a 10-bit request an
+engine cannot serve is the software encoder's, as a 4:4:4 it lacks is (`hardware_lacks_ten_bit`), converted
+from the 8-bit source straight to 10-bit samples (`software::convert_to_yuv10_mt`); `pixelflux.SOFTWARE_FORMATS`
+and `pixelflux.hardware_formats` reports what a node carries; `vaapi/mock.rs` stands in for a driver so the session's every buffer is checked
 without hardware. The software HEVC (x265 with the `gpl` feature, else kvazaar; `encoders/hevc.rs`), VP8/VP9
 (libvpx, `encoders/vpx.rs`), and AV1 (SVT-AV1, `encoders/svtav1.rs`) encoders are linked directly and bound at
 build time from the headers of the copies that are linked (`codec-sys`), so which library serves a codec is the
@@ -140,7 +147,15 @@ only the siting is at stake). A 4:2:0 session therefore converts with `ChromaCon
 kernel the driver JIT-compiles (`encoders/argb_to_nv12.cu`, `scripts/build-ptx.sh`) that reads
 the packed surface, a pitch-linear dmabuf import, or a texture over an array-typed one and writes
 the NV12 NVENC encodes; 4:4:4 subsamples nothing and keeps the hardware conversion, as does a
-driver that refuses the kernel.
+driver that refuses the kernel. A 10-bit NVENC session (HEVC and AV1 where the device reports
+`NV_ENC_CAPS_SUPPORT_10BIT_ENCODE`, from API 12.2, which names a session's input depth; H.264
+stays 8-bit and a 10-bit request for it is the software encoder's) converts through the same
+module's 10-bit kernels, to P010 or planar 4:4:4 (`ConvertLayout`), at either chroma: NVENC
+upconverts an 8-bit surface itself, but from samples already rounded to eight (a 4:4:4 HEVC
+session coded that way came out under its 8-bit self, the luma half a level low), where the
+kernels leave a flat or graded picture a quarter of the 8-bit conversion's error
+(0.07 against 0.28 of an 8-bit level, RTX 3060). NVENC's quantizer runs 0 to 51 at either depth,
+so on text at one quality index the two depths code alike.
 `VideoDecoder::color_tags` reads what a stream declares, and the unit tests hold each
 encoder to it; the sequence headers travel with every IDR so a client joining or resynchronizing on any key
 frame can decode, which `encoders/v4l2m2m.rs` keeps true itself for the devices whose drivers will not
@@ -181,8 +196,8 @@ only a little. Under a constant quality the cleanup moves the session's quality 
 paint-over one until the region moves again (`pipeline::decide_constant_quality`, and the stripe's
 rate factor in `encode_cpu`), as main's paint-over did, so every encoder codes the cleanup key
 frame the way it codes one at that quality, with its own intra offset. Under a constant rate,
-a session whose rate control reports the quantizer and the bytes of its frames
-(`EncoderQuality::converges`: NVENC, and libx264 per stripe) is cleaned up through that rate
+a session that holds a quantizer and whose rate control reports the quantizer and the bytes of
+its frames (NVENC, and libx264 per stripe) is cleaned up through that rate
 control: the frames keep flowing, each within its budget, until it codes the region at the
 paint-over quantizer or finer in a small frame (`pipeline::convergence`), and no key frame is
 sent; only where NVENC's rate control stalls short of it (a low rate for the resolution) is the
@@ -193,12 +208,24 @@ is, else in one held frame. A whole refresh held at it in one frame measured 470
 and 8 Mbit/s, half a second of queue on a 12 Mbit/s link, where the rate control reaches the same
 picture in about a second with every frame within its budget. Elsewhere under
 a constant rate the frame is held at that quantizer through `FrameEncoder::hold_quantizer`:
-libvpx pins its bounds, and SVT-AV1 raises the target for a key frame, bounded to
+libvpx's VP8 pins its bounds, and SVT-AV1 raises the target for a key frame, bounded to
 `HELD_KEY_BUDGET_S` of the target. There is no cleanup where the encoder's last quantizer
 (`last_quality`) is already finer, since that rate control refines a still screen itself. Where a
-constant-rate session cannot hold a quantizer (`holds_quantizer`: VA-API and x265, kvazaar,
-Tegra, a stateful V4L2 device) it is cleaned up by a refresh and its burst at the rate control's
-own quality, which it refines, and never by a key frame, which its small buffer would starve.
+constant-rate session cannot hold a quantizer (`holds_quantizer`: VA-API, x265, kvazaar, and
+libvpx's VP9, whose held refresh was one frame of 80 budgets at 2 Mbit/s) but reports its frames'
+bytes, its frames flow through the rate control until the picture is done and no key frame is
+sent: VA-API until the reconstruction it reads back and measures against its source once a second
+stops improving (`FrameEncoder::measure`, `pipeline::plateau`; iHD's reported H.264 quantizer
+reads 26 through a refinement from 23 to 50 dB, and it keeps 10-bit HEVC and VP9 and packed 4:4:4
+reconstructions in a layout that cannot be read, which fall back to the quantizer), the others
+after a trigger period of frames at the paint-over quantizer, and any of them after `REFINE_S`.
+That cleanup then counts as settled, and only more than a small change arms another, so a caret
+on a clean screen costs its own frames. A session that reports no bytes (Tegra, a stateful V4L2
+device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264
+stripe is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame
+and a half its row-level control coarsens the rows it names a fine quantizer for. On Intel's iHD
+the VA-API rate control itself is bounded per codec (`vaapi::ConstantRate`): under the session's
+buffer of a frame and a half it skips every block and pads the frame to the target.
 
 Host capture of an external Wayland compositor (`wayland/host.rs`, `wayland_host_display`) picks each
 rung per capability from the host's registry, never by a setting: frames through
@@ -232,7 +259,8 @@ imports each dmabuf in place through the same `encode_dmabuf` the Wayland zero-c
 the general XShm path otherwise. Each zero-copy backend is declined -- with one line saying why --
 for a codec its engine does not serve, software encoding, a server or device that does not qualify
 (DRI3 also asks that the server draw on the encode node's GPU and that the encoder read the first frame),
-and NvFBC for a non-NVIDIA encode node, a watermark, a driver without it, or a libX11 bound to another
+and NvFBC for a non-NVIDIA encode node, a watermark, a driver without it, a 10-bit request NVENC lacks
+and the software encoder codes, or a libX11 bound to another
 copy of libxcb than the host's (a wheel that bundles libxcb and loads libX11 first), whose connection the
 driver would read at another structure layout; DRI3 composites a
 watermark through Render as it does the cursor, so that one costs it no readback. There is no

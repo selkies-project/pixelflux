@@ -184,6 +184,147 @@ pub(crate) fn convert_to_yuv_mt(
         .map(|_| ())
 }
 
+/// The fixed-point scale of the 10-bit conversion's coefficients.
+const YUV10_SHIFT: u32 = 14;
+
+/// The BT.709 coefficients that take 8-bit R, G, B to 10-bit Y, Cb, Cr at `full_range` or
+/// limited range, scaled by `1 << YUV10_SHIFT`: a row each for Y, Cb, and Cr, then the luma
+/// offset. The chroma offset is the 10-bit midpoint at either range.
+fn yuv10_coefficients(full_range: bool) -> ([[i32; 3]; 3], i32) {
+    const KR: f64 = 0.2126;
+    const KB: f64 = 0.0722;
+    const KG: f64 = 1.0 - KR - KB;
+    let (luma, chroma, offset) = if full_range {
+        (1023.0 / 255.0, 1023.0 / 255.0, 0)
+    } else {
+        (876.0 / 255.0, 896.0 / 255.0, 64)
+    };
+    let fixed = |k: f64| (k * (1 << YUV10_SHIFT) as f64).round() as i32;
+    let (cb, cr) = (chroma / (2.0 * (1.0 - KB)), chroma / (2.0 * (1.0 - KR)));
+    (
+        [
+            [fixed(luma * KR), fixed(luma * KG), fixed(luma * KB)],
+            [fixed(-cb * KR), fixed(-cb * KG), fixed(cb * (1.0 - KB))],
+            [fixed(cr * (1.0 - KR)), fixed(-cr * KG), fixed(-cr * KB)],
+        ],
+        offset,
+    )
+}
+
+/// Convert a packed BGRA/RGBA buffer to planar 10-bit YUV (4:2:0 or 4:4:4) in 16-bit samples,
+/// for the software encoders' 10-bit sessions, across up to `bands` threads as
+/// `convert_to_yuv_mt` splits them.
+///
+/// The 10-bit samples are computed from the 8-bit source directly rather than widened from an
+/// 8-bit conversion, so the two bits the encoder gains carry the precision an 8-bit Y, Cb, Cr
+/// rounds away. The matrix is BT.709 at `full_range` or limited range, and a 4:2:0 chroma
+/// sample is the conversion of the mean of its 2x2 block, which sites it at the block's
+/// center as the 8-bit conversion does. `strides` are in samples.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn convert_to_yuv10_mt(
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+    rgba_input: bool,
+    i444: bool,
+    full_range: bool,
+    y_buf: &mut [u16],
+    u_buf: &mut [u16],
+    v_buf: &mut [u16],
+    strides: (usize, usize),
+    bands: usize,
+) {
+    let (y_stride, uv_stride) = strides;
+    let (k, y_offset) = yuv10_coefficients(full_range);
+    let (ri, bi) = if rgba_input { (0, 2) } else { (2, 0) };
+    let half = 1 << (YUV10_SHIFT - 1);
+    let luma = move |r: i32, g: i32, b: i32| {
+        ((k[0][0] * r + k[0][1] * g + k[0][2] * b + half) >> YUV10_SHIFT) + y_offset
+    };
+    let chroma = move |row: &[i32; 3], r: i32, g: i32, b: i32, shift: u32| {
+        (((row[0] * r + row[1] * g + row[2] * b + (1 << (shift - 1))) >> shift) + 512)
+            .clamp(0, 1023) as u16
+    };
+
+    let convert_band = move |src: &[u8], y: &mut [u16], u: &mut [u16], v: &mut [u16], h: usize| {
+        for row in 0..h {
+            let line = &src[row * src_stride..row * src_stride + width * 4];
+            let out = &mut y[row * y_stride..row * y_stride + width];
+            for (px, y) in line.chunks_exact(4).zip(out.iter_mut()) {
+                *y = luma(px[ri] as i32, px[1] as i32, px[bi] as i32) as u16;
+            }
+        }
+        if i444 {
+            for row in 0..h {
+                let line = &src[row * src_stride..row * src_stride + width * 4];
+                let cb = &mut u[row * uv_stride..row * uv_stride + width];
+                let cr = &mut v[row * uv_stride..row * uv_stride + width];
+                for ((px, cb), cr) in line.chunks_exact(4).zip(cb.iter_mut()).zip(cr.iter_mut()) {
+                    let (r, g, b) = (px[ri] as i32, px[1] as i32, px[bi] as i32);
+                    *cb = chroma(&k[1], r, g, b, YUV10_SHIFT);
+                    *cr = chroma(&k[2], r, g, b, YUV10_SHIFT);
+                }
+            }
+            return;
+        }
+        let cw = width.div_ceil(2);
+        for row in 0..h.div_ceil(2) {
+            let top = &src[2 * row * src_stride..2 * row * src_stride + width * 4];
+            let below = (2 * row + 1).min(h - 1);
+            let bottom = &src[below * src_stride..below * src_stride + width * 4];
+            let cb = &mut u[row * uv_stride..row * uv_stride + cw];
+            let cr = &mut v[row * uv_stride..row * uv_stride + cw];
+            for (col, (cb, cr)) in cb.iter_mut().zip(cr.iter_mut()).enumerate() {
+                let left = 8 * col;
+                let right = (left + 4).min(width * 4 - 4);
+                let sum = |i: usize| {
+                    top[left + i] as i32
+                        + top[right + i] as i32
+                        + bottom[left + i] as i32
+                        + bottom[right + i] as i32
+                };
+                let (r, g, b) = (sum(ri), sum(1), sum(bi));
+                *cb = chroma(&k[1], r, g, b, YUV10_SHIFT + 2);
+                *cr = chroma(&k[2], r, g, b, YUV10_SHIFT + 2);
+            }
+        }
+    };
+
+    let band_h = ((height / bands.max(1)) & !1).max(2);
+    if bands <= 1 || height <= band_h {
+        convert_band(src, y_buf, u_buf, v_buf, height);
+        return;
+    }
+    let uv_rows = |rows: usize| if i444 { rows } else { rows.div_ceil(2) };
+    let mut jobs = Vec::new();
+    let (mut src_rest, mut y_rest, mut u_rest, mut v_rest) = (src, y_buf, u_buf, v_buf);
+    let mut row = 0;
+    while row < height {
+        let h = if height - row < band_h + 2 {
+            height - row
+        } else {
+            band_h
+        };
+        let last = row + h >= height;
+        let take = |len: usize, rows: usize, stride: usize| if last { len } else { rows * stride };
+        let (src_band, s_next) = src_rest.split_at(take(src_rest.len(), h, src_stride));
+        let (y_band, y_next) = y_rest.split_at_mut(take(y_rest.len(), h, y_stride));
+        let (u_band, u_next) = u_rest.split_at_mut(take(u_rest.len(), uv_rows(h), uv_stride));
+        let (v_band, v_next) = v_rest.split_at_mut(take(v_rest.len(), uv_rows(h), uv_stride));
+        src_rest = s_next;
+        y_rest = y_next;
+        u_rest = u_next;
+        v_rest = v_next;
+        row += h;
+        jobs.push((src_band, y_band, u_band, v_band, h));
+    }
+    jobs.into_par_iter()
+        .for_each(|(src_band, y_band, u_band, v_band, h)| {
+            convert_band(src_band, y_band, u_band, v_band, h)
+        });
+}
+
 thread_local! {
     /// Reused libjpeg-turbo compressor kept per worker thread to avoid paying a
     /// `tjInitCompress`/`tjDestroy` round trip for every stripe of every frame.
@@ -206,6 +347,15 @@ thread_local! {
 /// path where the real parallelism lives.
 #[cfg(feature = "gpl")]
 static X264_OPEN_CLOSE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What libx264 adds to a quantizer above 8 bits: its quantizer bounds, a frame's forced
+/// quantizer, and the one it reports are all on a scale that starts six below zero for every
+/// bit past eight, while the rate factor is not. Added going in and taken off coming out, so a
+/// session's quantizers mean what they do at 8 bits whatever its depth.
+#[cfg(feature = "gpl")]
+fn qp_offset(bit_depth: u32) -> i32 {
+    6 * (bit_depth as i32 - 8)
+}
 
 /// The rate an x264 session is opened at: the capture's, or 30 frames per second where it names
 /// less than one.
@@ -232,6 +382,8 @@ pub struct H264EncoderWrapper {
     pub height: i32,
     current_crf: i32,
     pub is_i444: bool,
+    /// The bits per sample the session was opened at, baked in as the chroma format is.
+    pub bit_depth: u32,
     is_cbr: bool,
     current_bitrate: i32,
     current_vbv: i32,
@@ -336,6 +488,7 @@ impl H264EncoderWrapper {
             height,
             crf,
             is_i444,
+            8,
             fps,
             threads,
             cbr_mode,
@@ -345,6 +498,49 @@ impl H264EncoderWrapper {
             max_qp,
             None,
         )
+    }
+
+    /// `new` at `bit_depth` bits per sample: 10 opens a High 10 session, or High 4:4:4
+    /// Predictive at 10 bits, which reads its planes as 16-bit samples.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_depth(
+        width: i32,
+        height: i32,
+        crf: i32,
+        is_i444: bool,
+        bit_depth: u32,
+        fps: f64,
+        threads: i32,
+        cbr_mode: bool,
+        bitrate_kbps: i32,
+        vbv_kbit: i32,
+        min_qp: i32,
+        max_qp: i32,
+    ) -> Option<Self> {
+        Self::open(
+            width,
+            height,
+            crf,
+            is_i444,
+            bit_depth,
+            fps,
+            threads,
+            cbr_mode,
+            bitrate_kbps,
+            vbv_kbit,
+            min_qp,
+            max_qp,
+            None,
+        )
+    }
+
+    /// Whether the linked libx264 opens a 10-bit session, which is a property of how the
+    /// library was built, asked once of a session too small to cost anything.
+    pub fn ten_bit() -> bool {
+        static TEN_BIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TEN_BIT.get_or_init(|| {
+            Self::with_depth(64, 64, 25, false, 10, 30.0, 1, false, 0, 0, 0, 0).is_some()
+        })
     }
 
     /// `new`, with a constant-rate session's first frame given a budget of its own where `key`
@@ -357,6 +553,7 @@ impl H264EncoderWrapper {
         height: i32,
         crf: i32,
         is_i444: bool,
+        bit_depth: u32,
         fps: f64,
         threads: i32,
         cbr_mode: bool,
@@ -413,29 +610,41 @@ impl H264EncoderWrapper {
                 }
                 param.rc.b_filler = 0;
                 if min_qp > 0 {
-                    param.rc.i_qp_min = min_qp.min(51);
+                    param.rc.i_qp_min = min_qp.min(51) + qp_offset(bit_depth);
                 }
-                param.rc.i_qp_max = if max_qp > 0 { max_qp.min(51) } else { 51 };
+                param.rc.i_qp_max =
+                    if max_qp > 0 { max_qp.min(51) } else { 51 } + qp_offset(bit_depth);
             } else {
                 param.rc.i_rc_method = x264_sys::X264_RC_CRF as i32;
                 param.rc.f_rf_constant = crf as f32;
                 if vbv_kbit > 0 {
                     param.rc.i_vbv_max_bitrate = bitrate_kbps.saturating_abs();
                     param.rc.i_vbv_buffer_size = vbv_kbit;
-                    param.rc.i_qp_max = 51;
+                    param.rc.i_qp_max = 51 + qp_offset(bit_depth);
                 }
             }
-            param.i_csp = if is_i444 {
+            let depth_flag = if bit_depth > 8 {
+                x264_sys::X264_CSP_HIGH_DEPTH
+            } else {
+                0
+            };
+            param.i_csp = (if is_i444 {
                 x264_sys::X264_CSP_I444
             } else {
                 x264_sys::X264_CSP_I420
-            } as i32;
+            } | depth_flag) as i32;
+            param.i_bitdepth = bit_depth as i32;
             param.vui.b_fullrange = if is_i444 { 1 } else { 0 };
             param.vui.i_colorprim = 1;
             param.vui.i_transfer = 1;
             param.vui.i_colmatrix = 1;
 
-            let profile = CString::new(if is_i444 { "high444" } else { "baseline" }).unwrap();
+            let profile = CString::new(match (is_i444, bit_depth > 8) {
+                (true, _) => "high444",
+                (false, true) => "high10",
+                (false, false) => "baseline",
+            })
+            .unwrap();
             x264_sys::x264_param_apply_profile(&mut param, profile.as_ptr());
 
             param.i_threads = threads;
@@ -458,6 +667,7 @@ impl H264EncoderWrapper {
                     height,
                     current_crf: crf,
                     is_i444,
+                    bit_depth,
                     is_cbr: cbr_mode,
                     current_bitrate: bitrate_kbps.saturating_abs(),
                     current_vbv: vbv_kbit,
@@ -526,11 +736,12 @@ impl H264EncoderWrapper {
             return;
         }
         if reopen {
-            if let Some(fresh) = H264EncoderWrapper::new(
+            if let Some(fresh) = H264EncoderWrapper::with_depth(
                 self.width,
                 self.height,
                 self.current_crf,
                 self.is_i444,
+                self.bit_depth,
                 new_fps.fps(),
                 self.threads,
                 self.is_cbr,
@@ -595,6 +806,7 @@ impl H264EncoderWrapper {
             self.height,
             self.current_crf,
             self.is_i444,
+            self.bit_depth,
             self.current_fps.fps(),
             self.threads,
             self.is_cbr,
@@ -713,11 +925,15 @@ impl H264EncoderWrapper {
             let mut pic_in: x264_sys::x264_picture_t = std::mem::zeroed();
             x264_sys::x264_picture_init(&mut pic_in);
 
-            pic_in.img.i_csp = if self.is_i444 {
+            pic_in.img.i_csp = (if self.is_i444 {
                 x264_sys::X264_CSP_I444
             } else {
                 x264_sys::X264_CSP_I420
-            } as i32;
+            } | if self.bit_depth > 8 {
+                x264_sys::X264_CSP_HIGH_DEPTH
+            } else {
+                0
+            }) as i32;
             pic_in.img.i_plane = 3;
             pic_in.img.plane[0] = y.as_ptr() as *mut u8;
             pic_in.img.plane[1] = u.as_ptr() as *mut u8;
@@ -732,7 +948,8 @@ impl H264EncoderWrapper {
                 x264_sys::X264_TYPE_AUTO
             } as i32;
             let held = self.held_qp.take();
-            pic_in.i_qpplus1 = held.map_or(x264_sys::X264_QP_AUTO as i32, |q| q + 1);
+            let offset = qp_offset(self.bit_depth);
+            pic_in.i_qpplus1 = held.map_or(x264_sys::X264_QP_AUTO as i32, |q| q + offset + 1);
 
             let mut pic_out: x264_sys::x264_picture_t = std::mem::zeroed();
             let mut nals: *mut x264_sys::x264_nal_t = ptr::null_mut();
@@ -748,7 +965,8 @@ impl H264EncoderWrapper {
 
             if frame_size > 0 {
                 if held.is_none() {
-                    self.last_qp = (pic_out.i_qpplus1 > 0).then(|| (pic_out.i_qpplus1 - 1) as u32);
+                    self.last_qp = (pic_out.i_qpplus1 > 0)
+                        .then(|| (pic_out.i_qpplus1 - 1 - offset).max(0) as u32);
                 }
                 let frame_type = if pic_out.i_type == x264_sys::X264_TYPE_IDR as i32 {
                     FRAME_KEY
@@ -820,8 +1038,14 @@ impl H264EncoderWrapper {
 ///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes
 ///   of the stripe's last frame under its rate control) and `idle_frames` (a constant-rate
 ///   cleanup's run of small frames short of the paint-over quality) tell a cleanup that runs
-///   through the rate control when it has converged or stalled, and `sweep` (the next band's
-///   start and the last band's size, as shares of the picture) carries the band sweep a
+///   through the rate control when it has converged or stalled, `fine_frames` counts its run
+///   of frames at the paint-over quantizer or finer, `measured`, `measuring`,
+///   `level_checks`, and `measure_in` are the last measurement of the picture it is refining,
+///   whether the frame before was measured, the measurements in a row that found it level,
+///   and the frames to the next (`pipeline::plateau`), `settled` records
+///   that such a cleanup ran its course under a rate control it cannot hold a quantizer
+///   under, so no other starts before the region moves, and `sweep` (the next band's start
+///   and the last band's size, as shares of the picture) carries the band sweep a
 ///   full-frame refresh falls back to (`pipeline::decide_hw_fullframe`).
 /// - **Content-hash damage** (only for sources without external damage, i.e. X11): `last_hash` is
 ///   the previous frame's content hash, `consecutive_changes` counts changed frames toward the
@@ -839,6 +1063,12 @@ pub struct StripeState {
     pub clean_quality: bool,
     pub rc_bytes: usize,
     pub idle_frames: u32,
+    pub settled: bool,
+    pub fine_frames: u32,
+    pub measured: Option<f32>,
+    pub measuring: bool,
+    pub level_checks: u32,
+    pub measure_in: u32,
     pub sweep: Option<(f64, f64)>,
     #[cfg(feature = "gpl")]
     pub h264_encoder: Option<H264EncoderWrapper>,
@@ -851,11 +1081,28 @@ pub struct StripeState {
     pub u_buf: Vec<u8>,
     #[cfg(feature = "gpl")]
     pub v_buf: Vec<u8>,
+    /// The planes of a 10-bit stripe, as 16-bit samples.
+    #[cfg(feature = "gpl")]
+    pub yuv16: [Vec<u16>; 3],
     pub packet_buf: Vec<u8>,
     pub last_hash: u64,
     pub consecutive_changes: u32,
     pub in_damage_block: bool,
     pub damage_block_frames_remaining: i32,
+}
+
+/// The bits per sample the striped H.264 path codes `settings` at: 10 where they ask for it
+/// and the build's libx264 opens such a session, else 8.
+pub fn stripe_bit_depth(settings: &RustCaptureSettings) -> u32 {
+    #[cfg(feature = "gpl")]
+    if settings.codec == Codec::H264
+        && settings.video_bit_depth >= 10
+        && H264EncoderWrapper::ten_bit()
+    {
+        return 10;
+    }
+    let _ = settings;
+    8
 }
 
 /// Fast, non-cryptographic 64-bit content hash used only for in-memory change detection.
@@ -1141,6 +1388,8 @@ pub fn encode_cpu(
                 holds,
                 reopens: false,
                 band: None,
+                measures: false,
+                psnr: None,
             },
         )
     };
@@ -1205,6 +1454,8 @@ pub fn encode_cpu(
     let video_po_crf = settings.video_paintover_crf;
     let video_burst = settings.video_paintover_burst_frames;
     let video_fullcolor = settings.video_fullcolor;
+    #[cfg(feature = "gpl")]
+    let bit_depth = stripe_bit_depth(settings);
     let video_streaming = settings.video_streaming_mode;
     let jpeg_q = settings.jpeg_quality;
     let paint_q = settings.paint_over_jpeg_quality;
@@ -1218,6 +1469,8 @@ pub fn encode_cpu(
     // x264 reads the VBV share.
     #[cfg_attr(not(feature = "gpl"), allow(unused_variables))]
     let (video_bitrate, video_vbv) = stripe_rate_control(settings, *carrying, n_processing_stripes);
+    #[cfg(feature = "gpl")]
+    let cleanup_vbv = cleanup_vbv_kbit(settings, video_bitrate).max(video_vbv);
     // Full-frame x264 threads: one fewer than the cores (headroom for the
     // capture thread), clamped to [1, 4] to match the four-slice ceiling below.
     // A full-frame OpenH264 instance applies the same policy internally.
@@ -1295,6 +1548,8 @@ pub fn encode_cpu(
             holds,
             reopens: false,
             band: None,
+            measures: false,
+            psnr: None,
         };
         let refresh_crf = crate::pipeline::held_refresh_quality(settings, quality) as i32;
         if cleanup != Cleanup::None {
@@ -1411,6 +1666,7 @@ pub fn encode_cpu(
                     enc.width != width_usize as i32
                         || enc.height != actual_height as i32
                         || enc.is_i444 != video_fullcolor
+                        || enc.bit_depth != bit_depth
                 } else {
                     true
                 };
@@ -1419,11 +1675,12 @@ pub fn encode_cpu(
                 // constant quality codes it at that rate factor.
                 let x264_crf = if video_cbr { quality_or_crf } else { hold.unwrap_or(quality_or_crf) };
                 if needs_reinit {
-                    stripe_state.h264_encoder = H264EncoderWrapper::new(
+                    stripe_state.h264_encoder = H264EncoderWrapper::with_depth(
                         width_usize as i32,
                         actual_height as i32,
                         x264_crf,
                         video_fullcolor,
+                        bit_depth,
                         target_fps,
                         h264_threads,
                         video_cbr,
@@ -1435,7 +1692,9 @@ pub fn encode_cpu(
                     force_idr = true;
                 } else if let Some(ref mut enc) = stripe_state.h264_encoder {
                     enc.reconfigure_crf(x264_crf);
-                    enc.reconfigure_rate(video_bitrate, video_vbv, target_fps);
+                    let cleaning = converges && stripe_state.h264_burst_frames_remaining > 0;
+                    let vbv = if cleaning { cleanup_vbv } else { video_vbv };
+                    enc.reconfigure_rate(video_bitrate, vbv, target_fps);
                 }
 
                 if let Some(ref mut enc) = stripe_state.h264_encoder {
@@ -1444,34 +1703,56 @@ pub fn encode_cpu(
                     }
                     let y_size = width_usize * actual_height;
                     let uv_size = if video_fullcolor { y_size } else { y_size / 4 };
-                    if stripe_state.y_buf.len() != y_size {
-                        stripe_state.y_buf.resize(y_size, 0);
-                    }
-                    if stripe_state.u_buf.len() != uv_size {
-                        stripe_state.u_buf.resize(uv_size, 0);
-                    }
-                    if stripe_state.v_buf.len() != uv_size {
-                        stripe_state.v_buf.resize(uv_size, 0);
-                    }
-
                     let y_stride = width_usize as i32;
                     let uv_stride =
                         (if video_fullcolor { width_usize } else { width_usize / 2 }) as i32;
-                    let conversion_result = convert_to_yuv_mt(
-                        stripe_bytes,
-                        (width_usize * 4) as u32,
-                        width_usize,
-                        actual_height,
-                        use_gpu,
-                        video_fullcolor,
-                        video_fullcolor,
-                        false,
-                        &mut stripe_state.y_buf,
-                        &mut stripe_state.u_buf,
-                        &mut stripe_state.v_buf,
-                        (y_stride as usize, uv_stride as usize),
-                        csc_bands,
-                    );
+                    let wide = bit_depth > 8;
+                    let conversion_result = if wide {
+                        let [y16, u16, v16] = &mut stripe_state.yuv16;
+                        y16.resize(y_size, 0);
+                        u16.resize(uv_size, 0);
+                        v16.resize(uv_size, 0);
+                        convert_to_yuv10_mt(
+                            stripe_bytes,
+                            width_usize * 4,
+                            width_usize,
+                            actual_height,
+                            use_gpu,
+                            video_fullcolor,
+                            video_fullcolor,
+                            y16,
+                            u16,
+                            v16,
+                            (y_stride as usize, uv_stride as usize),
+                            csc_bands,
+                        );
+                        Ok(())
+                    } else {
+                        if stripe_state.y_buf.len() != y_size {
+                            stripe_state.y_buf.resize(y_size, 0);
+                        }
+                        if stripe_state.u_buf.len() != uv_size {
+                            stripe_state.u_buf.resize(uv_size, 0);
+                        }
+                        if stripe_state.v_buf.len() != uv_size {
+                            stripe_state.v_buf.resize(uv_size, 0);
+                        }
+                        convert_to_yuv_mt(
+                            stripe_bytes,
+                            (width_usize * 4) as u32,
+                            width_usize,
+                            actual_height,
+                            use_gpu,
+                            video_fullcolor,
+                            video_fullcolor,
+                            false,
+                            &mut stripe_state.y_buf,
+                            &mut stripe_state.u_buf,
+                            &mut stripe_state.v_buf,
+                            (y_stride as usize, uv_stride as usize),
+                            csc_bands,
+                        )
+                    };
 
                     if let Err(e) = conversion_result {
                         eprintln!(
@@ -1481,13 +1762,27 @@ pub fn encode_cpu(
                         return None;
                     }
 
+                    let bytes = |plane: &[u16]| unsafe {
+                        std::slice::from_raw_parts(plane.as_ptr().cast::<u8>(), plane.len() * 2)
+                    };
+                    let (y, u, v, scale) = if wide {
+                        let [y16, u16, v16] = &stripe_state.yuv16;
+                        (bytes(y16), bytes(u16), bytes(v16), 2)
+                    } else {
+                        (
+                            stripe_state.y_buf.as_slice(),
+                            stripe_state.u_buf.as_slice(),
+                            stripe_state.v_buf.as_slice(),
+                            1,
+                        )
+                    };
                     if enc.encode_with_headers(
-                        &stripe_state.y_buf,
-                        &stripe_state.u_buf,
-                        &stripe_state.v_buf,
-                        y_stride,
-                        uv_stride,
-                        uv_stride,
+                        y,
+                        u,
+                        v,
+                        y_stride * scale,
+                        uv_stride * scale,
+                        uv_stride * scale,
                         frame_counter,
                         y_start as u16,
                         force_idr,
@@ -1665,6 +1960,28 @@ pub fn stripe_count(height: i32, codec: Codec, fullframe: bool) -> usize {
         .min(MAX_STRIPES)
         .min((height / MIN_STRIPE_HEIGHT) as usize)
         .max(1)
+}
+
+/// Frames of the target a constant-rate x264 stripe is given as its buffer while its cleanup
+/// runs through the rate control: in the session's buffer of a frame and a half x264's
+/// row-level control prices a still screen's whole residual against the buffer and coarsens
+/// the rows it names a fine quantizer for, so a screen of text at 2 Mbit/s at 1080p sat at
+/// 31 dB while the frame quantizer read 19; in four it reached 46 dB in five seconds with no
+/// frame over a budget and a half.
+#[cfg(feature = "gpl")]
+const CLEANUP_VBV_FRAMES: f64 = 4.0;
+
+/// The buffer, in kbit, of a stripe at `bitrate_kbps` while it is cleaned up
+/// (`CLEANUP_VBV_FRAMES`).
+#[cfg(feature = "gpl")]
+fn cleanup_vbv_kbit(settings: &RustCaptureSettings, bitrate_kbps: i32) -> i32 {
+    (crate::encoders::vbv_bits(
+        (bitrate_kbps as u32).saturating_mul(1000),
+        settings.target_fps,
+        0.0,
+        CLEANUP_VBV_FRAMES,
+    ) / 1000)
+        .max(1) as i32
 }
 
 /// Split the configured rate budget across the stripes carrying it, returning the
@@ -2444,6 +2761,224 @@ mod tests {
         );
         let worst = crate::encoders::chroma_siting::worst(&dec.frame().expect("frame"));
         assert!(worst <= 4.0, "JPEG chroma sits {worst:.1} off neutral");
+    }
+
+    /// The 10-bit conversion against the BT.709 arithmetic it implements, at both ranges and
+    /// both chroma formats: every sample within one code value, a 4:2:0 chroma sample being
+    /// the conversion of its block's mean, and the same picture whatever the band count.
+    #[test]
+    fn ten_bit_conversion_matches_bt709() {
+        use super::convert_to_yuv10_mt;
+        let (w, h) = (34usize, 18usize);
+        let mut bgra = vec![0u8; w * h * 4];
+        let mut seed = 0x2545_f491u32;
+        for px in bgra.chunks_exact_mut(4) {
+            for c in px.iter_mut().take(3) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *c = (seed >> 11) as u8;
+            }
+            px[3] = 255;
+        }
+        let reference = |r: f64, g: f64, b: f64, full: bool| {
+            let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            let (cb, cr) = ((b - y) / 1.8556, (r - y) / 1.5748);
+            if full {
+                (
+                    y * 1023.0 / 255.0,
+                    512.0 + cb * 1023.0 / 255.0,
+                    512.0 + cr * 1023.0 / 255.0,
+                )
+            } else {
+                (
+                    64.0 + y * 876.0 / 255.0,
+                    512.0 + cb * 896.0 / 255.0,
+                    512.0 + cr * 896.0 / 255.0,
+                )
+            }
+        };
+        let rgb = |x: usize, y: usize| {
+            let p = &bgra[(y * w + x) * 4..];
+            (p[2] as f64, p[1] as f64, p[0] as f64)
+        };
+        for full in [false, true] {
+            for i444 in [false, true] {
+                let (cw, ch) = if i444 { (w, h) } else { (w / 2, h / 2) };
+                let convert = |bands: usize| {
+                    let (mut y, mut u, mut v) =
+                        (vec![0u16; w * h], vec![0u16; cw * ch], vec![0u16; cw * ch]);
+                    convert_to_yuv10_mt(
+                        &bgra,
+                        w * 4,
+                        w,
+                        h,
+                        false,
+                        i444,
+                        full,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        (w, cw),
+                        bands,
+                    );
+                    (y, u, v)
+                };
+                let (y, u, v) = convert(1);
+                assert_eq!(
+                    (y.clone(), u.clone(), v.clone()),
+                    convert(4),
+                    "bands change nothing"
+                );
+                for row in 0..h {
+                    for col in 0..w {
+                        let (r, g, b) = rgb(col, row);
+                        let want = reference(r, g, b, full).0;
+                        assert!((y[row * w + col] as f64 - want).abs() <= 1.0, "luma");
+                    }
+                }
+                for row in 0..ch {
+                    for col in 0..cw {
+                        let (r, g, b) = if i444 {
+                            rgb(col, row)
+                        } else {
+                            let mut sum = (0.0, 0.0, 0.0);
+                            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                                let p = rgb(2 * col + dx, 2 * row + dy);
+                                sum = (sum.0 + p.0 / 4.0, sum.1 + p.1 / 4.0, sum.2 + p.2 / 4.0);
+                            }
+                            sum
+                        };
+                        let (_, cb, cr) = reference(r, g, b, full);
+                        assert!((u[row * cw + col] as f64 - cb).abs() <= 1.0, "cb");
+                        assert!((v[row * cw + col] as f64 - cr).abs() <= 1.0, "cr");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A 10-bit x264 session takes and reports quantizers on the scale an 8-bit one does: the
+    /// rate factor's first frame reads the same quantizer at either depth, and a key frame held
+    /// at a coarse quantizer comes out as small.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_quantizers_keep_their_scale_at_ten_bits() {
+        use super::H264EncoderWrapper;
+        if !H264EncoderWrapper::ten_bit() {
+            println!("this libx264 was built for 8 bits alone; nothing to check");
+            return;
+        }
+        let (w, h) = (640usize, 360usize);
+        let mut seed = 7u32;
+        let mut noise = |n: usize, amplitude: u32, base: u32| -> Vec<u32> {
+            (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    base + seed % amplitude
+                })
+                .collect()
+        };
+        let (luma, chroma) = (noise(w * h, 60, 90), noise(w * h / 4, 20, 118));
+        let mut seen = Vec::new();
+        for depth in [8u32, 10] {
+            let plane = |samples: &[u32]| -> Vec<u8> {
+                if depth == 10 {
+                    samples
+                        .iter()
+                        .flat_map(|s| ((s * 4) as u16).to_le_bytes())
+                        .collect()
+                } else {
+                    samples.iter().map(|s| *s as u8).collect()
+                }
+            };
+            let (y, c) = (plane(&luma), plane(&chroma));
+            let bytes = (depth as usize).div_ceil(8);
+            let mut enc = H264EncoderWrapper::with_depth(
+                w as i32, h as i32, 25, false, depth, 30.0, 1, false, 0, 0, 0, 0,
+            )
+            .expect("x264 init");
+            let encode = |enc: &mut H264EncoderWrapper, id: u16| {
+                let mut out = Vec::new();
+                assert!(enc.encode_with_headers(
+                    &y,
+                    &c,
+                    &c,
+                    (w * bytes) as i32,
+                    (w / 2 * bytes) as i32,
+                    (w / 2 * bytes) as i32,
+                    id,
+                    0,
+                    true,
+                    true,
+                    &mut out,
+                ));
+                out.len()
+            };
+            encode(&mut enc, 0);
+            let rate_factor_qp = enc.last_qp().expect("a quantizer");
+            enc.hold_quantizer(45);
+            seen.push((rate_factor_qp, encode(&mut enc, 1)));
+        }
+        let ((qp8, held8), (qp10, held10)) = (seen[0], seen[1]);
+        assert!(
+            qp8.abs_diff(qp10) <= 2,
+            "rate factor quantizers {qp8} and {qp10}"
+        );
+        assert!(
+            held10 < 2 * held8,
+            "held key frames of {held8} and {held10} bytes"
+        );
+    }
+
+    /// A 10-bit x264 session declares High 10, or High 4:4:4 Predictive, and codes the
+    /// 16-bit planes it is handed.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_codes_ten_bits() {
+        use super::H264EncoderWrapper;
+        if !H264EncoderWrapper::ten_bit() {
+            println!("this libx264 was built for 8 bits alone; nothing to check");
+            return;
+        }
+        let (w, h) = (64usize, 64usize);
+        for (i444, profile) in [(false, 110u8), (true, 244u8)] {
+            let mut enc = H264EncoderWrapper::with_depth(
+                w as i32, h as i32, 25, i444, 10, 30.0, 1, false, 0, 0, 0, 0,
+            )
+            .expect("x264 init");
+            assert_eq!(enc.bit_depth, 10);
+            let (cw, ch) = if i444 { (w, h) } else { (w / 2, h / 2) };
+            let planes = [
+                vec![400u16; w * h],
+                vec![512u16; cw * ch],
+                vec![600u16; cw * ch],
+            ];
+            let bytes = |p: &[u16]| unsafe {
+                std::slice::from_raw_parts(p.as_ptr().cast::<u8>(), p.len() * 2).to_vec()
+            };
+            let (y, u, v) = (bytes(&planes[0]), bytes(&planes[1]), bytes(&planes[2]));
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(
+                &y,
+                &u,
+                &v,
+                (w * 2) as i32,
+                (cw * 2) as i32,
+                (cw * 2) as i32,
+                0,
+                0,
+                true,
+                true,
+                &mut out,
+            ));
+            let sps = crate::encoders::codec::annexb_nals(&out)
+                .find(|n| n[0] & 0x1f == 7)
+                .expect("a sequence parameter set");
+            assert_eq!(sps[1], profile, "the profile declared");
+        }
     }
 }
 

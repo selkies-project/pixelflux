@@ -86,12 +86,21 @@ before-all = """
             make install)
     }
 
+    # x265 fixes its sample depth at compile time, so the 10-bit encoder is built
+    # first as a static library and linked into the 8-bit one, which then answers
+    # x265_api_get(10) as well.
     build_x265() {
         (cd /tmp && \
             clone_source 4.2 x265 https://bitbucket.org/multicoreware/x265_git.git && \
             cd x265 && \
+            cmake -S source -B build10 -DCMAKE_BUILD_TYPE=Release -DHIGH_BIT_DEPTH=ON \
+                -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF \
+                -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+            cmake --build build10 -j$(nproc) && \
+            mkdir -p build && cp build10/libx265.a build/libx265_main10.a && \
             cmake -S source -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
-                -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF && \
+                -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF \
+                -DEXTRA_LIB=x265_main10.a -DEXTRA_LINK_FLAGS=-L/tmp/x265/build -DLINKED_10BIT=ON && \
             cmake --build build -j$(nproc) && \
             cmake --install build)
     }
@@ -111,7 +120,7 @@ before-all = """
             clone_source v1.15.2 libvpx https://chromium.googlesource.com/webm/libvpx https://github.com/webmproject/libvpx.git && \
             cd libvpx && \
             ./configure --prefix=/usr/local --enable-shared --disable-static --disable-examples \
-                --disable-tools --disable-docs --disable-unit-tests \
+                --disable-tools --disable-docs --disable-unit-tests --enable-vp9-highbitdepth \
                 $([ "$(uname -m)" = x86_64 ] && echo --as=nasm) && \
             make -j$(nproc) && \
             make install)

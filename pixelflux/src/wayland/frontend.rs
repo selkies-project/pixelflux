@@ -291,6 +291,13 @@ pub struct OutputNode {
     /// overlap.
     pub pos: (i32, i32),
     pub damage_tracker: OutputDamageTracker,
+    /// What changed on the output between one software-rendered frame and the next, apart
+    /// from `damage_tracker`'s answer, which is what the buffer rendered into has to have
+    /// repainted: that render goes straight into a pool buffer, and one the encoder held
+    /// through a slow frame is older than the tracker's history, so repainting it damages
+    /// the whole output though nothing on it changed. Built on the first such frame, and
+    /// again after the output changes size.
+    pub content_tracker: Option<OutputDamageTracker>,
     /// Host-side scratch target: pixman throttle path renders here, GLES screenshots read
     /// back here.
     pub frame_buffer: Vec<u8>,

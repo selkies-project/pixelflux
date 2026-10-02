@@ -19,7 +19,10 @@
 //! Pixels reach the codec on a VA surface -- a Wayland dmabuf imported in place, or a packed
 //! host frame uploaded -- and the video processor converts to the surface format on the GPU,
 //! so no colorspace conversion happens on the CPU. Chroma follows `video_fullcolor` where the
-//! codec carries 4:4:4 (HEVC, and VP9 as profile 1): a 4:4:4 session tries the surface formats
+//! codec carries 4:4:4 (HEVC, and VP9 as profile 1), and the sample depth `video_bit_depth`
+//! where the driver encodes the codec's 10-bit profile (HEVC Main 10 and Main 4:4:4 10, VP9
+//! profiles 2 and 3, AV1), a session staying at 8 bits where it does not. A 4:4:4 session
+//! tries the surface formats
 //! the driver allocates and its video processor renders, read through a `VAProfileNone`
 //! configuration, until one survives the surface pool, the convert, and the codec open. Every
 //! session converts with the BT.709 matrix the sRGB source's own primaries and transfer belong
@@ -90,10 +93,32 @@ pub enum Input {
 /// convert, so neither is nearer the host.
 const FULLCOLOR_FOURCCS: [u32; 2] = [VA_FOURCC_444P, VA_FOURCC_XYUV];
 
+/// The surface formats a session of this chroma and sample depth tries, in order.
+fn surface_fourccs(fullcolor: bool, bit_depth: u32) -> &'static [u32] {
+    match (fullcolor, bit_depth) {
+        (false, 10) => &[VA_FOURCC_P010],
+        (true, 10) => &[VA_FOURCC_Y410],
+        (true, _) => &FULLCOLOR_FOURCCS,
+        (false, _) => &[VA_FOURCC_NV12],
+    }
+}
+
+/// The render target format of a chroma and sample depth.
+fn rt_format(fullcolor: bool, bit_depth: u32) -> u32 {
+    match (fullcolor, bit_depth) {
+        (false, 10) => VA_RT_FORMAT_YUV420_10,
+        (true, 10) => VA_RT_FORMAT_YUV444_10,
+        (true, _) => VA_RT_FORMAT_YUV444,
+        (false, _) => VA_RT_FORMAT_YUV420,
+    }
+}
+
 /// The name of a surface format, for the session log.
 pub(crate) fn fourcc_name(fourcc: u32) -> String {
     match fourcc {
         VA_FOURCC_NV12 => "nv12".into(),
+        VA_FOURCC_P010 => "p010".into(),
+        VA_FOURCC_Y410 => "y410".into(),
         VA_FOURCC_444P => "yuv444p".into(),
         VA_FOURCC_XYUV => "vuyx".into(),
         VA_FOURCC_BGRA => "bgra".into(),
@@ -124,6 +149,52 @@ unsafe extern "C" fn log_info(_user: *mut c_void, message: *const c_char) {
                 .trim_end()
         );
     }
+}
+
+/// What bounds the frames of a constant-rate session, by what the driver's rate control does
+/// with each bound.
+///
+/// A buffer of `vbv_bits` (a frame and a half) with every frame capped at it is the tightest,
+/// and the default. Intel's iHD stops coding under it: measured on an Arc A750 at 1080p and
+/// 60 fps, its H.264 and HEVC rate controls skip every block and pad the frame with zeros up
+/// to the target once the buffer or the cap binds, and its AV1 one spends a third of the
+/// target, so a scroll sat at 19 to 20 dB at 2, 8, and 30 Mbit/s alike and a still screen was
+/// never refined. So on that driver H.264 and HEVC run with no bound of their own, where a
+/// still screen of text at 2 Mbit/s reaches 46 to 51 dB, and AV1, which takes no cap, in a
+/// buffer of `IHD_AV1_BUFFER_S`, which halved its largest frame. The driver's low-delay frame
+/// tolerance holds an H.264 frame to three budgets, but leaves a still screen of dense text
+/// at 27 dB, every block skipped; a cap of six budgets cost HEVC 3 dB. Its VP9 refines in
+/// the default buffer and keeps it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ConstantRate {
+    /// The session's buffer, and the frame cap where the driver takes one.
+    Buffer,
+    /// No buffer and no cap.
+    Unbounded,
+    /// A buffer of this many seconds of the target and no cap.
+    Seconds(f64),
+}
+
+/// Seconds of the target iHD's AV1 rate control is given as a buffer (`ConstantRate`).
+const IHD_AV1_BUFFER_S: f64 = 0.1;
+
+/// The rows a reconstruction is compared with its source on (`VaapiEncoder::last_psnr`): one
+/// in this many.
+const PSNR_ROW_STEP: usize = 8;
+
+/// The PSNR under which a reconstruction is no picture of its source (`picture_psnr`): the
+/// coarsest quantizer leaves a screen of text near 19 dB.
+const UNREADABLE_DB: f32 = 12.0;
+
+/// Drop the zero bytes a driver's constant rate pads an H.264 or HEVC frame with (iHD fills a
+/// frame up to the target after the last slice): trailing zero bytes are no part of a NAL
+/// unit, whose last byte carries the stop bit.
+fn strip_zero_padding(out: &mut Vec<u8>, from: usize) {
+    let end = out[from..]
+        .iter()
+        .rposition(|&b| b != 0)
+        .map_or(from, |i| from + i + 1);
+    out.truncate(end);
 }
 
 /// A VA display opened on a render node, terminated with the device.
@@ -264,6 +335,19 @@ impl Device {
             vendor,
             vce,
         })
+    }
+
+    /// Whether the driver's video processor, converting to 4:2:0, reads a linear surface at a
+    /// pitch rounded up to 64 bytes rather than the one its import declares, as Intel's does:
+    /// such a surface converts sheared unless its pitch is already a multiple of 64.
+    fn rounds_linear_pitch(&self) -> bool {
+        self.vendor.contains("Intel")
+    }
+
+    /// Whether the driver's rate control stops coding in a buffer of a frame or two, as Intel's
+    /// iHD does (`ConstantRate`).
+    fn starves_in_a_small_buffer(&self) -> bool {
+        self.vendor.contains("iHD")
     }
 
     fn check(&self, status: VAStatus, what: &str) -> Result<(), String> {
@@ -491,13 +575,17 @@ fn error_text(api: &VaApi, status: VAStatus) -> String {
 /// `vainfo` reports and what a session checks first. The device is opened the way a session
 /// opens it and released. An error names the step that failed: no such node, no VA driver on
 /// it, or a libva the probe cannot reach.
-pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, bool)>, String> {
+pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<Served>, String> {
     probe_codecs_on(&Device::open(libva()?, encode_node_index)?)
 }
 
-/// `probe_codecs` on an open device: each codec a profile of its 4:2:0 ladder encodes, and
-/// whether the profile its 4:4:4 session opens under encodes and renders 4:4:4 surfaces too.
-pub(crate) fn probe_codecs_on(device: &Device) -> Result<Vec<(Codec, bool)>, String> {
+/// A codec a device encodes, with the formats it encodes the codec in.
+pub(crate) type Served = (Codec, super::Formats);
+
+/// `probe_codecs` on an open device: each codec a profile of its 8-bit 4:2:0 ladder encodes,
+/// and whether the profile each other format's session opens under encodes and renders that
+/// format's surfaces too.
+pub(crate) fn probe_codecs_on(device: &Device) -> Result<Vec<Served>, String> {
     let profiles = device.profiles()?;
     let entrypoints = |profile: VAProfile| {
         if profiles.contains(&profile) {
@@ -509,39 +597,54 @@ pub(crate) fn probe_codecs_on(device: &Device) -> Result<Vec<(Codec, bool)>, Str
     Ok(Codec::VIDEO
         .into_iter()
         .filter(|&codec| {
-            profile_ladder(codec, false)
+            profile_ladder(codec, false, 8)
                 .into_iter()
                 .any(|p| !entrypoints(p).is_empty())
         })
         .map(|codec| {
-            let fullcolor = profile_ladder(codec, true).into_iter().any(|p| {
-                entrypoints(p).into_iter().any(|e| {
-                    device
-                        .attribute(p, e, VAConfigAttribRTFormat)
-                        .is_none_or(|f| f & VA_RT_FORMAT_YUV444 != 0)
-                })
-            });
-            (codec, fullcolor)
+            let carries = |fullcolor: bool, bit_depth: u32| {
+                profile_ladder(codec, fullcolor, bit_depth)
+                    .into_iter()
+                    .any(|p| {
+                        entrypoints(p).into_iter().any(|e| {
+                            device
+                                .attribute(p, e, VAConfigAttribRTFormat)
+                                .is_none_or(|f| f & rt_format(fullcolor, bit_depth) != 0)
+                        })
+                    })
+            };
+            (
+                codec,
+                super::Formats {
+                    fullcolor: carries(true, 8),
+                    ten_bit: [carries(false, 10), carries(true, 10)],
+                },
+            )
         })
         .collect())
 }
 
-/// The VA profiles a session opens under, in order of preference: for 4:2:0, the ones an
-/// 8-bit session comes up as; for a 4:4:4 request, the profile that carries it, or nothing
-/// where the codec has none the session serves.
-fn profile_ladder(codec: Codec, fullcolor: bool) -> Vec<VAProfile> {
-    match (codec, fullcolor) {
-        (Codec::H264, false) => vec![
+/// The VA profiles a session opens under, in order of preference: for 8-bit 4:2:0, the ones
+/// such a session comes up as; for 4:4:4 or 10 bits, the profile that carries the format, or
+/// nothing where the codec has none the session serves. AV1's main profile carries both of
+/// its depths, told apart by the surface format.
+fn profile_ladder(codec: Codec, fullcolor: bool, bit_depth: u32) -> Vec<VAProfile> {
+    match (codec, fullcolor, bit_depth) {
+        (Codec::H264, false, 8) => vec![
             VAProfileH264High,
             VAProfileH264Main,
             VAProfileH264ConstrainedBaseline,
         ],
-        (Codec::H265, false) => vec![VAProfileHEVCMain],
-        (Codec::H265, true) => vec![VAProfileHEVCMain444],
-        (Codec::Vp8, false) => vec![VAProfileVP8Version0_3],
-        (Codec::Vp9, false) => vec![VAProfileVP9Profile0],
-        (Codec::Vp9, true) => vec![VAProfileVP9Profile1],
-        (Codec::Av1, false) => vec![VAProfileAV1Profile0],
+        (Codec::H265, false, 8) => vec![VAProfileHEVCMain],
+        (Codec::H265, false, 10) => vec![VAProfileHEVCMain10],
+        (Codec::H265, true, 8) => vec![VAProfileHEVCMain444],
+        (Codec::H265, true, 10) => vec![VAProfileHEVCMain444_10],
+        (Codec::Vp8, false, 8) => vec![VAProfileVP8Version0_3],
+        (Codec::Vp9, false, 8) => vec![VAProfileVP9Profile0],
+        (Codec::Vp9, true, 8) => vec![VAProfileVP9Profile1],
+        (Codec::Vp9, false, 10) => vec![VAProfileVP9Profile2],
+        (Codec::Vp9, true, 10) => vec![VAProfileVP9Profile3],
+        (Codec::Av1, false, 8 | 10) => vec![VAProfileAV1Profile0],
         _ => Vec::new(),
     }
 }
@@ -613,6 +716,7 @@ pub(super) struct Negotiated {
     /// sequence declares.
     pub dpb_level: u32,
     pub fullcolor: bool,
+    pub bit_depth: u32,
     /// The quantizer bounds of a constant-rate session in the codec's own domain, 0 for none.
     pub min_qp: u32,
     pub max_qp: u32,
@@ -762,6 +866,15 @@ pub struct VaapiEncoder {
     held: Option<u32>,
     /// Whether the driver caps each coded frame at the size a constant-rate session names.
     frame_cap: bool,
+    /// The bytes of the last coded frame, padding aside.
+    last_bytes: Option<usize>,
+    /// The quality index of the average quantizer the driver reported for it.
+    last_quality: Option<u32>,
+    /// Whether the next frame is measured, the last measurement (`last_psnr`), and whether
+    /// the driver's surfaces have been readable so far (`measures`).
+    measure: bool,
+    last_psnr: Option<f32>,
+    measures: bool,
     /// The quality level asked of the driver: the highest it takes, its fastest, where libva's
     /// level 1 is the best quality and the slowest; None where it reports none.
     quality_level: Option<u32>,
@@ -835,39 +948,38 @@ impl VaapiEncoder {
         input: Input,
     ) -> Result<Self, String> {
         let fullcolor = settings.video_fullcolor && codec.fullcolor();
-        let ladder = profile_ladder(codec, fullcolor);
-        if ladder.is_empty() {
-            return Err(format!(
-                "no VA-API profile carries {} 4:4:4",
-                codec.display()
-            ));
-        }
-        let listed = device.profiles()?;
-        let (profile, entrypoints) = ladder
-            .iter()
-            .filter(|p| listed.contains(p))
-            .map(|&p| (p, device.encode_entrypoints(p)))
-            .find(|(_, entrypoints)| !entrypoints.is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "this VA-API driver encodes no {} {}",
-                    codec.display(),
-                    super::chroma_name(fullcolor)
-                )
-            })?;
-        let mut last = None;
-        let formats: Vec<u32> = if fullcolor {
-            FULLCOLOR_FOURCCS.to_vec()
+        let depths: &[u32] = if settings.video_bit_depth >= 10 && codec.high_bit_depth() {
+            &[10, 8]
         } else {
-            vec![VA_FOURCC_NV12]
+            &[8]
         };
-        for entrypoint in entrypoints {
-            for &fourcc in &formats {
-                match Self::open(
-                    &device, settings, codec, input, profile, entrypoint, fourcc, fullcolor,
-                ) {
-                    Ok(session) => return Ok(session),
-                    Err(e) => last = Some(e),
+        let listed = device.profiles()?;
+        let mut last = None;
+        for &bit_depth in depths {
+            let served = profile_ladder(codec, fullcolor, bit_depth)
+                .into_iter()
+                .filter(|p| listed.contains(p))
+                .map(|p| (p, device.encode_entrypoints(p)))
+                .find(|(_, entrypoints)| !entrypoints.is_empty());
+            let Some((profile, entrypoints)) = served else {
+                last.get_or_insert_with(|| {
+                    format!(
+                        "this VA-API driver encodes no {} {} at {bit_depth} bits",
+                        codec.display(),
+                        super::chroma_name(fullcolor)
+                    )
+                });
+                continue;
+            };
+            for entrypoint in entrypoints {
+                for &fourcc in surface_fourccs(fullcolor, bit_depth) {
+                    match Self::open(
+                        &device, settings, codec, input, profile, entrypoint, fourcc, fullcolor,
+                        bit_depth,
+                    ) {
+                        Ok(session) => return Ok(session),
+                        Err(e) => last = Some(e),
+                    }
                 }
             }
         }
@@ -886,15 +998,12 @@ impl VaapiEncoder {
         entrypoint: VAEntrypoint,
         fourcc: u32,
         fullcolor: bool,
+        bit_depth: u32,
     ) -> Result<Self, String> {
         let api = device.api;
         let rate = RateSettings::new(settings);
         let rc_mode = if rate.cbr { VA_RC_CBR } else { VA_RC_CQP };
-        let rt_format = if fullcolor {
-            VA_RT_FORMAT_YUV444
-        } else {
-            VA_RT_FORMAT_YUV420
-        };
+        let rt_format = rt_format(fullcolor, bit_depth);
         let width = settings.width.max(1) as u32;
         let height = settings.height.max(1) as u32;
         let fps = rate.fps;
@@ -908,7 +1017,7 @@ impl VaapiEncoder {
         if let Some(formats) = device.attribute(profile, entrypoint, VAConfigAttribRTFormat) {
             if formats & rt_format == 0 {
                 return Err(format!(
-                    "the {} entry point renders no {} surfaces",
+                    "the {} entry point renders no {} {bit_depth}-bit surfaces",
                     fourcc_name(fourcc),
                     super::chroma_name(fullcolor)
                 ));
@@ -962,6 +1071,7 @@ impl VaapiEncoder {
                 profile,
                 device.attribute(profile, entrypoint, VAConfigAttribEncHEVCFeatures),
                 device.attribute(profile, entrypoint, VAConfigAttribEncHEVCBlockSizes),
+                device.attribute(profile, entrypoint, VAConfigAttribPredictionDirection),
             )),
             Codec::Vp8 => Arm::Vp8(vp8::Arm::new()),
             Codec::Vp9 => Arm::Vp9(vp9::Arm::new()),
@@ -1033,6 +1143,7 @@ impl VaapiEncoder {
                 dpb,
                 dpb_level,
                 fullcolor,
+                bit_depth,
                 min_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.min_qp),
                 max_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.max_qp),
             },
@@ -1055,6 +1166,11 @@ impl VaapiEncoder {
             qp: codec.hardware_quantizer(Hardware::Vaapi, settings.video_crf),
             held: None,
             frame_cap: false,
+            last_bytes: None,
+            last_quality: None,
+            measure: false,
+            last_psnr: None,
+            measures: true,
             quality_level: None,
             sequence_start: true,
             omit_headers: settings.omit_stripe_headers,
@@ -1175,8 +1291,11 @@ fn arm_block(arm: &Arm) -> u32 {
 
 /// How many slices a picture of `rows` block rows is cut into and how many rows each
 /// takes, for `wanted` slices under the driver's slice structure and at most `max_slices`:
-/// arbitrary rows as asked, a power of two of rows where that is all the driver takes, one row
-/// each where it takes only equal rows.
+/// arbitrary rows as asked, equal rows with a shorter last slice where the driver wants them
+/// equal (iHD's H.264), a power of two of rows where that is all it takes, one row each
+/// where it takes only that. A slice a row is 68 slices at 1080p, none predicting from the
+/// row above and each restarting the entropy coder: on an Arc A750 a scroll of text at one
+/// quantizer cost 12.4 kB a frame so cut and 8.6 kB in four slices, at the same PSNR.
 fn slice_layout(
     structure: u32,
     max_slices: u32,
@@ -1196,6 +1315,9 @@ fn slice_layout(
             k *= 2;
         }
         (rows.div_ceil(k), k)
+    } else if structure & VA_ENC_SLICE_STRUCTURE_EQUAL_MULTI_ROWS != 0 {
+        let size = rows.div_ceil(wanted);
+        (rows.div_ceil(size), size)
     } else if structure & VA_ENC_SLICE_STRUCTURE_EQUAL_ROWS != 0 {
         (rows, 1)
     } else {
@@ -1352,6 +1474,11 @@ impl VaapiEncoder {
         self.negotiated.fullcolor
     }
 
+    /// The bits per sample the session opened at.
+    pub fn bit_depth(&self) -> u32 {
+        self.negotiated.bit_depth
+    }
+
     /// The name of the surface format frames reach the codec in, for the session log.
     pub fn surface_format_name(&self) -> String {
         fourcc_name(self.fourcc)
@@ -1440,6 +1567,129 @@ impl VaapiEncoder {
         self.rate.cbr
     }
 
+    /// The bytes of the last frame coded, the driver's padding aside: what tells a
+    /// constant-rate cleanup the rate control has nothing left to refine.
+    pub fn last_size(&self) -> Option<usize> {
+        self.last_bytes
+    }
+
+    /// The quality index the rate control last coded a frame at: for H.264 and HEVC where the
+    /// driver reports a picture's average quantizer with its coded buffer (iHD does), for AV1
+    /// and VP9 the `base_q_idx` it wrote into the frame header. A picture that is mostly skipped
+    /// blocks reports near the quantizer its slices open at, so the figure is trusted for
+    /// having reached a quality, never for the lack of it.
+    pub fn last_quality(&self) -> Option<u32> {
+        self.last_quality
+    }
+
+    /// Whether `measure` yields a measurement: until a surface turns out unreadable, as the
+    /// reconstruction of iHD's packed 4:4:4 does, kept at another geometry than its source.
+    pub fn measures(&self) -> bool {
+        self.measures
+    }
+
+    /// Measure the next frame's reconstruction against its source (`last_psnr`).
+    pub fn measure(&mut self) {
+        self.measure = true;
+    }
+
+    /// The luma PSNR, in dB, of the last frame measured: its reconstruction against the
+    /// converted picture it was coded from, both read back on every `PSNR_ROW_STEP`th row.
+    /// What tells a constant-rate cleanup whether the driver's rate control is still refining
+    /// a still screen, whatever the driver says of its quantizer; None where a surface cannot
+    /// be read as the picture's rows.
+    pub fn last_psnr(&self) -> Option<f32> {
+        self.last_psnr
+    }
+
+    /// The sampled luma rows of `surface`, as 8-bit samples (the high eight bits of a 10-bit
+    /// one), with the format and the rows the driver keeps it in.
+    fn luma_rows(&self, surface: VASurfaceID) -> Option<(u32, u16, Vec<u8>)> {
+        let api = self.device.api;
+        let display = self.device.display;
+        let mut image: VAImage = unsafe { std::mem::zeroed() };
+        if unsafe { (api.vaDeriveImage)(display, surface, &mut image) }
+            != VA_STATUS_SUCCESS as VAStatus
+        {
+            return None;
+        }
+        let fourcc = image.format.fourcc;
+        let (bytes, luma) = match fourcc {
+            VA_FOURCC_NV12 | VA_FOURCC_444P => (1, 0),
+            VA_FOURCC_P010 => (2, 1),
+            VA_FOURCC_XYUV | VA_FOURCC_Y410 => (4, 2),
+            _ => (0, 0),
+        };
+        let mut address: *mut c_void = ptr::null_mut();
+        let mut rows = None;
+        if bytes > 0
+            && image.height as u32 >= self.negotiated.height
+            && unsafe { (api.vaMapBuffer)(display, image.buf, &mut address) }
+                == VA_STATUS_SUCCESS as VAStatus
+        {
+            let width = (self.negotiated.width as usize).min(image.width as usize);
+            let height = self.negotiated.height as usize;
+            let (offset, pitch) = (image.offsets[0] as usize, image.pitches[0] as usize);
+            let mut out = Vec::with_capacity(width * height.div_ceil(PSNR_ROW_STEP));
+            for y in (0..height).step_by(PSNR_ROW_STEP) {
+                let row = unsafe {
+                    std::slice::from_raw_parts(
+                        (address as *const u8).add(offset + y * pitch),
+                        width * bytes,
+                    )
+                };
+                if fourcc == VA_FOURCC_Y410 {
+                    out.extend(
+                        row.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|p| ((u32::from_le_bytes(*p) >> 12) & 0xff) as u8),
+                    );
+                } else {
+                    out.extend(row.iter().skip(luma).step_by(bytes));
+                }
+            }
+            unsafe { (api.vaUnmapBuffer)(display, image.buf) };
+            rows = Some((fourcc, image.height, out));
+        }
+        unsafe { (api.vaDestroyImage)(display, image.image_id) };
+        rows
+    }
+
+    /// The luma PSNR of `recon` against the converted picture, over the sampled rows; None
+    /// where the driver keeps the reconstruction in another layout than the source, which
+    /// would read as noise: iHD's of 10-bit HEVC and VP9 reports `P016` for `p010`, its packed
+    /// 4:4:4 one fewer rows, and either measured under `UNREADABLE_DB`.
+    fn picture_psnr(&self, recon: VASurfaceID) -> Option<f32> {
+        let (format, rows, source) = self.luma_rows(self.converted[0])?;
+        let (coded_format, coded_rows, coded) = self.luma_rows(recon)?;
+        if (format, rows) != (coded_format, coded_rows) || source.is_empty() {
+            return None;
+        }
+        let sse: u64 = source
+            .iter()
+            .zip(&coded)
+            .map(|(&a, &b)| {
+                let d = a as i64 - b as i64;
+                (d * d) as u64
+            })
+            .sum();
+        let mse = (sse as f64 / source.len() as f64).max(1e-3);
+        Some((10.0 * (255.0 * 255.0 / mse).log10()) as f32).filter(|&db| db >= UNREADABLE_DB)
+    }
+
+    /// How this driver's rate control is bounded (`ConstantRate`).
+    fn constant_rate(&self) -> ConstantRate {
+        if !self.device.starves_in_a_small_buffer() {
+            return ConstantRate::Buffer;
+        }
+        match self.arm {
+            Arm::H264(_) | Arm::H265(_) => ConstantRate::Unbounded,
+            Arm::Av1(_) => ConstantRate::Seconds(IHD_AV1_BUFFER_S),
+            Arm::Vp8(_) | Arm::Vp9(_) => ConstantRate::Buffer,
+        }
+    }
+
     /// Encode the next frame at the quantizer the quality index `crf` selects, and leave the
     /// session's own quantizer for the frame after: the cleanup of a still screen, at a constant
     /// quantizer. A constant-rate session codes the frame under its rate control: radeonsi drops
@@ -1454,7 +1704,8 @@ impl VaapiEncoder {
 
     /// The rate control of a sequence: the target, buffer, and frame rate a constant-rate
     /// session holds, with no filler data up to the target and each frame capped at the buffer
-    /// where the driver takes a cap, and the frame rate and quality level of any.
+    /// where the driver takes a cap and codes under one (`ConstantRate`), and the frame rate
+    /// and quality level of any.
     fn rate_control(&self, out: &mut Buffers) {
         if self.rate.cbr {
             let bps = self.negotiated.bits_per_second;
@@ -1473,18 +1724,26 @@ impl VaapiEncoder {
             rc.basic_unit_size = 0;
             rc.ICQ_quality_factor = 1;
             rc.quality_factor = 0;
+            let bound = self.constant_rate();
             unsafe {
                 rc.rc_flags.bits.set_mb_rate_control(2);
                 rc.rc_flags.bits.set_disable_bit_stuffing(1);
             }
             out.push_misc(VAEncMiscParameterTypeRateControl, &rc);
-            let hrd = VAEncMiscParameterHRD {
-                initial_buffer_fullness: vbv,
-                buffer_size: vbv,
-                va_reserved: [0; 4],
+            let buffer = match bound {
+                ConstantRate::Buffer => Some(vbv),
+                ConstantRate::Seconds(s) => Some((bps as f64 * s) as u32),
+                ConstantRate::Unbounded => None,
             };
-            out.push_misc(VAEncMiscParameterTypeHRD, &hrd);
-            if self.frame_cap {
+            if let Some(bits) = buffer {
+                let hrd = VAEncMiscParameterHRD {
+                    initial_buffer_fullness: bits,
+                    buffer_size: bits,
+                    va_reserved: [0; 4],
+                };
+                out.push_misc(VAEncMiscParameterTypeHRD, &hrd);
+            }
+            if self.frame_cap && bound == ConstantRate::Buffer {
                 let cap = VAEncMiscParameterBufferMaxFrameSize {
                     type_: VAEncMiscParameterTypeMaxFrameSize,
                     max_frame_size: vbv,
@@ -1629,6 +1888,17 @@ impl VaapiEncoder {
             other => return Err(format!("DRM format {other:#x} is not one VA-API maps")),
         };
         let planes: Vec<(u32, u32)> = dmabuf.strides().zip(dmabuf.offsets()).collect();
+        let modifier = u64::from(dmabuf.format().modifier);
+        if modifier == 0
+            && !self.negotiated.fullcolor
+            && self.device.rounds_linear_pitch()
+            && !planes[0].0.is_multiple_of(64)
+        {
+            return Err(format!(
+                "this VA-API driver reads a linear surface at a 64-byte pitch, not the {} of this dmabuf",
+                planes[0].0
+            ));
+        }
         let mut surface = VA_INVALID_SURFACE;
         let mut attribs: [VASurfaceAttrib; 2] = unsafe { std::mem::zeroed() };
         attribs[0].type_ = VASurfaceAttribMemoryType;
@@ -1637,7 +1907,6 @@ impl VaapiEncoder {
         attribs[1].type_ = VASurfaceAttribExternalBufferDescriptor;
         attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
         attribs[1].value.type_ = VAGenericValueTypePointer;
-        let modifier = u64::from(dmabuf.format().modifier);
         if modifier != 0x00ff_ffff_ffff_ffff {
             let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
             desc.fourcc = fourcc;
@@ -1872,6 +2141,10 @@ impl VaapiEncoder {
         };
         let mut output = vec![0; header_len];
         self.issue(&out, &mut output)?;
+        if std::mem::take(&mut self.measure) {
+            self.last_psnr = self.picture_psnr(recon);
+            self.measures = self.last_psnr.is_some();
+        }
         if key
             && self.codec == Codec::H264
             && let Some(bounded) = self.reorder.apply(&output[header_len..])
@@ -2013,6 +2286,10 @@ impl VaapiEncoder {
             )
             .filter(|s| !s.buf.is_null())
         };
+        let from = out.len();
+        let average_qp = segments()
+            .next()
+            .map_or(0, |s| s.status & VA_CODED_BUF_STATUS_PICTURE_AVE_QP_MASK);
         out.reserve(segments().map(|s| s.size as usize).sum());
         for s in segments() {
             out.extend_from_slice(unsafe {
@@ -2020,6 +2297,19 @@ impl VaapiEncoder {
             });
         }
         unsafe { (api.vaUnmapBuffer)(display, self.coded) };
+        if self.rate.cbr && matches!(self.arm, Arm::H264(_) | Arm::H265(_)) {
+            strip_zero_padding(out, from);
+        }
+        self.last_bytes = Some(out.len() - from);
+        let quantizer = match &self.arm {
+            Arm::H264(_) | Arm::H265(_) => Some(average_qp).filter(|&q| q > 0),
+            Arm::Av1(a) => a.coded_qindex(&out[from..]),
+            Arm::Vp9(_) => super::codec::vp9_base_q_idx(&out[from..]),
+            Arm::Vp8(_) => None,
+        };
+        self.last_quality = quantizer
+            .filter(|_| self.rate.cbr)
+            .map(|q| self.codec.hardware_quality_index(Hardware::Vaapi, q));
         Ok(())
     }
 }
@@ -2137,14 +2427,33 @@ mod tests {
         assert_eq!(fourcc_name(VA_FOURCC_XYUV), "vuyx");
         assert_eq!(fourcc_name(VA_FOURCC_444P), "yuv444p");
         assert!(
-            profile_ladder(Codec::H264, true).is_empty(),
+            profile_ladder(Codec::H264, true, 8).is_empty(),
             "no 4:4:4 H.264 profile is served"
         );
-        assert_eq!(profile_ladder(Codec::H265, true), [VAProfileHEVCMain444]);
-        assert_eq!(profile_ladder(Codec::Vp9, true), [VAProfileVP9Profile1]);
-        assert!(profile_ladder(Codec::Av1, true).is_empty());
+        assert_eq!(profile_ladder(Codec::H265, true, 8), [VAProfileHEVCMain444]);
+        assert_eq!(profile_ladder(Codec::Vp9, true, 8), [VAProfileVP9Profile1]);
+        assert!(profile_ladder(Codec::Av1, true, 8).is_empty());
+        assert_eq!(
+            profile_ladder(Codec::H265, false, 10),
+            [VAProfileHEVCMain10]
+        );
+        assert_eq!(
+            profile_ladder(Codec::H265, true, 10),
+            [VAProfileHEVCMain444_10]
+        );
+        assert_eq!(
+            profile_ladder(Codec::Vp9, false, 10),
+            [VAProfileVP9Profile2]
+        );
+        assert_eq!(profile_ladder(Codec::Vp9, true, 10), [VAProfileVP9Profile3]);
+        assert_eq!(
+            profile_ladder(Codec::Av1, false, 10),
+            [VAProfileAV1Profile0]
+        );
+        assert!(profile_ladder(Codec::H264, false, 10).is_empty());
+        assert!(profile_ladder(Codec::Vp8, false, 10).is_empty());
         for codec in Codec::VIDEO {
-            assert!(!profile_ladder(codec, false).is_empty(), "{codec:?}");
+            assert!(!profile_ladder(codec, false, 8).is_empty(), "{codec:?}");
         }
     }
 
@@ -2194,9 +2503,9 @@ mod tests {
         );
     }
 
-    /// Slices follow the driver's structure: as many rows as asked where rows are free, a
-    /// power of two of rows where that is all the driver takes, and one row each where only
-    /// equal rows are.
+    /// Slices follow the driver's structure: as many rows as asked where rows are free, equal
+    /// rows where the driver wants them equal, a power of two of rows where that is all it
+    /// takes, and one row each where only that is.
     #[test]
     fn slice_layout_follows_the_driver() {
         assert_eq!(
@@ -2214,6 +2523,25 @@ mod tests {
         assert!(
             slice_layout(VA_ENC_SLICE_STRUCTURE_EQUAL_ROWS, 32, 68, 4).is_err(),
             "more slices than the driver takes"
+        );
+        assert_eq!(
+            slice_layout(
+                VA_ENC_SLICE_STRUCTURE_EQUAL_ROWS | VA_ENC_SLICE_STRUCTURE_EQUAL_MULTI_ROWS,
+                256,
+                68,
+                4
+            ),
+            Ok((4, 17)),
+            "equal rows of more than one where the driver offers both"
+        );
+        assert_eq!(
+            slice_layout(VA_ENC_SLICE_STRUCTURE_EQUAL_MULTI_ROWS, 32, 68, 4),
+            Ok((4, 17))
+        );
+        assert_eq!(
+            slice_layout(VA_ENC_SLICE_STRUCTURE_EQUAL_MULTI_ROWS, 32, 67, 4),
+            Ok((4, 17)),
+            "the last slice is the shorter one"
         );
         assert!(slice_layout(0, 32, 68, 4).is_err());
         assert_eq!(

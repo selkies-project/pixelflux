@@ -11,13 +11,15 @@
 //! quote rather than assert; configured through `PF_BENCH_*`:
 //!
 //! `CODEC` (h264, h265, vp8, vp9, av1, jpeg), `CPU` (1 forces software), `FULLFRAME` (1),
+//! `FULLCOLOR` (1 for 4:4:4), `DEPTH` (bits per sample),
 //! `TURBO` (1), `CBR` (1), `KBPS`, `CRF`, `PAINT_CRF`, `PAINT` (use_paint_over_quality, 1),
 //! `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `CARET` (frames per caret toggle, 0 none),
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
 //! moving `JUMP` rows at once: a window opening on a clean still screen), `TARGET_DB` (the PSNR
 //! whose time to reach it is reported), `SSIM` (1 measures SSIM on every frame, not only from the
-//! stop), and `ROWS` (a file for every frame's figures). Each run reports its largest frame and
+//! stop), `ROWS` (a file for every frame's figures), `STREAM` (a file for the coded stream), and
+//! `SOURCE` (a file for the last frame's BGRA rows). Each run reports its largest frame and
 //! the worst wait a frame meets behind the ones before it on a 12, 20, 50, and 100 Mbit/s link.
 //!
 //! `cargo test --release --lib cleanup_bench::cleanup_bench -- --exact --ignored --nocapture
@@ -256,6 +258,9 @@ fn cleanup_bench() {
         damage_block_duration: 20,
         jpeg_quality: env("JPEG_Q", 40),
         paint_over_jpeg_quality: env("PAINT_JPEG_Q", 90),
+        video_vbv_multiplier: env("VBV", 0.0),
+        video_fullcolor: env("FULLCOLOR", 0) == 1,
+        video_bit_depth: env("DEPTH", 8),
         ..Default::default()
     };
     let motion: usize = env("MOTION", 90);
@@ -304,6 +309,9 @@ fn cleanup_bench() {
     let mut records: Vec<(i64, usize, String, f64, f64, f64)> = Vec::new();
     let mut sent: Vec<(f64, usize)> = Vec::new();
     let rows_path = std::env::var("PF_BENCH_ROWS").ok();
+    let mut stream = std::env::var("PF_BENCH_STREAM")
+        .ok()
+        .map(|path| std::fs::File::create(&path).unwrap_or_else(|e| panic!("{path}: {e}")));
     let mut frame = vec![0u8; w * 4 * h];
     for t in 0..total {
         let scroll = if t < motion {
@@ -340,6 +348,9 @@ fn cleanup_bench() {
                 )
             };
             kinds.push(kind);
+            if let Some(file) = stream.as_mut() {
+                std::io::Write::write_all(file, payload).expect("stream");
+            }
             let dec = decoders
                 .entry(s.stripe_y_start)
                 .or_insert_with(|| match codec {
@@ -403,6 +414,9 @@ fn cleanup_bench() {
             if measure { last_psnr } else { -1.0 },
             last_ssim,
         ));
+    }
+    if let Ok(path) = std::env::var("PF_BENCH_SOURCE") {
+        std::fs::write(&path, &frame).unwrap_or_else(|e| panic!("{path}: {e}"));
     }
     if let Some(path) = rows_path {
         let rows: Vec<String> = records
@@ -526,6 +540,7 @@ impl Session {
                 settings.width as usize,
                 settings.height as usize,
                 false,
+                8,
             );
             return (Session::X264(Box::new(enc), planes), "x264".into());
         }

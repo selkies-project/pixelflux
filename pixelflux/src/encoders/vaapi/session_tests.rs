@@ -111,8 +111,11 @@ fn nal(stream: &[u8], kind: u8, h265: bool) -> Vec<u8> {
 fn every_codec_comes_up_and_asks_for_what_it_needs() {
     for codec in Codec::VIDEO {
         mock::reset(Driver::generous());
-        let (served, fullcolor): (Vec<Codec>, Vec<bool>) =
-            probe_codecs_on(&device()).unwrap().into_iter().unzip();
+        let (served, fullcolor): (Vec<Codec>, Vec<bool>) = probe_codecs_on(&device())
+            .unwrap()
+            .into_iter()
+            .map(|(codec, formats)| (codec, formats.fullcolor))
+            .unzip();
         assert_eq!(served, Codec::VIDEO.to_vec());
         assert_eq!(
             fullcolor,
@@ -129,7 +132,7 @@ fn every_codec_comes_up_and_asks_for_what_it_needs() {
         mock::with(|d| {
             let (profile, entrypoint, attribs) = &d.configs[0];
             assert_eq!(*entrypoint, VAEntrypointEncSliceLP);
-            assert_eq!(*profile, profile_ladder(codec, false)[0], "{codec:?}");
+            assert_eq!(*profile, profile_ladder(codec, false, 8)[0], "{codec:?}");
             let value = |kind| attribs.iter().find(|a| a.type_ == kind).map(|a| a.value);
             assert_eq!(value(VAConfigAttribRTFormat), Some(VA_RT_FORMAT_YUV420));
             assert_eq!(value(VAConfigAttribRateControl), Some(VA_RC_CQP));
@@ -1066,7 +1069,7 @@ fn a_driver_writing_its_own_headers_tracks_no_reference() {
     let served: Vec<Codec> = probe_codecs_on(&device())
         .unwrap()
         .into_iter()
-        .map(|(codec, _)| codec)
+        .map(|(codec, ..)| codec)
         .collect();
     assert_eq!(served, [Codec::H264, Codec::Vp8, Codec::Vp9, Codec::H265]);
 }
@@ -1744,4 +1747,187 @@ fn the_hevc_sequence_declares_a_finite_intra_period() {
             "its next power of two does not overflow"
         );
     });
+}
+
+/// A driver that also lists the 10-bit profiles and renders their surfaces.
+fn ten_bit_driver() -> Driver {
+    let mut driver = Driver::generous();
+    driver.profiles.extend([
+        VAProfileHEVCMain10,
+        VAProfileHEVCMain444_10,
+        VAProfileVP9Profile2,
+        VAProfileVP9Profile3,
+    ]);
+    for attribute in &mut driver.attributes {
+        if attribute.0 == VAConfigAttribRTFormat {
+            attribute.1 |= VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV444_10;
+        }
+    }
+    driver
+        .surface_fourccs
+        .extend([VA_FOURCC_P010, VA_FOURCC_Y410]);
+    driver
+}
+
+/// A 10-bit request opens the codec's 10-bit profile on that depth's surfaces where the
+/// driver lists one and declares it in the stream, and comes up at 8 bits where the driver
+/// lists none or the codec has none.
+#[test]
+fn ten_bit_follows_the_driver() {
+    for codec in Codec::VIDEO {
+        mock::reset(Driver::generous());
+        let mut s = settings(codec, false);
+        s.video_bit_depth = 10;
+        let enc = open(codec, &s).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(enc.bit_depth(), 8, "{codec:?} on a driver without 10 bits");
+    }
+    for (codec, fullcolor, profile, format, surfaces) in [
+        (
+            Codec::H265,
+            false,
+            VAProfileHEVCMain10,
+            VA_RT_FORMAT_YUV420_10,
+            "p010",
+        ),
+        (
+            Codec::H265,
+            true,
+            VAProfileHEVCMain444_10,
+            VA_RT_FORMAT_YUV444_10,
+            "y410",
+        ),
+        (
+            Codec::Vp9,
+            false,
+            VAProfileVP9Profile2,
+            VA_RT_FORMAT_YUV420_10,
+            "p010",
+        ),
+        (
+            Codec::Vp9,
+            true,
+            VAProfileVP9Profile3,
+            VA_RT_FORMAT_YUV444_10,
+            "y410",
+        ),
+        (
+            Codec::Av1,
+            false,
+            VAProfileAV1Profile0,
+            VA_RT_FORMAT_YUV420_10,
+            "p010",
+        ),
+    ] {
+        mock::reset(ten_bit_driver());
+        let mut s = settings(codec, false);
+        s.video_bit_depth = 10;
+        s.video_fullcolor = fullcolor;
+        let mut enc = open(codec, &s).unwrap_or_else(|e| panic!("{codec:?}: {e}"));
+        assert_eq!(enc.bit_depth(), 10, "{codec:?}");
+        assert_eq!(enc.is_fullcolor(), fullcolor, "{codec:?}");
+        assert_eq!(enc.surface_format_name(), surfaces, "{codec:?}");
+        mock::with(|d| {
+            let (opened, _, attribs) = &d.configs[0];
+            assert_eq!(*opened, profile, "{codec:?}");
+            let rt = attribs
+                .iter()
+                .find(|a| a.type_ == VAConfigAttribRTFormat)
+                .map(|a| a.value);
+            assert_eq!(rt, Some(format), "{codec:?}");
+        });
+        if codec == Codec::H265 {
+            let key = encode(&mut enc, 0, true);
+            let sps = nal(&key[VIDEO_HEADER_LEN..], 33, true);
+            let mut r = Reader {
+                bytes: &sps,
+                pos: 0,
+            };
+            r.u(4 + 3 + 1 + 2 + 1);
+            assert_eq!(
+                r.u(5),
+                if fullcolor { 4 } else { 2 },
+                "the profile declared"
+            );
+        }
+    }
+    for codec in [Codec::H264, Codec::Vp8] {
+        mock::reset(ten_bit_driver());
+        let mut s = settings(codec, false);
+        s.video_bit_depth = 10;
+        assert_eq!(
+            open(codec, &s).unwrap().bit_depth(),
+            8,
+            "{codec:?} has no 10 bits"
+        );
+    }
+    mock::reset(ten_bit_driver());
+    let ten_bit: Vec<(Codec, [bool; 2])> = probe_codecs_on(&device())
+        .unwrap()
+        .into_iter()
+        .map(|(codec, formats)| (codec, formats.ten_bit))
+        .collect();
+    assert_eq!(
+        ten_bit,
+        [
+            (Codec::H264, [false, false]),
+            (Codec::Vp8, [false, false]),
+            (Codec::Vp9, [true, true]),
+            (Codec::Av1, [true, false]),
+            (Codec::H265, [true, true]),
+        ]
+    );
+}
+
+/// A driver that asks for both reference lists of a predicted slice gets a B slice naming
+/// the one reference in each, in the slice header and in the slice parameters; one that asks
+/// nothing gets the P slice.
+#[test]
+fn hevc_predicts_in_the_direction_the_driver_takes() {
+    for (direction, slice_type) in [
+        (None, 1u32),
+        (Some(VA_PREDICTION_DIRECTION_PREVIOUS), 1),
+        (
+            Some(
+                VA_PREDICTION_DIRECTION_PREVIOUS
+                    | VA_PREDICTION_DIRECTION_FUTURE
+                    | VA_PREDICTION_DIRECTION_BI_NOT_EMPTY,
+            ),
+            0,
+        ),
+    ] {
+        let mut driver = Driver::generous();
+        if let Some(direction) = direction {
+            driver
+                .attributes
+                .push((VAConfigAttribPredictionDirection, direction));
+        }
+        mock::reset(driver);
+        let mut enc = session(Codec::H265, false);
+        encode(&mut enc, 0, true);
+        let delta = encode(&mut enc, 1, false);
+        let slice = nal(&delta[VIDEO_HEADER_LEN..], 1, true);
+        let mut r = Reader {
+            bytes: &slice,
+            pos: 0,
+        };
+        assert_eq!(r.u(1), 1, "the first slice of the picture");
+        assert_eq!(r.ue(), 0);
+        assert_eq!(r.ue(), slice_type, "{direction:?}");
+        mock::with(|d| {
+            for bytes in d.last_buffers(VAEncSliceParameterBufferType) {
+                let s: VAEncSliceParameterBufferHEVC =
+                    unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
+                assert_eq!(s.slice_type as u32, slice_type, "{direction:?}");
+                assert_ne!(s.ref_pic_list0[0].picture_id, VA_INVALID_ID);
+                assert_eq!(
+                    s.ref_pic_list1[0].picture_id != VA_INVALID_ID,
+                    slice_type == 0,
+                    "the second list is named only for a B slice"
+                );
+                if slice_type == 0 {
+                    assert_eq!(s.ref_pic_list1[0].picture_id, s.ref_pic_list0[0].picture_id);
+                }
+            }
+        });
+    }
 }

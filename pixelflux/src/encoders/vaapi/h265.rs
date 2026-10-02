@@ -5,11 +5,15 @@
  */
 
 //! The HEVC arm: the sequence, picture, and slice parameters, the packed VPS, SPS, PPS, and slice
-//! headers, and the reference picture set behind them. Main profile, or Main 4:4:4 for a 4:4:4
-//! session, with the coding tools and block sizes the driver reports, one reference per slice,
-//! and a decoded picture buffer of the frames the level admits: every slice header carries an
-//! explicit short-term reference picture set naming the frames the decoder keeps, with the
-//! newest one the client still has as the one used.
+//! headers, and the reference picture set behind them. Main profile, Main 10 at 10 bits, or the
+//! range extensions' Main 4:4:4 and Main 4:4:4 10 for a 4:4:4 session, with the coding tools
+//! and block sizes the driver reports, one reference per slice, and a decoded picture buffer of
+//! the frames the level admits: every slice header carries an explicit short-term reference
+//! picture set naming the frames the decoder keeps, with the newest one the client still has
+//! as the one used. Where the driver says a predicted slice has to carry both reference lists
+//! (`VA_PREDICTION_DIRECTION_BI_NOT_EMPTY`, Intel's low-power encoder), a predicted frame is a B
+//! slice whose two lists name that same frame, which codes what a P slice would: such an
+//! encoder fails a P slice on some generations and takes it on others.
 
 use va_sys::*;
 
@@ -52,6 +56,8 @@ pub(super) struct Arm {
     dpb: u32,
     pic_init_qp: u32,
     cu_qp_delta: bool,
+    /// Whether a predicted frame is coded as a B slice with the one reference in both lists.
+    low_delay_b: bool,
     sequence: VAEncSequenceParameterBufferHEVC,
     headers: Vec<u8>,
 }
@@ -59,7 +65,12 @@ pub(super) struct Arm {
 impl Arm {
     /// The arm on `profile`, with the driver's feature and block-size attributes where it
     /// reports them.
-    pub(super) fn new(profile: VAProfile, features: Option<u32>, block_sizes: Option<u32>) -> Self {
+    pub(super) fn new(
+        profile: VAProfile,
+        features: Option<u32>,
+        block_sizes: Option<u32>,
+        prediction: Option<u32>,
+    ) -> Self {
         let mut tools = Tools {
             ctu_size: 32,
             min_cb_size: 16,
@@ -108,6 +119,7 @@ impl Arm {
             dpb: 1,
             pic_init_qp: PIC_INIT_QP_CBR,
             cu_qp_delta: false,
+            low_delay_b: prediction.is_some_and(|p| p & VA_PREDICTION_DIRECTION_BI_NOT_EMPTY != 0),
             sequence: unsafe { std::mem::zeroed() },
             headers: Vec::new(),
         }
@@ -126,8 +138,18 @@ impl Arm {
         self.slices
     }
 
-    fn profile_tier_level(&self, w: &mut BitWriter, fullcolor: bool) {
-        let profile_idc: u32 = if fullcolor { 4 } else { 1 };
+    /// The profile a session declares: the range extensions for 4:4:4, else Main 10 or Main.
+    fn profile_idc(n: &Negotiated) -> u32 {
+        match (n.fullcolor, n.bit_depth) {
+            (true, _) => 4,
+            (false, 10) => 2,
+            (false, _) => 1,
+        }
+    }
+
+    fn profile_tier_level(&self, w: &mut BitWriter, n: &Negotiated) {
+        let (fullcolor, bit_depth) = (n.fullcolor, n.bit_depth);
+        let profile_idc = Self::profile_idc(n);
         w.u(2, 0);
         w.u(1, self.tier as u64);
         w.u(5, profile_idc as u64);
@@ -150,7 +172,7 @@ impl Arm {
         if profile_idc == 4 {
             w.flag(true);
             w.flag(true);
-            w.flag(true);
+            w.flag(bit_depth == 8);
             w.flag(!fullcolor);
             w.flag(!fullcolor);
             w.flag(false);
@@ -208,7 +230,7 @@ impl Arm {
         w.u(3, 0);
         w.flag(true);
         w.u(16, 0xffff);
-        self.profile_tier_level(&mut w, n.fullcolor);
+        self.profile_tier_level(&mut w, n);
         w.flag(false);
         w.ue(self.dpb);
         w.ue(0);
@@ -229,7 +251,7 @@ impl Arm {
         w.u(4, 0);
         w.u(3, 0);
         w.flag(true);
-        self.profile_tier_level(&mut w, n.fullcolor);
+        self.profile_tier_level(&mut w, n);
         w.ue(0);
         w.ue(if n.fullcolor { 3 } else { 1 });
         if n.fullcolor {
@@ -244,8 +266,8 @@ impl Arm {
             w.ue(0);
             w.ue((surface_height - n.height) >> chroma_shift);
         }
-        w.ue(0);
-        w.ue(0);
+        w.ue(n.bit_depth - 8);
+        w.ue(n.bit_depth - 8);
         w.ue(LOG2_MAX_POC_LSB_MINUS4);
         w.flag(false);
         w.ue(self.dpb);
@@ -344,7 +366,7 @@ impl Arm {
 
         let s = &mut self.sequence;
         *s = unsafe { std::mem::zeroed() };
-        s.general_profile_idc = if n.fullcolor { 4 } else { 1 };
+        s.general_profile_idc = Self::profile_idc(n) as u8;
         s.general_level_idc = self.level_idc as u8;
         s.general_tier_flag = self.tier as u8;
         s.intra_period = 1 << (4 + LOG2_MAX_POC_LSB_MINUS4);
@@ -356,6 +378,8 @@ impl Arm {
         unsafe {
             let f = &mut s.seq_fields.bits;
             f.set_chroma_format_idc(if n.fullcolor { 3 } else { 1 });
+            f.set_bit_depth_luma_minus8(n.bit_depth - 8);
+            f.set_bit_depth_chroma_minus8(n.bit_depth - 8);
             f.set_amp_enabled_flag(t.amp as u32);
             f.set_sample_adaptive_offset_enabled_flag(t.sao as u32);
             f.set_pcm_enabled_flag(t.pcm as u32);
@@ -469,7 +493,11 @@ impl Arm {
             let address = first_row * self.ctb_width;
             let count = rows * self.ctb_width;
             let last = i + 1 == slice_count;
-            let slice_type: u32 = if frame.key { 2 } else { 1 };
+            let slice_type: u32 = match (frame.key, self.low_delay_b) {
+                (true, _) => 2,
+                (false, true) => 0,
+                (false, false) => 1,
+            };
 
             if n.packed & VA_ENC_PACKED_HEADER_SLICE != 0 {
                 let mut w = BitWriter::new();
@@ -507,6 +535,12 @@ impl Arm {
                 }
                 if !frame.key {
                     w.flag(false);
+                    if self.low_delay_b {
+                        w.flag(false);
+                        if t.temporal_mvp {
+                            w.flag(true);
+                        }
+                    }
                     w.ue(0);
                 }
                 w.se(slice_qp_delta);
@@ -526,6 +560,9 @@ impl Arm {
             slice.ref_pic_list1 = [invalid; 15];
             if let Some((pts, surface)) = frame.reference {
                 slice.ref_pic_list0[0] = picture(pts, surface);
+                if self.low_delay_b {
+                    slice.ref_pic_list1[0] = picture(pts, surface);
+                }
             }
             slice.max_num_merge_cand = 5;
             slice.slice_qp_delta = slice_qp_delta as i8;

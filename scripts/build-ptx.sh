@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerate the ARGB→NV12 convert's PTX from its CUDA source.
+# Regenerate the PTX of the ARGB→NV12 convert and its 10-bit kernels from their CUDA source.
 #
 # The encoder ships PTX rather than a cubin so `libcuda`'s own JIT compiles it for whatever GPU
 # is present, which is what keeps the NVENC path free of a runtime CUDA compiler. Two edits make

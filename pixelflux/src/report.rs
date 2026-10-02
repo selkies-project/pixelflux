@@ -45,6 +45,7 @@ pub struct StreamInfo {
     pub encoder_reason: String,
     pub codec: &'static str,
     pub fullcolor: bool,
+    pub bit_depth: u32,
     pub full_range: bool,
     pub stripes: usize,
     pub gpu: String,
@@ -258,9 +259,15 @@ pub fn stream(
         }
         info.codec = settings.codec.name();
         info.fullcolor = fullcolor;
+        info.bit_depth = 8;
         info.full_range = full_range;
         info.stripes = stripes;
     });
+}
+
+/// The bits per sample the session's encoder runs at, where that is not the 8 `stream` records.
+pub fn bit_depth(depth: u32) {
+    record(|info| info.bit_depth = depth);
 }
 
 /// How the Wayland compositor renders, which every capture of it shares: `gl` on a render

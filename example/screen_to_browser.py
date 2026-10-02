@@ -108,6 +108,8 @@ def build_capture_settings():
     cs.video_paintover_burst_frames = 5
     # Use I444 (full color) instead of I420. Better quality, higher CPU/bandwidth.
     cs.video_fullcolor = False
+    # Bits per sample, 8 or 10: 10 where an encoder of the codec carries it, in software where the GPU does not.
+    cs.video_bit_depth = 8
     # Encode full frames instead of just changed stripes.
     cs.video_fullframe = False
     # Flag the stream to be in streaming mode to bypass all vnc logic
