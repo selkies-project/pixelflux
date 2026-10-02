@@ -42,6 +42,19 @@ before-all = """
         return 1
     }
 
+    # A mirror still syncing an update answers 404 for the repodata the index it
+    # was handed names, and dnf gives up once every mirror has, so the install
+    # is retried with fresh metadata over the few minutes a sync takes.
+    dnf_install() {
+        for attempt in 1 2 3 4; do
+            dnf install -y --disablerepo='epel*' "$@" && return 0
+            echo "dnf_install: failed (attempt ${attempt}/4)" >&2
+            dnf clean metadata
+            sleep $((attempt * 30))
+        done
+        return 1
+    }
+
     # The same native builds on both platforms, so a wheel carries the same
     # native code whichever libc it targets. No distro package is used for any
     # of them: manylinux has none, Alpine's are GPL builds auditwheel would
@@ -145,7 +158,7 @@ before-all = """
     # PowerTools, so no third-party repository (RPM Fusion, EPEL) is added, and
     # the EPEL one the image carries is left out of the install.
     if command -v dnf; then
-        dnf install -y --disablerepo='epel*' \
+        dnf_install \
             curl \
             clang \
             pixman-devel \
