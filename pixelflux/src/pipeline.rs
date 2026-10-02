@@ -71,6 +71,12 @@ const FALLBACK_TRIGGERS: u32 = 6;
 /// Seconds a constant-rate cleanup through the rate control flows at most.
 const CONVERGE_S: f64 = 10.0;
 
+/// Frame budgets the rate control's frames of a still screen exceed for a trigger period when it
+/// is pinned at its coarsest quantizer, refining nothing within the rate: NVENC's H.264 codes a
+/// still screen of texture at 0.1 Mbit/s at 1080p in 3.3 kB frames, 16 budgets, at quantizer 51,
+/// where at 2 Mbit/s single frames after a change reach 4.5 budgets.
+const OVERSHOOT_BUDGETS: f64 = 2.0;
+
 /// The same for a session that holds no quantizer but says the one it codes at or measures its
 /// pictures, which has no refresh to fall back to and ends its cleanup at the paint-over
 /// quantizer or once the picture stops improving: at 2 Mbit/s at 1080p x265's rate control
@@ -482,10 +488,19 @@ pub fn periodic_idr_due(settings: &RustCaptureSettings, frame_counter: u16) -> b
 /// screen at the paint-over quantizer after heavy motion at a low rate would cost many frames of
 /// budget at once.
 pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality) -> u32 {
+    refresh_quality(settings, encoder, 1.0)
+}
+
+/// `held_refresh_quality` from a rate control's last frame of `spent` frame budgets rather than
+/// one: a rate control pinned at its coarsest quantizer (`OVERSHOOT_BUDGETS`) refreshed in one
+/// held frame, which then costs that much more.
+fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spent: f64) -> u32 {
     let paint = settings.video_paintover_crf.max(0) as u32;
     match (settings.video_cbr_mode, encoder.last) {
         (true, Some(last)) => {
-            let frames = (crate::encoders::HELD_KEY_BUDGET_S * settings.target_fps).max(1.0);
+            let frames = (crate::encoders::HELD_KEY_BUDGET_S * settings.target_fps
+                / spent.max(1.0))
+            .max(1.0);
             paint.max(last.saturating_sub((6.0 * frames.log2()).floor() as u32))
         }
         _ => paint,
@@ -520,10 +535,16 @@ pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQual
 ///    band a frame where the encoder holds one (`FIRST_BAND`, `BAND_BUDGETS`) until the sweep
 ///    has covered it or motion ends it, else one held frame; at 2 Mbit/s at 1080p a key frame
 ///    capped to `HELD_KEY_BUDGET_S` of the target came out coarser than the picture it cleaned
-///    (35.9 dB), where the refresh reached 44.2. A session that reports its frames' bytes but
-///    holds no quantizer at a constant rate (VA-API, x265, kvazaar, libvpx's VP9) has no
-///    refresh to fall back to, so its frames flow, each the rate control's, until the picture
-///    is done: where the session measures its reconstruction against its source (VA-API,
+///    (35.9 dB), where the refresh reached 44.2. A rate control whose frames of the still screen
+///    run over `OVERSHOOT_BUDGETS` for a trigger period is pinned at its coarsest quantizer and
+///    refines nothing within the rate, and every frame of a sweep would carry the rest of the
+///    picture at that cost: NVENC's at 0.1 Mbit/s codes a still 1080p screen of texture in
+///    16-budget frames, and its sweep sent 4.7 MB in 40 s without ending. Such a screen is
+///    refreshed at once in one held frame, coarsened to what `HELD_KEY_BUDGET_S` buys at those
+///    frames' size, and a burst that has no refresh to fall back to ends. A session that reports
+///    its frames' bytes but holds no quantizer at a constant rate (VA-API, x265, kvazaar, libvpx's
+///    VP9) has no refresh to fall back to, so its frames flow, each the rate control's, until the
+///    picture is done: where the session measures its reconstruction against its source (VA-API,
 ///    `plateau`) until that stops improving, else after a trigger period of frames at the
 ///    paint-over quantizer; and in either case after `STALL_TRIGGERS` periods of small frames
 ///    or `REFINE_S`. A fixed burst left such a screen where the motion did (19 to 27 dB at
@@ -539,7 +560,8 @@ pub fn held_refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQual
 /// 2. **Recovery keyframe**: a requested or scheduled IDR, at the rate control's own quality: it
 ///    answers a join or a loss, often on a link that just fell behind, where a key frame the
 ///    size of a cleanup would only fall behind again. On a still screen it opens the burst,
-///    which lasts until the rate control converges where the cleanup runs through it.
+///    which lasts until the rate control converges where the cleanup runs through it, or is
+///    pinned (`OVERSHOOT_BUDGETS`).
 /// 3. **Recovery burst**: the frames after a keyframe or cleanup on a still screen keep flowing
 ///    so rate control settles, until motion resumes: after a cleanup held at the refresh's
 ///    quantizer where the paint-over one still improves on the rate control's, so they go on
@@ -638,6 +660,7 @@ pub fn decide_hw_fullframe(
             if (st.h264_burst_frames_remaining <= 0 && !st.settled) || recovery_idr {
                 st.h264_burst_frames_remaining = cleanup_frames(settings, encoder);
                 st.idle_frames = 0;
+                st.over_frames = 0;
                 st.fine_frames = 0;
                 st.measured = None;
                 st.level_checks = 0;
@@ -665,13 +688,25 @@ pub fn decide_hw_fullframe(
         d.hold_band = Some((from, to));
         return d;
     }
+    let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
+    let trigger = settings.paint_over_trigger_frames.max(1);
     if converges && st.h264_burst_frames_remaining > 0 {
-        match convergence(
-            encoder.last,
-            encoder.bytes,
-            paint_qp,
-            frame_budget(settings.video_bitrate_kbps, settings.target_fps),
-        ) {
+        st.over_frames = if encoder
+            .bytes
+            .is_some_and(|b| b as f64 > budget * OVERSHOOT_BUDGETS)
+        {
+            st.over_frames.saturating_add(1)
+        } else {
+            0
+        };
+    }
+    let pinned = converges && st.h264_burst_frames_remaining > 0 && st.over_frames >= trigger;
+    if pinned && !(improves && encoder.holds) {
+        st.h264_burst_frames_remaining = 0;
+        st.settled = !encoder.holds;
+    }
+    if converges && st.h264_burst_frames_remaining > 0 {
+        match convergence(encoder.last, encoder.bytes, paint_qp, budget) {
             Convergence::Converged if !encoder.measures => {
                 st.h264_burst_frames_remaining = 0;
                 st.change_mass = 0.0;
@@ -692,7 +727,6 @@ pub fn decide_hw_fullframe(
         st.h264_burst_frames_remaining -= 1;
         d.send = true;
         d.hold_qp = (st.burst_held && improves).then_some(refresh_qp);
-        let trigger = settings.paint_over_trigger_frames.max(1);
         let elapsed = (converge_frames(settings) - st.h264_burst_frames_remaining).max(0) as u32;
         let stalled = st.idle_frames >= STALL_TRIGGERS * trigger;
         if converges && !encoder.holds {
@@ -704,10 +738,21 @@ pub fn decide_hw_fullframe(
                 st.h264_burst_frames_remaining = 0;
                 st.settled = true;
             }
-        } else if converges && improves && (stalled || elapsed >= FALLBACK_TRIGGERS * trigger) {
-            d.hold_qp = Some(refresh_qp);
+        } else if converges
+            && improves
+            && (stalled || pinned || elapsed >= FALLBACK_TRIGGERS * trigger)
+        {
+            d.hold_qp = Some(if pinned {
+                refresh_quality(
+                    settings,
+                    encoder,
+                    encoder.bytes.unwrap_or(0) as f64 / budget,
+                )
+            } else {
+                refresh_qp
+            });
             st.h264_burst_frames_remaining = 0;
-            if encoder.band.is_some() {
+            if encoder.band.is_some() && !pinned {
                 d.hold_band = Some((0.0, FIRST_BAND));
                 st.sweep = Some((FIRST_BAND, FIRST_BAND));
             }
@@ -1851,6 +1896,106 @@ mod tests {
             Some(held_refresh_quality(&s, crawling))
         );
         assert!(still[held[0] + 1..].iter().all(|d| !d.send));
+    }
+
+    /// A rate control pinned at its coarsest quantizer on a still screen, its frames many budgets
+    /// each, is refreshed by one held frame at once, coarsened to what a second of the target buys
+    /// at the bytes its frames take, and the cleanup ends: a band sweep would carry the rest of
+    /// every frame at that quantizer.
+    #[test]
+    fn a_rate_control_pinned_at_its_coarsest_quantizer_is_refreshed_once() {
+        let s = RustCaptureSettings {
+            video_bitrate_kbps: 100,
+            ..hw_settings()
+        };
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let pinned = EncoderQuality {
+            last: Some(51),
+            bytes: Some((budget * 16.0) as usize),
+            holds: true,
+            reopens: false,
+            band: Some(0),
+            measures: false,
+            psnr: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
+        let still: Vec<HwFrameDecision> = (1..=200)
+            .map(|i| decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, pinned))
+            .collect();
+        let sent: Vec<usize> = still
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.send)
+            .map(|(i, _)| i)
+            .collect();
+        let trigger = s.paint_over_trigger_frames as usize;
+        let refresh = 2 * trigger - 1;
+        assert_eq!(
+            sent,
+            (trigger - 1..=refresh).collect::<Vec<_>>(),
+            "a trigger period through the rate control, then the refresh"
+        );
+        assert_eq!(
+            (still[refresh].hold_qp, still[refresh].hold_band),
+            (Some(40), None),
+            "frames of 16 budgets leave 11 steps of the 35 a second buys"
+        );
+    }
+
+    /// A key frame asked for on a still screen with the paint-over off opens a burst through the
+    /// rate control, which ends at once where the rate control is pinned at its coarsest quantizer.
+    #[test]
+    fn a_pinned_rate_control_ends_a_recovery_burst() {
+        let s = RustCaptureSettings {
+            video_bitrate_kbps: 100,
+            use_paint_over_quality: false,
+            ..hw_settings()
+        };
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let pinned = EncoderQuality {
+            last: Some(51),
+            bytes: Some((budget * 16.0) as usize),
+            holds: true,
+            reopens: false,
+            band: Some(0),
+            measures: false,
+            psnr: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
+        assert!((1..=20).all(|i| {
+            !decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, pinned).send
+        }));
+        let key = decide_hw_fullframe(&mut st, &s, 21, Damage::None, false, true, pinned);
+        assert!(key.send && key.force_idr);
+        let trigger = s.paint_over_trigger_frames as u16;
+        assert!(
+            (22..21 + trigger).all(|i| decide_hw_fullframe(
+                &mut st,
+                &s,
+                i,
+                Damage::None,
+                false,
+                false,
+                pinned
+            )
+            .send),
+            "its burst until a trigger period over the budget"
+        );
+        assert!(
+            (21 + trigger..=200).all(|i| !decide_hw_fullframe(
+                &mut st,
+                &s,
+                i,
+                Damage::None,
+                false,
+                false,
+                pinned
+            )
+            .send),
+            "and no more"
+        );
     }
 
     #[test]

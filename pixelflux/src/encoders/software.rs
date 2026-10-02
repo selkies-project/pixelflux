@@ -1041,14 +1041,15 @@ impl H264EncoderWrapper {
 ///   paint-over quantizer where `burst_held`), and `dirty_run`, `change_mass`, `unclean_frames`,
 ///   and `motion` (the share of recent frames in motion) are what `pipeline::cleanup_due` weighs
 ///   to pick the cleanup's moment and kind; `clean_quality` keeps a constant-quality session at
-///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes
-///   of the stripe's last frame under its rate control) and `idle_frames` (a constant-rate
-///   cleanup's run of small frames short of the paint-over quality) tell a cleanup that runs
-///   through the rate control when it has converged or stalled, `fine_frames` counts its run
-///   of frames at the paint-over quantizer or finer, `measured`, `measuring`,
-///   `level_checks`, and `measure_in` are the last measurement of the picture it is refining,
-///   whether the frame before was measured, the measurements in a row that found it level,
-///   and the frames to the next (`pipeline::plateau`), `settled` records
+///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes of
+///   the stripe's last frame under its rate control), `idle_frames` (a constant-rate cleanup's run
+///   of small frames short of the paint-over quality), and `over_frames`
+///   (its run of frames over `pipeline::OVERSHOOT_BUDGETS`) tell a cleanup that runs through the
+///   rate control when it has converged, stalled, or been pinned at its coarsest quantizer,
+///   `fine_frames` counts its run of frames at the paint-over quantizer or finer, `measured`,
+///   `measuring`, `level_checks`, and `measure_in` are the last measurement of the picture it is
+///   refining, whether the frame before was measured, the measurements in a row that found it
+///   level, and the frames to the next (`pipeline::plateau`), `settled` records
 ///   that such a cleanup ran its course under a rate control it cannot hold a quantizer
 ///   under, so no other starts before the region moves, and `sweep` (the next band's start
 ///   and the last band's size, as shares of the picture) carries the band sweep a
@@ -1069,6 +1070,7 @@ pub struct StripeState {
     pub clean_quality: bool,
     pub rc_bytes: usize,
     pub idle_frames: u32,
+    pub over_frames: u32,
     pub settled: bool,
     pub fine_frames: u32,
     pub measured: Option<f32>,

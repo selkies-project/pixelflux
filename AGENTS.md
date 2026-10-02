@@ -206,8 +206,12 @@ where it takes one (H.264 and HEVC; `FrameEncoder::band_size`), each band sized 
 budget and the rest of the frame held at the coarsest quantizer, which leaves a still region as it
 is, else in one held frame. A whole refresh held at it in one frame measured 470-730 kB at 1080p
 and 8 Mbit/s, half a second of queue on a 12 Mbit/s link, where the rate control reaches the same
-picture in about a second with every frame within its budget. Elsewhere under
-a constant rate the frame is held at that quantizer through `FrameEncoder::hold_quantizer`:
+picture in about a second with every frame within its budget. A rate control pinned at its coarsest
+quantizer, its frames of the still screen over two budgets for a trigger period (NVENC's at
+0.1 Mbit/s at 1080p), refines nothing and would put that cost on every band, so the screen is
+refreshed at once in one held frame coarsened to `HELD_KEY_BUDGET_S` at those frames' size.
+Elsewhere under a constant rate the frame is held at that quantizer through
+`FrameEncoder::hold_quantizer`:
 libvpx's VP8 pins its bounds, and SVT-AV1 raises the target for a key frame, bounded to
 `HELD_KEY_BUDGET_S` of the target. There is no cleanup where the encoder's last quantizer
 (`last_quality`) is already finer, since that rate control refines a still screen itself. Where a
