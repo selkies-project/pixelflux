@@ -950,6 +950,9 @@ pub struct X11Pipeline {
     /// rebuild; together they drive `recover_hw`.
     hw_error_streak: u32,
     hw_rebuilt: bool,
+    /// The quantizer the last full frame was decided to be held at, and the one it was held at.
+    #[cfg(test)]
+    hold: (Option<u32>, Option<u32>),
 }
 
 impl X11Pipeline {
@@ -977,6 +980,8 @@ impl X11Pipeline {
             pending_force_idr: false,
             hw_error_streak: 0,
             hw_rebuilt: false,
+            #[cfg(test)]
+            hold: (None, None),
         };
         pipeline.record_stream();
         pipeline
@@ -1217,7 +1222,7 @@ impl X11Pipeline {
                 )
             };
             let quality = EncoderQuality::of(self.hw.as_ref().unwrap());
-            let d = decide_hw_fullframe(
+            let mut d = decide_hw_fullframe(
                 &mut self.hw_state,
                 &self.settings,
                 self.frame_counter,
@@ -1226,6 +1231,37 @@ impl X11Pipeline {
                 requested,
                 quality,
             );
+            // A Turbo frame is decided on the hash of the one before, so a frame held whole could
+            // carry a change it was not decided for, coded at the held quantizer. Such a frame is
+            // hashed before it is encoded instead of beside it, and one that moved goes to the
+            // rate control. A held band needs none of this: the rest of its frame is held at the
+            // coarsest quantizer.
+            #[cfg(test)]
+            let decided = d.hold_qp;
+            let mut hashed = None;
+            if turbo
+                && self.settings.use_paint_over_quality
+                && d.send
+                && d.hold_qp.is_some()
+                && d.hold_band.is_none()
+            {
+                let dirty = hash_bands(
+                    &mut self.bands,
+                    argb,
+                    stride,
+                    height as usize,
+                    threshold,
+                    duration,
+                );
+                if band_damage(&dirty).is_motion() {
+                    d.hold_qp = None;
+                }
+                hashed = Some(dirty);
+            }
+            #[cfg(test)]
+            {
+                self.hold = (decided, d.hold_qp);
+            }
             let fc = self.frame_counter as u64;
             if d.send || self.hw.as_ref().unwrap().holds_frame() {
                 let force_idr = d.force_idr;
@@ -1238,7 +1274,10 @@ impl X11Pipeline {
                         enc.push_held(fc)
                     }
                 };
-                let res = if turbo && self.settings.use_paint_over_quality {
+                let res = if let Some(dirty) = hashed {
+                    self.turbo_dirty = dirty;
+                    encode()
+                } else if turbo && self.settings.use_paint_over_quality {
                     let (res, dirty) = hash_beside(
                         &mut self.bands,
                         argb,
@@ -2556,6 +2595,73 @@ mod tests {
         assert!(
             p.process(&frame, stride).is_empty(),
             "stream goes quiet again after the recovery burst"
+        );
+    }
+
+    /// A Turbo frame is decided on the hash of the frame before it, so a change can land on a
+    /// frame decided to be held whole at the cleanup's quantizer (SVT-AV1's held frames). That
+    /// frame is hashed before it is encoded and goes to the rate control.
+    #[test]
+    fn a_turbo_frame_decided_held_that_moved_goes_to_the_rate_control() {
+        let s = RustCaptureSettings {
+            width: 640,
+            height: 384,
+            codec: Codec::Av1,
+            use_cpu: true,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 100,
+            video_crf: 25,
+            video_paintover_crf: 18,
+            paint_over_trigger_frames: 15,
+            use_paint_over_quality: true,
+            video_streaming_mode: true,
+            target_fps: 60.0,
+            ..Default::default()
+        };
+        let stride = 640 * 4;
+        // Noise, so the rate control codes the still screen coarser than the cleanup's quantizer.
+        let screen = |seed: u8| -> Vec<u8> {
+            (0..stride * 384)
+                .map(|i| {
+                    (i as u32)
+                        .wrapping_mul(2654435761)
+                        .wrapping_add(seed as u32 * 97) as u8
+                })
+                .collect()
+        };
+        let still = screen(42);
+        let lead = |p: &mut X11Pipeline| {
+            for i in 0..3u8 {
+                p.process(&screen(i), stride);
+            }
+        };
+        let mut p = X11Pipeline::new(s.clone());
+        assert!(p.hw.is_some(), "AV1 runs as a full-frame session");
+        lead(&mut p);
+        let at = (0..300)
+            .find(|_| {
+                p.process(&still, stride);
+                p.hold.0.is_some()
+            })
+            .expect("a still screen is cleaned up by a held frame");
+        assert_eq!(
+            p.hold.1, p.hold.0,
+            "a frame that stood still keeps its hold"
+        );
+
+        let mut q = X11Pipeline::new(s);
+        lead(&mut q);
+        for _ in 0..at {
+            q.process(&still, stride);
+        }
+        assert!(
+            !q.process(&screen(9), stride).is_empty(),
+            "the moved frame is sent"
+        );
+        assert!(
+            q.hold.0.is_some() && q.hold.1.is_none(),
+            "a held frame that moved is coded under the rate control: {:?}",
+            q.hold
         );
     }
 
