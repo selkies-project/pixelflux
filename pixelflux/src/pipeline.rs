@@ -2599,8 +2599,9 @@ mod tests {
     }
 
     /// A Turbo frame is decided on the hash of the frame before it, so a change can land on a
-    /// frame decided to be held whole at the cleanup's quantizer (SVT-AV1's held frames). That
-    /// frame is hashed before it is encoded and goes to the rate control.
+    /// frame decided to be held whole at the cleanup's quantizer (SVT-AV1's held frames, from the
+    /// release that takes a new target with a picture). That frame is hashed before it is
+    /// encoded and goes to the rate control.
     #[test]
     fn a_turbo_frame_decided_held_that_moved_goes_to_the_rate_control() {
         let s = RustCaptureSettings {
@@ -2637,6 +2638,10 @@ mod tests {
         };
         let mut p = X11Pipeline::new(s.clone());
         assert!(p.hw.is_some(), "AV1 runs as a full-frame session");
+        if !codec_sys::svtav1::HAS_EVENTS {
+            assert!(!EncoderQuality::of(p.hw.as_ref().unwrap()).holds);
+            return;
+        }
         lead(&mut p);
         let at = (0..300)
             .find(|_| {
