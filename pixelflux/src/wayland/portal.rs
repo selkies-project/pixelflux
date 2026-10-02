@@ -66,6 +66,8 @@ pub struct PortalSession {
     /// RemoteDesktop interface version, 0 when the session drives no input. `ConnectToEIS`
     /// exists from version 2.
     pub rd_version: u32,
+    /// KDE's backend serves the session: it reads a smooth scroll's vertical axis negated.
+    kde: bool,
 }
 
 fn opt_u32(o: &mut Options<'_>, key: &'static str, v: u32) {
@@ -186,6 +188,7 @@ impl PortalSession {
             cursor_mode,
             restore_token: None,
             rd_version: 0,
+            kde: false,
         };
         let opener = this
             .remote
@@ -282,6 +285,18 @@ impl PortalSession {
         if capture && this.streams.is_empty() {
             return Err("the portal started no monitor stream".into());
         }
+        // The backend has answered Start, so it runs by now; the frontend names none.
+        this.kde = this.remote.is_some()
+            && zbus::blocking::fdo::DBusProxy::new(&this.conn)
+                .and_then(|bus| {
+                    bus.name_has_owner(
+                        "org.freedesktop.impl.portal.desktop.kde"
+                            .try_into()
+                            .map_err(zbus::Error::from)?,
+                    )
+                    .map_err(zbus::Error::from)
+                })
+                .unwrap_or(false);
         Ok(this)
     }
 
@@ -410,10 +425,14 @@ impl PortalSession {
         );
     }
 
-    /// Smooth scroll by logical pixels; `finish` closes the scroll series.
+    /// Smooth scroll by logical pixels, positive down and right as on `wl_pointer`; `finish`
+    /// closes the scroll series. KDE's backend negates the vertical axis it is handed and drops
+    /// `finish` (xdg-desktop-portal-kde's `requestPointerAxis`, 5.27 through master), where
+    /// GNOME's passes both on, so it is handed the axis negated.
     pub fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) {
         let mut options = Options::new();
         options.insert("finish", Value::Bool(finish));
+        let dy = if self.kde { -dy } else { dy };
         self.notify(
             "NotifyPointerAxis",
             &(self.session.clone(), options, dx, dy),
