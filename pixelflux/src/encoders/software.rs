@@ -251,7 +251,7 @@ pub(crate) fn convert_to_yuv10_mt(
         for row in 0..h {
             let line = &src[row * src_stride..row * src_stride + width * 4];
             let out = &mut y[row * y_stride..row * y_stride + width];
-            for (px, y) in line.chunks_exact(4).zip(out.iter_mut()) {
+            for (px, y) in line.as_chunks::<4>().0.iter().zip(out.iter_mut()) {
                 *y = luma(px[ri] as i32, px[1] as i32, px[bi] as i32) as u16;
             }
         }
@@ -260,7 +260,13 @@ pub(crate) fn convert_to_yuv10_mt(
                 let line = &src[row * src_stride..row * src_stride + width * 4];
                 let cb = &mut u[row * uv_stride..row * uv_stride + width];
                 let cr = &mut v[row * uv_stride..row * uv_stride + width];
-                for ((px, cb), cr) in line.chunks_exact(4).zip(cb.iter_mut()).zip(cr.iter_mut()) {
+                for ((px, cb), cr) in line
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(cb.iter_mut())
+                    .zip(cr.iter_mut())
+                {
                     let (r, g, b) = (px[ri] as i32, px[1] as i32, px[bi] as i32);
                     *cb = chroma(&k[1], r, g, b, YUV10_SHIFT);
                     *cr = chroma(&k[2], r, g, b, YUV10_SHIFT);
@@ -2772,7 +2778,7 @@ mod tests {
         let (w, h) = (34usize, 18usize);
         let mut bgra = vec![0u8; w * h * 4];
         let mut seed = 0x2545_f491u32;
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             for c in px.iter_mut().take(3) {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;
