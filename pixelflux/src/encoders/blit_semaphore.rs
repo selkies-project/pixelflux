@@ -213,11 +213,11 @@ pub(crate) fn opaque_fd_pair(uuid: [u8; 16]) -> Result<(OwnedFd, OwnedFd), Strin
 
             let mut count = 0u32;
             enumerate(instance, &mut count, ptr::null_mut());
-            let mut devices = vec![ptr::null_mut(); count as usize];
+            let mut devices: Vec<VkPhysicalDevice> = Vec::with_capacity(count as usize);
             enumerate(instance, &mut count, devices.as_mut_ptr());
+            devices.set_len(count as usize);
             let physical = devices
                 .into_iter()
-                .take(count as usize)
                 .find(|&d| {
                     let mut id = PhysicalDeviceIdProperties {
                         s_type: STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
