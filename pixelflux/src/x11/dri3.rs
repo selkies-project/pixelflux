@@ -187,6 +187,20 @@ fn prune_modifier(modifiers: &mut Vec<u64>, chosen: u64) {
     }
 }
 
+/// Whether `modifier` is one of Intel's compressed (CCS) layouts. The plane count does not tell:
+/// DG2 and later keep the compression state outside the buffer, so theirs are single-plane, and
+/// the media driver reads such a buffer as if it were uncompressed. Intel's uncompressed
+/// layouts are the few named here; every other one it defines is a CCS variant.
+fn intel_compressed(modifier: u64) -> bool {
+    const INTEL: u64 = 0x01;
+    const X_TILED: u64 = 1;
+    const Y_TILED: u64 = 2;
+    const YF_TILED: u64 = 3;
+    const TILE4: u64 = 9;
+    let layout = modifier & 0x00ff_ffff_ffff_ffff;
+    modifier >> 56 == INTEL && !matches!(layout, X_TILED | Y_TILED | YF_TILED | TILE4)
+}
+
 /// Why the DRI3 path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
     println!("[X11] Zero-copy capture (DRI3) unavailable: {reason}; capturing through XShm.");
@@ -292,11 +306,12 @@ impl XScreen {
             .map_err(|e| x_err("DRI3 modifiers", e))?
             .reply()
             .map_err(|e| x_err("the server listed no buffer modifiers", e))?;
-        let modifiers = if modifiers_reply.window_modifiers.is_empty() {
+        let mut modifiers = if modifiers_reply.window_modifiers.is_empty() {
             modifiers_reply.screen_modifiers
         } else {
             modifiers_reply.window_modifiers
         };
+        modifiers.retain(|&m| !intel_compressed(m));
 
         let gc = conn.generate_id().map_err(|e| x_err("GC id", e))?;
         conn.create_gc(
@@ -1329,11 +1344,26 @@ where
 
 #[cfg(test)]
 mod modifier_tests {
-    use super::prune_modifier;
+    use super::{intel_compressed, prune_modifier};
 
     const CCS_CC: u64 = 0x0100_0000_0000_0008;
     const CCS: u64 = 0x0100_0000_0000_0006;
     const Y_TILED: u64 = 0x0100_0000_0000_0002;
+
+    /// The list Xvfb offers on an Arc card keeps its linear and tiled layouts and loses both
+    /// compressed ones, the single-plane one included.
+    #[test]
+    fn the_single_plane_compressed_layouts_are_not_offered() {
+        const X_TILED: u64 = 0x0100_0000_0000_0001;
+        const TILE4: u64 = 0x0100_0000_0000_0009;
+        const DG2_RC_CCS: u64 = 0x0100_0000_0000_000a;
+        const DG2_RC_CCS_CC: u64 = 0x0100_0000_0000_000c;
+        let mut mods = vec![0, X_TILED, TILE4, DG2_RC_CCS, DG2_RC_CCS_CC];
+        mods.retain(|&m| !intel_compressed(m));
+        assert_eq!(mods, vec![0, X_TILED, TILE4]);
+        assert!(intel_compressed(CCS) && intel_compressed(CCS_CC));
+        assert!(!intel_compressed(Y_TILED) && !intel_compressed(0x00ff_ffff_ffff_ffff));
+    }
 
     /// A compressed layout the server offered is dropped and the rest stays offered, so the
     /// retry walks the server's list down to a single-plane layout.
