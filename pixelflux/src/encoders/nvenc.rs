@@ -6019,22 +6019,28 @@ mod gpu_tests {
         }
     }
 
-    /// On a real GPU, a session is opened at the capture's rate as the fraction it names, a live
-    /// change of rate reaches the driver the same way, and an H.264 stream declares the rate in
-    /// its timing. Ignored by default.
+    /// On a real GPU, a session of every codec the device carries is opened at the capture's
+    /// rate as the fraction it names, a live change of rate reaches the driver the same way, and
+    /// an H.264 stream declares the rate in its timing. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_frame_rate_reaches_the_driver_as_its_fraction() {
         let f = frame(640, 360, 30);
-        for codec in [Codec::H264, Codec::H265] {
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             for (num, den) in [(60000u32, 1001u32), (120000, 1001), (144000, 1001), (60, 1)] {
                 let fps = num as f64 / den as f64;
                 let mut s = settings(640, 360, fps);
                 s.codec = codec;
                 s.video_cbr_mode = true;
                 s.video_bitrate_kbps = 8000;
-                let mut enc =
-                    host_session(&s).unwrap_or_else(|e| panic!("{codec:?} at {num}/{den}: {e}"));
+                let mut enc = match host_session(&s) {
+                    Ok(enc) => enc,
+                    Err(e) if codec == Codec::Av1 && e.contains("engine") => {
+                        println!("{codec:?}: {e}");
+                        break;
+                    }
+                    Err(e) => panic!("{codec:?} at {num}/{den}: {e}"),
+                };
                 assert_eq!(
                     (enc.init_params.frameRateNum, enc.init_params.frameRateDen),
                     (num, den),
