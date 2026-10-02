@@ -225,10 +225,12 @@ reconstructions in a layout that cannot be read, which fall back to the quantize
 after a trigger period of frames at the paint-over quantizer, and any of them after `REFINE_S`.
 That cleanup then counts as settled, and only more than a small change arms another, so a caret
 on a clean screen costs its own frames. A session that reports no bytes (Tegra, a stateful V4L2
-device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264
-stripe is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame
-and a half its row-level control coarsens the rows it names a fine quantizer for. On Intel's iHD
-the VA-API rate control itself is bounded per codec (`vaapi::ConstantRate`): under the session's
+device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264 stripe
+is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame and a half
+its row-level control coarsens the rows it names a fine quantizer for, and its cleanup ends once its
+frames have been slice headers alone for `EMPTY_S`: x264 keeps its quantizer on a screen that does
+not change. On Intel's iHD the VA-API rate control itself is bounded per codec
+(`vaapi::ConstantRate`): under the session's
 buffer of a frame and a half it skips every block and pads the frame to the target.
 
 Host capture of an external Wayland compositor (`wayland/host.rs`, `wayland_host_display`) picks each

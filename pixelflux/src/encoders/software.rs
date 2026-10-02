@@ -1043,7 +1043,7 @@ impl H264EncoderWrapper {
 ///   to pick the cleanup's moment and kind; `clean_quality` keeps a constant-quality session at
 ///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes of
 ///   the stripe's last frame under its rate control), `idle_frames` (a constant-rate cleanup's run
-///   of small frames short of the paint-over quality), and `over_frames`
+///   of small frames short of the paint-over quality, of empty ones for x264), and `over_frames`
 ///   (its run of frames over `pipeline::OVERSHOOT_BUDGETS`) tell a cleanup that runs through the
 ///   rate control when it has converged, stalled, or been pinned at its coarsest quantizer,
 ///   `fine_frames` counts its run of frames at the paint-over quantizer or finer, `measured`,
@@ -1317,12 +1317,13 @@ pub fn stripes_held_still(stripes: &[StripeState], settings: &RustCaptureSetting
 /// 4. **Per-stripe cleanup** (`pipeline::cleanup_due`, one region per stripe): a stripe that
 ///    changed is cleaned up once it has held still for `paint_over_trigger_frames`, or has kept
 ///    changing only a little for four times that, at the paint-over JPEG quality or, for H.264,
-///    at the paint-over quality: under CBR through libx264's rate control, the stripe sent until
-///    it codes at the paint-over quantizer or finer in a small frame (`pipeline::convergence`),
-///    with no key frame, and where the stripe's encoder reports no quantizer (OpenH264) as a
-///    refresh and burst at its rate control's quality; under CRF as the stripe's rate factor
-///    until it changes again, as main's paint-over was, as a key frame after a run of changes and
-///    a refresh otherwise, then a burst. The stripes whose cleanups fall due on one
+///    at the paint-over quality: under CBR through libx264's rate control, the stripe sent until it
+///    codes at the paint-over quantizer or finer in a small frame (`pipeline::convergence`), or its
+///    frames have been slice headers alone for `pipeline::EMPTY_S`, with no key frame, and where
+///    the stripe's encoder reports no quantizer (OpenH264) as a refresh and burst at its rate
+///    control's quality; under CRF as the stripe's rate factor until it changes again, as main's
+///    paint-over was, as a key frame after a run of changes and a refresh otherwise, then a burst.
+///    The stripes whose cleanups fall due on one
 ///    frame are spread over `CLEANUP_STAGGER_FRAMES` frames, so a screen going still costs no
 ///    one frame the whole screen's cleanup. A stripe is otherwise sent when it is dirty, while
 ///    its burst runs, or when streaming mode is on, at the base quality; a newly dirty frame
@@ -1511,6 +1512,12 @@ pub fn encode_cpu(
     } else {
         1
     };
+    // A frame of x264's slices, one a thread, that refines nothing.
+    #[cfg(feature = "gpl")]
+    let empty_bytes = crate::encoders::codec::VIDEO_HEADER_LEN
+        + crate::pipeline::EMPTY_SLICE_BYTES * h264_threads as usize;
+    #[cfg(not(feature = "gpl"))]
+    let empty_bytes = 0;
     #[cfg(feature = "gpl")]
     let csc_bands = 1;
     if video && video_fullcolor && !crate::encoders::software_fullcolor(Codec::H264) {
@@ -1597,8 +1604,14 @@ pub fn encode_cpu(
         {
             let budget = crate::pipeline::frame_budget(video_bitrate, target_fps);
             let bytes = (stripe_state.rc_bytes > 0).then_some(stripe_state.rc_bytes);
+            stripe_state.idle_frames = if bytes.is_some_and(|b| b <= empty_bytes) {
+                stripe_state.idle_frames.saturating_add(1)
+            } else {
+                0
+            };
             if crate::pipeline::convergence(quality.last, bytes, video_po_crf.max(0) as u32, budget)
                 == crate::pipeline::Convergence::Converged
+                || stripe_state.idle_frames as f64 >= crate::pipeline::EMPTY_S * target_fps
             {
                 stripe_state.h264_burst_frames_remaining = 0;
             }
@@ -1611,6 +1624,7 @@ pub fn encode_cpu(
         {
             stripe_state.h264_burst_frames_remaining = crate::pipeline::converge_frames(settings);
             stripe_state.burst_held = false;
+            stripe_state.idle_frames = 0;
         } else if video && (force_idr || cleanup != Cleanup::None) && video_burst > 0 {
             stripe_state.h264_burst_frames_remaining = video_burst;
             stripe_state.burst_held =

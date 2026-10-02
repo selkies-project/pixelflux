@@ -77,6 +77,16 @@ const CONVERGE_S: f64 = 10.0;
 /// where at 2 Mbit/s single frames after a change reach 4.5 budgets.
 const OVERSHOOT_BUDGETS: f64 = 2.0;
 
+/// Bytes a slice that refines nothing comes to at most: a frame of x264's four slices skipping
+/// every block takes 61 to 66 at 720p and 1080p with the wire header, a third of the budget at
+/// 0.1 Mbit/s, so never a small frame.
+pub(crate) const EMPTY_SLICE_BYTES: usize = 32;
+
+/// Seconds of such frames after which a constant-rate cleanup through x264 ends: x264 keeps its
+/// quantizer on a screen that does not change, and at 0.1 Mbit/s refines one in frames as far
+/// as 2.4 s apart.
+pub(crate) const EMPTY_S: f64 = 3.0;
+
 /// The same for a session that holds no quantizer but says the one it codes at or measures its
 /// pictures, which has no refresh to fall back to and ends its cleanup at the paint-over
 /// quantizer or once the picture stops improving: at 2 Mbit/s at 1080p x265's rate control
@@ -2813,6 +2823,56 @@ mod tests {
                     .wrapping_add(seed as u32 * 97) as u8
             })
             .collect()
+    }
+
+    /// A still screen x264 refines nothing more of at a constant rate, its frames slice headers
+    /// alone, ends its cleanup after `EMPTY_S` of them rather than `CONVERGE_S`. The quantizer
+    /// floor holds x264 at its coarsest, as at 0.1 Mbit/s, on every run and thread count.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn an_x264_cleanup_whose_frames_refine_nothing_ends() {
+        let mut p = X11Pipeline::new(RustCaptureSettings {
+            width: 640,
+            height: 384,
+            codec: Codec::H264,
+            use_cpu: true,
+            video_fullframe: true,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 100,
+            video_min_qp: 51,
+            video_paintover_crf: 18,
+            paint_over_trigger_frames: 15,
+            use_paint_over_quality: true,
+            target_fps: 60.0,
+            ..Default::default()
+        });
+        for i in 0..12u8 {
+            p.process(&noise(i), 640 * 4);
+        }
+        let window = converge_frames(&p.settings) as usize;
+        let frames: Vec<Vec<usize>> = (0..window + 60)
+            .map(|_| {
+                p.process(&noise(42), 640 * 4)
+                    .iter()
+                    .map(|e| e.data.len())
+                    .collect()
+            })
+            .collect();
+        let last = frames
+            .iter()
+            .rposition(|f| !f.is_empty())
+            .expect("a cleanup");
+        let empty = crate::encoders::codec::VIDEO_HEADER_LEN + 4 * EMPTY_SLICE_BYTES;
+        let run = (EMPTY_S * 60.0) as usize;
+        assert!(last < window, "the cleanup ends at {last} of {window}");
+        assert!(
+            frames[last + 1 - run..=last]
+                .iter()
+                .flatten()
+                .all(|&b| b <= empty),
+            "on frames that carry nothing: {:?}",
+            &frames[last + 1 - run..=last]
+        );
     }
 
     /// The probes (`X11Pipeline::hold`) of a Turbo session's first still frame coded at a
