@@ -3681,30 +3681,6 @@ fn render_node_tick(
                             let window_loc =
                                 state.space.element_location(window).unwrap_or_default() - origin;
 
-                            if let Some(surface) = window.wl_surface() {
-                                let popups = PopupManager::popups_for_surface(&surface);
-                                for (popup, location) in popups {
-                                    let popup_surface = popup.wl_surface();
-                                    let popup_pos = window_loc + location;
-                                    let elem = smithay::wayland::compositor::with_states(
-                                        popup_surface,
-                                        |states| {
-                                            WaylandSurfaceRenderElement::from_surface(
-                                            renderer,
-                                            popup_surface,
-                                            states,
-                                            popup_pos.to_physical_precise_round(output_scale_val),
-                                            1.0,
-                                            smithay::backend::renderer::element::Kind::Unspecified
-                                        )
-                                        },
-                                    );
-                                    if let Ok(Some(e)) = elem {
-                                        elements.push(CompositionElements::Surface(e));
-                                    }
-                                }
-                            }
-
                             elements.extend(
                                 window
                                     .render_elements(
@@ -3923,32 +3899,6 @@ fn render_node_tick(
 
                 for window in state.space.elements_for_output(&output).rev() {
                     let loc = state.space.element_location(window).unwrap_or_default() - origin;
-
-                    if let Some(surface) = window.wl_surface() {
-                        let popups = PopupManager::popups_for_surface(&surface);
-                        for (popup, location) in popups {
-                            let popup_surface = popup.wl_surface();
-                            {
-                                let popup_pos = loc + location;
-                                let elem = smithay::wayland::compositor::with_states(
-                                    popup_surface,
-                                    |states| {
-                                        WaylandSurfaceRenderElement::from_surface(
-                                            renderer,
-                                            popup_surface,
-                                            states,
-                                            popup_pos.to_physical_precise_round(output_scale_val),
-                                            1.0,
-                                            smithay::backend::renderer::element::Kind::Unspecified,
-                                        )
-                                    },
-                                );
-                                if let Ok(Some(e)) = elem {
-                                    elements.push(CompositionElements::Surface(e));
-                                }
-                            }
-                        }
-                    }
 
                     elements.extend(
                         window
