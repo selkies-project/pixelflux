@@ -3428,7 +3428,7 @@ impl NvencEncoder {
                 return Err("the CUDA device has no UUID to find its Vulkan device by".into());
             }
             let (cuda_fd, server_fd) =
-                super::blit_semaphore::opaque_fd_pair(uuid.bytes.map(|b| b as u8))?;
+                super::blit_semaphore::opaque_fd_pair(uuid.bytes.map(|b| b.to_ne_bytes()[0]))?;
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
             if !self.blit_semaphore.is_null() {
                 destroy(self.blit_semaphore);
