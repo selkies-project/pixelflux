@@ -714,9 +714,9 @@ const HEADROOM_FPS: u32 = 60;
 
 /// The frames a reference window holds for a decoded picture buffer of `dpb`: an H.265 session
 /// keeping anchors still reaches, on Pascal's NVENC, the frame the next frame's reference picture
-/// set lets go, one past the buffer it declares. Ada's does not, and predicts from the anchor
-/// before that frame where the window names it: a dependency the window states no older than
-/// the real one, so a client holding the frame named holds the one used.
+/// set lets go, one past the buffer it declares. Turing's, Ampere's and Ada's do not, and
+/// predict from the anchor before that frame where the window names it: a dependency the window
+/// states no older than the real one, so a client holding the frame named holds the one used.
 fn window_frames(codec: Codec, dpb: u32, anchored: bool) -> u32 {
     dpb + u32::from(codec == Codec::H265 && anchored)
 }
@@ -754,8 +754,8 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
     }
 }
 
-/// The share of an AV1 level's Annex A MaxBitrate NVENC lets a session declare at it, as a
-/// fraction: two thirds, in either tier.
+/// The share of an AV1 level's Annex A MaxBitrate the strictest driver lets a session declare
+/// at it, as a fraction: two thirds on 595.71.05, where 595.91.07 and 615.71.09 take the whole.
 const NVENC_AV1_RATE: (u64, u64) = (2, 3);
 
 /// The highest CBR target an NVENC session of `codec` opens at, its top level's bitrate ceiling:
@@ -1746,12 +1746,13 @@ impl Drop for NvencEncoder {
 /// take that level whatever the picture. The driver holds every codec's level to its bitrate
 /// ceiling as well, refusing a CBR target past it as an invalid level, so a declared rate
 /// raises the level to the first that admits it; `hevc_high_tier` names the HEVC tier the
-/// session declares, whose ceiling is the one that applies. An AV1 level holds two thirds of
-/// its Annex A MaxBitrate, `NVENC_AV1_RATE` (5.1 26.7 Mbit/s rather than 40, on an RTX 4090
-/// with driver 595.71.05, whatever the frame rate or buffer), so an AV1 rate is weighed at
-/// one and a half times itself. An HEVC picture is counted in whole 32-pixel coding tree
-/// blocks, NVENC's, as the driver counts it: 1280x720 at 144 fps is inside 4.1 by its own
-/// samples, and the driver refuses it as 4.1.
+/// session declares, whose ceiling is the one that applies. Driver 595.71.05 holds an AV1
+/// level to two thirds of its Annex A MaxBitrate, `NVENC_AV1_RATE` (5.1 26.7 Mbit/s rather
+/// than 40, on an RTX 4090 and an L4, whatever the frame rate or buffer), so an AV1 rate is
+/// weighed at one and a half times itself; under 595.91.07 and 615.71.09, which hold Annex A's
+/// rate, a session past 26.7 Mbit/s can then declare a level more than it needs. An HEVC picture
+/// is counted in whole 32-pixel coding tree blocks, NVENC's, as the driver counts it: 1280x720
+/// at 144 fps is inside 4.1 by its own samples, and the driver refuses it as 4.1.
 fn nvenc_level(
     codec: Codec,
     width: u32,
@@ -6601,9 +6602,9 @@ mod gpu_tests {
 
     /// On a real GPU, a 1080p60 CBR session whose target lies past the ceiling of the level the
     /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50, AV1's
-    /// headroom 5.1 at the 26.7 NVENC holds it to) opens on the level the rate raises it to,
-    /// and a live raise past the ceiling, to 200 Mbit/s, which AV1 holds at 106.7, is taken
-    /// rather than refused. Ignored by default.
+    /// headroom 5.1 at the 26.7 `NVENC_AV1_RATE` holds it to) opens on the level the rate raises
+    /// it to, and a live raise past the ceiling, to 200 Mbit/s, which AV1 holds at 106.7, is
+    /// taken rather than refused. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_cbr_targets_past_the_picture_level_open() {
@@ -8562,8 +8563,8 @@ mod decision_tests {
             nvenc_level(Codec::H265, 1920, 1080, 60, 60_000_000, false),
             156
         );
-        // NVENC holds an AV1 level to two thirds of its Annex A MaxBitrate: 5.1 to 26.7 Mbit/s,
-        // 5.2 to 40, 6.1 to 66.7, 6.2 to 106.7.
+        // `NVENC_AV1_RATE` holds an AV1 level to two thirds of its Annex A MaxBitrate: 5.1 to
+        // 26.7 Mbit/s, 5.2 to 40, 6.1 to 66.7, 6.2 to 106.7.
         for (bps, level) in [
             (26_666_666, 13),
             (26_666_667, 14),
