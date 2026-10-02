@@ -20,6 +20,15 @@
 //! answers only after the blit it ordered before has landed, so the encoder never reads a
 //! half-copied frame, and no fence object or implicit-sync assumption is involved.
 //!
+//! Where the server offers SELKIES-SEMAPHORE (the images' Xvfb) and the encoder can wait on a GPU
+//! semaphore (NVENC), the server signals one the encoder made after each blit instead, and the
+//! encode is queued at once behind a wait on it. Under a GPU-bound client each GPU job that has
+//! to wait for the CPU to submit it waits a draw of that client for its turn, so the GetImage
+//! cost two draws a frame where the semaphore costs one: an uncapped 72 fps client streamed at
+//! 36 fps with the GetImage. A checked Signal request is the round trip the wait follows, which
+//! answers once the server has queued the signal, not once the GPU ran it: a wait queued before
+//! the server's signal lost its turn as well.
+//!
 //! Nothing here reads pixels, so what stands in for the XShm path's per-stripe content hashing is
 //! the Damage extension on the root window: the server's report is both what says a frame is worth
 //! encoding and what ends the wait for one, within the pacing [`crate::pace`] keeps, so a change is
@@ -37,6 +46,7 @@
 
 use std::ffi::c_void;
 use std::fs::File;
+use std::io::IoSlice;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
@@ -47,7 +57,7 @@ use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as Gbm
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::GbmDevice;
 use smithay::backend::egl::EGLDisplay;
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::dri3::ConnectionExt as Dri3Ext;
 use x11rb::protocol::render::{self, ConnectionExt as RenderExt};
 use x11rb::protocol::xfixes::ConnectionExt as XfixesExt;
@@ -125,7 +135,12 @@ struct XScreen {
     /// choice and the server learns the layout from the modifier the allocation reports.
     modifiers: Vec<u64>,
     device: String,
+    /// SELKIES-SEMAPHORE's major opcode, where the server offers it.
+    semaphore_opcode: Option<u8>,
 }
+
+/// The images' Xvfb extension for GPU semaphores shared with the screen's renderer.
+const SEMAPHORE_EXTENSION: &str = "SELKIES-SEMAPHORE";
 
 /// A running zero-copy capture, on the thread that owns every context in it.
 ///
@@ -156,6 +171,9 @@ struct GpuCapture {
     cap_y: i16,
     root_w: u16,
     root_h: u16,
+    /// The server's id for the encoder's blit semaphore, which it signals after each blit for
+    /// the encode to wait on; `None` waits for each blit with a GetImage.
+    blit_semaphore: Option<u32>,
 }
 
 /// Take `chosen` out of the modifiers the next allocation may pick. A choice the list never
@@ -292,6 +310,11 @@ impl XScreen {
         .check()
         .map_err(|e| x_err("CreateGC", e))?;
         let damage = RootDamage::create(&conn, root).ok_or("the server has no Damage extension")?;
+        let semaphore_opcode = conn
+            .extension_information(SEMAPHORE_EXTENSION)
+            .ok()
+            .flatten()
+            .map(|e| e.major_opcode);
 
         Ok((
             Self {
@@ -305,9 +328,56 @@ impl XScreen {
                 argb_format,
                 modifiers,
                 device: encode_path,
+                semaphore_opcode,
             },
             device_fd,
         ))
+    }
+
+    /// One SELKIES-SEMAPHORE request: its minor opcode and CARD32 fields, and an fd if it takes one.
+    fn semaphore_request(
+        &self,
+        minor: u8,
+        fields: &[u32],
+        fds: Vec<OwnedFd>,
+    ) -> Result<x11rb::cookie::VoidCookie<'_, RustConnection>, String> {
+        let opcode = self
+            .semaphore_opcode
+            .ok_or("the server has no SELKIES-SEMAPHORE")?;
+        let mut req = vec![opcode, minor];
+        req.extend_from_slice(&(1 + fields.len() as u16).to_ne_bytes());
+        for f in fields {
+            req.extend_from_slice(&f.to_ne_bytes());
+        }
+        self.conn
+            .send_request_without_reply(&[IoSlice::new(&req)], fds)
+            .map_err(|e| x_err("SELKIES-SEMAPHORE", e))
+    }
+
+    /// Hand the server a semaphore to signal after the blits it is asked to (`signal_semaphore`),
+    /// returning its id there.
+    fn import_semaphore(&self, fd: OwnedFd) -> Result<u32, String> {
+        let id = self
+            .conn
+            .generate_id()
+            .map_err(|e| x_err("semaphore id", e))?;
+        self.semaphore_request(1, &[id, self.root], vec![fd])?
+            .check()
+            .map_err(|e| format!("the server did not take the semaphore: {e}"))?;
+        Ok(id)
+    }
+
+    /// Have the server signal the semaphore once the rendering requested before has landed.
+    /// The check's round trip answers once the server has queued the signal, which is what the
+    /// encoder's wait has to come after; an error means no signal is coming.
+    fn signal_semaphore(&self, id: u32) -> Result<(), String> {
+        self.semaphore_request(2, &[id], Vec::new())?
+            .check()
+            .map_err(|e| format!("the server did not signal the semaphore: {e}"))
+    }
+
+    fn free_semaphore(&self, id: u32) {
+        let _ = self.semaphore_request(3, &[id], Vec::new());
     }
 
     /// Wait for the blit into `pixmap` to land: the reply to a read of one of its pixels comes
@@ -577,6 +647,7 @@ impl GpuCapture {
     /// Replace the encoder with the startup construction, releasing the old session first so
     /// the two never hold device memory at once.
     fn rebuild_encoder(&mut self) -> Result<(), String> {
+        self.detach_semaphore();
         drop(self.encoder.take());
         let source = FrameSource::Dmabuf {
             egl_display: self.egl_display,
@@ -586,6 +657,7 @@ impl GpuCapture {
             Some(enc) if enc.is_hardware() => {
                 self.encoder = Some(enc);
                 self.settings = settings;
+                self.attach_semaphore();
                 Ok(())
             }
             Some(_) => Err("no hardware encoder is left for the zero-copy path".to_string()),
@@ -593,9 +665,39 @@ impl GpuCapture {
         }
     }
 
+    /// Give the server the encoder's blit semaphore, where it offers SELKIES-SEMAPHORE and the
+    /// encoder can wait on one; otherwise each blit is waited for with a GetImage.
+    fn attach_semaphore(&mut self) {
+        self.detach_semaphore();
+        if self.x.semaphore_opcode.is_none() {
+            return;
+        }
+        let Some(fd) = self.enc().blit_semaphore_fd() else {
+            return;
+        };
+        match fd.and_then(|fd| self.x.import_semaphore(fd)) {
+            Ok(id) => {
+                self.blit_semaphore = Some(id);
+                println!(
+                    "[X11] DRI3 capture: the encoder waits for each blit on the GPU, behind a semaphore the server signals ({SEMAPHORE_EXTENSION})."
+                );
+            }
+            Err(e) => crate::log::debug!(
+                "[X11] DRI3 capture: no blit semaphore ({e}); each blit is waited for with a GetImage"
+            ),
+        }
+    }
+
+    fn detach_semaphore(&mut self) {
+        if let Some(id) = self.blit_semaphore.take() {
+            self.x.free_semaphore(id);
+        }
+    }
+
     /// Blit the capture region into the next pool buffer, composite the cursor if asked, and
-    /// wait for the server's GPU work to land. Returns the buffer to encode.
-    fn grab(&mut self, with_cursor: bool) -> Result<usize, String> {
+    /// either have the server signal the blit semaphore after it or wait for it to land. Returns
+    /// the buffer to encode and whether its encode has to wait on the semaphore.
+    fn grab(&mut self, with_cursor: bool) -> Result<(usize, bool), String> {
         let idx = self.next;
         self.next = (self.next + 1) % self.buffers.len();
         let (w, h) = (self.settings.width as u16, self.settings.height as u16);
@@ -620,8 +722,21 @@ impl GpuCapture {
             self.x.free_cursor(&c);
         }
         self.composite_watermark(idx)?;
+        if let Some(id) = self.blit_semaphore {
+            match self.x.signal_semaphore(id) {
+                Ok(()) => return Ok((idx, true)),
+                // No signal is coming, so this frame waits for its blit the other way, and so
+                // does every later one.
+                Err(e) => {
+                    eprintln!(
+                        "[X11] DRI3 capture: {e}; waiting for each blit with a GetImage from now on."
+                    );
+                    self.detach_semaphore();
+                }
+            }
+        }
         self.x.await_blit(dst)?;
-        Ok(idx)
+        Ok((idx, false))
     }
 
     /// Draw the watermark over the freshly blitted frame, on the GPU. The image is uploaded
@@ -786,6 +901,7 @@ impl GpuCapture {
 
 impl Drop for GpuCapture {
     fn drop(&mut self) {
+        self.detach_semaphore();
         if let Some(c) = self.cursor.take() {
             self.x.free_cursor(&c);
         }
@@ -876,6 +992,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         cap_y: clamp_offset(request.capture_y, geo.height),
         root_w: geo.width,
         root_h: geo.height,
+        blit_semaphore: None,
         x,
         gbm,
         _egl: egl,
@@ -899,6 +1016,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         None => return declined("no hardware encoder opened for this session"),
     };
     gpu.settings = live;
+    gpu.attach_semaphore();
     println!(
         "[X11] Zero-copy capture (DRI3): {}x{} blitted by the X server into {} GPU buffers on {}, encoded in place on {}.",
         gpu.settings.width,
@@ -1092,7 +1210,11 @@ where
         }
         let mut delivered = false;
         if decision.send {
-            let idx = match gpu.grab(want_cursor) {
+            // The frame is the screen as the CopyArea finds it, so it is stamped as that is sent:
+            // a later reading would leave out the wait for the blit, which is most of a frame's
+            // latency under a GPU-bound client.
+            let grabbed_ns = crate::wayland::host::now_ns();
+            let (idx, after_blit) = match gpu.grab(want_cursor) {
                 Ok(i) => {
                     x_failures = 0;
                     i
@@ -1106,19 +1228,26 @@ where
                     continue;
                 }
             };
-            // The blit has landed and the encode reads the same buffer next, so one reading
-            // stamps both.
-            let grabbed_ns = crate::wayland::host::now_ns();
             let dmabuf = gpu.buffers[idx].dmabuf.clone();
             if let Some(q) = decision.hold_qp {
                 gpu.enc().hold_quantizer(q, decision.hold_band);
             }
-            let result = gpu.enc().encode_dmabuf(
-                &dmabuf,
-                frame_counter as u64,
-                decision.target_qp,
-                decision.force_idr,
-            );
+            let encode_start_ns = crate::wayland::host::now_ns();
+            let result = if after_blit {
+                gpu.enc().encode_dmabuf_after_blit(
+                    &dmabuf,
+                    frame_counter as u64,
+                    decision.target_qp,
+                    decision.force_idr,
+                )
+            } else {
+                gpu.enc().encode_dmabuf(
+                    &dmabuf,
+                    frame_counter as u64,
+                    decision.target_qp,
+                    decision.force_idr,
+                )
+            };
             match result {
                 Ok(data) if !data.is_empty() => {
                     encode_errors = 0;
@@ -1130,7 +1259,7 @@ where
                         frame_id: frame_counter as i32,
                         timing: FrameTiming {
                             capture_ns: grabbed_ns,
-                            encode_start_ns: grabbed_ns,
+                            encode_start_ns,
                             encode_end_ns: crate::wayland::host::now_ns(),
                         },
                         reference: gpu.enc().last_reference(),
@@ -1241,6 +1370,23 @@ mod gpu_tests {
     use crate::encoders::codec::{FRAME_DELTA, FRAME_KEY, VIDEO_HEADER_LEN, parse_video_type};
     use crate::webcam::decode::{Codec as DecCodec, Decoder, VideoDecoder};
 
+    /// Encode the buffer `grab` returned, behind the blit semaphore where the server signals it,
+    /// as the capture does.
+    fn encode_grabbed(
+        gpu: &mut GpuCapture,
+        (idx, after_blit): (usize, bool),
+        i: u64,
+        key: bool,
+    ) -> Vec<u8> {
+        let dmabuf = gpu.buffers[idx].dmabuf.clone();
+        if after_blit {
+            gpu.enc().encode_dmabuf_after_blit(&dmabuf, i, 25, key)
+        } else {
+            gpu.enc().encode_dmabuf(&dmabuf, i, 25, key)
+        }
+        .expect("encode in place")
+    }
+
     /// The primary node of the encode node's GPU is the same GPU to the DRI3 check, as the
     /// node an Xorg on the modesetting driver hands its DRI3 clients. Ignored by default.
     #[test]
@@ -1295,12 +1441,8 @@ mod gpu_tests {
             );
             return;
         };
-        let idx = gpu.grab(false).expect("blit and composite");
-        let dmabuf = gpu.buffers[idx].dmabuf.clone();
-        let pkt = gpu
-            .enc()
-            .encode_dmabuf(&dmabuf, 0, 25, true)
-            .expect("encode in place");
+        let grabbed = gpu.grab(false).expect("blit and composite");
+        let pkt = encode_grabbed(&mut gpu, grabbed, 0, true);
         let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
         assert!(
             dec.decode(&pkt[VIDEO_HEADER_LEN..]).expect("decode"),
@@ -1358,11 +1500,8 @@ mod gpu_tests {
         let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
 
         let encode = |gpu: &mut GpuCapture, i: u64, key: bool| -> Vec<u8> {
-            let idx = gpu.grab(false).expect("blit into the pool");
-            let dmabuf = gpu.buffers[idx].dmabuf.clone();
-            gpu.enc()
-                .encode_dmabuf(&dmabuf, i, 25, key)
-                .expect("encode in place")
+            let grabbed = gpu.grab(false).expect("blit into the pool");
+            encode_grabbed(gpu, grabbed, i, key)
         };
 
         let pkt = encode(&mut gpu, 0, true);

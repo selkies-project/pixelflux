@@ -106,6 +106,17 @@ than the encode node's, a buffer the server will not import, or a first frame th
 read; the session then streams through XShm. A watermark is not a reason: the server composites it
 through Render like the cursor, so it costs no readback here.
 
+Each blit is waited for with a one-pixel `GetImage`, which the server answers once it has landed.
+Where the server offers `SELKIES-SEMAPHORE` (the Selkies images' Xvfb) and the session encodes on
+NVENC, the server signals a GPU semaphore pixelflux made instead (through Vulkan, imported into
+CUDA), and the encode is queued at once behind a wait on it. Under an uncapped GPU-bound client a
+GPU job submitted only once the CPU has learnt that the one before it finished waits a whole draw
+of that client for its turn, so the `GetImage` costs two draws a frame: an uncapped 72 fps client
+on a GTX 1080 streams at 35 fps through it, and at 60 fps through the semaphore with grab to
+encoded at 10-12 ms instead of 28. The GPU serves its contexts in the order they were made, so
+that holds where the encoder's context is older than the client's; a capture started while the
+game already runs keeps the two draws, as it would with the `GetImage`.
+
 Whichever path runs, an X11 capture publishes its frame rate on the root window as
 `_FAKE_SCREEN_FPS` (CARDINAL), the fastest running capture's, and deletes it when the last one ends.
 A server that fakes its vblank reads it: the Selkies build of XLibre's Xvfb runs the vblank at that

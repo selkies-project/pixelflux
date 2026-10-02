@@ -10,6 +10,8 @@
 
 /// The bit writer the packed headers of the VA-API session are written with.
 pub mod bits;
+/// The GPU semaphore an X server's blit signals for the encoder, made through Vulkan.
+pub(crate) mod blit_semaphore;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
 /// A frame rate as the fraction encoder parameters and bitstream timing take.
@@ -1206,6 +1208,34 @@ impl FrameEncoder {
                 "the {} session takes host frames",
                 self.backend_name()
             )),
+        }
+    }
+
+    /// `encode_dmabuf`, for a buffer the X server signals the session's blit semaphore after
+    /// blitting into (`blit_semaphore_fd`): the frame's GPU work waits on it on the GPU.
+    pub fn encode_dmabuf_after_blit(
+        &mut self,
+        dmabuf: &Dmabuf,
+        frame_number: u64,
+        qp: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, String> {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.encode_after_blit(dmabuf, frame_number, qp, force_idr),
+            _ => Err(format!(
+                "the {} session waits on no blit semaphore",
+                self.backend_name()
+            )),
+        }
+    }
+
+    /// A semaphore for the X server to signal after each blit, as the fd it imports, for
+    /// `encode_dmabuf_after_blit` to wait on; None for a session that cannot wait on one (NVENC
+    /// alone can, through CUDA).
+    pub fn blit_semaphore_fd(&mut self) -> Option<Result<std::os::fd::OwnedFd, String>> {
+        match self {
+            FrameEncoder::Nvenc(enc) => Some(enc.blit_semaphore_fd()),
+            _ => None,
         }
     }
 }

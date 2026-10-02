@@ -218,6 +218,23 @@ struct CudaFunctions {
     cuDeviceGetName: unsafe extern "C" fn(name: *mut c_char, len: i32, dev: CUdevice) -> CUresult,
     cuDeviceGetUuid: unsafe extern "C" fn(uuid: *mut CUuuid, dev: CUdevice) -> CUresult,
     cuGetErrorName: unsafe extern "C" fn(error: CUresult, pStr: *mut *const c_char) -> CUresult,
+    /// External semaphores (CUDA 10), bound only where present: the X server's blit semaphore is
+    /// imported and waited on through them, and a driver without them keeps the GetImage fence.
+    cuImportExternalSemaphore: Option<
+        unsafe extern "C" fn(
+            out: *mut CUexternalSemaphore,
+            desc: *const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC,
+        ) -> CUresult,
+    >,
+    cuWaitExternalSemaphoresAsync: Option<
+        unsafe extern "C" fn(
+            semaphores: *const CUexternalSemaphore,
+            params: *const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS,
+            count: u32,
+            stream: CUstream,
+        ) -> CUresult,
+    >,
+    cuDestroyExternalSemaphore: Option<unsafe extern "C" fn(sem: CUexternalSemaphore) -> CUresult>,
 }
 
 /// Dynamically loaded NVENC entry points (from `libnvidia-encode`).
@@ -1434,6 +1451,9 @@ pub struct NvencEncoder {
     /// reference, and nothing is tracked.
     references: Option<ReferenceWindow>,
     last_reference: Reference,
+    /// The X server's blit semaphore imported into this context (`blit_semaphore_fd`), which
+    /// `encode_after_blit` queues each frame's wait on; null until one is made.
+    blit_semaphore: CUexternalSemaphore,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -1492,6 +1512,12 @@ impl Drop for NvencEncoder {
                 if *len > 0 {
                     (self.cuda.cuMemHostUnregister)(*base as *mut c_void);
                 }
+            }
+
+            if !self.blit_semaphore.is_null()
+                && let Some(destroy) = self.cuda.cuDestroyExternalSemaphore
+            {
+                destroy(self.blit_semaphore);
             }
 
             if !self.encoder_session.is_null() {
@@ -1659,6 +1685,15 @@ impl NvencEncoder {
                 cuDeviceGetName: load!(lib, b"cuDeviceGetName\0"),
                 cuDeviceGetUuid: load!(lib, b"cuDeviceGetUuid\0"),
                 cuGetErrorName: load!(lib, b"cuGetErrorName\0"),
+                cuImportExternalSemaphore: lib.get(b"cuImportExternalSemaphore\0").ok().map(|s| *s),
+                cuWaitExternalSemaphoresAsync: lib
+                    .get(b"cuWaitExternalSemaphoresAsync\0")
+                    .ok()
+                    .map(|s| *s),
+                cuDestroyExternalSemaphore: lib
+                    .get(b"cuDestroyExternalSemaphore\0")
+                    .ok()
+                    .map(|s| *s),
                 _lib: lib,
             })
         }
@@ -2321,6 +2356,7 @@ impl NvencEncoder {
                     }
                 }),
                 last_reference: Reference::Untracked,
+                blit_semaphore: ptr::null_mut(),
             })
         }
     }
@@ -3356,6 +3392,77 @@ impl NvencEncoder {
         crf: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
+        self.encode_frame(dmabuf, frame_number, crf, force_idr, false)
+    }
+
+    /// `encode`, for a buffer the X server is still blitting into: the frame's work is queued
+    /// behind a wait on the semaphore the server signals once the blit has landed
+    /// (`blit_semaphore_fd`), so it runs on the GPU right behind the blit instead of after the
+    /// CPU has learnt of it. NVENC reads its input on the default stream, as the copy and the
+    /// convert do, so one wait there orders all of it.
+    pub fn encode_after_blit(
+        &mut self,
+        dmabuf: &Dmabuf,
+        frame_number: u64,
+        crf: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, String> {
+        self.encode_frame(dmabuf, frame_number, crf, force_idr, true)
+    }
+
+    /// A new semaphore for the X server to signal after a blit and `encode_after_blit` to wait
+    /// on: made on this session's GPU, imported into its context in place of any earlier one,
+    /// and returned as the fd the server imports.
+    pub fn blit_semaphore_fd(&mut self) -> Result<std::os::fd::OwnedFd, String> {
+        use std::os::fd::IntoRawFd;
+        unsafe {
+            let (Some(import), Some(_), Some(destroy)) = (
+                self.cuda.cuImportExternalSemaphore,
+                self.cuda.cuWaitExternalSemaphoresAsync,
+                self.cuda.cuDestroyExternalSemaphore,
+            ) else {
+                return Err("the CUDA driver has no external semaphores".into());
+            };
+            let mut uuid = CUuuid { bytes: [0; 16] };
+            if (self.cuda.cuDeviceGetUuid)(&mut uuid, self.cuda_device) != CUresult::CUDA_SUCCESS {
+                return Err("the CUDA device has no UUID to find its Vulkan device by".into());
+            }
+            let (cuda_fd, server_fd) =
+                super::blit_semaphore::opaque_fd_pair(uuid.bytes.map(|b| b as u8))?;
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            if !self.blit_semaphore.is_null() {
+                destroy(self.blit_semaphore);
+                self.blit_semaphore = ptr::null_mut();
+            }
+            let mut desc = CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC {
+                type_: CUexternalSemaphoreHandleType::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD,
+                ..Default::default()
+            };
+            desc.handle.fd = cuda_fd.as_raw_fd();
+            let mut semaphore: CUexternalSemaphore = ptr::null_mut();
+            let r = import(&mut semaphore, &desc);
+            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+            if r != CUresult::CUDA_SUCCESS {
+                return Err(format!(
+                    "CUDA refused the semaphore ({})",
+                    Self::get_error_string(&self.cuda, r)
+                ));
+            }
+            // A successful import owns its fd.
+            let _ = cuda_fd.into_raw_fd();
+            self.blit_semaphore = semaphore;
+            Ok(server_fd)
+        }
+    }
+
+    fn encode_frame(
+        &mut self,
+        dmabuf: &Dmabuf,
+        frame_number: u64,
+        crf: u32,
+        force_idr: bool,
+        after_blit: bool,
+    ) -> Result<Vec<u8>, String> {
         unsafe {
             self.reconfigure_if_needed(crf);
             let fd = dmabuf.handles().next().ok_or("No handles")?.as_raw_fd();
@@ -3363,6 +3470,26 @@ impl NvencEncoder {
             let modifier: u64 = fmt.modifier.into();
             let identity = DmaBufIdentity::probe(fd, modifier, self.width, self.height);
             let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+
+            // First, before anything can fail: each signal the server was asked for has exactly
+            // one wait, or the binary semaphore would be signalled again while still signalled.
+            if after_blit {
+                let wait = self.cuda.cuWaitExternalSemaphoresAsync;
+                let queued = match wait {
+                    Some(wait) if !self.blit_semaphore.is_null() => {
+                        let params = CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS::default();
+                        wait(&self.blit_semaphore, &params, 1, ptr::null_mut())
+                    }
+                    _ => CUresult::CUDA_ERROR_NOT_INITIALIZED,
+                };
+                if queued != CUresult::CUDA_SUCCESS {
+                    (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    return Err(format!(
+                        "the wait for the server's blit could not be queued ({})",
+                        Self::get_error_string(&self.cuda, queued)
+                    ));
+                }
+            }
 
             // A raw fd number is not an identity: the host recycles fd numbers across slot
             // renegotiations, so an entry whose stored identity no longer matches is torn down and
