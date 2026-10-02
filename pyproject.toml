@@ -141,11 +141,11 @@ before-all = """
     }
 
     # --- MANYLINUX (RPM-based) ---
+    # Everything below comes from the image's AlmaLinux 8 BaseOS, AppStream and
+    # PowerTools, so no third-party repository (RPM Fusion, EPEL) is added, and
+    # the EPEL one the image carries is left out of the install.
     if command -v dnf; then
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://download1.rpmfusion.org/nonfree/el/rpmfusion-nonfree-release-$(rpm -E %rhel).noarch.rpm && \
-        dnf localinstall -y --nogpgcheck https://dl.fedoraproject.org/pub/epel/epel-release-latest-$(rpm -E %rhel).noarch.rpm && \
-        dnf install -y \
+        dnf install -y --disablerepo='epel*' \
             curl \
             clang \
             pixman-devel \
