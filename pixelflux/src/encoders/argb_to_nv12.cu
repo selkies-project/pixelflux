@@ -6,7 +6,7 @@
 
 // ARGB/ABGR -> NV12, and to P010 and planar 4:4:4 at 10 bits, BT.709 at limited range. NVENC's own conversion follows the matrix a
 // session declares but weights the two columns of a 4:2:0 block 3:1 instead of averaging them,
-// which is what these kernels replace.
+// which is what these kernels replace. A hash per band of rows follows, for change detection.
 
 __device__ __forceinline__ float luma(float r, float g, float b)
 {
@@ -222,4 +222,47 @@ extern "C" __global__ void argb_tex_to_yuv444p10(
 {
     Texture read = { src, swap_rb };
     block_yuv444p10(read, dst, dst_pitch, width, height);
+}
+
+// A hash of each band of `band_rows` rows of a packed 32-bit frame: the change detection of a
+// capture that reports no damage (NvFBC's), run where the frame lies. Each pixel's color, its
+// alpha byte aside, is mixed with its place in the band and the mixes summed, a reduction that
+// needs no order: one block of HASH_THREADS threads a band and segment of its columns (the grid's
+// y), whose sums the caller adds into the band's.
+#define HASH_THREADS 256
+
+__device__ __forceinline__ unsigned long long mix64(unsigned long long x)
+{
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+extern "C" __global__ void band_hash(
+    const unsigned char* src, int src_pitch,
+    int width, int height, int band_rows,
+    unsigned long long* out)
+{
+    __shared__ unsigned long long sums[HASH_THREADS];
+    int top = blockIdx.x * band_rows;
+    int bottom = min(top + band_rows, height);
+    int stride = gridDim.y * HASH_THREADS;
+    unsigned long long sum = 0;
+    for (int y = top; y < bottom; ++y) {
+        const unsigned int* row = (const unsigned int*)(src + (long)src_pitch * y);
+        unsigned long long at = (unsigned long long)(y - top) * width;
+        for (int x = blockIdx.y * HASH_THREADS + threadIdx.x; x < width; x += stride)
+            sum += mix64((at + x) << 24 | (row[x] & 0xffffffu));
+    }
+    sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s = HASH_THREADS / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            sums[threadIdx.x] += sums[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        out[blockIdx.x * gridDim.y + blockIdx.y] = sums[0];
 }

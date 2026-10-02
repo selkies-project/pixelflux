@@ -116,7 +116,7 @@ impl Damage {
     }
 
     /// Whether the change is more than a small one, so the frame counts as motion.
-    fn is_motion(self) -> bool {
+    pub(crate) fn is_motion(self) -> bool {
         match self {
             Damage::None => false,
             Damage::Area(f) => f > SMALL_AREA,
@@ -435,7 +435,7 @@ pub struct HwFrameDecision {
 impl HwFrameDecision {
     /// The quality the whole frame is coded at in place of the session's `normal` one: a
     /// quantizer held for it, or a constant quality's paint-over one.
-    fn cleanup_quality(&self, normal: u32) -> Option<u32> {
+    pub(crate) fn cleanup_quality(&self, normal: u32) -> Option<u32> {
         self.hold_qp
             .filter(|_| self.hold_band.is_none())
             .or((self.target_qp != normal).then_some(self.target_qp))
@@ -815,7 +815,7 @@ fn decide_constant_quality(
 /// Rows per band of the content hash a full-frame X11 session reads its damage from: one band is
 /// under `SMALL_AREA` of a screen from 720 rows up, so a caret or a clock reads as the small
 /// change it is.
-const DAMAGE_BAND_ROWS: usize = 32;
+pub(crate) const DAMAGE_BAND_ROWS: usize = 32;
 
 /// Which bands of `DAMAGE_BAND_ROWS` rows of a host frame (`stride` bytes per row, `height` rows)
 /// changed against the frame before, read from a content hash per band
@@ -859,6 +859,23 @@ fn band_damage(dirty: &[bool]) -> Damage {
     } else {
         Damage::Area(changed as f32 / dirty.len() as f32)
     }
+}
+
+/// The damage of a frame whose bands were hashed where it lies (NvFBC's, on the GPU) against the
+/// hashes of the frame before, which `last` keeps: the share of the bands that changed. No hashes
+/// before is all new.
+pub(crate) fn hashed_damage(last: &mut Vec<u64>, hashes: Vec<u64>) -> Damage {
+    let dirty: Vec<bool> = if last.len() == hashes.len() {
+        hashes
+            .iter()
+            .zip(last.iter())
+            .map(|(a, b)| a != b)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    *last = hashes;
+    band_damage(&dirty)
 }
 
 /// The damage of a host frame against the one before it, from its band hash (`hash_bands`).
@@ -3112,6 +3129,32 @@ mod tests {
         );
         assert_eq!(band_damage(&[true, true, false, true]), Damage::Area(0.75));
         assert_eq!(band_damage(&[]), Damage::Area(1.0));
+    }
+
+    /// Band hashes taken elsewhere read as the share of the bands that changed: a caret's band of
+    /// a 1080p screen is a small change and three are motion; a first frame, or one of another
+    /// height, is all new.
+    #[test]
+    fn hashed_damage_reports_the_bands_that_changed() {
+        let n = 1080usize.div_ceil(DAMAGE_BAND_ROWS);
+        let frame: Vec<u64> = (0..n as u64).collect();
+        let mut last = Vec::new();
+        assert_eq!(hashed_damage(&mut last, frame.clone()), Damage::Area(1.0));
+        assert_eq!(hashed_damage(&mut last, frame.clone()), Damage::None);
+        let mut caret = frame.clone();
+        caret[6] ^= 1;
+        let d = hashed_damage(&mut last, caret.clone());
+        assert_eq!(d, Damage::Area(1.0 / n as f32));
+        assert!(!d.is_motion());
+        let mut window = caret.clone();
+        for band in &mut window[10..13] {
+            *band ^= 1;
+        }
+        assert!(hashed_damage(&mut last, window).is_motion());
+        assert_eq!(
+            hashed_damage(&mut last, frame[..n - 1].to_vec()),
+            Damage::Area(1.0)
+        );
     }
 }
 

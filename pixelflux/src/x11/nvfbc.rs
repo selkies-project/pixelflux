@@ -26,8 +26,9 @@
 //!    which lets the driver attach to a fullscreen unoccluded application and have it present
 //!    into the capture buffer, bypassing the X server entirely.
 //! 3. **Unrestricted frame rate.** Capture and encode share one thread with no hand-off, and
-//!    neither does any per-pixel CPU work: no shm round-trip, no content hashing, no cursor
-//!    blend. What the loop can sustain is what NVENC can sustain.
+//!    neither does any per-pixel CPU work: no shm round-trip, no content hashing on the host
+//!    (the GPU hashes a new frame's bands where it lies), no cursor blend. What the loop can
+//!    sustain is what NVENC can sustain.
 //!
 //! Requirements are checked rather than assumed, because none of them holds everywhere: the
 //! session must encode on NVENC (the device pointer is meaningless to any other encoder), the X
@@ -59,7 +60,9 @@ use super::Controls;
 use crate::RustCaptureSettings;
 use crate::encoders::nvenc::NvencEncoder;
 use crate::encoders::software::{EncodedStripe, FrameTiming, StripeState};
-use crate::pipeline::{Damage, EncoderQuality, decide_hw_fullframe};
+use crate::pipeline::{
+    DAMAGE_BAND_ROWS, Damage, EncoderQuality, decide_hw_fullframe, hashed_damage, periodic_idr_due,
+};
 use crate::recording_sink::RecordingSink;
 use nvcodec_sys::cuda::CUdeviceptr;
 
@@ -935,8 +938,11 @@ const GEOMETRY_POLL_FRAMES: i32 = 30;
 /// 4. **Follows the geometry**: a framebuffer resize restarts the capture session at the new size
 ///    and reconfigures NVENC in place.
 /// 5. **Encodes** through the same send / quality / key-frame policy every full-frame encoder
-///    obeys, with the driver's own "this frame is new" report standing in for the damage signal,
-///    and hands the bitstream to the recording sink and the delivery callback.
+///    obeys, with the driver's own "this frame is new" report standing in for the damage signal
+///    and a hash of the new frame's bands on the GPU (`NvencEncoder::band_hashes`) saying how
+///    much of it changed, so a blinking caret stays a small change while directly rendered GL,
+///    which the X server may not report, reads as the motion it is; and hands the bitstream to
+///    the recording sink and the delivery callback.
 pub fn run_capture<F>(
     settings: RustCaptureSettings,
     controls: Arc<Controls>,
@@ -956,6 +962,8 @@ where
 
     let recording_sink = RecordingSink::try_bind(&settings.recording_socket, settings.target_fps);
     let mut state = StripeState::default();
+    let mut hashes: Vec<u64> = Vec::new();
+    let mut lagged = Damage::None;
     let mut frame_counter: u16 = 0;
     let mut pending_force_idr = false;
     let mut next_frame = Instant::now();
@@ -1036,6 +1044,8 @@ where
                 match restart_session(&mut gpu, region, size, want_cursor) {
                     Ok(()) => {
                         state = StripeState::default();
+                        hashes.clear();
+                        lagged = Damage::None;
                         pending_force_idr = true;
                     }
                     Err(e) => {
@@ -1068,6 +1078,8 @@ where
                     return Some(Err(format!("NvFBC capture could not be rebuilt: {e}")));
                 }
                 state = StripeState::default();
+                hashes.clear();
+                lagged = Damage::None;
                 pending_force_idr = true;
                 continue;
             }
@@ -1088,18 +1100,47 @@ where
                 )));
             }
             state = StripeState::default();
+            hashes.clear();
+            lagged = Damage::None;
             pending_force_idr = true;
         }
 
-        let decision = decide_hw_fullframe(
+        let pitch = frame_pitch(frame.byte_size, frame.width, frame.height);
+        let hash = |encoder: &mut NvencEncoder, hashes: &mut Vec<u64>| {
+            encoder
+                .band_hashes(
+                    frame.device_ptr,
+                    pitch,
+                    frame.width,
+                    frame.height,
+                    DAMAGE_BAND_ROWS as u32,
+                )
+                .map_or(Damage::Unknown, |h| hashed_damage(hashes, h))
+        };
+        // Without Turbo the extent decides whether a new frame is sent, so it is hashed first.
+        // Turbo sends every frame and only its cleanup reads the extent, so there it reads the
+        // frame before's (`lagged`), hashed after that frame's delivery: beside a GPU-bound GL
+        // client the hash waits for the GPU, half a millisecond a frame on the path to the
+        // client. As on the XShm path, a new frame coded whole at a cleanup's quality is hashed
+        // first instead, and one that moved is coded as motion is; a held band codes the rest of
+        // its frame at the coarsest quantizer, so a change there costs one coarse frame. Turbo
+        // without the paint-over reads no extent.
+        let lags = gpu.settings.video_streaming_mode && gpu.settings.use_paint_over_quality;
+        let damage = if lags {
+            std::mem::replace(&mut lagged, Damage::None)
+        } else if !frame.is_new {
+            Damage::None
+        } else if gpu.settings.video_streaming_mode {
+            hashes.clear();
+            Damage::Unknown
+        } else {
+            hash(&mut gpu.encoder, &mut hashes)
+        };
+        let mut decision = decide_hw_fullframe(
             &mut state,
             &gpu.settings,
             frame_counter,
-            if frame.is_new {
-                Damage::Unknown
-            } else {
-                Damage::None
-            },
+            damage,
             false,
             pending_force_idr,
             EncoderQuality {
@@ -1112,9 +1153,20 @@ where
                 psnr: None,
             },
         );
+        let normal = gpu.settings.video_crf as u32;
+        let mut extent = None;
+        if lags && frame.is_new && decision.send && decision.cleanup_quality(normal).is_some() {
+            let d = hash(&mut gpu.encoder, &mut hashes);
+            if d.is_motion() {
+                decision.hold_qp = None;
+                decision.target_qp = normal;
+                decision.force_idr =
+                    pending_force_idr || periodic_idr_due(&gpu.settings, frame_counter);
+            }
+            extent = Some(d);
+        }
         let mut delivered = false;
         if decision.send {
-            let pitch = frame_pitch(frame.byte_size, frame.width, frame.height);
             let encode_start_ns = crate::wayland::host::now_ns();
             if let Some(q) = decision.hold_qp {
                 gpu.encoder.hold_quantizer(q, decision.hold_band);
@@ -1163,6 +1215,13 @@ where
                     }
                 }
             }
+        }
+        if lags {
+            lagged = match extent {
+                Some(d) => d,
+                None if frame.is_new => hash(&mut gpu.encoder, &mut hashes),
+                None => Damage::None,
+            };
         }
         // An unserved request stays armed: on an infinite GOP a key frame lost to an encode error
         // or a skipped tick would never come back on its own.

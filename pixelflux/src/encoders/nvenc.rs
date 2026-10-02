@@ -51,11 +51,20 @@ use nvcodec_sys::*;
 type CUmodule = *mut c_void;
 type CUfunction = *mut c_void;
 
-/// The ARGB/ABGR → NV12 convert, as PTX the driver JIT-compiles at session open. PTX is the
-/// portable form: `libcuda` compiles it for whatever GPU is present, so nothing beyond the
-/// driver NVENC already needs has to be installed, and `.version 3.1`/`.target sm_30` keeps
-/// every NVENC-capable GPU in range.
+/// The ARGB/ABGR → NV12 convert and the band hash, as PTX the driver JIT-compiles at session
+/// open. PTX is the portable form: `libcuda` compiles it for whatever GPU is present, so nothing
+/// beyond the driver NVENC already needs has to be installed, and `.version 3.1`/`.target sm_30`
+/// keeps every NVENC-capable GPU in range.
 const ARGB_TO_NV12_PTX: &[u8] = include_bytes!("argb_to_nv12.ptx");
+
+/// JIT the kernels' module into the current context; `None` where the driver refuses it.
+unsafe fn load_kernels(cuda: &CudaFunctions) -> Option<CUmodule> {
+    let mut ptx = ARGB_TO_NV12_PTX.to_vec();
+    ptx.push(0);
+    let mut module: CUmodule = ptr::null_mut();
+    ((cuda.cuModuleLoadData)(&mut module, ptx.as_ptr() as *const c_void) == CUresult::CUDA_SUCCESS)
+        .then_some(module)
+}
 
 /// EGL C-interop type aliases and the `EGL_*` attribute constants used to wrap a dmabuf as
 /// an `EGLImageKHR` for CUDA import.
@@ -1255,14 +1264,7 @@ impl ChromaConvert {
         height: u32,
         layout: ConvertLayout,
     ) -> Option<Self> {
-        let mut ptx = ARGB_TO_NV12_PTX.to_vec();
-        ptx.push(0);
-        let mut module: CUmodule = ptr::null_mut();
-        if (cuda.cuModuleLoadData)(&mut module, ptx.as_ptr() as *const c_void)
-            != CUresult::CUDA_SUCCESS
-        {
-            return None;
-        }
+        let module = load_kernels(cuda)?;
         let mut kernel: CUfunction = ptr::null_mut();
         let mut kernel_tex: CUfunction = ptr::null_mut();
         let (linear, texture) = layout.kernels();
@@ -1450,6 +1452,105 @@ impl ChromaConvert {
     }
 }
 
+/// A hash per band of rows of a packed 32-bit frame in video memory (`band_hash`), computed
+/// where the frame lies and read back as one word a band and column segment.
+struct BandHash {
+    module: CUmodule,
+    kernel: CUfunction,
+    sums: CUdeviceptr,
+    capacity: usize,
+}
+
+/// The threads of a `band_hash` block, as the kernel sizes its reduction, and the blocks a band
+/// is split into across its columns, so a frame's few bands fill the GPU: a P100 hashed 1080p in
+/// 0.08 ms this way and in 0.12 with a block a band, its 34 bands leaving 22 of the 56
+/// multiprocessors idle.
+const HASH_THREADS: u32 = 256;
+const HASH_SEGMENTS: u32 = 4;
+
+impl BandHash {
+    unsafe fn new(cuda: &CudaFunctions) -> Option<Self> {
+        let module = load_kernels(cuda)?;
+        let mut kernel: CUfunction = ptr::null_mut();
+        if (cuda.cuModuleGetFunction)(&mut kernel, module, c"band_hash".as_ptr())
+            != CUresult::CUDA_SUCCESS
+        {
+            (cuda.cuModuleUnload)(module);
+            return None;
+        }
+        Some(Self {
+            module,
+            kernel,
+            sums: 0,
+            capacity: 0,
+        })
+    }
+
+    /// On the default stream so the hash is ordered behind whatever produced the frame; the copy
+    /// back waits for it.
+    unsafe fn run(
+        &mut self,
+        cuda: &CudaFunctions,
+        src: CUdeviceptr,
+        pitch: usize,
+        width: u32,
+        height: u32,
+        rows: u32,
+    ) -> Option<Vec<u64>> {
+        let bands = height.div_ceil(rows.max(1)) as usize;
+        let words = bands * HASH_SEGMENTS as usize;
+        if words > self.capacity {
+            if self.sums != 0 {
+                (cuda.cuMemFree_v2)(self.sums);
+            }
+            self.capacity = 0;
+            if (cuda.cuMemAlloc_v2)(&mut self.sums, words * 8) != CUresult::CUDA_SUCCESS {
+                self.sums = 0;
+                return None;
+            }
+            self.capacity = words;
+        }
+        let (mut src, mut sp, mut out) = (src, pitch as i32, self.sums);
+        let (mut w, mut h, mut r) = (width as i32, height as i32, rows.max(1) as i32);
+        let mut params: [*mut c_void; 6] = [
+            &mut src as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+        ];
+        let mut sums = vec![0u64; words];
+        ((cuda.cuLaunchKernel)(
+            self.kernel,
+            bands as u32,
+            HASH_SEGMENTS,
+            1,
+            HASH_THREADS,
+            1,
+            1,
+            0,
+            ptr::null_mut(),
+            params.as_mut_ptr(),
+            ptr::null_mut(),
+        ) == CUresult::CUDA_SUCCESS
+            && (cuda.cuMemcpyDtoH_v2)(sums.as_mut_ptr() as *mut c_void, self.sums, words * 8)
+                == CUresult::CUDA_SUCCESS)
+            .then(|| {
+                sums.chunks(HASH_SEGMENTS as usize)
+                    .map(|band| band.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
+                    .collect()
+            })
+    }
+
+    unsafe fn release(self, cuda: &CudaFunctions) {
+        if self.sums != 0 {
+            (cuda.cuMemFree_v2)(self.sums);
+        }
+        (cuda.cuModuleUnload)(self.module);
+    }
+}
+
 /// A live NVENC encoder session with its CUDA context and interop resources.
 ///
 /// One instance owns a CUDA context bound to a specific GPU plus an NVENC session and everything
@@ -1544,6 +1645,9 @@ pub struct NvencEncoder {
     /// The X server's blit semaphore imported into this context (`blit_semaphore_fd`), which
     /// `encode_after_blit` queues each frame's wait on; null until one is made.
     blit_semaphore: CUexternalSemaphore,
+    /// The band hash (`band_hashes`), loaded by the first frame that asks for one; `Some(None)`
+    /// where the driver refused it.
+    band_hash: Option<Option<BandHash>>,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -1572,6 +1676,9 @@ impl Drop for NvencEncoder {
             self.unmap_external_input();
             if let Some(csc) = self.csc.take() {
                 csc.release(&self.cuda, &self.nvenc_funcs, self.encoder_session);
+            }
+            if let Some(Some(hash)) = self.band_hash.take() {
+                hash.release(&self.cuda);
             }
             if !self.mapped_input_buffer.is_null() {
                 (self.nvenc_funcs.nvEncUnmapInputResource.unwrap())(
@@ -2489,6 +2596,7 @@ impl NvencEncoder {
                 }),
                 last_reference: Reference::Untracked,
                 blit_semaphore: ptr::null_mut(),
+                band_hash: None,
             })
         }
     }
@@ -4265,6 +4373,34 @@ impl NvencEncoder {
             }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
+        }
+    }
+
+    /// The hash of each band of `rows` rows of the `width`x`height` packed frame at
+    /// `device_ptr` (`pitch` bytes a row, in this session's context), computed where the frame
+    /// lies: the change detection of a capture that reports none, NvFBC's. None where the driver
+    /// refuses the kernel.
+    pub fn band_hashes(
+        &mut self,
+        device_ptr: CUdeviceptr,
+        pitch: usize,
+        width: u32,
+        height: u32,
+        rows: u32,
+    ) -> Option<Vec<u64>> {
+        if pitch < width as usize * 4 {
+            return None;
+        }
+        unsafe {
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            let cuda = &self.cuda;
+            let hashes = self
+                .band_hash
+                .get_or_insert_with(|| BandHash::new(cuda))
+                .as_mut()
+                .and_then(|h| h.run(cuda, device_ptr, pitch, width, height, rows));
+            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+            hashes
         }
     }
 }
@@ -6945,6 +7081,118 @@ mod gpu_tests {
             let cu = enc.cuda.clone();
             (cu.cuCtxPushCurrent_v2)(enc.cuda_context);
             (cu.cuMemFree_v2)(external);
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+    }
+
+    /// On a real GPU: the band hash reads a caret as the one band it is in and two pixels
+    /// swapped as a change, but neither the alpha byte nor the pitch's padding as one; and what
+    /// it costs a 1080p frame against the encode of it. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_band_hash_reads_the_bands_that_changed() {
+        let (w, h, rows) = (1920usize, 1080usize, 32usize);
+        let pitch = w * 4 + 64;
+        let mut enc = host_session(&settings(w as i32, h as i32, 60.0)).expect("NVENC init");
+        let (cu, ctx) = (enc.cuda.clone(), enc.cuda_context);
+        let picture = frame(w, h, 3);
+        let mut host = vec![0u8; pitch * h];
+        for y in 0..h {
+            host[y * pitch..][..w * 4].copy_from_slice(&picture[y * w * 4..][..w * 4]);
+        }
+        let mut dev: CUdeviceptr = 0;
+        unsafe {
+            (cu.cuCtxPushCurrent_v2)(ctx);
+            assert_eq!(
+                (cu.cuMemAlloc_v2)(&mut dev, pitch * h),
+                CUresult::CUDA_SUCCESS
+            );
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+        }
+        let upload = |host: &[u8]| unsafe {
+            (cu.cuCtxPushCurrent_v2)(ctx);
+            assert_eq!(
+                (cu.cuMemcpyHtoD_v2)(dev, host.as_ptr() as *const c_void, host.len()),
+                CUresult::CUDA_SUCCESS
+            );
+            (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
+        };
+        let changed = |a: &[u64], b: &[u64]| -> Vec<usize> {
+            (0..a.len()).filter(|&i| a[i] != b[i]).collect()
+        };
+        upload(&host);
+        let hash =
+            |enc: &mut NvencEncoder| enc.band_hashes(dev, pitch, w as u32, h as u32, rows as u32);
+        let jit = std::time::Instant::now();
+        let first = hash(&mut enc).expect("the driver takes the band hash");
+        let jit = jit.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(first.len(), h.div_ceil(rows));
+        assert_eq!(hash(&mut enc).unwrap(), first, "one frame, one hash");
+
+        for y in 200..220 {
+            for x in 300..302 {
+                host[y * pitch + x * 4..][..3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        upload(&host);
+        let caret = hash(&mut enc).unwrap();
+        assert_eq!(changed(&first, &caret), vec![200 / rows], "a 2x20 caret");
+
+        for y in 0..h {
+            for x in 0..w {
+                host[y * pitch + x * 4 + 3] ^= 0x5a;
+            }
+            host[y * pitch + w * 4..][..64].fill(0xa5);
+        }
+        upload(&host);
+        assert_eq!(
+            hash(&mut enc).unwrap(),
+            caret,
+            "the alpha byte and the padding are not the picture"
+        );
+
+        let (a, b) = (650 * pitch + 100 * 4, 650 * pitch + 101 * 4);
+        assert_ne!(host[a..a + 3], host[b..b + 3]);
+        for i in 0..4 {
+            host.swap(a + i, b + i);
+        }
+        upload(&host);
+        assert_eq!(
+            changed(&caret, &hash(&mut enc).unwrap()),
+            vec![650 / rows],
+            "two pixels swapped"
+        );
+
+        let mut time = |w: u32, h: u32| -> Vec<f64> {
+            let mut ms: Vec<f64> = (0..300)
+                .map(|_| {
+                    let t = std::time::Instant::now();
+                    enc.band_hashes(dev, pitch, w, h, rows as u32).unwrap();
+                    t.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            ms.sort_by(f64::total_cmp);
+            ms
+        };
+        let (hashing, fixed) = (time(w as u32, h as u32), time(64, rows as u32));
+        let mut encoding: Vec<f64> = (0..120u64)
+            .map(|i| {
+                let t = std::time::Instant::now();
+                enc.encode_cuda_pitch(dev, pitch, false, i, 25, i == 0)
+                    .expect("encode");
+                t.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        encoding.sort_by(f64::total_cmp);
+        println!(
+            "[band hash] 1080p: {:.3} ms median, {:.3} ms p99 a frame ({:.3} ms of it for a 64x{rows} \
+             one), the first {jit:.1} ms with the module's load; the encode {:.3} ms median",
+            hashing[150], hashing[297], fixed[150], encoding[60]
+        );
+        enc.release_external_input();
+        unsafe {
+            (cu.cuCtxPushCurrent_v2)(ctx);
+            (cu.cuMemFree_v2)(dev);
             (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
     }

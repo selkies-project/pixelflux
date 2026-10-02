@@ -188,7 +188,7 @@ and the lock, so a build ahead of a release carries the series version and a rel
 
 A still screen is cleaned up by one policy (`pipeline::cleanup_due`, run per frame by
 `decide_hw_fullframe` and per stripe by `encode_cpu`) that reads what changed from the content —
-compositor damage, the X server's or NvFBC's report, a content hash — never from what was sent,
+compositor damage, the X server's report, a content hash (NvFBC's on the GPU) — never from what was sent,
 so Turbo (`video_streaming_mode`) sees the screen go still like any other mode: a refresh at the
 paint-over quantizer once the region holds still for the trigger, a key frame at it once a large
 change has held still for four times that, and the same cleanup for a region that keeps changing
@@ -269,7 +269,12 @@ pays about 7 ms once per capture start to find that out.
 All three publish a change as it lands rather than on the next tick: NvFBC because the driver
 generates a frame on damage and the grab waits for it, DRI3 and XShm because the X server's
 DAMAGE reports end the wait early. How far any of them may come early is the frame pacing the
-Wayland backend also keeps (`pace.rs`), so the rate stays the configured one. The NvFBC
+Wayland backend also keeps (`pace.rs`), so the rate stays the configured one. NvFBC's driver says
+only that a frame is new; how much of it changed comes from a hash of its bands on the GPU
+(`band_hash`, in the convert's module, read back as one word a band), the XShm path's band damage
+computed where the frame lies, so a caret reads as the small change it is and directly rendered GL,
+which the X server's DAMAGE may never report, as motion. Under Turbo the cleanup reads the frame
+before's, hashed after its delivery, as the XShm path's reads the hash run beside the encode. The NvFBC
 structures are hand-written FFI checked against the SDK by the layout and version assertions
 in that module, and `libnvidia-fbc.so.1` is
 loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
