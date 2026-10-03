@@ -155,7 +155,7 @@ unsafe extern "C" fn log_info(_user: *mut c_void, message: *const c_char) {
 /// with each bound.
 ///
 /// A buffer of `vbv_bits` (a frame and a half) with every frame capped at it is the tightest,
-/// and the default. Intel's iHD stops coding under it: measured on an Arc A750 at 1080p and
+/// and the default. Intel's iHD stops coding under it: measured on Intel Arc at 1080p and
 /// 60 fps, its H.264 and HEVC rate controls skip every block and pad the frame with zeros up
 /// to the target once the buffer or the cap binds, and its AV1 one spends a third of the
 /// target, so a scroll sat at 19 to 20 dB at 2, 8, and 30 Mbit/s alike and a still screen was
@@ -342,6 +342,16 @@ impl Device {
     /// such a surface converts sheared unless its pitch is already a multiple of 64.
     fn rounds_linear_pitch(&self) -> bool {
         self.vendor.contains("Intel")
+    }
+
+    /// The quantizer curve the driver's sessions read: Intel's has its own where its encoders
+    /// were measured apart from AMD's.
+    fn hardware(&self) -> Hardware {
+        if self.vendor.contains("Intel") {
+            Hardware::VaapiIntel
+        } else {
+            Hardware::Vaapi
+        }
     }
 
     /// Whether the driver's rate control stops coding in a buffer of a frame or two, as Intel's
@@ -1144,8 +1154,8 @@ impl VaapiEncoder {
                 dpb_level,
                 fullcolor,
                 bit_depth,
-                min_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.min_qp),
-                max_qp: codec.hardware_quantizer_bound(Hardware::Vaapi, rate.max_qp),
+                min_qp: codec.hardware_quantizer_bound(device.hardware(), rate.min_qp),
+                max_qp: codec.hardware_quantizer_bound(device.hardware(), rate.max_qp),
             },
             fourcc,
             rt_format,
@@ -1163,7 +1173,7 @@ impl VaapiEncoder {
             surfaces_of: HashMap::new(),
             last_reference: Reference::Untracked,
             rate,
-            qp: codec.hardware_quantizer(Hardware::Vaapi, settings.video_crf),
+            qp: codec.hardware_quantizer(device.hardware(), settings.video_crf),
             held: None,
             frame_cap: false,
             last_bytes: None,
@@ -1294,7 +1304,7 @@ fn arm_block(arm: &Arm) -> u32 {
 /// arbitrary rows as asked, equal rows with a shorter last slice where the driver wants them
 /// equal (iHD's H.264), a power of two of rows where that is all it takes, one row each
 /// where it takes only that. A slice a row is 68 slices at 1080p, none predicting from the
-/// row above and each restarting the entropy coder: on an Arc A750 a scroll of text at one
+/// row above and each restarting the entropy coder: on Intel Arc a scroll of text at one
 /// quantizer cost 12.4 kB a frame so cut and 8.6 kB in four slices, at the same PSNR.
 fn slice_layout(
     structure: u32,
@@ -1535,10 +1545,10 @@ impl VaapiEncoder {
         };
         self.negotiated.min_qp = self
             .codec
-            .hardware_quantizer_bound(Hardware::Vaapi, rate.min_qp);
+            .hardware_quantizer_bound(self.device.hardware(), rate.min_qp);
         self.negotiated.max_qp = self
             .codec
-            .hardware_quantizer_bound(Hardware::Vaapi, rate.max_qp);
+            .hardware_quantizer_bound(self.device.hardware(), rate.max_qp);
         match &mut self.arm {
             Arm::H264(a) => a.configure(
                 &self.negotiated,
@@ -1699,7 +1709,10 @@ impl VaapiEncoder {
     /// screen to by itself (51 against 61 dB at 8 Mbit/s), so `FrameEncoder::holds_quantizer`
     /// says no there.
     pub fn hold_quantizer(&mut self, crf: u32) {
-        self.held = Some(self.codec.hardware_quantizer(Hardware::Vaapi, crf as i32));
+        self.held = Some(
+            self.codec
+                .hardware_quantizer(self.device.hardware(), crf as i32),
+        );
     }
 
     /// The rate control of a sequence: the target, buffer, and frame rate a constant-rate
@@ -2044,7 +2057,9 @@ impl VaapiEncoder {
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
         if !self.rate.cbr {
-            self.qp = self.codec.hardware_quantizer(Hardware::Vaapi, crf as i32);
+            self.qp = self
+                .codec
+                .hardware_quantizer(self.device.hardware(), crf as i32);
         }
         let held_qp = self.held.take();
         self.convert(source)?;
@@ -2309,7 +2324,7 @@ impl VaapiEncoder {
         };
         self.last_quality = quantizer
             .filter(|_| self.rate.cbr)
-            .map(|q| self.codec.hardware_quality_index(Hardware::Vaapi, q));
+            .map(|q| self.codec.hardware_quality_index(self.device.hardware(), q));
         Ok(())
     }
 }
