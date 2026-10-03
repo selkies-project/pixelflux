@@ -105,6 +105,13 @@ const SAME_FRAME_QUALITY: u32 = 45;
 /// sweep runs this long at most too.
 const REFINE_S: f64 = 30.0;
 
+/// Seconds the finest quantizer such a session has coded the still screen at stands before its
+/// rate control counts as done with the picture, where the session says its quantizer and does
+/// not measure: at 0.25 Mbit/s at 1080p x265 takes a step finer every 2 to 8 s for a tenth of
+/// a dB a second, and libvpx's VP9 one every 6 s after its first ten, each for all of `REFINE_S`
+/// at the full rate, where at 2 Mbit/s x265 takes one every 2 s for its first twenty.
+const LEVEL_S: f64 = 4.0;
+
 /// Where the encoder holds a band of the picture (`EncoderQuality::band`), the refresh that
 /// falls back from a constant-rate cleanup sweeps the picture a band a frame in raster order,
 /// the first `FIRST_BAND` of it and each next sized from the bytes of the last to
@@ -572,8 +579,9 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    VP9) has no refresh to fall back to, so its frames flow, each the rate control's, until the
 ///    picture is done: where the session measures its reconstruction against its source (VA-API,
 ///    `plateau`) until that stops improving, else after a trigger period of frames at the
-///    paint-over quantizer; and in either case after `STALL_TRIGGERS` periods of small frames
-///    or `REFINE_S`. A fixed burst left such a screen where the motion did (19 to 27 dB at
+///    paint-over quantizer or once the finest quantizer it has coded at has stood for
+///    `LEVEL_S`; and in either case after `STALL_TRIGGERS` periods of small frames or
+///    `REFINE_S`. A fixed burst left such a screen where the motion did (19 to 27 dB at
 ///    2 Mbit/s at 1080p on iHD, x265, and SVT-AV1, each frame within its budget), and a
 ///    reported quantizer alone ends it early or never: iHD's H.264 average reads 26 through
 ///    a refinement from 23 to 50 dB. That cleanup then counts as settled
@@ -689,6 +697,8 @@ pub fn decide_hw_fullframe(
                 st.over_frames = 0;
                 st.same_frames = 0;
                 st.rc_bytes = 0;
+                st.finest = None;
+                st.finest_frames = 0;
                 st.fine_frames = 0;
                 st.measured = None;
                 st.level_checks = 0;
@@ -783,7 +793,16 @@ pub fn decide_hw_fullframe(
             st.rc_bytes = bytes;
             let same = st.same_frames as f64 >= EMPTY_S * settings.target_fps
                 && encoder.last.is_some_and(|q| q >= SAME_FRAME_QUALITY);
-            if ((stalled || same) && !encoder.measures)
+            if let Some(q) = encoder.last {
+                if st.finest.is_none_or(|finest| q < finest) {
+                    st.finest = Some(q);
+                    st.finest_frames = 0;
+                } else {
+                    st.finest_frames = st.finest_frames.saturating_add(1);
+                }
+            }
+            let level = st.finest_frames as f64 >= LEVEL_S * settings.target_fps;
+            if ((stalled || same || level) && !encoder.measures)
                 || done
                 || st.h264_burst_frames_remaining == 0
             {
@@ -1820,7 +1839,8 @@ mod tests {
 
     /// A session that holds no quantizer has no refresh to fall back to: its cleanup flows
     /// through the rate control past the window a holding one is given, and ends after a
-    /// trigger period of frames coded at the paint-over quantizer, whatever their size.
+    /// trigger period of frames coded at the paint-over quantizer, whatever their size, or
+    /// once its finest quantizer has stood for `LEVEL_S`.
     #[test]
     fn a_session_that_holds_no_quantizer_is_refined_until_it_reaches_the_paint_over_quality() {
         let s = hw_settings();
@@ -1863,7 +1883,24 @@ mod tests {
                 .count() as f64
                 / s.target_fps
         };
-        assert!((window(at(40)) - REFINE_S).abs() < 1.0);
+        assert!(
+            (window(at(40)) - LEVEL_S).abs() < 1.0,
+            "a quantizer that stands ends it"
+        );
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, at(44));
+        let step = (2.0 * s.target_fps) as u32;
+        let refining = (1..u16::MAX)
+            .filter(|&i| {
+                let q = 44 - (i as u32 / step).min(20);
+                decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, at(q)).send
+            })
+            .count() as f64
+            / s.target_fps;
+        assert!(
+            (refining - REFINE_S).abs() < 1.0,
+            "one a step finer every two seconds runs the window"
+        );
         let silent = EncoderQuality {
             last: None,
             ..at(40)

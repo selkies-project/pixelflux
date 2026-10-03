@@ -1044,7 +1044,8 @@ impl H264EncoderWrapper {
 ///   the paint-over quality from a cleanup until the region changes again; `rc_bytes` (the bytes of
 ///   the stripe's last frame under its rate control), `idle_frames` (a constant-rate cleanup's run
 ///   of small frames short of the paint-over quality, of empty ones for x264), `same_frames` (of
-///   frames the size of the one before), and `over_frames` (its run of frames over
+///   frames the size of the one before), `finest` and `finest_frames` (the finest quality index
+///   its rate control has coded at and the frames since), and `over_frames` (its run of frames over
 ///   `pipeline::OVERSHOOT_BUDGETS`) tell a cleanup that runs through the rate control when it has
 ///   converged, stalled, or been pinned at its coarsest quantizer, `fine_frames` counts its run of
 ///   frames at the paint-over quantizer or finer, `measured`, `measuring`, `level_checks`, and
@@ -1074,6 +1075,8 @@ pub struct StripeState {
     pub idle_frames: u32,
     pub over_frames: u32,
     pub same_frames: u32,
+    pub finest: Option<u32>,
+    pub finest_frames: u32,
     pub settled: bool,
     pub fine_frames: u32,
     pub measured: Option<f32>,

@@ -31,8 +31,10 @@ use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{Pending, Planes, Quality, RateSettings, encode_threads};
 use crate::RustCaptureSettings;
 
-/// The lowest quantizer level the real-time mode runs at; below it the library faults.
-const RTC_MIN_LEVEL: u32 = 3;
+/// The lowest quantizer level the real-time mode runs at. Below three the library faults, and
+/// below ten it codes every other frame of a scrolling text desktop with the lower third of
+/// the picture wrong, at three times the bytes of level ten.
+const RTC_MIN_LEVEL: u32 = 10;
 
 /// The highest constant-rate target the library takes, at open and live alike.
 const MAX_BITRATE_BPS: u64 = 100_000_000;
@@ -194,7 +196,11 @@ impl SvtAv1Encoder {
                 cfg.target_bit_rate = bps as u32;
                 cfg.rate_control_mode = 2;
                 cfg.max_qp_allowed = if hi > 0 { Self::level(hi) } else { 63 };
-                cfg.min_qp_allowed = if lo > 0 { Self::level(lo) } else { 1 };
+                cfg.min_qp_allowed = if lo > 0 {
+                    Self::level(lo)
+                } else {
+                    RTC_MIN_LEVEL
+                };
                 // The library refuses a rate-control buffer shorter than 20 ms, which the
                 // 1.5-frame VBV falls under above 75 fps.
                 let vbv = (rate.vbv() as u64).max(bps / 50);

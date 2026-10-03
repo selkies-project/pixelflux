@@ -709,7 +709,10 @@ fn vp9_addresses_its_slots_by_timestamp() {
             d.last_param(VAEncPictureParameterBufferType).unwrap();
         assert_eq!(unsafe { pic.ref_flags.bits.ref_last_idx() }, 4);
         assert_eq!(pic.refresh_frame_flags, 1 << 0, "timestamp 8 takes slot 0");
-        assert_eq!(pic.luma_ac_qindex, Codec::Vp9.quantizer(25) as u8);
+        assert_eq!(
+            pic.luma_ac_qindex,
+            Codec::Vp9.hardware_quantizer(Hardware::Vaapi, 25) as u8
+        );
     });
 }
 
