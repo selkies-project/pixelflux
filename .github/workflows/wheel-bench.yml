@@ -1,0 +1,89 @@
+name: Wheel bench
+
+# Builds every wheel one way without publishing anything, to time the ways
+# against each other.
+
+run-name: bench ${{ inputs.strategy }} jobs=${{ inputs.jobs }} image=${{ inputs.image }} abi3=${{ inputs.abi3 }} ${{ inputs.note }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: platform (one job per platform, before-all in it), wheel (Wheels as on main) or next (Wheels next)
+        type: choice
+        options: [platform, wheel, next]
+        default: next
+      jobs:
+        description: Jobs per platform (next)
+        type: number
+        default: 1
+      image:
+        description: cache or run (next)
+        type: choice
+        options: [cache, run]
+        default: cache
+      abi3:
+        description: Limited-API floor such as cp311 (next), empty for none
+        type: string
+        default: ''
+      salt:
+        description: Image cache key salt (next)
+        type: string
+        default: ''
+      note:
+        description: Label for the run name
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  platform:
+    if: inputs.strategy == 'platform'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [manylinux, musllinux]
+        target:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    name: ${{ matrix.platform }}_${{ matrix.target.arch }}
+    runs-on: ${{ matrix.target.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build the wheels
+        uses: pypa/cibuildwheel@e090b81e30c4d855ea63bf4b6e59204c09a101ae # v4.2.1
+        env:
+          CIBW_BUILD: "*-${{ matrix.platform }}_${{ matrix.target.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.platform }}_${{ matrix.target.arch }}
+          path: wheelhouse/*.whl
+          retention-days: 1
+          compression-level: 0
+
+  wheel:
+    if: inputs.strategy == 'wheel'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/wheels.yml
+
+  next:
+    if: inputs.strategy == 'next'
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/wheels-next.yml
+    with:
+      jobs: ${{ inputs.jobs }}
+      image: ${{ inputs.image }}
+      abi3: ${{ inputs.abi3 }}
+      salt: ${{ inputs.salt }}
