@@ -222,11 +222,13 @@ bytes, its frames flow through the rate control until the picture is done and no
 sent: VA-API until the reconstruction it reads back and measures against its source once a second
 stops improving (`FrameEncoder::measure`, `pipeline::plateau`; iHD's reported H.264 quantizer
 reads 26 through a refinement from 23 to 50 dB, and it keeps 10-bit HEVC and VP9 and packed 4:4:4
-reconstructions in a layout that cannot be read, which fall back to the quantizer), the others
-after a trigger period of frames at the paint-over quantizer, and any of them after `REFINE_S`.
-That cleanup then counts as settled, and only more than a small change arms another, so a caret
-on a clean screen costs its own frames. A session that reports no bytes (Tegra, a stateful V4L2
-device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264 stripe
+reconstructions in a layout that cannot be read, which fall back to the quantizer), the others after
+a trigger period of frames at the paint-over quantizer or once their frames have kept the size of
+the one before for `EMPTY_S` at a quantizer as coarse as the floor's, and any of them after
+`REFINE_S`. That cleanup then counts as settled, and only more than a small change arms another, so
+a caret on a clean screen costs its own frames. A session that reports no bytes (Tegra, a stateful
+V4L2 device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264
+stripe
 is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame and a half
 its row-level control coarsens the rows it names a fine quantizer for, and its cleanup ends once its
 frames have been slice headers alone for `EMPTY_S`: x264 keeps its quantizer on a screen that does

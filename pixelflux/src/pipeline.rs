@@ -84,8 +84,19 @@ pub(crate) const EMPTY_SLICE_BYTES: usize = 32;
 
 /// Seconds of such frames after which a constant-rate cleanup through x264 ends: x264 keeps its
 /// quantizer on a screen that does not change, and at 0.1 Mbit/s refines one in frames as far
-/// as 2.4 s apart.
+/// as 2.4 s apart. A session that holds no quantizer and measures nothing ends the same way
+/// once its frames at its coarsest have kept the size of the one before as long
+/// (`SAME_FRAME_SHARE`).
 pub(crate) const EMPTY_S: f64 = 3.0;
+
+/// The share of the frame before it within which a frame of a still screen codes nothing new,
+/// and the quality index from which its rate control sits at its coarsest: at 0.1 Mbit/s at
+/// 1080p libvpx's VP9 frames are 266 bytes each at index 51, or 220-221 at 46-47, and x265's
+/// 224 at 50-51, its strict constant rate padding them with filler, while the picture stays
+/// level, so never small against the 208-byte budget. From 1 Mbit/s their rate controls code a
+/// still screen at 36 and finer, x265's padded frames again of one size while it refines.
+const SAME_FRAME_SHARE: f64 = 0.125;
+const SAME_FRAME_QUALITY: u32 = 45;
 
 /// The same for a session that holds no quantizer but says the one it codes at or measures its
 /// pictures, which has no refresh to fall back to and ends its cleanup at the paint-over
@@ -676,6 +687,8 @@ pub fn decide_hw_fullframe(
                 st.h264_burst_frames_remaining = cleanup_frames(settings, encoder);
                 st.idle_frames = 0;
                 st.over_frames = 0;
+                st.same_frames = 0;
+                st.rc_bytes = 0;
                 st.fine_frames = 0;
                 st.measured = None;
                 st.level_checks = 0;
@@ -759,7 +772,21 @@ pub fn decide_hw_fullframe(
             let (measure, level) = plateau(st, encoder.psnr, PLATEAU_TRIGGERS * trigger);
             d.measure = measure;
             let done = if encoder.measures { level } else { reached };
-            if (stalled && !encoder.measures) || done || st.h264_burst_frames_remaining == 0 {
+            let bytes = encoder.bytes.unwrap_or(0);
+            st.same_frames = if bytes > 0
+                && bytes.abs_diff(st.rc_bytes) as f64 <= st.rc_bytes as f64 * SAME_FRAME_SHARE
+            {
+                st.same_frames.saturating_add(1)
+            } else {
+                0
+            };
+            st.rc_bytes = bytes;
+            let same = st.same_frames as f64 >= EMPTY_S * settings.target_fps
+                && encoder.last.is_some_and(|q| q >= SAME_FRAME_QUALITY);
+            if ((stalled || same) && !encoder.measures)
+                || done
+                || st.h264_burst_frames_remaining == 0
+            {
                 st.h264_burst_frames_remaining = 0;
                 st.settled = true;
             }
@@ -2205,6 +2232,39 @@ mod tests {
         assert!(
             (12..=15).contains(&coarser),
             "about the 12 steps that quarter the picture's cost: {coarser}"
+        );
+    }
+
+    /// A session that holds no quantizer and measures nothing, whose frames of a still screen keep
+    /// the size of the one before (libvpx's VP9 at 0.1 Mbit/s, over the budget and so never
+    /// small), ends its cleanup after `EMPTY_S` of them rather than `REFINE_S`.
+    #[test]
+    fn a_cleanup_whose_frames_keep_one_size_ends() {
+        let s = RustCaptureSettings {
+            video_bitrate_kbps: 100,
+            ..hw_settings()
+        };
+        let level = EncoderQuality {
+            last: Some(51),
+            bytes: Some(266),
+            holds: false,
+            reopens: false,
+            band: None,
+            measures: false,
+            psnr: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, level);
+        let sent = (1..=2400u16)
+            .filter(|&i| {
+                decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, level).send
+            })
+            .count();
+        let run = (EMPTY_S * s.target_fps) as usize;
+        assert!(
+            (run..=run + 4).contains(&sent),
+            "{sent} frames, not the {} of REFINE_S",
+            (REFINE_S * s.target_fps) as usize
         );
     }
 
