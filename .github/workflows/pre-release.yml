@@ -11,7 +11,7 @@ jobs:
   build:
     permissions:
       contents: read
-      actions: write
+      actions: read
     uses: ./.github/workflows/wheels.yml
 
   release:

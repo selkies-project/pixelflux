@@ -114,7 +114,7 @@ jobs:
     needs: check
     permissions:
       contents: read
-      actions: write
+      actions: read
     uses: ./.github/workflows/wheels.yml
     with:
       tag: ${{ inputs.tag || github.ref_name }}
