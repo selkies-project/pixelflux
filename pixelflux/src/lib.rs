@@ -219,7 +219,7 @@ smithay::backend::renderer::element::render_elements! {
 }
 
 /// Push an output's wlr-layer surfaces on `target_layer` into `elements`, top-most first, the
-/// order `layer_map.layers()` reversed gives. Shared by both renderers and by both of a frame's
+/// order `layer_map.layers()` reversed gives, each with its popups and subsurfaces. Shared by both renderers and by both of a frame's
 /// layer passes, which differ only in the layers they name.
 fn push_layer_elements<R>(
     renderer: &mut R,
@@ -235,19 +235,17 @@ fn push_layer_elements<R>(
         if surface.layer() == target_layer
             && let Some(geo) = layer_map.layer_geometry(surface)
         {
-            let elem = smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
-                WaylandSurfaceRenderElement::from_surface(
+            elements.extend(
+                AsRenderElements::<R>::render_elements::<WaylandSurfaceRenderElement<R>>(
+                    surface,
                     renderer,
-                    surface.wl_surface(),
-                    states,
                     geo.loc.to_physical_precise_round(scale),
+                    Scale::from(scale),
                     1.0,
-                    smithay::backend::renderer::element::Kind::Unspecified,
                 )
-            });
-            if let Ok(Some(e)) = elem {
-                elements.push(CompositionElements::Surface(e));
-            }
+                .into_iter()
+                .map(CompositionElements::Surface),
+            );
         }
     }
 }

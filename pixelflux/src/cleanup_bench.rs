@@ -16,7 +16,9 @@
 //! `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `CARET` (frames per caret toggle, 0 none),
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
-//! moving `JUMP` rows at once: a window opening on a clean still screen), `TARGET_DB` (the PSNR
+//! moving `JUMP` rows at once: a window opening on a clean still screen), `IDR_AT` and `IDR_EVERY`
+//! (a key frame asked for that many frames into the still phase, and every so many after, as a
+//! joining or recovering client does), `TARGET_DB` (the PSNR
 //! whose time to reach it is reported), `SSIM` (1 measures SSIM on every frame, not only from the
 //! stop), `ROWS` (a file for every frame's figures), `STREAM` (a file for the coded stream), and
 //! `SOURCE` (a file for the last frame's BGRA rows). Each run reports its largest frame and
@@ -271,6 +273,8 @@ fn cleanup_bench() {
     let caret_period: usize = env("CARET", 0);
     let target_db: f64 = env("TARGET_DB", 0.0);
     let ssim_all = env("SSIM", 0) == 1;
+    let idr_at: i64 = env("IDR_AT", 0);
+    let idr_every: i64 = env("IDR_EVERY", 0);
     let canvas = Canvas::for_bench(w, h);
     let mut p = X11Pipeline::new(settings.clone());
     let codec = p.codec();
@@ -325,6 +329,10 @@ fn cleanup_bench() {
         };
         let caret = caret_period > 0 && t >= stop && ((t - stop) / caret_period).is_multiple_of(2);
         canvas.frame(&mut frame, h, scroll, caret);
+        let since = t as i64 - stop as i64 - idr_at;
+        if idr_at > 0 && since >= 0 && (since == 0 || (idr_every > 0 && since % idr_every == 0)) {
+            p.request_idr();
+        }
         let start = Instant::now();
         let out = p.process(&frame, w * 4);
         let ms = start.elapsed().as_secs_f64() * 1e3;
