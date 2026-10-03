@@ -15,8 +15,8 @@ on:
         default: next
       jobs:
         description: Jobs per platform (next)
-        type: number
-        default: 1
+        type: string
+        default: '1'
       image:
         description: cache or run (next)
         type: choice

@@ -10,8 +10,8 @@ on:
         default: ''
       jobs:
         description: Jobs per platform
-        type: number
-        default: 1
+        type: string
+        default: '1'
       image:
         description: cache keeps each platform's image across runs; run builds it every run
         type: string
