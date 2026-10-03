@@ -202,9 +202,10 @@ control: the frames keep flowing, each within its budget, until it codes the reg
 paint-over quantizer or finer in a small frame (`pipeline::convergence`), and no key frame is
 sent; only where NVENC's rate control stalls short of it (a low rate for the resolution) is the
 picture refreshed at the paint-over quantizer, a band a frame through the session's QP delta map
-where it takes one (H.264 and HEVC; `FrameEncoder::band_size`), each band sized to a frame's
-budget and the rest of the frame held at the coarsest quantizer, which leaves a still region as it
-is, else in one held frame. A whole refresh held at it in one frame measured 470-730 kB at 1080p
+where it takes one (H.264 and HEVC; `FrameEncoder::band_size`), each band sized to a frame's budget
+and the rest of the frame held at the coarsest quantizer, which leaves a still region as it is, and
+a step coarser a band while the rest would run the sweep past `REFINE_S`, else in one held frame.
+A whole refresh held at it in one frame measured 470-730 kB at 1080p
 and 8 Mbit/s, half a second of queue on a 12 Mbit/s link, where the rate control reaches the same
 picture in about a second with every frame within its budget. A rate control pinned at its coarsest
 quantizer, its frames of the still screen over two budgets for a trigger period (NVENC's at

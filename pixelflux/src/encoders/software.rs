@@ -1053,7 +1053,8 @@ impl H264EncoderWrapper {
 ///   that such a cleanup ran its course under a rate control it cannot hold a quantizer
 ///   under, so no other starts before the region moves, and `sweep` (the next band's start
 ///   and the last band's size, as shares of the picture) carries the band sweep a
-///   full-frame refresh falls back to (`pipeline::decide_hw_fullframe`).
+///   full-frame refresh falls back to (`pipeline::decide_hw_fullframe`), `sweep_frames` its
+///   bands so far and `sweep_coarser` the steps they are coded coarser than the refresh.
 /// - **Content-hash damage** (only for sources without external damage, i.e. X11): `last_hash` is
 ///   the previous frame's content hash, `consecutive_changes` counts changed frames toward the
 ///   damage-block threshold, and `in_damage_block` / `damage_block_frames_remaining` drive the
@@ -1078,6 +1079,8 @@ pub struct StripeState {
     pub level_checks: u32,
     pub measure_in: u32,
     pub sweep: Option<(f64, f64)>,
+    pub sweep_frames: u32,
+    pub sweep_coarser: u32,
     #[cfg(feature = "gpl")]
     pub h264_encoder: Option<H264EncoderWrapper>,
     #[cfg(not(feature = "gpl"))]

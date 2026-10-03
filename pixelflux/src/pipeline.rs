@@ -90,7 +90,8 @@ pub(crate) const EMPTY_S: f64 = 3.0;
 /// The same for a session that holds no quantizer but says the one it codes at or measures its
 /// pictures, which has no refresh to fall back to and ends its cleanup at the paint-over
 /// quantizer or once the picture stops improving: at 2 Mbit/s at 1080p x265's rate control
-/// refines a screen of text by 0.7 dB a second, still short of that quality after ten.
+/// refines a screen of text by 0.7 dB a second, still short of that quality after ten. A band
+/// sweep runs this long at most too.
 const REFINE_S: f64 = 30.0;
 
 /// Where the encoder holds a band of the picture (`EncoderQuality::band`), the refresh that
@@ -543,7 +544,11 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    periods of small frames at a coarser quantizer), as where the rate is low for the
 ///    resolution, is the picture refreshed at `held_refresh_quality`, which ends the cleanup: a
 ///    band a frame where the encoder holds one (`FIRST_BAND`, `BAND_BUDGETS`) until the sweep
-///    has covered it or motion ends it, else one held frame; at 2 Mbit/s at 1080p a key frame
+///    has covered it or motion ends it, else one held frame. A sweep whose rest would take it
+///    past `REFINE_S` at its bands' pace, once they are sized to the budget, is coded a step
+///    coarser a band until the pace fits, and ends where that reaches the rate control's own
+///    quantizer: dense text at 0.1 and 0.25 Mbit/s never finished in 40 s at the paint-over
+///    one. At 2 Mbit/s at 1080p a key frame
 ///    capped to `HELD_KEY_BUDGET_S` of the target came out coarser than the picture it cleaned
 ///    (35.9 dB), where the refresh reached 44.2. A rate control whose frames of the still screen
 ///    run over `OVERSHOOT_BUDGETS` for a trigger period is pinned at its coarsest quantizer and
@@ -686,15 +691,25 @@ pub fn decide_hw_fullframe(
         return d;
     }
     if let Some((from, size)) = st.sweep {
-        let size = band_share(
-            size,
-            encoder.band,
-            frame_budget(settings.video_bitrate_kbps, settings.target_fps),
-        );
+        let budget = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
+        let size = band_share(size, encoder.band, budget);
         let to = (from + size).min(1.0);
+        st.sweep_frames = st.sweep_frames.saturating_add(1);
+        let left = (REFINE_S * settings.target_fps.max(1.0)).round() - st.sweep_frames as f64;
+        let paced = encoder
+            .band
+            .is_some_and(|b| b as f64 <= 2.0 * BAND_BUDGETS * budget);
+        if paced && (1.0 - to) / size > left.max(1.0) {
+            st.sweep_coarser += 1;
+        }
+        let q = refresh_qp + st.sweep_coarser;
+        if encoder.last.is_some_and(|last| q >= last) {
+            st.sweep = None;
+            return d;
+        }
         st.sweep = (to < 1.0).then_some((to, size));
         d.send = true;
-        d.hold_qp = Some(refresh_qp);
+        d.hold_qp = Some(q);
         d.hold_band = Some((from, to));
         return d;
     }
@@ -765,6 +780,8 @@ pub fn decide_hw_fullframe(
             if encoder.band.is_some() && !pinned {
                 d.hold_band = Some((0.0, FIRST_BAND));
                 st.sweep = Some((FIRST_BAND, FIRST_BAND));
+                st.sweep_frames = 0;
+                st.sweep_coarser = 0;
             }
         }
         return d;
@@ -2141,6 +2158,54 @@ mod tests {
             "each a budget: {bands:?}"
         );
         assert_eq!(sent_after, 0, "which ends the cleanup");
+    }
+
+    /// A sweep whose bands, each a budget, would take longer than `REFINE_S` to cover the picture
+    /// is coded a step coarser a band until its pace fits: here a picture of four times as many
+    /// budgets at the refresh's quantizer, half that six steps coarser.
+    #[test]
+    fn a_sweep_that_would_run_past_refine_s_is_coded_coarser() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let idle = |held: usize| EncoderQuality {
+            last: Some(38),
+            bytes: Some(budget as usize / 10),
+            holds: true,
+            reopens: false,
+            band: Some(held),
+            measures: false,
+            psnr: None,
+        };
+        let refresh = held_refresh_quality(&s, idle(0));
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle(0));
+        let window = (REFINE_S * s.target_fps).round() as usize;
+        let mut bands: Vec<(f64, f64, u32)> = Vec::new();
+        for i in 1..=(2 * window) as u16 {
+            let held = bands.last().map_or(0, |(a, b, q)| {
+                let cost = 4.0 * window as f64 * 2f64.powf(-((q - refresh) as f64) / 6.0);
+                ((b - a) * cost * budget) as usize
+            });
+            let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, idle(held));
+            if let (Some((a, b)), Some(q)) = (d.hold_band, d.hold_qp) {
+                bands.push((a, b, q));
+            }
+        }
+        let coarser = bands.last().unwrap().2 - refresh;
+        assert_eq!(bands.last().unwrap().1, 1.0, "the sweep covers the picture");
+        assert!(
+            bands.len() <= window + window / 10,
+            "within REFINE_S: {} bands",
+            bands.len()
+        );
+        assert!(
+            bands.windows(2).all(|w| w[0].2 <= w[1].2),
+            "never finer again"
+        );
+        assert!(
+            (12..=15).contains(&coarser),
+            "about the 12 steps that quarter the picture's cost: {coarser}"
+        );
     }
 
     #[test]
