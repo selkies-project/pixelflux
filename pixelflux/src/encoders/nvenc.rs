@@ -31,6 +31,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use libloading::{Library, Symbol};
 use smithay::backend::allocator::{Buffer, Fourcc, dmabuf::Dmabuf};
@@ -757,6 +758,21 @@ fn nvenc_headroom(size: u32, floor: u32, cap: Option<i32>) -> u32 {
 /// The share of an AV1 level's Annex A MaxBitrate the strictest driver lets a session declare
 /// at it, as a fraction: two thirds on 595.71.05, where 595.91.07 and 615.71.09 take the whole.
 const NVENC_AV1_RATE: (u64, u64) = (2, 3);
+
+/// Whether the process's driver holds an AV1 level to `NVENC_AV1_RATE` of its Annex A rate: set
+/// where it refused a session or a rate change at the Annex A level and took the weighted one,
+/// so later sessions declare the weighted level without the refusal.
+static NVENC_AV1_WEIGHTED: AtomicBool = AtomicBool::new(false);
+
+/// The rate a `codec` level has to admit for a peak of `bps`: AV1's weighed by `NVENC_AV1_RATE`
+/// where the driver holds a level to that share.
+fn level_rate(codec: Codec, bps: u64, weighted: bool) -> u64 {
+    if codec == Codec::Av1 && weighted {
+        (bps * NVENC_AV1_RATE.1).div_ceil(NVENC_AV1_RATE.0)
+    } else {
+        bps
+    }
+}
 
 /// The highest CBR target an NVENC session of `codec` opens at, its top level's bitrate ceiling:
 /// H.264 6.2's 1 Gbit/s, HEVC 6.2's 800 Mbit/s at the High tier production sessions declare,
@@ -1748,11 +1764,11 @@ impl Drop for NvencEncoder {
 /// raises the level to the first that admits it; `hevc_high_tier` names the HEVC tier the
 /// session declares, whose ceiling is the one that applies. Driver 595.71.05 holds an AV1
 /// level to two thirds of its Annex A MaxBitrate, `NVENC_AV1_RATE` (5.1 26.7 Mbit/s rather
-/// than 40, on an RTX 4090 and an L4, whatever the frame rate or buffer), so an AV1 rate is
-/// weighed at one and a half times itself; under 595.91.07 and 615.71.09, which hold Annex A's
-/// rate, a session past 26.7 Mbit/s can then declare a level more than it needs. An HEVC picture
-/// is counted in whole 32-pixel coding tree blocks, NVENC's, as the driver counts it: 1280x720
-/// at 144 fps is inside 4.1 by its own samples, and the driver refuses it as 4.1.
+/// than 40, on an RTX 4090 and an L4, whatever the frame rate or buffer), where 595.91.07 and
+/// 615.71.09 hold Annex A's, so a session asks for the Annex A level first and, refused, for
+/// the level `level_rate` weighs the rate to (`NVENC_AV1_WEIGHTED`). An HEVC picture is counted
+/// in whole 32-pixel coding tree blocks, NVENC's, as the driver counts it: 1280x720 at 144 fps
+/// is inside 4.1 by its own samples, and the driver refuses it as 4.1.
 fn nvenc_level(
     codec: Codec,
     width: u32,
@@ -1767,7 +1783,7 @@ fn nvenc_level(
             width.max(HEADROOM_WIDTH),
             height.max(HEADROOM_HEIGHT),
             fps,
-            (bitrate_bps * NVENC_AV1_RATE.1).div_ceil(NVENC_AV1_RATE.0),
+            bitrate_bps,
         ),
         Codec::H265 => h265_level(
             width.next_multiple_of(32),
@@ -2328,14 +2344,18 @@ impl NvencEncoder {
             config.rcParams.set_enableLookahead(0);
             config.rcParams.lookaheadDepth = 0;
             let rate = FrameRate::of(settings.target_fps);
-            let level = nvenc_level(
-                codec,
-                width,
-                height,
-                rate.ceil(),
-                config.rcParams.maxBitRate as u64,
-                tuning.hevc_high_tier,
-            );
+            let level_at = |weighted| {
+                nvenc_level(
+                    codec,
+                    width,
+                    height,
+                    rate.ceil(),
+                    level_rate(codec, config.rcParams.maxBitRate as u64, weighted),
+                    tuning.hevc_high_tier,
+                )
+            };
+            let level = level_at(NVENC_AV1_WEIGHTED.load(Ordering::Relaxed));
+            let weighted_level = level_at(true);
             let dpb = match codec {
                 Codec::H265 => h265_dpb_frames(level, width, height),
                 Codec::Av1 => AV1_REFERENCES,
@@ -2396,7 +2416,32 @@ impl NvencEncoder {
             init_params.set_splitEncodeMode(split as u32);
 
             let init_fn = function_list.nvEncInitializeEncoder.unwrap();
-            let headroom_status = init_fn(encoder_session, &mut Negotiated::new(init_params).value);
+            let mut headroom_status =
+                init_fn(encoder_session, &mut Negotiated::new(init_params).value);
+            if headroom_status != NVENCSTATUS::NV_ENC_SUCCESS && weighted_level != level {
+                // A driver holding AV1 to `NVENC_AV1_RATE` refuses the Annex A level as invalid,
+                // and a refused encoder stays refused: the weighted level opens a session of its
+                // own.
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                encoder_session = ptr::null_mut();
+                if open_fn(&mut session_params, &mut encoder_session) != NVENCSTATUS::NV_ENC_SUCCESS
+                {
+                    (cuda.cuMemFree_v2)(input_device_ptr);
+                    (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                    return Err("Failed to reopen the AV1 session at the weighted level".into());
+                }
+                config.encodeCodecConfig.av1Config.level = weighted_level;
+                init_params.encodeConfig = &mut config;
+                headroom_status = init_fn(encoder_session, &mut Negotiated::new(init_params).value);
+                if headroom_status == NVENCSTATUS::NV_ENC_SUCCESS {
+                    NVENC_AV1_WEIGHTED.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "[NVENC] The driver refused AV1 level {level} at {} kbps; declaring {weighted_level}",
+                        config.rcParams.maxBitRate / 1000
+                    );
+                }
+            }
             if headroom_status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
                     "[NVENC] Init with {}x{} resize headroom failed ({headroom_status:?}): {}",
@@ -2767,7 +2812,7 @@ impl NvencEncoder {
     }
 
     /// The level a `width` x `height` stream at `fps` takes at the live config's peak bitrate
-    /// and HEVC tier.
+    /// and HEVC tier, and the driver's AV1 share (`NVENC_AV1_WEIGHTED`).
     fn level_for(&self, width: u32, height: u32, fps: u32) -> u32 {
         let high_tier = unsafe { self.encode_config.encodeCodecConfig.hevcConfig.tier == 1 };
         nvenc_level(
@@ -2775,7 +2820,11 @@ impl NvencEncoder {
             width,
             height,
             fps,
-            self.encode_config.rcParams.maxBitRate as u64,
+            level_rate(
+                self.codec,
+                self.encode_config.rcParams.maxBitRate as u64,
+                NVENC_AV1_WEIGHTED.load(Ordering::Relaxed),
+            ),
             high_tier,
         )
     }
@@ -3383,7 +3432,32 @@ impl NvencEncoder {
             if !changed {
                 return true;
             }
-            let status = self.reconfigure(false, level_raised);
+            let mut status = self.reconfigure(false, level_raised);
+            if status != NVENCSTATUS::NV_ENC_SUCCESS
+                && self.codec == Codec::Av1
+                && !NVENC_AV1_WEIGHTED.swap(true, Ordering::Relaxed)
+            {
+                let (w, h) = (self.init_params.encodeWidth, self.init_params.encodeHeight);
+                let fps = self
+                    .init_params
+                    .frameRateNum
+                    .div_ceil(self.init_params.frameRateDen.max(1));
+                let refused = self.declared_level();
+                if self.level_for(w, h, fps) > refused {
+                    self.set_level(w, h, fps);
+                    level_raised = true;
+                    status = self.reconfigure(false, true);
+                }
+                if status == NVENCSTATUS::NV_ENC_SUCCESS {
+                    eprintln!(
+                        "[NVENC] The driver refused AV1 level {refused} at {} kbps; declaring {}",
+                        self.encode_config.rcParams.maxBitRate / 1000,
+                        self.declared_level()
+                    );
+                } else {
+                    NVENC_AV1_WEIGHTED.store(false, Ordering::Relaxed);
+                }
+            }
             if status != NVENCSTATUS::NV_ENC_SUCCESS {
                 eprintln!(
                     "[NVENC] Rate reconfigure refused ({status:?}): {}",
@@ -6602,9 +6676,9 @@ mod gpu_tests {
 
     /// On a real GPU, a 1080p60 CBR session whose target lies past the ceiling of the level the
     /// picture alone would declare (H.264 4.2 at 62.5 Mbit/s, HEVC 4.1 High at 50, AV1's
-    /// headroom 5.1 at the 26.7 `NVENC_AV1_RATE` holds it to) opens on the level the rate raises
-    /// it to, and a live raise past the ceiling, to 200 Mbit/s, which AV1 holds at 106.7, is
-    /// taken rather than refused. Ignored by default.
+    /// headroom 5.1 at the 26.7 `NVENC_AV1_RATE` holds it to where the driver does) opens on the
+    /// level the rate raises it to, and a live raise past the ceiling, to 200 Mbit/s, which AV1
+    /// holds at 106.7, is taken rather than refused. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_cbr_targets_past_the_picture_level_open() {
@@ -6625,6 +6699,11 @@ mod gpu_tests {
                 }
                 Err(e) => panic!("{codec:?} at {kbps} kbps must open on level {level}: {e}"),
             };
+            let level = if codec == Codec::Av1 && !NVENC_AV1_WEIGHTED.load(Ordering::Relaxed) {
+                13
+            } else {
+                level
+            };
             assert_eq!(
                 enc.declared_level(),
                 level,
@@ -6642,6 +6721,62 @@ mod gpu_tests {
             println!(
                 "{codec:?}: {kbps} kbps opened on level {level}; 200 Mbit/s live took level {}",
                 enc.declared_level()
+            );
+        }
+    }
+
+    /// On a real GPU with AV1, a 30 Mbit/s session declares 5.1, Annex A's level for the rate,
+    /// where the driver admits it, and where the driver holds AV1 to `NVENC_AV1_RATE` it opens on
+    /// 5.2 after the refusal, as does a live raise from 8 Mbit/s, at a key frame; either session
+    /// then codes a frame. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_av1_declares_the_lowest_level_the_driver_admits() {
+        let f = frame(1920, 1080, 30);
+        for raised in [false, true] {
+            NVENC_AV1_WEIGHTED.store(false, Ordering::Relaxed);
+            let mut s = settings(1920, 1080, 60.0);
+            s.codec = Codec::Av1;
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = if raised { 8_000 } else { 30_000 };
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) if e.contains("engine") => {
+                    println!("Av1: {e}");
+                    return;
+                }
+                Err(e) => panic!("Av1 at {} kbps: {e}", s.video_bitrate_kbps),
+            };
+            enc.encode_cpu_argb(&f, 1920 * 4, 0, 25, true)
+                .expect("encode");
+            if raised {
+                assert_eq!(enc.declared_level(), 13);
+                s.video_bitrate_kbps = 30_000;
+                assert!(
+                    enc.reconfigure_rate(&s),
+                    "the raise to 30 Mbit/s was refused"
+                );
+            }
+            let weighted = NVENC_AV1_WEIGHTED.load(Ordering::Relaxed);
+            assert_eq!(enc.declared_level(), if weighted { 14 } else { 13 });
+            let pkt = enc
+                .encode_cpu_argb(&f, 1920 * 4, 1, 25, false)
+                .expect("encode at the level");
+            if raised && weighted {
+                assert!(
+                    crate::encoders::codec::av1_is_key(&pkt[VIDEO_HEADER_LEN..]),
+                    "a raised level reaches the decoder at a key frame"
+                );
+            }
+            println!(
+                "Av1 30 Mbit/s {}: level {} ({})",
+                if raised { "raised from 8" } else { "opened" },
+                enc.declared_level(),
+                if weighted {
+                    "the driver holds two thirds of Annex A"
+                } else {
+                    "Annex A"
+                }
             );
         }
     }
@@ -8563,22 +8698,35 @@ mod decision_tests {
             nvenc_level(Codec::H265, 1920, 1080, 60, 60_000_000, false),
             156
         );
-        // `NVENC_AV1_RATE` holds an AV1 level to two thirds of its Annex A MaxBitrate: 5.1 to
-        // 26.7 Mbit/s, 5.2 to 40, 6.1 to 66.7, 6.2 to 106.7.
-        for (bps, level) in [
-            (26_666_666, 13),
-            (26_666_667, 14),
-            (40_000_000, 14),
-            (45_000_000, 17),
-            (66_666_667, 18),
-            (106_666_666, 18),
+        // An AV1 level holds its Annex A MaxBitrate, 5.1 40 Mbit/s, 5.2 60, 6.1 100, 6.2 160;
+        // weighed by `NVENC_AV1_RATE`, two thirds of it: 5.1 26.7, 5.2 40, 6.1 66.7, 6.2 106.7.
+        for (bps, annex_a, weighted) in [
+            (26_666_666, 13, 13),
+            (26_666_667, 13, 14),
+            (40_000_000, 13, 14),
+            (40_000_001, 14, 17),
+            (45_000_000, 14, 17),
+            (60_000_001, 17, 17),
+            (66_666_667, 17, 18),
+            (100_000_001, 18, 18),
+            (106_666_666, 18, 18),
         ] {
-            assert_eq!(
-                nvenc_level(Codec::Av1, 1920, 1080, 60, bps, true),
-                level,
-                "AV1 at {bps} bit/s"
-            );
+            for (weigh, level) in [(false, annex_a), (true, weighted)] {
+                assert_eq!(
+                    nvenc_level(
+                        Codec::Av1,
+                        1920,
+                        1080,
+                        60,
+                        level_rate(Codec::Av1, bps, weigh),
+                        true
+                    ),
+                    level,
+                    "AV1 at {bps} bit/s, weighed {weigh}"
+                );
+            }
         }
+        assert_eq!(level_rate(Codec::H265, 60_000_000, true), 60_000_000);
     }
 
     /// A frame splits across the engines for AV1 at any picture, in three strips on three, and
