@@ -10,8 +10,8 @@
 //! refreshes its own slot and names the slot of the newest frame the client still has as all
 //! seven of its references, which is also where its probability contexts load from. The
 //! frame header is written with the bit positions of the quantizer, loop filter, and CDEF
-//! fields, which a constant-rate driver rewrites in place, and with OBU sizes of the fixed
-//! width it asks for.
+//! fields, which a constant-rate driver rewrites in place and a constant-quantizer session
+//! fills itself, and with OBU sizes of the fixed width it asks for.
 
 use va_sys::*;
 
@@ -55,6 +55,30 @@ pub(super) struct Arm {
     sequence_header: Vec<u8>,
     /// The bit `base_q_idx` stands at in the last frame header OBU written.
     qindex_offset: u32,
+}
+
+/// The in-loop filters of a frame: the deblocking level of every plane and edge, and the one
+/// CDEF strength (primary in the high four bits, secondary in the low two) with its damping.
+/// A constant-rate driver chooses its own and rewrites the header; a constant-quantizer
+/// session has to name them, and all zero leaves the picture unfiltered.
+#[derive(Clone, Copy, Default)]
+struct Filters {
+    level: u8,
+    cdef_strength: u8,
+    cdef_damping_minus_3: u8,
+}
+
+impl Filters {
+    /// The filters of a constant-quantizer frame at `qindex`, measured on Intel Arc on a
+    /// text desktop and a gradient wallpaper: deblocking rises with the quantizer, CDEF holds
+    /// primary 8 and secondary 2, and its damping widens as the steps coarsen.
+    fn at(qindex: u32) -> Self {
+        Self {
+            level: (qindex / 8).min(63) as u8,
+            cdef_strength: (8 << 2) | 2,
+            cdef_damping_minus_3: (qindex >> 6).min(3) as u8,
+        }
+    }
 }
 
 /// How many bits `value` needs, at least one.
@@ -212,7 +236,7 @@ impl Arm {
         w.u(1, 0);
         w.u(3, (ORDER_HINT_BITS - 1) as u64);
         w.flag(false);
-        w.flag(cbr);
+        w.flag(true);
         w.flag(false);
         w.flag(n.bit_depth == 10);
         w.flag(false);
@@ -238,9 +262,7 @@ impl Arm {
             let f = &mut s.seq_fields.bits;
             f.set_enable_order_hint(1);
             f.set_bit_depth_minus8(n.bit_depth - 8);
-            if cbr {
-                f.set_enable_cdef(1);
-            }
+            f.set_enable_cdef(1);
         }
         if cbr {
             s.bits_per_second = n.bits_per_second;
@@ -371,20 +393,25 @@ impl Arm {
         w.flag(false);
         w.flag(false);
         w.flag(false);
+        let filters = if cbr {
+            Filters::default()
+        } else {
+            Filters::at(qindex)
+        };
         let loopfilter_offset = header_prefix_bits + w.len() as u32;
-        w.u(6, 0);
-        w.u(6, 0);
+        w.u(6, filters.level as u64);
+        w.u(6, filters.level as u64);
+        if filters.level > 0 {
+            w.u(6, filters.level as u64);
+            w.u(6, filters.level as u64);
+        }
         w.u(3, 0);
         w.flag(false);
         let cdef_offset = header_prefix_bits + w.len() as u32;
-        if cbr {
-            w.u(2, 0);
-            w.u(2, 0);
-            w.u(4, 0);
-            w.u(2, 0);
-            w.u(4, 0);
-            w.u(2, 0);
-        }
+        w.u(2, filters.cdef_damping_minus_3 as u64);
+        w.u(2, 0);
+        w.u(6, filters.cdef_strength as u64);
+        w.u(6, filters.cdef_strength as u64);
         let cdef_size = header_prefix_bits + w.len() as u32 - cdef_offset;
         w.flag(self.tx_mode_select);
         if !frame.key {
@@ -426,6 +453,12 @@ impl Arm {
             pic.tile_group_obu_hdr_info.bits.set_obu_has_size_field(1);
         }
         pic.base_qindex = qindex as u8;
+        pic.filter_level = [filters.level; 2];
+        pic.filter_level_u = filters.level;
+        pic.filter_level_v = filters.level;
+        pic.cdef_damping_minus_3 = filters.cdef_damping_minus_3;
+        pic.cdef_y_strengths[0] = filters.cdef_strength;
+        pic.cdef_uv_strengths[0] = filters.cdef_strength;
         pic.tile_cols = t.cols as u8;
         pic.tile_rows = t.rows as u8;
         let tile_width_sb = (t.sb_cols + (1 << t.cols_log2) - 1) >> t.cols_log2;

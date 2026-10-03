@@ -29,6 +29,7 @@ pub enum Codec {
 pub enum Hardware {
     Nvenc,
     Vaapi,
+    VaapiIntel,
 }
 
 use super::reference::{REFERENCE_FRAMES, Reference};
@@ -207,16 +208,23 @@ impl Codec {
     /// NVENC (Pascal and Ada) and on AMD's VA-API, which agree within a step, each coding a
     /// quantizer about three finer than the index to match x264; AMD's VA-API H.265 follows
     /// the same curve within a step, where NVENC's H.265 is within two steps of the index from
-    /// 22 up and keeps it. AV1 is measured on NVENC (Ada), and a VA-API AV1 session reads the
-    /// same curve, unmeasured on VA-API hardware. VP8 and VP9 keep the software tables. NVENC
-    /// refuses an AV1 index of zero, so the floor stays one.
+    /// 22 up and keeps it. Intel's VA-API H.265 matches x264 on a still frame at that curve but
+    /// refines a moving picture well past it for fewer bytes (Arc and Alder Lake-N), so it reads
+    /// one two steps coarser. AV1 has a curve per backend: NVENC's is measured on Ada, and VA-API's
+    /// on Intel (Arc) with the in-loop filters its constant-quantizer frames carry, on a
+    /// text desktop and a gradient wallpaper, taking the finer match of the two. VP8 and VP9
+    /// keep the software tables. NVENC refuses an AV1 index of zero, so the floor stays one.
     pub fn hardware_quantizer(self, hw: Hardware, crf: i32) -> u32 {
         let crf = crf.clamp(0, 51) as u32;
         match (self, hw) {
             (Codec::H264, _) | (Codec::H265, Hardware::Vaapi) => {
                 interpolate(&H26X_HARDWARE_QP, crf)
             }
-            (Codec::Av1, _) => interpolate(&AV1_HARDWARE_QINDEX, crf).max(1),
+            (Codec::H265, Hardware::VaapiIntel) => interpolate(&H265_INTEL_QP, crf),
+            (Codec::Av1, Hardware::Nvenc) => interpolate(&AV1_NVENC_QINDEX, crf).max(1),
+            (Codec::Av1, Hardware::Vaapi | Hardware::VaapiIntel) => {
+                interpolate(&AV1_VAAPI_QINDEX, crf).max(1)
+            }
             _ => self.quantizer(crf as i32),
         }
     }
@@ -303,8 +311,37 @@ const H26X_HARDWARE_QP: [(u32, u32); 11] = [
     (50, 47),
     (51, 48),
 ];
-/// Session quality index → hardware AV1 `base_q_idx` breakpoints.
-const AV1_HARDWARE_QINDEX: [(u32, u32); 12] = [
+/// Session quality index → Intel VA-API H.265 QP breakpoints.
+const H265_INTEL_QP: [(u32, u32); 11] = [
+    (0, 0),
+    (10, 10),
+    (15, 16),
+    (20, 19),
+    (25, 24),
+    (30, 29),
+    (35, 34),
+    (40, 39),
+    (45, 45),
+    (50, 49),
+    (51, 50),
+];
+/// Session quality index → VA-API AV1 `base_q_idx` breakpoints.
+const AV1_VAAPI_QINDEX: [(u32, u32); 12] = [
+    (0, 1),
+    (5, 3),
+    (10, 10),
+    (15, 26),
+    (20, 40),
+    (25, 80),
+    (30, 106),
+    (35, 136),
+    (40, 171),
+    (45, 205),
+    (50, 236),
+    (51, 244),
+];
+/// Session quality index → NVENC AV1 `base_q_idx` breakpoints.
+const AV1_NVENC_QINDEX: [(u32, u32); 12] = [
     (0, 1),
     (5, 20),
     (10, 26),
@@ -973,7 +1010,7 @@ mod tests {
             for crf in 0..=51 {
                 let q = codec.quantizer(crf);
                 assert!(q >= last, "{codec:?} crf {crf}: {q} < {last}");
-                for hw in [Hardware::Nvenc, Hardware::Vaapi] {
+                for hw in [Hardware::Nvenc, Hardware::Vaapi, Hardware::VaapiIntel] {
                     let h = codec.hardware_quantizer(hw, crf);
                     assert!(h >= codec.hardware_quantizer(hw, crf.max(1) - 1));
                     assert!(h <= codec.quantizer_max());
@@ -994,7 +1031,10 @@ mod tests {
         assert_eq!(Codec::H264.hardware_quantizer(Hardware::Vaapi, 25), 22);
         assert_eq!(Codec::H265.hardware_quantizer(Hardware::Nvenc, 25), 25);
         assert_eq!(Codec::H265.hardware_quantizer(Hardware::Vaapi, 25), 22);
-        assert_eq!(Codec::Av1.hardware_quantizer(Hardware::Vaapi, 25), 105);
+        assert_eq!(Codec::Av1.hardware_quantizer(Hardware::Vaapi, 25), 80);
+        assert_eq!(Codec::H265.hardware_quantizer(Hardware::VaapiIntel, 25), 24);
+        assert_eq!(Codec::H264.hardware_quantizer(Hardware::VaapiIntel, 25), 22);
+        assert_eq!(Codec::Av1.hardware_quantizer(Hardware::VaapiIntel, 25), 80);
         assert_eq!(Codec::Av1.hardware_quantizer(Hardware::Nvenc, 0), 1);
         assert_eq!(
             Codec::Vp9.hardware_quantizer(Hardware::Vaapi, 25),
