@@ -7,7 +7,8 @@
 ``matrix IMAGE JOBS`` prints the two job matrices as ``name=json`` lines for
 ``$GITHUB_OUTPUT``. ``groups`` deals the wheels the installed cibuildwheel
 selects from ``pyproject.toml`` into jobs, each platform's into as many as
-JOBS (``manylinux=2 musllinux=4``) gives its libc. ``images`` lists the
+JOBS (``manylinux=2 musllinux=4``) gives its libc, the first of them the one
+that saves the platform's compiled dependencies. ``images`` lists the
 platforms whose image the Actions cache holds no copy of that this run can
 restore, each naming the base image that cibuildwheel release pins for it. Both
 carry the cache key of the platform's image, a hash of its recipe, its base,
@@ -109,6 +110,7 @@ def matrix(image, jobs):
                 "platform": platform,
                 "runner": RUNNERS[arch],
                 "key": key,
+                "saves": n == 0,
             })
     held = cached([i["key"] for i in images])
     print(f"groups={json.dumps(groups)}")
