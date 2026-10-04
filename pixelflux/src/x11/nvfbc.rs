@@ -1148,6 +1148,7 @@ where
                 bytes: gpu.encoder.last_size(),
                 holds: true,
                 reopens: false,
+                keys: true,
                 band: gpu.encoder.band_size(),
                 measures: false,
                 psnr: None,

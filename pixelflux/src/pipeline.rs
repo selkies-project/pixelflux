@@ -299,6 +299,7 @@ pub fn cleanup_pending(st: &StripeState, trigger: u32, enabled: bool, keys: bool
 /// the bytes of that frame, where it reports them too (`FrameEncoder::last_size`), whether it
 /// holds a frame at a quantizer it is asked for (`FrameEncoder::holds_quantizer`), whether a
 /// change of its constant quality re-opens it on a key frame (`FrameEncoder::reopens_on_quality`),
+/// whether its constant-rate cleanup ends on a key frame (`FrameEncoder::cleans_up_with_key`),
 /// where it holds a band of a frame at that quantizer (`FrameEncoder::band_size`), the
 /// bytes of its last held frame, and, where it measures a frame's reconstruction against its
 /// source when asked (`FrameEncoder::measures`), the last measurement.
@@ -308,6 +309,7 @@ pub struct EncoderQuality {
     pub bytes: Option<usize>,
     pub holds: bool,
     pub reopens: bool,
+    pub keys: bool,
     pub band: Option<usize>,
     pub measures: bool,
     pub psnr: Option<f32>,
@@ -321,6 +323,7 @@ impl EncoderQuality {
             bytes: encoder.last_size(),
             holds: encoder.holds_quantizer(),
             reopens: encoder.reopens_on_quality(),
+            keys: encoder.cleans_up_with_key(),
             band: encoder.band_size(),
             measures: encoder.measures(),
             psnr: encoder.last_psnr(),
@@ -545,13 +548,13 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 /// stripe inside `encode_cpu`.
 ///
 /// 1. **Cleanup** (`cleanup_due`): once the content stops changing, whatever Turbo sends, a
-///    refresh and, after a large change and a longer stillness, a key frame, each encoded at
-///    the paint-over quantizer held for it (`hold_qp`, which the encoder applies under any rate
-///    control; a refresh of a constant-rate session coarsened to `held_refresh_quality`, a key
-///    frame capped by the encoder at `HELD_KEY_BUDGET_S`) and followed by a recovery burst. A
-///    constant-rate session whose rate control reports its frames' bytes
-///    (`EncoderQuality::converges`) is cleaned up through that rate control instead, NVENC's
-///    like this:
+///    refresh and, after a large change and a longer stillness, a key frame where the encoder's
+///    cleanup ends on one (`EncoderQuality::keys`), each encoded at the paint-over quantizer held
+///    for it (`hold_qp`, which the encoder applies under any rate control; a refresh of a
+///    constant-rate session coarsened to `held_refresh_quality`, a key frame capped by the encoder
+///    at `HELD_KEY_BUDGET_S`) and followed by a recovery burst. A constant-rate session whose rate
+///    control reports its frames' bytes (`EncoderQuality::converges`) is cleaned up through that
+///    rate control instead, NVENC's like this:
 ///    the frames keep flowing, each within the rate control's budget, until it codes the screen
 ///    at the paint-over quantizer or finer in a frame under `CONVERGED_SHARE` of the budget
 ///    (`convergence`), for `CONVERGE_S` at most. A frame held at the paint-over quantizer the
@@ -654,7 +657,7 @@ pub fn decide_hw_fullframe(
         settings.paint_over_trigger_frames,
         improves,
         true,
-        holds,
+        holds && encoder.keys,
         damage,
     );
     let refresh_qp = held_refresh_quality(settings, encoder);
@@ -1598,6 +1601,7 @@ mod tests {
         bytes: None,
         holds: true,
         reopens: false,
+        keys: true,
         band: None,
         measures: false,
         psnr: None,
@@ -1713,6 +1717,7 @@ mod tests {
             bytes: None,
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -1785,6 +1790,52 @@ mod tests {
         );
     }
 
+    /// An encoder whose held refresh restores the picture whole (libvpx's VP8) is never keyed:
+    /// after a large change and a long stillness its refresh and burst are the whole cleanup,
+    /// where one that holds only key frames (SVT-AV1) ends on a key frame.
+    #[test]
+    fn a_refresh_that_restores_the_picture_is_not_followed_by_a_key_frame() {
+        let s = RustCaptureSettings {
+            video_paintover_burst_frames: 0,
+            ..hw_settings()
+        };
+        for (encoder, keyed) in [
+            (
+                EncoderQuality {
+                    keys: false,
+                    ..HOLDS
+                },
+                0,
+            ),
+            (HOLDS, 1),
+        ] {
+            let mut st = StripeState::default();
+            for i in 0..2u16 {
+                decide_hw_fullframe(&mut st, &s, i, Damage::Area(1.0), false, false, encoder);
+            }
+            let still: Vec<HwFrameDecision> = (0..40u16)
+                .map(|i| {
+                    decide_hw_fullframe(&mut st, &s, 10 + i, Damage::None, false, false, encoder)
+                })
+                .collect();
+            assert_eq!(
+                still
+                    .iter()
+                    .filter(|d| d.hold_qp.is_some() && !d.force_idr)
+                    .count(),
+                1,
+                "keys {}: one refresh",
+                encoder.keys
+            );
+            assert_eq!(
+                still.iter().filter(|d| d.force_idr).count(),
+                keyed,
+                "keys {}: the key frames",
+                encoder.keys
+            );
+        }
+    }
+
     /// A still screen the rate control codes finer than the paint-over quantizer owes no cleanup,
     /// so its still frames are no low motion: the first frames of the next large change (a
     /// window opening) go out at the session quality, and the key frame waits for the screen to
@@ -1798,6 +1849,7 @@ mod tests {
             bytes: Some(budget),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -1807,6 +1859,7 @@ mod tests {
             bytes: Some(budget / 8),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -1851,6 +1904,7 @@ mod tests {
             bytes: Some(budget),
             holds: false,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -1923,6 +1977,7 @@ mod tests {
             bytes: Some(budget / 8),
             holds: false,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -1960,6 +2015,7 @@ mod tests {
             bytes: Some(budget / 2),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2006,6 +2062,7 @@ mod tests {
             bytes: Some((budget * 16.0) as usize),
             holds: true,
             reopens: false,
+            keys: true,
             band: Some(0),
             measures: false,
             psnr: None,
@@ -2050,6 +2107,7 @@ mod tests {
             bytes: Some((budget * 16.0) as usize),
             holds: true,
             reopens: false,
+            keys: true,
             band: Some(0),
             measures: false,
             psnr: None,
@@ -2099,6 +2157,7 @@ mod tests {
             bytes: Some(budget / 2),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2143,6 +2202,7 @@ mod tests {
             bytes: Some(budget / 10),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2181,6 +2241,7 @@ mod tests {
             bytes: Some(budget as usize / 10),
             holds: true,
             reopens: false,
+            keys: true,
             band: Some(held),
             measures: false,
             psnr: None,
@@ -2237,6 +2298,7 @@ mod tests {
             bytes: Some(budget as usize / 10),
             holds: true,
             reopens: false,
+            keys: true,
             band: Some(held),
             measures: false,
             psnr: None,
@@ -2287,6 +2349,7 @@ mod tests {
             bytes: Some(266),
             holds: false,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2315,6 +2378,7 @@ mod tests {
             bytes: Some(budget / 10),
             holds: true,
             reopens: false,
+            keys: true,
             band: Some(budget),
             measures: false,
             psnr: None,
@@ -2360,6 +2424,7 @@ mod tests {
             bytes: Some(budget),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2369,6 +2434,7 @@ mod tests {
             bytes: Some(budget / 8),
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2413,6 +2479,7 @@ mod tests {
             bytes: None,
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2422,6 +2489,7 @@ mod tests {
             bytes: None,
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2615,6 +2683,7 @@ mod tests {
             bytes: None,
             holds: true,
             reopens: false,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -2693,6 +2762,7 @@ mod tests {
                         bytes: None,
                         holds,
                         reopens: false,
+                        keys: true,
                         band: None,
                         measures: false,
                         psnr: None,
@@ -2797,6 +2867,7 @@ mod tests {
             bytes: None,
             holds: true,
             reopens: true,
+            keys: true,
             band: None,
             measures: false,
             psnr: None,
@@ -3416,6 +3487,7 @@ mod tests {
                     bytes: None,
                     holds: true,
                     reopens: false,
+                    keys: true,
                     band: None,
                     measures: false,
                     psnr: None,

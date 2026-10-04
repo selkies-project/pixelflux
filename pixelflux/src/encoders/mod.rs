@@ -1229,6 +1229,16 @@ impl FrameEncoder {
         matches!(self, FrameEncoder::Hevc(_) | FrameEncoder::Av1(_))
     }
 
+    /// Whether a constant-rate cleanup ends on a key frame after a large change and a longer
+    /// stillness (`pipeline::decide_hw_fullframe`). SVT-AV1 holds only a key frame, so that is its
+    /// cleanup. libvpx's VP8 holds the refresh before it, a predicted frame that restores the
+    /// picture whole, and its key frame only sent the picture again: 1080p text at 0.25 Mbit/s
+    /// went quiet on 1.3 MB without it against 2.7, at the same 42 dB, since the key frame came
+    /// out capped coarser than the picture (216 kB at 21.6 dB) and a second refresh restored it.
+    pub fn cleans_up_with_key(&self) -> bool {
+        !matches!(self, FrameEncoder::Vpx(enc) if enc.codec() == Codec::Vp8)
+    }
+
     /// Encode the next frame at the quantizer the quality index `crf` selects whatever the rate
     /// control, and leave the session's own rate control and quality as they were for the frame
     /// after: the cleanup of a still screen, where `holds_quantizer`. A session whose engine takes
