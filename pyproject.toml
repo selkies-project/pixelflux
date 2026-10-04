@@ -237,6 +237,20 @@ before-all = """
     fi
 """
 
+# smithay is a git dependency, and cargo retries few of a git fetch's failures
+# (none of libgit2's SSL errors), so the build's crates are fetched first and
+# retried like the sources above. The build then needs no network, and a job's
+# later wheels find them fetched.
+before-build = """
+    for attempt in 1 2 3 4; do
+        cargo fetch --locked --manifest-path pixelflux/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/^host: //p')" && exit 0
+        echo "cargo fetch: failed (attempt ${attempt}/4)" >&2
+        sleep $((attempt * 15))
+    done
+    exit 1
+"""
+
 repair-wheel-command = """
     auditwheel repair -w {dest_dir} {wheel} \
     --exclude libgbm.so.1 \
