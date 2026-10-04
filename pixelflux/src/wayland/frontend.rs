@@ -67,7 +67,8 @@ use smithay::wayland::pointer_constraints::{
 };
 use smithay::input::pointer::PointerHandle;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
-use smithay::desktop::{PopupKind, PopupManager};
+use smithay::desktop::utils::under_from_surface_tree;
+use smithay::desktop::{PopupKind, PopupManager, WindowSurfaceType};
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::foreign_toplevel_list::{
     ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
@@ -894,6 +895,9 @@ impl CompositorHandler for AppState {
     ///      on it at once.
     fn commit(&mut self, surface: &WlSurface) {
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
+        // A popup created without a parent, as a layer surface's always is, joins its parent's
+        // popups when it maps.
+        self.popups.commit(surface);
 
         for node in &self.output_nodes {
             let mut layer_map = layer_map_for_output(&node.output);
@@ -1215,8 +1219,10 @@ impl AppState {
     }
 
     /// What the pointer targets at a logical layout point: an overlay or top layer surface,
-    /// then a window, then a bottom or background layer surface. Layer geometry is
-    /// output-local, so layers are hit-tested with the point local to the output under it.
+    /// then a window, then a bottom or background layer surface, each through its popup where
+    /// one lies under the point, since a popup takes pointer events on its own surface. Layer
+    /// geometry is output-local, so layers are hit-tested with the point local to the output
+    /// under it.
     pub(crate) fn pointer_target_under(
         &self,
         p: Point<f64, Logical>,
@@ -1228,20 +1234,28 @@ impl AppState {
             let local = (p - origin.to_f64()).to_i32_round();
             let layer_map = layer_map_for_output(&node.output);
             layer_map.layers().rev().find_map(|layer| {
+                if !layers.contains(&layer.layer()) {
+                    return None;
+                }
                 let bbox = layer_map.layer_geometry(layer)?;
-                (layers.contains(&layer.layer()) && bbox.contains(local)).then(|| {
-                    (
-                        FocusTarget::LayerSurface(layer.clone()),
-                        (bbox.loc + origin).to_f64(),
-                    )
+                popup_under(layer.wl_surface(), bbox.loc + origin, p).or_else(|| {
+                    bbox.contains(local).then(|| {
+                        (
+                            FocusTarget::LayerSurface(layer.clone()),
+                            (bbox.loc + origin).to_f64(),
+                        )
+                    })
                 })
             })
         };
         layer_hit(&[Layer::Overlay, Layer::Top])
             .or_else(|| {
-                self.space
-                    .element_under(p)
-                    .map(|(window, loc)| (FocusTarget::Window(window.clone()), loc.to_f64()))
+                self.space.element_under(p).map(|(window, loc)| {
+                    window
+                        .wl_surface()
+                        .and_then(|root| popup_under(&root, loc + window.geometry().loc, p))
+                        .unwrap_or_else(|| (FocusTarget::Window(window.clone()), loc.to_f64()))
+                })
             })
             .or_else(|| layer_hit(&[Layer::Bottom, Layer::Background]))
     }
@@ -2245,6 +2259,20 @@ pub enum FocusTarget {
     LayerSurface(DesktopLayerSurface),
 }
 
+/// The popup of `root`, whose popups are placed from `origin`, that lies under the logical
+/// point `p`, as a focus target with the popup's own origin.
+fn popup_under(
+    root: &WlSurface,
+    origin: Point<i32, Logical>,
+    p: Point<f64, Logical>,
+) -> Option<(FocusTarget, Point<f64, Logical>)> {
+    PopupManager::popups_for_surface(root).find_map(|(popup, location)| {
+        let at = origin + location - popup.geometry().loc;
+        under_from_surface_tree(popup.wl_surface(), p, at, WindowSurfaceType::ALL)
+            .map(|_| (FocusTarget::Popup(popup), at.to_f64()))
+    })
+}
+
 /// Wrap a `Window` as a focus target.
 impl From<Window> for FocusTarget {
     fn from(w: Window) -> Self {
@@ -2833,8 +2861,8 @@ impl XdgShellHandler for AppState {
         }
         let _ = surface.send_configure();
     }
-    /// Popup grab: find the popup's root surface and its window, then install a popup grab so
-    /// dismissal and pointer routing behave correctly.
+    /// Popup grab: find the popup's root surface and its window or layer surface, then install a
+    /// popup grab so dismissal and pointer routing behave correctly.
     fn grab(
         &mut self,
         surface: PopupSurface,
@@ -2842,16 +2870,25 @@ impl XdgShellHandler for AppState {
         serial: Serial,
     ) {
         let kind = PopupKind::Xdg(surface);
-        if let Ok(root_surface) = smithay::desktop::find_popup_root_surface(&kind)
-            && let Some(window) = self
-                .space
-                .elements()
-                .find(|w| w.wl_surface().as_deref() == Some(&root_surface))
-                .cloned()
-        {
-            let _ = self
-                .popups
-                .grab_popup(FocusTarget::Window(window), kind, &self.seat, serial);
+        let Ok(root_surface) = smithay::desktop::find_popup_root_surface(&kind) else {
+            return;
+        };
+        let root = self
+            .space
+            .elements()
+            .find(|w| w.wl_surface().as_deref() == Some(&root_surface))
+            .cloned()
+            .map(FocusTarget::Window)
+            .or_else(|| {
+                self.output_nodes.iter().find_map(|node| {
+                    layer_map_for_output(&node.output)
+                        .layer_for_surface(&root_surface, WindowSurfaceType::TOPLEVEL)
+                        .cloned()
+                        .map(FocusTarget::LayerSurface)
+                })
+            });
+        if let Some(root) = root {
+            let _ = self.popups.grab_popup(root, kind, &self.seat, serial);
         }
     }
     /// Re-track a popup whose position changed (e.g. a submenu flipping sides to stay
