@@ -574,7 +574,8 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    picture at that cost: NVENC's at 0.1 Mbit/s codes a still 1080p screen of texture in
 ///    16-budget frames, and its sweep sent 4.7 MB in 40 s without ending. Such a screen is
 ///    refreshed at once in one held frame, coarsened to what `HELD_KEY_BUDGET_S` buys at those
-///    frames' size, and a burst that has no refresh to fall back to ends. A session that reports
+///    frames' size and coded again to fit it where it comes out past `HELD_REFRESH_LIMIT_S`, as
+///    dense text does, and a burst that has no refresh to fall back to ends. A session that reports
 ///    its frames' bytes but holds no quantizer at a constant rate (VA-API, x265, kvazaar, libvpx's
 ///    VP9) has no refresh to fall back to, so its frames flow, each the rate control's, until the
 ///    picture is done: where the session measures its reconstruction against its source (VA-API,

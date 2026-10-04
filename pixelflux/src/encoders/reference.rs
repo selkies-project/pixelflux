@@ -277,6 +277,36 @@ impl ReferenceWindow {
         reference
     }
 
+    /// Take back the frame just recorded, which the session codes again in its place under the
+    /// same id: it is left out of the predictions as a frame the client lost is, and `forget`
+    /// tells the encoder its timestamp. False, with the window as it was, where it was a key
+    /// frame, nothing older is left to predict from, it carries an H.264 `frame_num` 0, which
+    /// the decoder has to see (`set_frame_num_range`), or `forget` refuses.
+    pub fn retract(&mut self, forget: impl FnOnce(u64) -> bool) -> bool {
+        let Some(pts) = self.next_pts.checked_sub(1) else {
+            return false;
+        };
+        let older = self
+            .frames
+            .iter()
+            .copied()
+            .chain(self.anchor_frames())
+            .any(|f| !f.2 && f.1 < pts);
+        let wraps =
+            self.frame_num_range > 0 && (pts - self.key_pts).is_multiple_of(self.frame_num_range);
+        if !older || wraps || !forget(pts) {
+            return false;
+        }
+        let held = self
+            .frames
+            .iter_mut()
+            .chain(self.anchors.iter_mut().flatten());
+        for f in held.chain(self.recent.iter_mut()).filter(|f| f.1 == pts) {
+            f.2 = true;
+        }
+        true
+    }
+
     /// Leave `frame_id` and every frame encoded after it out of the references. A report for
     /// a picture already removed by an earlier invalidation leaves the recovered chain intact.
     /// The bounded history dates those reports across capture-id gaps and wrap; a loss older
@@ -312,7 +342,8 @@ impl ReferenceWindow {
         let Some(&(oldest, _, _)) = self.frames.front() else {
             return Invalidation::Ignored;
         };
-        match self.frames.iter().position(|f| f.0 == frame_id) {
+        // The newest with the id: a retracted frame shares it with the one sent in its place.
+        match self.frames.iter().rposition(|f| f.0 == frame_id) {
             Some(at) => {
                 let pts = self.frames[at].1;
                 let wraps = self.frame_num_range > 0
@@ -715,6 +746,65 @@ mod tests {
             w.invalidate(16),
             Invalidation::Forget(16),
             "a codec without the counter predicts past it"
+        );
+    }
+
+    #[test]
+    fn a_frame_coded_again_predicts_past_the_first_attempt() {
+        let mut w = ReferenceWindow::new(4);
+        assert!(!w.retract(|_| true), "nothing recorded");
+        w.record(10, true);
+        assert!(
+            !w.retract(|_| panic!("a key frame is coded again as a key frame")),
+            "nothing older than a key frame"
+        );
+        w.record(11, false);
+        w.record(12, false);
+        assert!(!w.retract(|_| false), "the encoder refused");
+        assert_eq!(w.record(13, false), Reference::Frame(12));
+        let mut told = None;
+        assert!(w.retract(|pts| told.replace(pts).is_none()));
+        assert_eq!(told, Some(3));
+        assert_eq!(
+            w.record(13, false),
+            Reference::Frame(12),
+            "the frame sent in its place predicts from the one before"
+        );
+        assert_eq!(w.record(14, false), Reference::Frame(13));
+        assert_eq!(
+            w.invalidate(13),
+            Invalidation::Forget(4),
+            "a loss of 13 is the frame sent"
+        );
+        assert_eq!(w.record(15, false), Reference::Frame(12));
+
+        let mut w = ReferenceWindow::with_anchors(5, 2);
+        let a = w.plan_anchor(true);
+        w.record_marked(0, true, a);
+        for id in 1..12u16 {
+            let a = w.plan_anchor(false);
+            w.record_marked(id, false, a);
+        }
+        let a = w.plan_anchor(false);
+        assert_eq!(a, Some(1), "frame 12 is an anchor");
+        w.record_marked(12, false, a);
+        assert!(w.retract(|pts| pts == 12));
+        assert_eq!(w.record_marked(12, false, a), Reference::Frame(11));
+        assert_eq!(w.record(13, false), Reference::Frame(12));
+        assert_eq!(w.invalidate(12), Invalidation::Forget(13));
+        assert_eq!(w.record(14, false), Reference::Frame(11));
+
+        let mut w = ReferenceWindow::new(8);
+        w.set_frame_num_range(16);
+        w.record(0, true);
+        for id in 1..=15u16 {
+            w.record(id, false);
+        }
+        assert!(w.retract(|_| true));
+        w.record(15, false);
+        assert!(
+            !w.retract(|_| panic!("frame_num 0 has to reach the decoder")),
+            "the frame sent in place of 15 carries frame_num 0"
         );
     }
 

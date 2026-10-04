@@ -2870,6 +2870,19 @@ impl NvencEncoder {
         }
     }
 
+    /// Leave the frame just encoded out of the predictions as a frame the client lost is, for a
+    /// frame coded again in its place (`ReferenceWindow::retract`); false where the window or
+    /// the device cannot.
+    fn retract_last(&mut self) -> bool {
+        let (funcs, session) = (&self.nvenc_funcs, self.encoder_session);
+        self.references.as_mut().is_some_and(|r| {
+            r.retract(|pts| unsafe {
+                (funcs.nvEncInvalidateRefFrames.unwrap())(session, pts)
+                    == NVENCSTATUS::NV_ENC_SUCCESS
+            })
+        })
+    }
+
     /// How the session splits a frame across the device's encode engines (`split_mode`), for the
     /// line that says which device encodes.
     pub fn split_summary(&self) -> String {
@@ -3318,15 +3331,17 @@ impl NvencEncoder {
     }
 
     /// Encode the next frame at the constant quantizer the quality index `crf` selects, whatever
-    /// the rate control, and leave the session's own rate control and quantizer as they were
-    /// for the frame after: the cleanup of a still screen. A held key frame of a constant-rate
-    /// session that comes out past `HELD_KEY_BUDGET_S` of the target is coded again, as a key
-    /// frame, at the coarser quantizer `held_key_retry` picks. `band`, the share of the picture
-    /// from and to in raster order, confines `crf` to the blocks it covers (`band_size`), the rest
-    /// of the frame held at the coarsest quantizer, or for AV1 at the coarsest the delta map's
-    /// 128 steps reach above the band: a still region is left as it is at any quantizer, and a
-    /// change the frame carries before its damage is known (X11 under Turbo hashes a frame
-    /// beside its encode) costs what the rate control's own frame would.
+    /// the rate control, and leave the session's own rate control and quantizer as they were for
+    /// the frame after: the cleanup of a still screen. A held key frame of a constant-rate session
+    /// that comes out past `HELD_KEY_BUDGET_S` of the target is coded again, as a key frame, at the
+    /// coarser quantizer `held_key_retry` picks, and so is a held frame of the whole picture past
+    /// `HELD_REFRESH_LIMIT_S`, predicted from the frame before the first attempt, which the device
+    /// leaves out as it does a frame the client lost (`retract_last`). `band`, the share of the
+    /// picture from and to in raster order, confines `crf` to the blocks it covers (`band_size`),
+    /// the rest of the frame held at the coarsest quantizer, or for AV1 at the coarsest the delta
+    /// map's 128 steps reach above the band: a still region is left as it is at any quantizer, and
+    /// a change the frame carries before its damage is known (X11 under Turbo hashes a frame beside
+    /// its encode) costs what the rate control's own frame would.
     pub fn hold_quantizer(&mut self, crf: u32, band: Option<(f64, f64)>) {
         self.held_qp = Some(crf);
         self.held_band = band.filter(|_| self.band_size().is_some());
@@ -3578,8 +3593,11 @@ impl NvencEncoder {
         );
         let retry = match (held_qp, held, &result) {
             (Some(crf), Some(rc), Ok(coded))
-                if force_idr
-                    && rc.rateControlMode == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR =>
+                if rc.rateControlMode == NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR
+                    && (force_idr
+                        || band.is_none()
+                            && coded.len() as f64
+                                > rc.averageBitRate as f64 / 8.0 * super::HELD_REFRESH_LIMIT_S) =>
             {
                 let cap = (rc.averageBitRate as f64 / 8.0 * super::HELD_KEY_BUDGET_S) as usize;
                 super::held_key_retry(crf, coded.len(), cap)
@@ -3594,6 +3612,7 @@ impl NvencEncoder {
                     false,
                 )
                 .is_some()
+            && (force_idr || self.retract_last())
         {
             pic_params.inputTimeStamp = self
                 .references
@@ -5333,6 +5352,100 @@ mod gpu_tests {
                 "{codec:?}: without frames 80, 81 and 106 the last frame is {off:?} off"
             );
             println!("{codec:?}: frame 99 predicts from 98 after the covered report, {off:?} off");
+        }
+    }
+
+    /// A held refresh of the whole picture past `HELD_REFRESH_LIMIT_S` of a constant rate is coded
+    /// again to fit `HELD_KEY_BUDGET_S`, and one under it stands. The frame coded again predicts
+    /// from the frame before the first attempt, which the device leaves out as it does a lost
+    /// frame: a decoder that never sees the attempt decodes what follows as one that saw it does,
+    /// and a loss reported for the frame sent in its place leaves that frame out. Ignored by
+    /// default.
+    #[test]
+    #[ignore]
+    fn gpu_a_held_refresh_past_its_limit_is_coded_again() {
+        use crate::encoders::reference::Reference;
+        let (w, h) = (1280usize, 720usize);
+        let still = frame(w, h, 10);
+        let encode = |enc: &mut NvencEncoder, i: u64, held: Option<u32>| {
+            if let Some(crf) = held {
+                enc.hold_quantizer(crf, None);
+            }
+            let out = enc
+                .encode_cpu_argb(&still, w * 4, i, 25, i == 0)
+                .expect("encode");
+            (out, enc.last_reference())
+        };
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            s.omit_stripe_headers = true;
+            s.video_cbr_mode = true;
+            s.video_bitrate_kbps = 50_000;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            let mut frames: Vec<_> = (0..4).map(|i| encode(&mut enc, i, None).0).collect();
+            if enc.last_reference() == Reference::Untracked {
+                println!("{codec:?}: this device cannot invalidate a reference");
+                continue;
+            }
+            // An attempt within the limit of this rate, taken back as the session takes back one
+            // past it.
+            let (attempt, _) = encode(&mut enc, 4, Some(20));
+            assert!(enc.retract_last(), "{codec:?}: the device refused");
+            frames.push(attempt);
+            let (out, reference) = encode(&mut enc, 4, Some(40));
+            assert_eq!(reference, Reference::Frame(3), "{codec:?}");
+            frames.push(out);
+            let (out, reference) = encode(&mut enc, 5, None);
+            assert_eq!(reference, Reference::Frame(4), "{codec:?}");
+            frames.push(out);
+            let off = apart_without(codec, &frames, 4..5);
+            assert!(
+                off < 0.5,
+                "{codec:?}: without the attempt the frames after it decode {off:.2} off"
+            );
+            assert!(enc.invalidate_reference(4), "{codec:?}");
+            let (out, reference) = encode(&mut enc, 6, None);
+            assert!(
+                matches!(reference, Reference::Frame(id) if id < 4),
+                "{codec:?}: {reference:?} after losing the frame sent in place of the attempt"
+            );
+            frames.push(out);
+            let lost = apart_without(codec, &frames, 4..7);
+            assert!(
+                lost < 0.5,
+                "{codec:?}: past the loss the frame decodes {lost:.2} off"
+            );
+            // Past `HELD_REFRESH_LIMIT_S` of the target the session codes such a frame again on its
+            // own (AV1 on 595.91.07 caps a held frame at a second of the target itself); under it,
+            // the frame stands.
+            for (kbps, first) in [(100, 7u64), (1000, 11)] {
+                s.video_bitrate_kbps = kbps;
+                assert!(enc.reconfigure_rate(&s), "{codec:?}");
+                for i in first..first + 3 {
+                    encode(&mut enc, i, None);
+                }
+                let pts = |enc: &NvencEncoder| enc.references.as_ref().map_or(0, |r| r.next_pts());
+                let before = pts(&enc);
+                let (out, reference) = encode(&mut enc, first + 3, Some(20));
+                assert_eq!(reference, Reference::Frame(first as u16 + 2), "{codec:?}");
+                let spent = out.len() as f64 / (kbps as f64 * 1000.0 / 8.0);
+                let coded = pts(&enc) - before;
+                println!(
+                    "{codec:?}: a held frame at {kbps} kbps goes out at {} bytes, {spent:.2} s of the target, encoded {coded} times",
+                    out.len()
+                );
+                assert!(spent <= crate::encoders::HELD_REFRESH_LIMIT_S, "{codec:?}");
+                if kbps == 1000 {
+                    assert_eq!(coded, 1, "{codec:?}: a frame under the limit stands");
+                }
+            }
         }
     }
 

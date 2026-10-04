@@ -368,12 +368,22 @@ fn survives_in_child(f: impl FnOnce()) -> bool {
 /// held key frame larger than that is coded again at a coarser quantizer (`held_key_retry`), or
 /// planned with that budget where the library's own rate control sizes it (x264, SVT-AV1),
 /// and a held refresh is coarsened to fit from the rate control's last quantizer
-/// (`pipeline::decide_hw_fullframe`). A second of the target drains in 0.4 s at the pace the
-/// WebRTC pacer holds video to, so a user acting just as the cleanup goes out waits that long at
-/// most for it. It holds a 1080p key frame at the paint-over quantizer down to 2 Mbit/s (NVENC
-/// 144 kB, x264 182 kB); a quarter second made that key frame coarser than the picture it was
-/// cleaning (x264 52 kB at 31.7 dB, NVENC 99 kB at 45.3 dB at 2 Mbit/s).
+/// (`pipeline::decide_hw_fullframe`), and on NVENC coded again to fit where it comes out past
+/// `HELD_REFRESH_LIMIT_S`. A second of the target drains in 0.4 s at the pace the WebRTC pacer
+/// holds video to, so a user acting just as the cleanup goes out waits that long at most for
+/// it. It holds a 1080p key frame at the paint-over quantizer down to 2 Mbit/s (NVENC 144 kB,
+/// x264 182 kB); a quarter second made that key frame coarser than the picture it was cleaning
+/// (x264 52 kB at 31.7 dB, NVENC 99 kB at 45.3 dB at 2 Mbit/s).
 pub(crate) const HELD_KEY_BUDGET_S: f64 = 1.0;
+
+/// Seconds of a constant-rate target a held refresh of the whole picture, a predicted frame, may
+/// spend before it is coded again to fit `HELD_KEY_BUDGET_S` where the encoder can take it back
+/// (NVENC): what a cleanup through the rate control spends at most (`pipeline`'s `CONVERGE_S`).
+/// A refresh under it stands, since coding it coarser costs the picture more than the time it
+/// saves: NVENC's of a 1080p texture at 0.25 and 0.1 Mbit/s, 1.8 and 3.1 s of the target, came
+/// out at 1.3 and 1.7 s six to ten steps coarser, 6.4-6.8 dB worse. One of dense text at 0.1
+/// Mbit/s at 1080p took 52 s.
+pub(crate) const HELD_REFRESH_LIMIT_S: f64 = 10.0;
 
 /// The quality index a held key frame of `len` bytes is coded again at, from `crf`, where it
 /// came out larger than a budget of `cap` bytes; `None` where it fits. A quality index is a
