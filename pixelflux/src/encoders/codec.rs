@@ -214,8 +214,9 @@ impl Codec {
     /// 22 up and keeps it. Intel's VA-API H.265 matches x264 on a still frame at that curve but
     /// refines a moving picture well past it for fewer bytes (Arc and Alder Lake-N), so it reads
     /// one two steps coarser from index 25 up; below 20 its still frames of text fall 3 to 4 dB
-    /// short of x264's at that curve, so there it reads one finer. AV1 has a curve per backend: NVENC's is measured on Ada, and VA-API's
-    /// on Intel (Arc) with the in-loop filters its constant-quantizer frames carry, on a
+    /// short of x264's at that curve, so there it reads one finer. AV1 has a curve per backend:
+    /// NVENC's is measured on Ada, and VA-API's on Intel (Arc) with the in-loop filters its
+    /// constant-quantizer frames carry, on a
     /// text desktop and a gradient wallpaper, taking the finer match of the two. VA-API's VP9
     /// is matched the same way on Intel (Arc), finer than libvpx at the same index on text.
     /// VP8 keeps the software table. NVENC refuses an AV1 index of zero, so the floor stays one.

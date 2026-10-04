@@ -219,8 +219,9 @@ smithay::backend::renderer::element::render_elements! {
 }
 
 /// Push an output's wlr-layer surfaces on `target_layer` into `elements`, top-most first, the
-/// order `layer_map.layers()` reversed gives, each with its popups and subsurfaces. Shared by both renderers and by both of a frame's
-/// layer passes, which differ only in the layers they name.
+/// order `layer_map.layers()` reversed gives, each with its popups and subsurfaces. Shared by
+/// both renderers and by both of a frame's layer passes, which differ only in the layers they
+/// name.
 fn push_layer_elements<R>(
     renderer: &mut R,
     elements: &mut Vec<CompositionElements<R, WaylandSurfaceRenderElement<R>>>,
