@@ -51,6 +51,9 @@ const CYCLIC_REFRESH_AQ: c_int = 3;
 /// Mbit/s a 1080p texture under a moving box took 3.0 MB for its 3 s of motion against 5.8, at
 /// 42.0 dB against 41.4, and 304 kB still against 1185. Scrolling text codes the same.
 const VP8_STATIC_THRESHOLD: c_int = 100;
+/// The frame budget a macroblock, in bits, from which VP8 sweeps its refresh in bands
+/// (`VpxEncoder::band_size`): three times what a frame that skips every macroblock costs.
+const BAND_BITS_PER_MB: f64 = 1.0;
 
 /// Whether the loaded libvpx codes VP9 4:4:4 in the flexible mode the sessions run: before 1.13
 /// its layer machinery re-sizes every frame at 4:2:0, so a profile 1 session writes headers
@@ -84,6 +87,13 @@ pub struct VpxEncoder {
     plan: SlotPlan,
     /// The quality index the next frame is held at whatever the rate control (`hold_quantizer`).
     held: Option<u32>,
+    /// The share of the picture, from and to in raster order, the held quantizer covers, the
+    /// rest left as it is (`hold_quantizer`, VP8 only); `None` for the whole picture.
+    held_band: Option<(f64, f64)>,
+    /// The bytes of the last held frame, 0 before one (`band_size`).
+    held_bytes: usize,
+    /// One segment per macroblock for a held band (`band_roi`): 1 inside it, 0 outside.
+    band_map: Vec<u8>,
     /// The quality index the rate control last coded a frame at, held frames aside.
     last_quality: Option<u32>,
     /// The bytes of the last frame the rate control coded, held frames aside.
@@ -189,6 +199,9 @@ impl VpxEncoder {
             pending: Pending::default(),
             plan: SlotPlan::KEY,
             held: None,
+            held_band: None,
+            held_bytes: 0,
+            band_map: Vec::new(),
             last_quality: None,
             last_bytes: None,
             held_key: None,
@@ -406,8 +419,69 @@ impl VpxEncoder {
     /// last one says fits `HELD_KEY_BUDGET_S` of the target (`held_key_start`), and one that
     /// comes out past it is coded again, as a key frame, at the coarser quantizer
     /// `held_key_retry` picks.
-    pub fn hold_quantizer(&mut self, crf: u32) {
+    /// `band`, the share of the picture from and to in raster order, confines the quantizer to
+    /// the macroblocks it covers where the session holds a band (`band_size`), and the rest of
+    /// the frame is left as the reference has it.
+    pub fn hold_quantizer(&mut self, crf: u32, band: Option<(f64, f64)>) {
         self.held = Some(crf);
+        self.held_band = band.filter(|_| self.band_size().is_some());
+    }
+
+    /// The bytes of the last held frame (0 before one), where the session holds a band of a
+    /// frame at a quantizer: VP8, through libvpx's region-of-interest map (`band_roi`), at a rate
+    /// that leaves a band room in a frame. A VP8 frame codes every macroblock's mode even where
+    /// it skips them all, about a third of a bit each at 720p and 1080p, so below
+    /// `BAND_BITS_PER_MB` of frame budget a band a frame is mostly that and the sweep cannot keep
+    /// the rate: 1080p text at 0.25 Mbit/s (half a bit) ended at 29.5 dB in bands against 42.0
+    /// held whole, where 720p at 0.25 (1.2 bits) ended at 41.5 against 42.0 with the worst wait
+    /// at the target 5.0 s against 18.5. The refresh is held whole below it.
+    pub fn band_size(&self) -> Option<usize> {
+        let blocks = f64::from(self.cfg.g_w.div_ceil(16) * self.cfg.g_h.div_ceil(16));
+        let fps = f64::from(self.rate.fps.num) / f64::from(self.rate.fps.den.max(1));
+        let budget_bits = self.rate.bps() as f64 / fps.max(1.0);
+        (self.codec == Codec::Vp8 && budget_bits >= BAND_BITS_PER_MB * blocks)
+            .then_some(self.held_bytes)
+    }
+
+    /// Hand libvpx the region map of a held band (`band`, from and to in raster order of the
+    /// macroblocks, as NVENC's delta map counts them), or clear it with `None`. The band is
+    /// coded at the frame's own quantizer, the one held, with the static threshold the session
+    /// keeps (`VP8_STATIC_THRESHOLD`); every other macroblock is skipped, a static threshold
+    /// no prediction error reaches making it a copy of the reference, so the frame carries the
+    /// band and nothing else. VP8's segments take a quantizer delta of 63 at most, so the band
+    /// is not held finer than a coarse rest the way NVENC's map holds it: the rest is skipped
+    /// outright, which no quantizer of its own would do better.
+    fn band_roi(&mut self, band: Option<(f64, f64)>) -> Result<(), String> {
+        let cols = self.cfg.g_w.div_ceil(16);
+        let rows = self.cfg.g_h.div_ceil(16);
+        let mut roi: vpx_roi_map_t = unsafe { std::mem::zeroed() };
+        roi.rows = rows;
+        roi.cols = cols;
+        if let Some((from, to)) = band {
+            let blocks = (rows * cols) as usize;
+            let first = ((from.clamp(0.0, 1.0) * blocks as f64).floor() as usize).min(blocks);
+            let last = ((to.clamp(0.0, 1.0) * blocks as f64).ceil() as usize).clamp(first, blocks);
+            self.band_map.clear();
+            self.band_map.resize(blocks, 0);
+            self.band_map[first..last].fill(1);
+            roi.roi_map = self.band_map.as_mut_ptr();
+            roi.delta_q[0] = 63;
+            // No loop filter either, which would still touch a skipped block's edges.
+            roi.delta_lf[0] = -63;
+            roi.static_threshold[0] = u32::MAX >> 1;
+            roi.static_threshold[1] = VP8_STATIC_THRESHOLD as u32;
+        }
+        let res = unsafe {
+            vpx_codec_control_(
+                &mut self.ctx,
+                VP8E_SET_ROI_MAP as c_int,
+                &mut roi as *mut vpx_roi_map_t as *mut c_void,
+            )
+        };
+        if res != VPX_CODEC_OK {
+            return Err(error(&self.ctx, "libvpx refused the band's region map"));
+        }
+        Ok(())
     }
 
     /// Pin the configuration's quantizer bounds to the one the quality index `crf` selects.
@@ -458,8 +532,19 @@ impl VpxEncoder {
         if let Some(crf) = held {
             self.pin_quantizer(crf)?;
         }
+        // A key frame skips nothing, so a band is held on a predicted one alone.
+        let band = self
+            .held_band
+            .take()
+            .filter(|_| held.is_some() && !force_idr);
+        if band.is_some() {
+            self.band_roi(band)?;
+        }
         let quality = self.last_quality;
         let mut result = self.encode_frame(pixels, stride, rgba, frame_number, force_idr);
+        if band.is_some() {
+            self.band_roi(None)?;
+        }
         let mut coded_at = held;
         let retry = match (held, &result) {
             (Some(crf), Ok(coded)) if capped => super::held_key_retry(crf, coded.len(), cap),
@@ -474,6 +559,9 @@ impl VpxEncoder {
             self.held_key = Some((coded.len(), crf));
         }
         if held.is_some() {
+            if let Ok(coded) = &result {
+                self.held_bytes = coded.len();
+            }
             self.last_quality = quality;
             self.program_rate(self.rate, self.quality.current);
             self.reconfigure()?;
@@ -941,6 +1029,87 @@ mod tests {
     }
 
     /// A quality change reaches a running session without a key frame, and a rate change too.
+    /// The decoded picture's luma, `W` x `H`.
+    fn luma(dec: &VideoDecoder) -> Vec<u8> {
+        let f = dec.frame().expect("a decoded picture");
+        f.y.chunks(f.y_stride)
+            .take(H)
+            .flat_map(|row| row[..W].iter().copied())
+            .collect()
+    }
+
+    /// The mean luma difference of `a` and `b` over `rows`.
+    fn rows_distance(a: &[u8], b: &[u8], rows: std::ops::Range<usize>) -> f64 {
+        let n = rows.len() * W;
+        a[rows.start * W..rows.end * W]
+            .iter()
+            .zip(&b[rows.start * W..rows.end * W])
+            .map(|(&x, &y)| (x as f64 - y as f64).abs())
+            .sum::<f64>()
+            / n as f64
+    }
+
+    /// A VP8 refresh held in a band codes the band's macroblocks alone at the held quantizer and
+    /// leaves every other one as the reference has it: a quarter of the picture costs a fraction
+    /// of the whole refresh, the band decodes as the whole refresh's does, and the rest exactly
+    /// as the frame before.
+    #[test]
+    fn a_vp8_band_codes_its_macroblocks_alone() {
+        let mut s = settings(Codec::Vp8);
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 30;
+        let still = frame(0);
+        let run = |band: Option<(f64, f64)>| {
+            let mut enc = VpxEncoder::new(&s, Codec::Vp8, false).expect("session");
+            let mut dec = VideoDecoder::new(Codec::Vp8).unwrap();
+            for t in 0..6u64 {
+                let f = enc
+                    .encode_host(&still, W * 4, false, t, 25, t == 0)
+                    .unwrap();
+                assert!(dec.decode(&f[VIDEO_HEADER_LEN..]).unwrap());
+            }
+            let before = luma(&dec);
+            assert_eq!(enc.band_size(), Some(0), "no frame held yet");
+            enc.hold_quantizer(5, band);
+            let held = enc.encode_host(&still, W * 4, false, 6, 25, false).unwrap();
+            assert_eq!(parse_video_type(held[1]).map(|(_, k)| k), Some(FRAME_DELTA));
+            assert!(dec.decode(&held[VIDEO_HEADER_LEN..]).unwrap());
+            assert_eq!(enc.band_size(), Some(held.len()));
+            // The frame after goes back to the rate control, with no band left on it.
+            let next = enc.encode_host(&still, W * 4, false, 7, 25, false).unwrap();
+            assert!(dec.decode(&next[VIDEO_HEADER_LEN..]).unwrap());
+            (held.len(), before, luma(&dec))
+        };
+        let (whole, before, refreshed) = run(None);
+        // 300 macroblocks of 20 a row: the first quarter is rows 0 to 2 and part of row 3.
+        let (banded, band_before, band_after) = run(Some((0.0, 0.25)));
+        assert!(
+            banded * 2 < whole,
+            "a quarter of the picture cost {banded} bytes against {whole} for the whole"
+        );
+        assert_eq!(
+            before, band_before,
+            "both runs reach the same picture before the hold"
+        );
+        let changed = rows_distance(&before, &refreshed, 0..48);
+        assert!(
+            changed > 0.5,
+            "the held quantizer refines the picture ({changed:.2})"
+        );
+        let band = rows_distance(&band_after, &refreshed, 0..48);
+        assert!(
+            band < changed / 4.0,
+            "the band decodes as the whole refresh's ({band:.2})"
+        );
+        let rest = rows_distance(&band_after, &band_before, 64..H);
+        assert!(rest < 0.01, "the rest is left as it was ({rest:.3})");
+        // Half a bit of budget a macroblock (5 kbps at 300 macroblocks and 30 frames a second)
+        // is mostly the frame's own modes, so no band is offered and the refresh is held whole.
+        s.video_bitrate_kbps = 5;
+        let starved = VpxEncoder::new(&s, Codec::Vp8, false).expect("session");
+        assert_eq!(starved.band_size(), None);
+    }
+
     #[test]
     fn quality_and_rate_move_without_a_key_frame() {
         for codec in [Codec::Vp8, Codec::Vp9] {

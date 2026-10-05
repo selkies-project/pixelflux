@@ -1193,10 +1193,11 @@ impl FrameEncoder {
 
     /// The bytes of the last frame held at a quantizer (0 before one), where the session holds a
     /// band of a frame at it (`hold_quantizer`): NVENC's H.264, HEVC and AV1 sessions, through a
-    /// QP delta map.
+    /// QP delta map, and libvpx's VP8, through a region-of-interest map.
     pub fn band_size(&self) -> Option<usize> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.band_size(),
+            FrameEncoder::Vpx(enc) => enc.band_size(),
             _ => None,
         }
     }
@@ -1231,8 +1232,9 @@ impl FrameEncoder {
 
     /// Whether a constant-rate cleanup ends on a key frame after a large change and a longer
     /// stillness (`pipeline::decide_hw_fullframe`). SVT-AV1 holds only a key frame, so that is its
-    /// cleanup. libvpx's VP8 holds the refresh before it, a predicted frame that restores the
-    /// picture whole, and its key frame only sent the picture again: 1080p text at 0.25 Mbit/s
+    /// cleanup. libvpx's VP8 holds the refresh before it, predicted frames that restore the
+    /// picture whole (in bands where the rate leaves room, `VpxEncoder::band_size`), and its key
+    /// frame only sent the picture again: 1080p text at 0.25 Mbit/s
     /// went quiet on 1.3 MB without it against 2.7, at the same 42 dB, since the key frame came
     /// out capped coarser than the picture (216 kB at 21.6 dB) and a second refresh restored it.
     pub fn cleans_up_with_key(&self) -> bool {
@@ -1250,7 +1252,7 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(enc) => enc.hold_quantizer(crf, band),
             FrameEncoder::Vaapi(enc) => enc.hold_quantizer(crf),
-            FrameEncoder::Vpx(enc) => enc.hold_quantizer(crf),
+            FrameEncoder::Vpx(enc) => enc.hold_quantizer(crf, band),
             FrameEncoder::Hevc(enc) => enc.hold_quantizer(crf),
             FrameEncoder::Av1(enc) => enc.hold_quantizer(crf),
             #[cfg(target_arch = "aarch64")]

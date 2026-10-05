@@ -652,6 +652,9 @@ pub fn decide_hw_fullframe(
     let recovery_idr = requested_idr || periodic_idr_due(settings, frame_counter);
     let converges = encoder.converges();
     let holds = encoder.holds && !converges;
+    // A session that holds its refresh and a band of a frame (libvpx's VP8) sweeps the refresh
+    // a band a frame, as a converging one's fallback does, rather than holding it whole.
+    let sweeps = holds && encoder.band.is_some();
     let cleanup = cleanup_due(
         st,
         settings.paint_over_trigger_frames,
@@ -677,14 +680,19 @@ pub fn decide_hw_fullframe(
     if damage.is_dirty() {
         if !converges || damage.is_motion() {
             st.h264_burst_frames_remaining = 0;
-            st.sweep = None;
         }
+        // Motion ends a sweep. A small change (a caret) leaves it to finish: one that started
+        // over at every blink would never cover the picture.
         if damage.is_motion() {
+            st.sweep = None;
             st.settled = false;
         }
         d.send = true;
         d.force_idr = recovery_idr || cleanup == Cleanup::Key;
         d.hold_qp = cleanup_qp;
+        if sweeps && cleanup == Cleanup::Refresh && !d.force_idr {
+            sweep_refresh(st, &mut d);
+        }
         return d;
     }
     if cleanup != Cleanup::None || recovery_idr {
@@ -693,6 +701,8 @@ pub fn decide_hw_fullframe(
         d.hold_qp = cleanup_qp;
         if recovery_idr {
             st.sweep = None;
+        } else if sweeps && cleanup == Cleanup::Refresh && !d.force_idr {
+            sweep_refresh(st, &mut d);
         }
         if converges && (cleanup != Cleanup::None || (burst > 0 && recovery_idr)) {
             if (st.h264_burst_frames_remaining <= 0 && !st.settled) || recovery_idr {
@@ -710,7 +720,9 @@ pub fn decide_hw_fullframe(
                 st.measure_in = 0;
             }
             st.burst_held = false;
-        } else if burst > 0 && (d.force_idr || cleanup != Cleanup::None) {
+        } else if burst > 0 && (d.force_idr || cleanup != Cleanup::None) && st.sweep.is_none() {
+            // A sweep spends a budget a frame and leaves the rate control nothing to settle, so no
+            // burst follows it, which would hold whole frames again once it ends.
             st.h264_burst_frames_remaining = burst;
             st.burst_held =
                 holds && (cleanup != Cleanup::None || (improves && !settings.video_cbr_mode));
@@ -828,16 +840,34 @@ pub fn decide_hw_fullframe(
             });
             st.h264_burst_frames_remaining = 0;
             if encoder.band.is_some() && !pinned {
-                d.hold_band = Some((0.0, FIRST_BAND));
-                st.sweep = Some((FIRST_BAND, FIRST_BAND));
-                st.sweep_frames = 0;
-                st.sweep_coarser = 0;
+                start_sweep(st, &mut d);
             }
         }
         return d;
     }
     d.send = settings.video_streaming_mode || is_animated;
     d
+}
+
+/// Start a refresh sweep at the top of the picture: its first band in this frame, the rest a band
+/// a frame after it (`FIRST_BAND`, `band_share`).
+fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision) {
+    d.hold_band = Some((0.0, FIRST_BAND));
+    st.sweep = Some((FIRST_BAND, FIRST_BAND));
+    st.sweep_frames = 0;
+    st.sweep_coarser = 0;
+}
+
+/// A refresh due on a session that sweeps it (`decide_hw_fullframe`'s `sweeps`): a sweep from the
+/// top, or, with one under way, which is already refreshing the picture, nothing held, the frame
+/// going at the rate control's quality: a sweep started over at every change of a blinking caret
+/// would never cover the picture, and a whole held frame is what the sweep spreads.
+fn sweep_refresh(st: &mut StripeState, d: &mut HwFrameDecision) {
+    if st.sweep.is_some() {
+        d.hold_qp = None;
+    } else {
+        start_sweep(st, d);
+    }
 }
 
 /// `decide_hw_fullframe` for a constant-quality session: the cleanup moves the session's own
@@ -2284,6 +2314,60 @@ mod tests {
             "each a budget: {bands:?}"
         );
         assert_eq!(sent_after, 0, "which ends the cleanup");
+    }
+
+    /// A session that holds its refresh rather than converging to it, and holds a band of a frame
+    /// (libvpx's VP8), sweeps that refresh a band a frame from the top, each a budget, until it
+    /// covers the picture, with no whole held frame; a caret blinking meanwhile leaves the sweep
+    /// to finish.
+    #[test]
+    fn a_held_refresh_that_holds_a_band_sweeps_the_picture() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let vp8 = |held: usize| EncoderQuality {
+            last: Some(38),
+            bytes: None,
+            holds: true,
+            reopens: false,
+            keys: false,
+            band: Some(held),
+            measures: false,
+            psnr: None,
+        };
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, vp8(0));
+        let mut bands: Vec<(f64, f64)> = Vec::new();
+        let mut caret_in_sweep = false;
+        let mut blinked = false;
+        for i in 1..=600u16 {
+            let held = bands
+                .last()
+                .map_or(0, |(a, b)| ((b - a) * 128.0 * budget) as usize);
+            let caret = !blinked && bands.len() == 20;
+            blinked |= caret;
+            caret_in_sweep |= caret && st.sweep.is_some();
+            let damage = if caret {
+                Damage::Area(0.001)
+            } else {
+                Damage::None
+            };
+            let d = decide_hw_fullframe(&mut st, &s, i, damage, false, false, vp8(held));
+            assert!(!d.force_idr, "no key frame");
+            match d.hold_band {
+                Some(band) => {
+                    assert!(d.send && d.hold_qp == Some(held_refresh_quality(&s, vp8(0))));
+                    bands.push(band);
+                }
+                None => assert!(d.hold_qp.is_none(), "no whole held frame, frame {i}"),
+            }
+        }
+        assert!(caret_in_sweep, "the caret blinked mid-sweep");
+        assert_eq!(bands[0], (0.0, FIRST_BAND), "the sweep starts from the top");
+        assert!(
+            bands.windows(2).all(|w| w[0].1 == w[1].0),
+            "contiguous bands, the caret's frame between two: {bands:?}"
+        );
+        assert_eq!(bands.last().unwrap().1, 1.0, "that cover the picture");
     }
 
     /// A sweep whose bands, each a budget, would take longer than `REFINE_S` to cover the picture

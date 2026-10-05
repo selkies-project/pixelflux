@@ -802,10 +802,12 @@ asked for.
         keep flowing, each within its budget, until it codes the screen at the paint-over quality,
         with no key frame, and only where NVENC's rate control stops short of it (a low rate for
         the resolution) does NVENC refresh the screen at that quality, a band of it a frame, each
-        within the budget (one held frame for AV1). Other encoders that hold a quantizer
-        hold the cleanup frames at it; one that does not sends the refresh at the rate control's
-        own quality, never a key frame. A screen that keeps changing only a little (a blinking
-        caret) is cleaned up all the same.
+        within the budget. libvpx's VP8, whose rate control leaves a still screen as it is,
+        refreshes it the same way from the start of the cleanup where the rate leaves a band room
+        in a frame (a bit a macroblock: 0.5 Mbit/s at 1080p60, 0.22 at 720p60), else in one held
+        frame. Other encoders that hold a quantizer hold the cleanup frames at it; one that does
+        not sends the refresh at the rate control's own quality, never a key frame. A screen that
+        keeps changing only a little (a blinking caret) is cleaned up all the same.
     *   **Damage Throttling:** Limits processing during high-motion scenes.
     *   **On-demand keyframes:** `request_idr_frame()` forces an IDR for reconnecting clients.
     *   **Reference invalidation:** `invalidate_reference(frame_id)` has the encoder predict past a
