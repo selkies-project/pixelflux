@@ -1747,6 +1747,28 @@ impl Drop for NvencEncoder {
     }
 }
 
+/// Hold one reference on `device`'s primary CUDA context for the life of the process, once a
+/// session on it has opened. A capture restarted while a game fills the GPU's memory then
+/// retains the context it had instead of creating one, which can fail there and leave the
+/// stream on the CPU. The cost is the idle context's 106 MiB of VRAM on a device that has
+/// encoded once, kept also while no session runs. Its own copy of the driver's entry points
+/// keeps `libcuda` loaded after the last session's copy goes.
+fn keep_primary_context(device: CUdevice) {
+    static KEPT: std::sync::Mutex<Vec<CUdevice>> = std::sync::Mutex::new(Vec::new());
+    static CUDA: std::sync::OnceLock<Option<CudaFunctions>> = std::sync::OnceLock::new();
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if kept.contains(&device) {
+        return;
+    }
+    let Some(cuda) = CUDA.get_or_init(|| NvencEncoder::load_cuda().ok()) else {
+        return;
+    };
+    let mut context: CUcontext = ptr::null_mut();
+    if unsafe { (cuda.cuDevicePrimaryCtxRetain)(&mut context, device) } == CUresult::CUDA_SUCCESS {
+        kept.push(device);
+    }
+}
+
 /// The level an NVENC session advertises for a `width` x `height` stream at `fps` carrying up
 /// to `bitrate_bps` (`NV_ENC_LEVEL` shares each codec's own numbering: level_idc for H.264,
 /// general_level_idc for HEVC, seq_level_idx for AV1).
@@ -2588,6 +2610,7 @@ impl NvencEncoder {
                 (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
                 return Err("the driver took no 10-bit convert kernel".into());
             }
+            keep_primary_context(cu_device);
             crate::log::debug!(
                 "[NVENC] {} initialized (4:4:4 mode: {}, chroma convert: {}).",
                 codec.display(),
@@ -6117,6 +6140,73 @@ mod gpu_tests {
     /// and once one frees it lists the codecs again. A device that takes 65 sessions at once has
     /// no cap to reach and says so. The sessions are closed before anything is asserted, so a
     /// failure leaves none held against the cap for the tests after it. Ignored by default.
+    /// A capture restarted while a game holds the GPU's memory keeps its place: once a session
+    /// has opened, the device's primary CUDA context outlives it (`keep_primary_context`), so a
+    /// session reopened after another context has taken all but 48 MiB still opens and encodes,
+    /// where a context created afresh needs about 106 MiB.
+    #[test]
+    #[ignore]
+    fn gpu_a_session_reopened_under_a_full_gpu_keeps_its_context() {
+        type Ctx = *mut c_void;
+        let first = host_session(&settings(256, 128, 60.0)).expect("NVENC init");
+        let device = first.cuda_device;
+        drop(first);
+        unsafe {
+            let lib = Library::new("libcuda.so.1").expect("libcuda");
+            let state: Symbol<unsafe extern "C" fn(CUdevice, *mut u32, *mut i32) -> CUresult> =
+                lib.get(b"cuDevicePrimaryCtxGetState\0").unwrap();
+            let create: Symbol<unsafe extern "C" fn(*mut Ctx, u32, CUdevice) -> CUresult> =
+                lib.get(b"cuCtxCreate_v2\0").unwrap();
+            let destroy: Symbol<unsafe extern "C" fn(Ctx) -> CUresult> =
+                lib.get(b"cuCtxDestroy_v2\0").unwrap();
+            let info: Symbol<unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult> =
+                lib.get(b"cuMemGetInfo_v2\0").unwrap();
+            let alloc: Symbol<unsafe extern "C" fn(*mut u64, usize) -> CUresult> =
+                lib.get(b"cuMemAlloc_v2\0").unwrap();
+            let (mut flags, mut active) = (0u32, 0i32);
+            assert_eq!(
+                state(device, &mut flags, &mut active),
+                CUresult::CUDA_SUCCESS
+            );
+
+            let mut game: Ctx = ptr::null_mut();
+            assert_eq!(create(&mut game, 0, device), CUresult::CUDA_SUCCESS);
+            let (mut free, mut total) = (0usize, 0usize);
+            let mut chunk = 256usize << 20;
+            let mut taken = 0usize;
+            while chunk >= 1 << 20 {
+                let mut ptr = 0u64;
+                info(&mut free, &mut total);
+                if free < (48 << 20) + chunk || alloc(&mut ptr, chunk) != CUresult::CUDA_SUCCESS {
+                    chunk /= 2;
+                } else {
+                    taken += chunk;
+                }
+            }
+            info(&mut free, &mut total);
+            println!(
+                "took {} MiB; {} MiB of {} left",
+                taken >> 20,
+                free >> 20,
+                total >> 20
+            );
+            let reopened = host_session(&settings(256, 128, 60.0)).map(|mut enc| {
+                enc.encode_cpu_argb(&vec![0x40u8; 256 * 128 * 4], 256 * 4, 0, 25, true)
+                    .map(|out| out.len())
+            });
+            destroy(game);
+            println!(
+                "primary context active after the first session: {active}; reopened: {reopened:?}"
+            );
+            assert_eq!(
+                active, 1,
+                "the primary context outlived the session that opened it"
+            );
+            let bytes = reopened.expect("the session reopens").expect("and encodes");
+            assert!(bytes > 0);
+        }
+    }
+
     #[test]
     #[ignore]
     fn gpu_a_device_out_of_sessions_says_so() {
