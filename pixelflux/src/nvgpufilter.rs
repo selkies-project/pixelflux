@@ -9,7 +9,7 @@
 //!
 //! The problem: on NVIDIA driver 570-595, `libnvidia-encode` / `libcuda` / `libnvcuvid` enumerate
 //! every *host* GPU via the RM `GET_ATTACHED_IDS` ioctl and try to peer-init each one — including
-//! GPUs the container never exposed. A GPU whose `/dev/nvidiaX` node is absent then makes
+//! GPUs the container never exposed. A GPU whose `/dev/nvidiaX` node is absent or unopenable then makes
 //! `nvEncOpenEncodeSessionEx` fail with UNSUPPORTED_DEVICE, so the session cannot open at all even
 //! though a perfectly usable GPU is right there in the container.
 //!
@@ -196,14 +196,30 @@ fn ioc_no_size(req: c_ulong) -> c_ulong {
 }
 
 /// The reachability test the whole filter turns on: a GPU id is kept only if its
-/// `/dev/nvidia{minor}` node is actually present in the container, checked here via `access(F_OK)` on
-/// a NUL-terminated path.
-fn node_present(minor: u32) -> bool {
+/// `/dev/nvidia{minor}` node opens. Some runtimes create a node for every host GPU and enforce the
+/// allocation in the device cgroup, so an unallocated node exists but `open()` fails with `EPERM`;
+/// a presence test would count it as visible and leave the filter uninstalled.
+fn node_reachable(minor: u32) -> bool {
     let path = format!("/dev/nvidia{}\0", minor);
-    unsafe { libc::access(path.as_ptr() as *const c_char, libc::F_OK) == 0 }
+    path_opens(CStr::from_bytes_with_nul(path.as_bytes()).unwrap())
 }
 
-/// Map an RM `gpuId` to the `/dev/nvidia` minor that `node_present` needs: the id only
+/// Whether `path` opens read-write from this process. The descriptor is closed at once.
+fn path_opens(path: &CStr) -> bool {
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOCTTY,
+        );
+        if fd < 0 {
+            return false;
+        }
+        libc::close(fd);
+        true
+    }
+}
+
+/// Map an RM `gpuId` to the `/dev/nvidia` minor that `node_reachable` needs: the id only
 /// carries a PCI address, not a device minor, so this bridges the two by scanning
 /// `/proc/driver/nvidia/gpus`, returning -1 when no match is found.
 ///
@@ -370,7 +386,7 @@ unsafe fn rewrite_attached_ids(fd: c_int, rc: c_int, req: c_ulong, arg: *mut c_v
     let before = ids.iter().take_while(|&&id| id != INVALID_GPU_ID).count();
     filter_ids(ids, |id| {
         let minor = gpuid_to_minor(id);
-        minor >= 0 && node_present(minor as u32)
+        minor >= 0 && node_reachable(minor as u32)
     });
     if debug {
         let after = ids.iter().take_while(|&&id| id != INVALID_GPU_ID).count();
@@ -672,7 +688,7 @@ pub(crate) fn bound_import(object: &str, symbol: &[u8]) -> Option<usize> {
 ///
 /// Compares two counts: `host` is the number of GPUs the kernel driver knows, from the non-dot
 /// entries of `/proc/driver/nvidia/gpus`; `visible` is the number of `/dev/nvidia{0..31}` nodes
-/// actually present in the container. GPUs are hidden when `host > visible`, and the `visible > 0`
+/// the container can open. GPUs are hidden when `host > visible`, and the `visible > 0`
 /// clause ensures there is still a usable GPU (a container with no GPUs at all is not this case).
 fn has_hidden_gpus() -> bool {
     let host = std::fs::read_dir("/proc/driver/nvidia/gpus")
@@ -683,7 +699,7 @@ fn has_hidden_gpus() -> bool {
         })
         .unwrap_or(0);
     let visible = (0..MAX_ATTACHED_GPUS as u32)
-        .filter(|&m| node_present(m))
+        .filter(|&m| node_reachable(m))
         .count();
     host > visible && visible > 0
 }
@@ -824,5 +840,24 @@ mod tests {
         assert_eq!(ATTACHED_PARAMS_SIZE, 128);
         assert_eq!(PROBED_PARAMS_SIZE, 256);
         assert_eq!(std::mem::size_of::<NvRmControlParams>(), 32);
+    }
+
+    /// A node that exists but refuses `open()` is unreachable, as a device-cgroup-denied
+    /// `/dev/nvidiaN` is; existence alone must not count. Root bypasses mode bits, so the
+    /// unopenable case is only asserted for an unprivileged user.
+    #[test]
+    fn reachability_requires_open_not_existence() {
+        assert!(path_opens(c"/dev/null"));
+        assert!(!path_opens(c"/nonexistent/pixelflux-node"));
+        let path =
+            std::env::temp_dir().join(format!("pixelflux-unopenable-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!path_opens(&cpath));
+        }
+        std::fs::remove_file(&path).unwrap();
     }
 }
