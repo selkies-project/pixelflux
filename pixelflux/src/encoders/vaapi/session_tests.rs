@@ -1625,6 +1625,58 @@ fn an_h264_picture_on_vce_is_one_slice() {
     }
 }
 
+/// A part whose low-power H.264 encoder codes one slice a picture encodes H.264 on the full
+/// entry point, in four slices, where the driver offers one, and on the low-power one in a
+/// single slice where it does not; its HEVC, and every other part, stay on the low-power one.
+#[test]
+fn h264_avoids_a_low_power_encoder_that_codes_one_slice() {
+    let both = vec![VAEntrypointEncSliceLP, VAEntrypointEncSlice];
+    let low_power_only = vec![VAEntrypointEncSliceLP];
+    for (whole_picture, entrypoints, codec, low_power, slices) in [
+        (true, &both, Codec::H264, false, 4),
+        (true, &low_power_only, Codec::H264, true, 1),
+        (true, &both, Codec::H265, true, 4),
+        (false, &both, Codec::H264, true, 4),
+    ] {
+        let mut driver = Driver::generous();
+        driver.entrypoints = entrypoints.clone();
+        mock::reset(driver);
+        let node = std::fs::File::open("/dev/null").unwrap();
+        let mut device = Device::on(mock::api(), node.into(), "stand-in").unwrap();
+        assert!(
+            !device.whole_picture_vdenc,
+            "a node the kernel names no PCI device for is not such a part"
+        );
+        device.whole_picture_vdenc = whole_picture;
+        let mut enc = VaapiEncoder::on_device(
+            Arc::new(device),
+            &settings(codec, false),
+            codec,
+            Input::Host { rgba: false },
+        )
+        .unwrap();
+        let case = format!("{codec:?}, whole-picture {whole_picture}, {entrypoints:?}");
+        assert_eq!(enc.low_power(), low_power, "{case}");
+        encode(&mut enc, 0, true);
+        assert_eq!(
+            mock::with(|d| d.last_buffers(VAEncSliceParameterBufferType).len()),
+            slices,
+            "{case}"
+        );
+    }
+}
+
+/// The PCI ids the kernel lists for Skylake and Broxton, and none of a later part's.
+#[test]
+fn skylake_and_broxton_are_told_by_their_pci_ids() {
+    for id in [0x1902, 0x1912, 0x1916, 0x193b, 0x0a84, 0x5a85] {
+        assert!(skylake_or_broxton(id), "{id:#x}");
+    }
+    for id in [0x5912, 0x3e92, 0x3185, 0x9a49, 0x46d1, 0x56a0] {
+        assert!(!skylake_or_broxton(id), "{id:#x}");
+    }
+}
+
 /// A driver taking fewer slices than a session asks for gets as many as it takes, rather than
 /// no session at all.
 #[test]

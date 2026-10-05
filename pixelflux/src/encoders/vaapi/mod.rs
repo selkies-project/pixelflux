@@ -63,6 +63,8 @@ use crate::RustCaptureSettings;
 /// AMD's VCE is the exception for H.264: it codes a picture cut into four slices at less than
 /// half its one-slice rate (Radeon Pro VII, 2160p: 44.6 against 20.4 ms a frame, 1080p: 8.7
 /// against 5.7), where its HEVC and every other engine measured here cost nothing for them.
+/// The low-power H.264 of Skylake and Broxton is the other (`whole_picture_vdenc`), one slice
+/// where a session takes it, which it does only where the driver offers no full entry point.
 const SLICES: u32 = 4;
 /// The bytes a coded buffer holds: the uncompressed picture and some, an upper bound on any
 /// frame.
@@ -205,6 +207,39 @@ pub(crate) struct Device {
     vendor: String,
     /// Whether the device encodes H.264 on AMD's VCE (`amd_vce`).
     vce: bool,
+    /// Whether the device's low-power H.264 encoder codes a picture as one slice only
+    /// (`whole_picture_vdenc`).
+    whole_picture_vdenc: bool,
+}
+
+/// Whether the render node `fd` is an Intel part whose low-power H.264 encoder walks a picture
+/// once, top to bottom, wherever its slices are cut: Skylake and Broxton, told by the PCI
+/// device the kernel names, since their drivers list the entry point, and iHD a slice
+/// structure, as they do for the later parts that code the cut. A picture of four slices came
+/// out corrupt below the first there (HD 530), and whole from the full entry point.
+fn whole_picture_vdenc(fd: c_int) -> bool {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return false;
+    }
+    let id = |name: &str| {
+        let path = format!(
+            "/sys/dev/char/{}:{}/device/{name}",
+            libc::major(stat.st_rdev),
+            libc::minor(stat.st_rdev)
+        );
+        let text = std::fs::read_to_string(path).ok()?;
+        u32::from_str_radix(text.trim().trim_start_matches("0x"), 16).ok()
+    };
+    id("vendor") == Some(0x8086) && id("device").is_some_and(skylake_or_broxton)
+}
+
+/// Whether an Intel PCI device id is a Skylake or a Broxton part's.
+fn skylake_or_broxton(device: u32) -> bool {
+    matches!(
+        device,
+        0x1900..=0x19ff | 0x0a84 | 0x1a84 | 0x1a85 | 0x5a84 | 0x5a85
+    )
 }
 
 /// Whether the render node `fd` is an amdgpu device whose video encoder is VCE rather than VCN.
@@ -328,12 +363,14 @@ impl Device {
             }
         };
         let vce = amd_vce(fd.as_raw_fd());
+        let whole_picture_vdenc = whole_picture_vdenc(fd.as_raw_fd());
         Ok(Self {
             api,
             display,
             _fd: fd,
             vendor,
             vce,
+            whole_picture_vdenc,
         })
     }
 
@@ -352,6 +389,12 @@ impl Device {
         } else {
             Hardware::Vaapi
         }
+    }
+
+    /// Whether an H.264 picture of `entrypoint` is left as one slice (`SLICES`): on AMD's VCE,
+    /// and on a low-power encoder that codes no other cut.
+    fn one_slice_h264(&self, entrypoint: VAEntrypoint) -> bool {
+        self.vce || (self.whole_picture_vdenc && entrypoint == VAEntrypointEncSliceLP)
     }
 
     /// Whether the driver's rate control stops coding in a buffer of a frame or two, as Intel's
@@ -389,7 +432,8 @@ impl Device {
     /// generations expose it as the only one for HEVC, VP9, and AV1 and it is the shorter path
     /// where both exist; a session the low-power one cannot serve, such as a constant-rate one
     /// where it runs constant quantizer only, takes the full one. Empty where the profile
-    /// encodes on neither.
+    /// encodes on neither. H.264 on a part whose low-power encoder codes one slice a picture
+    /// takes the full one first instead (`on_device`).
     fn encode_entrypoints(&self, profile: VAProfile) -> Vec<VAEntrypoint> {
         let mut entrypoints = vec![
             0 as VAEntrypoint;
@@ -971,7 +1015,7 @@ impl VaapiEncoder {
                 .filter(|p| listed.contains(p))
                 .map(|p| (p, device.encode_entrypoints(p)))
                 .find(|(_, entrypoints)| !entrypoints.is_empty());
-            let Some((profile, entrypoints)) = served else {
+            let Some((profile, mut entrypoints)) = served else {
                 last.get_or_insert_with(|| {
                     format!(
                         "this VA-API driver encodes no {} {} at {bit_depth} bits",
@@ -981,6 +1025,13 @@ impl VaapiEncoder {
                 });
                 continue;
             };
+            if codec == Codec::H264 && device.whole_picture_vdenc {
+                entrypoints.sort_by_key(|&e| e == VAEntrypointEncSliceLP);
+                crate::log::debug!(
+                    "[vaapi] H.264 tries the full entry point first: this device's low-power \
+                     encoder codes one slice a picture."
+                );
+            }
             for entrypoint in entrypoints {
                 for &fourcc in surface_fourccs(fullcolor, bit_depth) {
                     match Self::open(
@@ -1202,7 +1253,7 @@ impl VaapiEncoder {
                 fourcc_name(fourcc)
             ));
         }
-        let wanted_slices = if matches!(arm, Arm::H264(_)) && device.vce {
+        let wanted_slices = if matches!(arm, Arm::H264(_)) && device.one_slice_h264(entrypoint) {
             1
         } else {
             SLICES
@@ -2615,7 +2666,8 @@ mod tests {
     }
 
     /// On a VA-API device (`cargo test vaapi_ -- --ignored --nocapture`): an AMD VCE device is
-    /// told from a VCN one by the kernel, and its H.264 key frame is one slice.
+    /// told from a VCN one by the kernel, and its H.264 key frame is one slice, as a Skylake's
+    /// or a Broxton's is on the low-power entry point.
     #[test]
     #[ignore]
     fn vaapi_vce_h264_is_one_slice() {
@@ -2643,7 +2695,12 @@ mod tests {
             enc.vendor(),
             enc.device.vce
         );
-        assert_eq!(slices, if enc.device.vce { 1 } else { SLICES as usize });
+        let wanted = if enc.device.one_slice_h264(enc.negotiated.entrypoint) {
+            1
+        } else {
+            SLICES as usize
+        };
+        assert_eq!(slices, wanted);
     }
 
     /// A node the kernel answers no DRM query on is not VCE.
