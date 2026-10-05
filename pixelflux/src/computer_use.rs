@@ -333,6 +333,30 @@ impl CuBackend for CuWaylandBackend {
     }
 }
 
+/// Distinct characters a `type` request binds and types at a time: each run's binds then fit
+/// the seat's text spares (`keymap::TEXT_SPARE_KEYCODES`; 9 free on a Japanese layout, 11 on
+/// most), on which every client types, where a bind past them lands above 255 and Chromium
+/// drops it.
+const TYPE_RUN_KEYSYMS: usize = 8;
+
+/// `syms` cut into consecutive runs of at most `max` distinct keysyms.
+fn distinct_runs(syms: &[u32], max: usize) -> Vec<&[u32]> {
+    let mut runs = Vec::new();
+    let (mut start, mut seen) = (0, std::collections::HashSet::new());
+    for (i, sym) in syms.iter().enumerate() {
+        if !seen.contains(sym) && seen.len() == max {
+            runs.push(&syms[start..i]);
+            start = i;
+            seen.clear();
+        }
+        seen.insert(*sym);
+    }
+    if start < syms.len() {
+        runs.push(&syms[start..]);
+    }
+    runs
+}
+
 /// Per-request literal-key resolver: batches keysym lookups against the backend's active
 /// keymap and caches them for the request's burst of key events (a fresh backend — and thus
 /// a fresh cache — is resolved per HTTP request, so a runtime layout switch is picked up by
@@ -580,44 +604,46 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
                     }
                 }
             }
-            let mut resolver = KeyResolver::new(b);
-            let syms: Vec<u32> = text.chars().map(keysym_for_char).collect();
-            resolver.prefetch(&syms);
-            // Base+AltGr resolution stays the preferred path; only what the active keymap
-            // cannot reach at all goes through the backend's transient-bind fallback.
-            let mut unresolved: Vec<u32> = Vec::new();
-            for &sym in &syms {
-                if sym != 0 && resolver.resolve(sym).is_none() && !unresolved.contains(&sym) {
-                    unresolved.push(sym);
+            let all: Vec<u32> = text.chars().map(keysym_for_char).collect();
+            for syms in distinct_runs(&all, TYPE_RUN_KEYSYMS) {
+                let mut resolver = KeyResolver::new(b);
+                resolver.prefetch(syms);
+                // Base+AltGr resolution stays the preferred path; only what the active keymap
+                // cannot reach at all goes through the backend's transient-bind fallback.
+                let mut unresolved: Vec<u32> = Vec::new();
+                for &sym in syms {
+                    if sym != 0 && resolver.resolve(sym).is_none() && !unresolved.contains(&sym) {
+                        unresolved.push(sym);
+                    }
                 }
+                b.with_transient_keysyms(&unresolved, &mut |bound| {
+                    for (i, &sym) in syms.iter().enumerate() {
+                        if i > 0 && i % 50 == 0 {
+                            sleep_ms(20);
+                        }
+                        if let Some((sc, level)) = resolver.resolve(sym) {
+                            let level_mods = level_modifiers(level, 0, b.altgr_keycode());
+                            for &m in &level_mods {
+                                b.key(m, true);
+                                sleep_ms(5);
+                            }
+                            b.key(sc, true);
+                            sleep_ms(10);
+                            b.key(sc, false);
+                            for &m in level_mods.iter().rev() {
+                                b.key(m, false);
+                            }
+                            sleep_ms(8);
+                        } else if let Some(&kc) = bound.get(&sym) {
+                            // Transient binds sit at the plain level: no modifiers needed.
+                            b.key(kc, true);
+                            sleep_ms(10);
+                            b.key(kc, false);
+                            sleep_ms(8);
+                        }
+                    }
+                });
             }
-            b.with_transient_keysyms(&unresolved, &mut |bound| {
-                for (i, &sym) in syms.iter().enumerate() {
-                    if i > 0 && i % 50 == 0 {
-                        sleep_ms(20);
-                    }
-                    if let Some((sc, level)) = resolver.resolve(sym) {
-                        let level_mods = level_modifiers(level, 0, b.altgr_keycode());
-                        for &m in &level_mods {
-                            b.key(m, true);
-                            sleep_ms(5);
-                        }
-                        b.key(sc, true);
-                        sleep_ms(10);
-                        b.key(sc, false);
-                        for &m in level_mods.iter().rev() {
-                            b.key(m, false);
-                        }
-                        sleep_ms(8);
-                    } else if let Some(&kc) = bound.get(&sym) {
-                        // Transient binds sit at the plain level: no modifiers needed.
-                        b.key(kc, true);
-                        sleep_ms(10);
-                        b.key(kc, false);
-                        sleep_ms(8);
-                    }
-                }
-            });
             Ok(ok_json())
         }
 
@@ -1302,6 +1328,24 @@ pub fn run_cu_server(listener: TcpListener) {
                         .unwrap(),
                 ),
         );
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::distinct_runs;
+
+    /// A text is cut where a run would name one distinct character too many, and a
+    /// character repeated in a run does not count again.
+    #[test]
+    fn a_text_is_typed_in_runs_of_few_distinct_characters() {
+        let syms = [1, 2, 1, 3, 4, 4, 5, 1, 6];
+        assert_eq!(
+            distinct_runs(&syms, 3),
+            vec![&[1, 2, 1, 3][..], &[4, 4, 5, 1][..], &[6][..]]
+        );
+        assert_eq!(distinct_runs(&syms, 9), vec![&syms[..]]);
+        assert!(distinct_runs(&[], 3).is_empty());
     }
 }
 

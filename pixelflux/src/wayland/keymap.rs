@@ -26,6 +26,20 @@ pub const OVERLAY_LAST_KEYCODE: u32 = 0x2ff;
 /// Overlay slot count (keycodes `OVERLAY_FIRST..=OVERLAY_LAST`).
 pub const OVERLAY_CAPACITY: usize = (OVERLAY_LAST_KEYCODE - OVERLAY_FIRST_KEYCODE + 1) as usize;
 
+/// Keycodes every client types a character on, the seat's overlay takes first: F13 to F24,
+/// then the JIS IntlRo and IntlYen keys, as selkies' own overlay does. A Wayland client may
+/// read a key's code as the physical key it names before the keysym the keymap gives, and
+/// Chromium drops a code naming no key it knows (every one past 255) and runs its browser,
+/// media and launcher keys as commands, so Computer-Use text bound from 0x120 never reached
+/// it. A text spare is taken only where the base leaves it unbound or bound to vendor keysyms
+/// alone, and not while selkies' overlay holds it.
+pub const TEXT_SPARE_KEYCODES: [u32; 14] = [
+    191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 97, 132,
+];
+
+/// The XF86 vendor keysyms: a base key carrying only these is free to shadow.
+const VENDOR_KEYSYMS: std::ops::RangeInclusive<u32> = 0x1008_0000..=0x1008_ffff;
+
 /// Highest shift level consulted when reverse-mapping the base keymap (plain, Shift,
 /// AltGr, Shift+AltGr).
 const MAX_LEVELS: u32 = 4;
@@ -44,6 +58,13 @@ pub struct KeymapPolicy {
     /// Overlay keycodes (xkb numbering) in the order free slots take them; slot i lives
     /// at `overlay_codes[i]`.
     overlay_codes: Vec<u32>,
+    /// How many of the leading overlay codes a bind prefers, recycling the oldest of them
+    /// before taking a free code past them: the seat's text spares, which Chromium types on.
+    preferred: usize,
+    /// The text spares the base binds to a keysym other than a vendor one, which an overlay
+    /// slot must not shadow. (The virtual-keyboard client's own codes are base character
+    /// keys it shadows on purpose, `unshadow` taking them back.)
+    base_bound: HashSet<u32>,
     /// Externally-owned overlay binds (keycode -> keysym): selkies resolves its own
     /// keysyms and hands the compositor explicit assignments. Held here so every keymap
     /// the policy emits carries them, and a policy rebuild (computer-use bind, base-layout
@@ -119,6 +140,19 @@ impl KeymapPolicy {
         Self::with_overlay_codes((OVERLAY_FIRST_KEYCODE..=OVERLAY_LAST_KEYCODE).collect())
     }
 
+    /// The compositor seat's policy: the text spares (`TEXT_SPARE_KEYCODES`) first, then the
+    /// above-255 range.
+    pub fn seat() -> Self {
+        let mut policy = Self::with_overlay_codes(
+            TEXT_SPARE_KEYCODES
+                .into_iter()
+                .chain(OVERLAY_FIRST_KEYCODE..=OVERLAY_LAST_KEYCODE)
+                .collect(),
+        );
+        policy.preferred = TEXT_SPARE_KEYCODES.len();
+        policy
+    }
+
     /// Policy with its own overlay keycodes (xkb numbering), taken in order. The seat
     /// uses `empty()`'s above-255 range; the virtual-keyboard client typing into a
     /// nested compositor uses the main block's character keys, which a base character
@@ -131,6 +165,8 @@ impl KeymapPolicy {
             by_sym: HashMap::new(),
             lru: VecDeque::new(),
             overlay_codes,
+            preferred: 0,
+            base_bound: HashSet::new(),
             manual_overlay: BTreeMap::new(),
         }
     }
@@ -145,6 +181,7 @@ impl KeymapPolicy {
             return false;
         };
         self.base_map.clear();
+        self.base_bound.clear();
         {
             let lo = keymap.min_keycode().raw();
             let hi = keymap.max_keycode().raw();
@@ -160,6 +197,9 @@ impl KeymapPolicy {
                         let raw = sym.raw();
                         if raw != 0 {
                             self.base_map.entry(raw).or_insert((kc, level));
+                            if TEXT_SPARE_KEYCODES.contains(&kc) && !VENDOR_KEYSYMS.contains(&raw) {
+                                self.base_bound.insert(kc);
+                            }
                         }
                     }
                 }
@@ -237,9 +277,12 @@ impl KeymapPolicy {
     ) -> (Vec<(u32, u32)>, bool) {
         let mut out = Vec::with_capacity(keysyms.len());
         let mut changed = false;
-        let reserved = self.unshadow(keysyms, pressed, false, &mut changed);
+        let mut reserved = self.unshadow(keysyms, pressed, false, &mut changed);
         for &sym in keysyms {
-            out.push(self.bind_one(sym, pressed, &reserved, false, &mut changed));
+            let hit = self.bind_one(sym, pressed, &reserved, false, &mut changed);
+            // A later keysym of the batch must not recycle the code this one now types on.
+            reserved.insert(hit.0);
+            out.push(hit);
         }
         (out, changed)
     }
@@ -250,9 +293,11 @@ impl KeymapPolicy {
     pub fn bind_many_plain(&mut self, keysyms: &[u32], pressed: &HashSet<u32>) -> (Vec<u32>, bool) {
         let mut out = Vec::with_capacity(keysyms.len());
         let mut changed = false;
-        let reserved = self.unshadow(keysyms, pressed, true, &mut changed);
+        let mut reserved = self.unshadow(keysyms, pressed, true, &mut changed);
         for &sym in keysyms {
-            out.push(self.bind_one(sym, pressed, &reserved, true, &mut changed).0);
+            let kc = self.bind_one(sym, pressed, &reserved, true, &mut changed).0;
+            reserved.insert(kc);
+            out.push(kc);
         }
         (out, changed)
     }
@@ -281,22 +326,23 @@ impl KeymapPolicy {
             self.lru.push_back(slot);
             return (self.overlay_codes[slot], 0);
         }
-        let free = (0..self.overlay_codes.len()).find(|&i| {
-            self.slots.get(i).is_none_or(Option::is_none)
-                && !reserved.contains(&self.overlay_codes[i])
-        });
-        let slot = match free {
-            Some(i) => {
-                if i >= self.slots.len() {
-                    self.slots.resize(i + 1, None);
-                }
-                i
-            }
-            None => match self.recycle_slot(pressed, reserved) {
-                Some(s) => s,
-                None => return (0, 0),
-            },
+        let free_in = |me: &Self, range: std::ops::Range<usize>| {
+            range.into_iter().find(|&i| {
+                me.slots.get(i).is_none_or(Option::is_none)
+                    && me.takes(me.overlay_codes[i], reserved)
+            })
         };
+        let preferred = self.preferred.min(self.overlay_codes.len());
+        let slot = free_in(self, 0..preferred)
+            .or_else(|| self.recycle_slot(pressed, reserved, preferred))
+            .or_else(|| free_in(self, preferred..self.overlay_codes.len()))
+            .or_else(|| self.recycle_slot(pressed, reserved, usize::MAX));
+        let Some(slot) = slot else {
+            return (0, 0);
+        };
+        if slot >= self.slots.len() {
+            self.slots.resize(slot + 1, None);
+        }
         if let Some(old) = self.slots[slot].replace(sym) {
             self.by_sym.remove(&old);
         }
@@ -306,23 +352,46 @@ impl KeymapPolicy {
         (self.overlay_codes[slot], 0)
     }
 
-    /// Oldest slot whose keycode is neither held down nor pressed for its base keysym by
-    /// this batch; a held keycode must keep its meaning until its release has been
+    /// Oldest slot below `below` whose keycode is neither held down nor pressed for its base
+    /// keysym by this batch; a held keycode must keep its meaning until its release has been
     /// delivered.
-    fn recycle_slot(&mut self, pressed: &HashSet<u32>, reserved: &HashSet<u32>) -> Option<usize> {
+    fn recycle_slot(
+        &mut self,
+        pressed: &HashSet<u32>,
+        reserved: &HashSet<u32>,
+        below: usize,
+    ) -> Option<usize> {
         let at = self.lru.iter().position(|&slot| {
             let kc = self.overlay_codes[slot];
-            !pressed.contains(&kc) && !reserved.contains(&kc)
+            slot < below && !pressed.contains(&kc) && self.takes(kc, reserved)
         })?;
         self.lru.remove(at)
+    }
+
+    /// Whether a slot may hold `keycode`: not one this batch presses for its base keysym,
+    /// not a text spare the base binds to a real keysym, and not one selkies' overlay holds.
+    fn takes(&self, keycode: u32, reserved: &HashSet<u32>) -> bool {
+        !reserved.contains(&keycode)
+            && !self.base_bound.contains(&keycode)
+            && !self.manual_overlay.contains_key(&keycode)
     }
 
     /// Replace the externally-owned overlay binds (keycode -> keysym). selkies resolves its
     /// own keysyms and re-sends the whole set on every change, so a full replace is the
     /// contract. They then ride along in every `keymap_text`, so a base-layout swap or a
     /// computer-use policy bind re-applies them instead of dropping them.
+    /// A slot on a keycode selkies now binds gives it up, so its keysym is bound afresh
+    /// elsewhere when next typed.
     pub fn set_manual_overlay(&mut self, binds: &[(u32, u32)]) {
         self.manual_overlay = binds.iter().copied().collect();
+        for slot in 0..self.slots.len() {
+            if self.manual_overlay.contains_key(&self.overlay_codes[slot])
+                && let Some(old) = self.slots[slot].take()
+            {
+                self.by_sym.remove(&old);
+                self.lru.retain(|&s| s != slot);
+            }
+        }
     }
 
     /// The full seat keymap: the base text with every occupied policy overlay slot and every
@@ -474,6 +543,83 @@ mod tests {
             assert_ne!(kc, held_kc, "held keycode must not be rebound");
         }
         assert_eq!(p.resolve(held_sym), Some((held_kc, 0)));
+    }
+
+    /// The seat binds Computer-Use text on the keys every client types on (`TEXT_SPARE_KEYCODES`)
+    /// before any above 255, which Chromium drops: on each spare the US base leaves free, the
+    /// spliced keymap carries the bound keysym, and only past them does a bind go above 255.
+    #[test]
+    fn the_seat_binds_text_on_the_text_spares_first() {
+        let mut p = KeymapPolicy::seat();
+        p.rebuild_base(us_base());
+        let free: Vec<u32> = TEXT_SPARE_KEYCODES
+            .into_iter()
+            .filter(|kc| !p.base_bound.contains(kc))
+            .collect();
+        assert!(
+            free.len() >= 10,
+            "the US base leaves most text spares free: {free:?}"
+        );
+        let syms: Vec<u32> = (0..free.len() as u32 + 1).map(|i| 0x100AC00 + i).collect();
+        let (out, changed) = p.bind_many(&syms, &HashSet::new());
+        assert!(changed);
+        let codes: Vec<u32> = out.iter().map(|&(kc, _)| kc).collect();
+        assert_eq!(codes[..free.len()], free[..], "the text spares, in order");
+        assert_eq!(codes[free.len()], OVERLAY_FIRST_KEYCODE, "then above 255");
+        let km = compile_keymap(&p.keymap_text()).expect("seat keymap compiles");
+        for (&kc, &sym) in codes.iter().zip(&syms) {
+            let got = km.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0);
+            assert_eq!(
+                got.iter().map(|s| s.raw()).collect::<Vec<_>>(),
+                vec![sym],
+                "keycode {kc}"
+            );
+        }
+    }
+
+    /// A text spare selkies' overlay binds is selkies': the seat's slot there gives it up, its
+    /// keysym binds afresh on another, and no seat bind takes it while selkies holds it.
+    #[test]
+    fn the_seat_gives_way_to_selkies_on_a_text_spare() {
+        let mut p = KeymapPolicy::seat();
+        p.rebuild_base(us_base());
+        let (out, _) = p.bind_many(&[0x100AC00], &HashSet::new());
+        let first = out[0].0;
+        assert_eq!(first, TEXT_SPARE_KEYCODES[0]);
+        p.set_manual_overlay(&[(first, 0x100D55C)]);
+        assert_eq!(p.resolve(0x100AC00), None, "the slot gave its keycode up");
+        let (out, changed) = p.bind_many(&[0x100AC00, 0x100AC01], &HashSet::new());
+        assert!(changed);
+        assert!(out.iter().all(|&(kc, _)| kc != first), "{out:?}");
+        let km = compile_keymap(&p.keymap_text()).expect("shared keymap compiles");
+        let at = |kc: u32| km.key_get_syms_by_level(xkb::Keycode::new(kc), 0, 0)[0].raw();
+        assert_eq!(at(first), 0x100D55C);
+        assert_eq!(at(out[0].0), 0x100AC00);
+    }
+
+    /// With the text spares full the seat recycles the oldest of them before it takes a code
+    /// above 255, and never one its own batch has just bound.
+    #[test]
+    fn the_seat_recycles_a_text_spare_before_going_above_255() {
+        let mut p = KeymapPolicy::seat();
+        p.rebuild_base(us_base());
+        let spares = TEXT_SPARE_KEYCODES
+            .into_iter()
+            .filter(|kc| !p.base_bound.contains(kc))
+            .count();
+        let first: Vec<u32> = (0..spares as u32).map(|i| 0x100AC00 + i).collect();
+        let (out, _) = p.bind_many(&first, &HashSet::new());
+        let (next, _) = p.bind_many(&[0x100B000, 0x100B001], &HashSet::new());
+        assert_eq!(next[0].0, out[0].0, "the oldest text spare");
+        assert_eq!(next[1].0, out[1].0, "then the next oldest");
+        let batch: Vec<u32> = (0..spares as u32 + 1).map(|i| 0x100C000 + i).collect();
+        let (out, _) = p.bind_many(&batch, &HashSet::new());
+        let codes: HashSet<u32> = out.iter().map(|&(kc, _)| kc).collect();
+        assert_eq!(
+            codes.len(),
+            batch.len(),
+            "every keysym of a batch keeps its own code: {out:?}"
+        );
     }
 
     #[test]

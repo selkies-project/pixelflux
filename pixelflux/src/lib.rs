@@ -5372,7 +5372,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         clock: Clock::new(),
         use_gpu,
         cursor_helper: Cursor::load(cursor_size),
-        keymap_policy: wayland::keymap::KeymapPolicy::empty(),
+        keymap_policy: wayland::keymap::KeymapPolicy::seat(),
         host: None,
         host_layout_pending: std::collections::HashMap::new(),
         host_frame_tx,
