@@ -1028,8 +1028,12 @@ impl VaapiEncoder {
             if codec == Codec::H264 && device.whole_picture_vdenc {
                 entrypoints.sort_by_key(|&e| e == VAEntrypointEncSliceLP);
                 crate::log::debug!(
-                    "[vaapi] H.264 tries the full entry point first: this device's low-power \
-                     encoder codes one slice a picture."
+                    "[vaapi] This device's low-power H.264 encoder codes one slice a picture: {}",
+                    if entrypoints[0] == VAEntrypointEncSliceLP {
+                        "the driver offers no full entry point, so the session codes one slice."
+                    } else {
+                        "H.264 tries the full entry point first."
+                    }
                 );
             }
             for entrypoint in entrypoints {
