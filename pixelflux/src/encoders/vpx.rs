@@ -51,6 +51,11 @@ const CYCLIC_REFRESH_AQ: c_int = 3;
 /// Mbit/s a 1080p texture under a moving box took 3.0 MB for its 3 s of motion against 5.8, at
 /// 42.0 dB against 41.4, and 304 kB still against 1185. Scrolling text codes the same.
 const VP8_STATIC_THRESHOLD: c_int = 100;
+/// VP8's token partitions, eight, the most it has: a client decoding in software spreads a frame
+/// across them, as across H.264's slices, where one leaves it on one thread. They cost nothing
+/// measurable: at 1080p text, a game frame and dense text code within 0.1% of the bytes and
+/// 0.02 dB of one partition while scrolling, and within 2% still.
+const VP8_TOKEN_PARTITIONS: c_int = VP8_EIGHT_TOKENPARTITION as c_int;
 /// The frame budget a macroblock, in bits, from which VP8 sweeps its refresh in bands
 /// (`VpxEncoder::band_size`): three times what a frame that skips every macroblock costs.
 const BAND_BITS_PER_MB: f64 = 1.0;
@@ -237,7 +242,7 @@ impl VpxEncoder {
         me.control(VP8E_SET_MAX_INTRA_BITRATE_PCT, 0)?;
         if codec == Codec::Vp8 {
             me.control(VP8E_SET_NOISE_SENSITIVITY, 0)?;
-            me.control(VP8E_SET_TOKEN_PARTITIONS, 0)?;
+            me.control(VP8E_SET_TOKEN_PARTITIONS, VP8_TOKEN_PARTITIONS)?;
         } else {
             // Column threading is per tile and VP9's narrowest tile is 256 pixels, so the
             // width sets how many columns the encode can spread across.
