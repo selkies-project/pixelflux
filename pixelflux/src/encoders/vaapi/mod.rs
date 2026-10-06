@@ -324,6 +324,14 @@ impl Device {
     /// initialize the driver on it.
     pub(crate) fn open(api: VaApi, encode_node_index: i32) -> Result<Self, String> {
         let render_node = format!("/dev/dri/renderD{}", 128 + encode_node_index.max(0));
+        // NVIDIA's VA driver only decodes, and its constructor calls cuInit under the loader's
+        // lock, while a cuInit in another thread loads libraries under CUDA's: each would wait
+        // for the other.
+        if crate::get_gpu_driver(encode_node_index.max(0)).contains("nvidia") {
+            return Err(format!(
+                "{render_node} is NVIDIA's, whose VA driver encodes nothing"
+            ));
+        }
         let path = CString::new(render_node.clone()).unwrap();
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
