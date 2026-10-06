@@ -41,7 +41,7 @@ jobs:
       groups: ${{ steps.plan.outputs.groups }}
       images: ${{ steps.plan.outputs.images }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
@@ -66,7 +66,7 @@ jobs:
     name: image (${{ matrix.image.platform }})
     runs-on: ${{ matrix.image.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
@@ -84,7 +84,7 @@ jobs:
           docker commit deps "${IMAGE}:${PLATFORM}"
           docker save "${IMAGE}:${PLATFORM}" | zstd -T0 > "${RUNNER_TEMP}/image.tar.zst"
 
-      - uses: actions/cache/save@v6
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/image.tar.zst
           key: ${{ matrix.image.key }}
@@ -99,7 +99,7 @@ jobs:
     name: ${{ matrix.group.name }}
     runs-on: ${{ matrix.group.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
@@ -107,7 +107,7 @@ jobs:
       # The platform's compiled dependencies, under its image's key and the
       # lock as committed (before a tag's version is written into it). The
       # container builds into them through cibuildwheel's /host mount.
-      - uses: actions/cache/restore@v6
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo
         with:
           path: ${{ runner.temp }}/cargo-target
@@ -132,7 +132,7 @@ jobs:
           grep -q "^version = \"${crate}\"$" pixelflux/Cargo.toml
           grep -A1 "^name = \"pixelflux\"$" pixelflux/Cargo.lock | grep -q "^version = \"${crate}\"$"
 
-      - uses: actions/cache/restore@v6
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: image
         with:
           path: ${{ runner.temp }}/image.tar.zst
@@ -159,13 +159,13 @@ jobs:
 
       # Once per platform, from main: an entry a tag saved would serve no other
       # run.
-      - uses: actions/cache/save@v6
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: matrix.group.saves && steps.cargo.outputs.cache-hit != 'true' && inputs.tag == ''
         with:
           path: ${{ runner.temp }}/cargo-target
           key: ${{ steps.cargo.outputs.cache-primary-key }}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.group.name }}
           path: wheelhouse/*.whl
