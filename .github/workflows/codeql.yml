@@ -6,7 +6,8 @@ name: CodeQL
 
 # Advanced setup rather than the repository's default setup, which has no Rust
 # to offer. Every language here is extracted without a build, so nothing native
-# is installed and the crate graph alone is resolved.
+# is installed and the crate graph alone is resolved. Python covers setup.py,
+# the scripts and the example; the C is vendored headers, so it is left out.
 
 on:
   workflow_dispatch:
@@ -28,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [actions, rust]
+        language: [actions, python, rust]
     steps:
       - uses: actions/checkout@v7
 
