@@ -19,6 +19,25 @@ const ANCHOR_EVERY: u64 = 12;
 /// before it is reported once it has moved on, which a longer period makes rarer.
 const ANCHOR_ALONE_EVERY: u64 = 48;
 
+/// An anchor predicts from the newest frame every consumer was sent (`settle`) only within an
+/// anchor period and `SETTLE_SLACK` frames of it, a consumer that took the last anchor. One
+/// further behind, for which every anchor would predict from far back and cost every consumer
+/// the bits, is predicted past on its own report instead (from the pinned anchor, where it comes
+/// to that). The frame where H.264's `frame_num` wraps reaches back however far: a decoder that
+/// misses it cannot be predicted past.
+const SETTLE_SLACK: u64 = 4;
+
+/// What the consumers say of a frame, applied in the order they said it ahead of an encode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferenceReport {
+    /// A consumer lost the frame (`invalidate_reference`).
+    Lost(u16),
+    /// Every consumer holds the frame (`ReferenceWindow::acknowledge`).
+    Held(u16),
+    /// Every consumer was sent the frame, which one may yet lose (`ReferenceWindow::acknowledge`).
+    Sent(u16),
+}
+
 /// The frame a delivered frame predicts from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Reference {
@@ -75,6 +94,12 @@ pub enum Invalidation {
 /// A window `with_anchors` also keeps long-term frames out of the buffer: the key frame is the
 /// first anchor and frames after it are marked on a schedule, and a loss older than every recent
 /// frame is predicted past from the newest anchor before it.
+///
+/// Where the consumers say which frames every one of them holds, or was sent (`acknowledge`),
+/// several of them share the stream and each recovers on its own: the newest anchor all of them
+/// hold is pinned, the schedule marking the other, so a loss of any depth is predicted past from a
+/// frame every consumer has; an anchor predicts from a frame they were all sent (`settle`), so each
+/// can decode it; and in H.264 the frame where `frame_num` wraps is an anchor too.
 pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
@@ -84,6 +109,9 @@ pub struct ReferenceWindow {
     age: KeyAge,
     key_pts: u64,
     frame_num_range: u64,
+    acknowledged: bool,
+    common: VecDeque<u64>,
+    sent: VecDeque<u64>,
 }
 
 /// How far a frame id lies behind the newest frame recorded, in capture frames counted across
@@ -125,6 +153,9 @@ impl ReferenceWindow {
             age: KeyAge::default(),
             key_pts: 0,
             frame_num_range: 0,
+            acknowledged: false,
+            common: VecDeque::new(),
+            sent: VecDeque::new(),
         }
     }
 
@@ -142,8 +173,19 @@ impl ReferenceWindow {
         !self.anchors.is_empty()
     }
 
+    /// How many anchors the window keeps.
+    pub fn anchor_count(&self) -> usize {
+        self.anchors.len()
+    }
+
     /// The anchor the next frame is marked into, if any: the first for a key frame or while none
-    /// is held, and on the schedule after it the one that is empty, lost, or older.
+    /// is held, and on the schedule after it the one that is empty, lost, or older, never the one
+    /// pinned (`acknowledge`) where there are two. Acknowledged, an H.264 frame where `frame_num`
+    /// wraps is an anchor too, and the frame after a key frame takes the second of two: NVENC
+    /// leaves the frames it forgot (`settle`, `invalidate`) out of the buffer it counts, though
+    /// the decoder still holds them, so a frame marked into an empty index later would take the
+    /// decoder past `max_num_ref_frames` without unmarking one, which Chromium's own decoder
+    /// (hardware decoding, Windows and Linux) fails.
     pub fn plan_anchor(&self, key: bool) -> Option<u8> {
         if self.anchors.is_empty() {
             return None;
@@ -151,19 +193,204 @@ impl ReferenceWindow {
         if key || !self.has_reference() || self.anchors.iter().all(Option::is_none) {
             return Some(0);
         }
-        let every = if self.anchors.len() == 1 {
-            ANCHOR_ALONE_EVERY
-        } else {
-            ANCHOR_EVERY
-        };
-        if !(self.next_pts - self.key_pts).is_multiple_of(every) {
+        if self.acknowledged && self.frame_num_range > 0 && self.anchors.iter().any(Option::is_none)
+        {
+            return self
+                .anchors
+                .iter()
+                .position(Option::is_none)
+                .map(|i| i as u8);
+        }
+        if !(self.next_pts - self.key_pts).is_multiple_of(self.anchor_period())
+            && !self.wraps_next()
+        {
             return None;
         }
         let rank = |a: &Option<(u16, u64, bool)>| {
             a.map_or((0, 0), |(_, pts, lost)| (u8::from(!lost), pts))
         };
+        let pinned = self.pinned_anchor();
         (0..self.anchors.len())
+            .filter(|&i| self.anchors.len() == 1 || Some(i) != pinned)
             .min_by_key(|&i| rank(&self.anchors[i]))
+            .map(|i| i as u8)
+    }
+
+    /// How many frames apart the schedule marks anchors.
+    fn anchor_period(&self) -> u64 {
+        if self.anchors.len() == 1 {
+            ANCHOR_ALONE_EVERY
+        } else {
+            ANCHOR_EVERY
+        }
+    }
+
+    /// Whether the next frame carries H.264 `frame_num` 0, the consumers acknowledging.
+    fn wraps_next(&self) -> bool {
+        self.acknowledging()
+            && self.frame_num_range > 0
+            && (self.next_pts - self.key_pts).is_multiple_of(self.frame_num_range)
+    }
+
+    /// The consumer says which frames its clients hold (`acknowledge`) from the first frame on.
+    pub fn set_acknowledged(&mut self) {
+        self.acknowledged = true;
+    }
+
+    /// Note that every consumer holds `frame_id`, or where not `held` was sent it; false for a
+    /// frame not remembered, one a consumer reported lost, or one from before the last key frame.
+    pub fn acknowledge(&mut self, frame_id: u16, held: bool) -> bool {
+        self.acknowledged = true;
+        let Some(&(_, pts, lost)) = self.recent.iter().rev().find(|f| f.0 == frame_id) else {
+            return false;
+        };
+        if lost || pts < self.key_pts {
+            return false;
+        }
+        let noted = if held {
+            &mut self.common
+        } else {
+            &mut self.sent
+        };
+        if let Err(at) = noted.binary_search(&pts) {
+            noted.insert(at, pts);
+        }
+        while noted.len() > RECENT_FRAMES {
+            noted.pop_front();
+        }
+        true
+    }
+
+    /// Whether the consumers acknowledge what they hold or were sent (`set_acknowledged`).
+    pub fn acknowledging(&self) -> bool {
+        self.acknowledged
+    }
+
+    /// Whether every consumer holds the frame at `pts`: the key frame, which each is sent before
+    /// any other, one acknowledged, or, acknowledged, an H.264 frame a consumer never leaves out
+    /// (`kept`), so the anchor at the `frame_num` wrap stays pinned until a newer one is held.
+    fn is_common(&self, pts: u64) -> bool {
+        pts == self.key_pts
+            || (self.acknowledged && self.kept(pts))
+            || self.common.binary_search(&pts).is_ok()
+    }
+
+    /// Whether the frame at `pts` is one a consumer sends every client of an H.264 stream it
+    /// sends any of (pixelflux's consumers do): where `frame_num` wraps, which a decoder cannot
+    /// be predicted past without, and the frame after a key frame, which takes the second
+    /// anchor.
+    fn kept(&self, pts: u64) -> bool {
+        let since_key = pts.saturating_sub(self.key_pts);
+        self.frame_num_range > 0
+            && pts > self.key_pts
+            && (since_key == 1 || since_key.is_multiple_of(self.frame_num_range))
+    }
+
+    /// Whether every consumer was sent the frame at `pts`, as every one holds a common one.
+    fn is_shared(&self, pts: u64) -> bool {
+        self.is_common(pts) || self.sent.binary_search(&pts).is_ok()
+    }
+
+    /// Whether every consumer was sent the frame `reference` names; a key frame needs none.
+    pub fn is_shared_reference(&self, reference: Reference) -> bool {
+        match reference {
+            Reference::None => true,
+            Reference::Untracked => false,
+            Reference::Frame(id) => self
+                .held()
+                .any(|f| f.0 == id && !f.2 && self.is_shared(f.1)),
+        }
+    }
+
+    /// The anchor holding the newest frame every consumer holds, which the schedule leaves.
+    fn pinned_anchor(&self) -> Option<usize> {
+        if !self.acknowledged {
+            return None;
+        }
+        self.anchors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| a.filter(|f| !f.2 && self.is_common(f.1)).map(|f| (i, f.1)))
+            .max_by_key(|&(_, pts)| pts)
+            .map(|(i, _)| i)
+    }
+
+    /// Before an anchor: where the newest frame held is not one every consumer was sent, forget
+    /// the frames after the newest that is, so the anchor predicts from it and every consumer can
+    /// decode it. The invalidation that does it, for the encoder; None where none is needed, no
+    /// frame held is one they were all sent, or that one lies further back than `SETTLE_SLACK`
+    /// allows.
+    pub fn settle(&mut self) -> Option<Invalidation> {
+        if !self.acknowledging() {
+            return None;
+        }
+        // The frame at a `frame_num` wrap predicts from one every consumer holds, not one it was
+        // only sent: a client that lost that one could not be predicted past the wrap.
+        let wraps = self.wraps_next();
+        let usable = |w: &Self, pts: u64| {
+            if wraps {
+                w.is_common(pts)
+            } else {
+                w.is_shared(pts)
+            }
+        };
+        let (_, newest) = self.newest_valid()?;
+        if usable(self, newest) {
+            return None;
+        }
+        let shared = self
+            .held()
+            .filter(|f| !f.2 && usable(self, f.1))
+            .map(|f| f.1)
+            .max()?;
+        if !wraps && self.next_pts - shared > self.anchor_period() + SETTLE_SLACK {
+            return None;
+        }
+        let &(first, _, _) = self.recent.iter().find(|f| f.1 > shared && !f.2)?;
+        Some(self.invalidate(first))
+    }
+
+    /// Before an H.264 frame: where the newest frame held is a recent one further back than the
+    /// buffer holds recent frames, forget the frames after the newest anchor every consumer was
+    /// sent (acknowledged: the pinned one, a newer one they were all sent, or the one a
+    /// consumer never leaves out, at the `frame_num` wrap or after the key frame), else every
+    /// recent one, so the frame predicts from an anchor. A decoder that fills a `frame_num` gap
+    /// with pictures of its own (FFmpeg's, which Chromium decodes in software with, and Firefox
+    /// and WebKit on Linux) has let that recent frame go by then for a client that missed the
+    /// frames since (anchors among them, which the recent frames leave out), and fails a frame
+    /// that names it (Chromium's does). The invalidation, for the encoder; None where none is
+    /// needed.
+    pub fn forget_stale(&mut self) -> Option<Invalidation> {
+        if self.frame_num_range == 0 || self.anchors.is_empty() {
+            return None;
+        }
+        let (_, newest) = self.newest_valid()?;
+        let recent = self.frames.iter().any(|f| f.1 == newest && !f.2);
+        if !recent || self.next_pts - newest <= self.capacity as u64 {
+            return None;
+        }
+        let target = self
+            .anchor_frames()
+            .filter(|a| !a.2 && (!self.acknowledged || self.is_shared(a.1)))
+            .map(|a| a.1)
+            .max();
+        let first = match target {
+            Some(anchor) => self.recent.iter().find(|f| f.1 > anchor && !f.2)?.0,
+            None => self.frames.iter().find(|f| !f.2)?.0,
+        };
+        Some(self.invalidate(first))
+    }
+
+    /// The anchor the next frame predicts from, where the newest frame held is an anchor; the
+    /// encoder names it, since NVENC's H.264 fallback takes the first anchor otherwise.
+    pub fn predicting_anchor(&self) -> Option<u8> {
+        let (_, pts) = self.newest_valid()?;
+        if self.frames.iter().any(|f| f.1 == pts && !f.2) {
+            return None;
+        }
+        self.anchors
+            .iter()
+            .position(|a| a.is_some_and(|a| a.1 == pts && !a.2))
             .map(|i| i as u8)
     }
 
@@ -178,6 +405,8 @@ impl ReferenceWindow {
         self.frames.clear();
         self.anchors.iter_mut().for_each(|a| *a = None);
         self.recent.clear();
+        self.common.clear();
+        self.sent.clear();
     }
 
     /// The decoded picture buffer the session has now; frames past it are let go. The anchors
@@ -255,6 +484,8 @@ impl ReferenceWindow {
         let reference = if key {
             self.frames.clear();
             self.anchors.iter_mut().for_each(|a| *a = None);
+            self.common.clear();
+            self.sent.clear();
             self.key_pts = pts;
             Reference::None
         } else {
@@ -445,8 +676,10 @@ pub struct ReferenceSlots {
     key_pts: u64,
 }
 
-/// How many recent frames are remembered by id; the anchors reach twenty-three back.
-const RECENT_FRAMES: usize = 64;
+/// How many recent frames are remembered by id, about eight seconds at 60 frames a second: a
+/// consumer whose clients hold a pinned anchor may report a run lost that long ago and have it
+/// predicted past (`acknowledge`); the anchors alone reach twenty-three back.
+const RECENT_FRAMES: usize = 512;
 
 /// VP8's GOLDEN and ALTREF each take every `ANCHOR_PERIOD`th frame, half a period apart.
 const ANCHOR_PERIOD: u64 = 24;
@@ -1275,7 +1508,7 @@ mod tests {
         assert_eq!(w.invalidate(id(81)), Invalidation::Ignored);
         assert_eq!(w.newest_valid(), Some((id(98), 98)));
         assert_eq!(w.invalidate(id(81) + 1), Invalidation::Ignored);
-        for n in 99..=160 {
+        for n in 99..=(98 + RECENT_FRAMES as u32) {
             w.record_marked(id(n), false, w.plan_anchor(false));
         }
         assert_eq!(w.invalidate(id(81)), Invalidation::KeyFrame);
@@ -1317,5 +1550,237 @@ mod tests {
         assert_eq!(w.newest_valid(), Some((17, 17)));
         assert_eq!(w.invalidate(15), Invalidation::KeyFrame);
         assert!(!w.has_reference());
+    }
+
+    /// Feed frames to a window as a session does: plan the anchor, settle it, record it.
+    fn feed(
+        w: &mut ReferenceWindow,
+        ids: std::ops::RangeInclusive<u16>,
+    ) -> Vec<(u16, Option<u8>, Reference)> {
+        ids.map(|id| {
+            let key = id == 0;
+            let slot = w.plan_anchor(key);
+            if slot.is_some() && !key {
+                w.settle();
+            }
+            (id, slot, w.record_marked(id, key, slot))
+        })
+        .collect()
+    }
+
+    #[test]
+    fn an_acknowledged_anchor_is_pinned_while_the_schedule_marks_the_other() {
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=0);
+        assert!(w.acknowledge(0, true));
+        let marks: Vec<(u16, u8)> = feed(&mut w, 1..=48)
+            .into_iter()
+            .filter_map(|(id, slot, _)| slot.map(|s| (id, s)))
+            .collect();
+        assert_eq!(
+            marks,
+            [(12, 1), (24, 1), (36, 1), (48, 1)],
+            "the key frame stays in slot 0"
+        );
+        assert!(w.acknowledge(48, true));
+        assert_eq!(
+            feed(&mut w, 49..=60).last().map(|f| f.1),
+            Some(Some(0)),
+            "48 pinned, the schedule takes slot 0 back"
+        );
+        assert!(!w.acknowledge(1000, true), "a frame never sent is not held");
+    }
+
+    #[test]
+    fn an_anchor_predicts_from_the_newest_frame_every_consumer_was_sent() {
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        feed(&mut w, 0..=11);
+        for id in 0..=9u16 {
+            assert!(w.acknowledge(id, true));
+        }
+        assert_eq!(w.plan_anchor(false), Some(1));
+        assert_eq!(
+            w.settle(),
+            Some(Invalidation::Forget(10)),
+            "10 and 11 are forgotten"
+        );
+        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(9));
+        assert!(w.is_shared_reference(Reference::Frame(9)));
+        assert_eq!(
+            w.record(13, false),
+            Reference::Frame(12),
+            "the stream goes on from the anchor"
+        );
+
+        // Held by no consumer but the key frame: the anchor predicts from it.
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=11);
+        assert!(w.acknowledge(0, true));
+        assert_eq!(w.settle(), Some(Invalidation::Forget(1)));
+        assert_eq!(w.record_marked(12, false, Some(1)), Reference::Frame(0));
+        assert_eq!(
+            w.predicting_anchor(),
+            Some(1),
+            "13 predicts from the anchor just marked"
+        );
+        assert_eq!(w.record(13, false), Reference::Frame(12));
+        assert_eq!(
+            w.predicting_anchor(),
+            None,
+            "and 14 from 13, a recent frame"
+        );
+
+        // Every consumer was sent the newest frame, which none holds yet: nothing to settle, and
+        // nothing pinned on it.
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=11);
+        assert!(w.acknowledge(0, true));
+        assert!(w.acknowledge(11, false));
+        assert_eq!(w.settle(), None);
+        assert!(w.is_shared_reference(Reference::Frame(11)));
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=11);
+        assert_eq!(
+            w.settle(),
+            None,
+            "unacknowledged, an anchor is settled by nothing"
+        );
+    }
+
+    #[test]
+    fn only_an_anchor_every_consumer_holds_is_pinned() {
+        // Sent to every consumer as it is marked, 12 is not pinned until all hold it: 24 is
+        // marked over it, the key frame they hold staying.
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=0);
+        assert!(w.acknowledge(0, true));
+        for id in 1..=24u16 {
+            feed(&mut w, id..=id);
+            assert!(w.acknowledge(id, false));
+        }
+        let anchors: Vec<u16> = w.anchor_frames().map(|a| a.0).collect();
+        assert!(anchors.contains(&0) && anchors.contains(&24), "{anchors:?}");
+        assert!(w.acknowledge(24, true));
+        assert_eq!(
+            feed(&mut w, 25..=36).last().map(|f| f.1),
+            Some(Some(0)),
+            "24 pinned"
+        );
+    }
+
+    #[test]
+    fn a_consumer_further_behind_than_an_anchor_period_is_predicted_past_on_its_report() {
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        for id in 0..=60u16 {
+            feed(&mut w, id..=id);
+            assert!(w.acknowledge(id, true));
+        }
+        let anchors: Vec<(u16, Reference)> = feed(&mut w, 61..=120)
+            .into_iter()
+            .filter(|f| f.1.is_some())
+            .map(|f| (f.0, f.2))
+            .collect();
+        assert_eq!(
+            anchors,
+            [
+                (72, Reference::Frame(60)),
+                (84, Reference::Frame(83)),
+                (96, Reference::Frame(95)),
+                (108, Reference::Frame(107)),
+                (120, Reference::Frame(119)),
+            ],
+            "a consumer holds nothing past 60: the anchor an anchor period on predicts from it, \
+             those further on from the frame before"
+        );
+        assert_eq!(w.invalidate(61), Invalidation::Ignored, "already left out");
+        assert_eq!(w.invalidate(121), Invalidation::Ignored, "never sent");
+        assert!(matches!(w.invalidate(72), Invalidation::Forget(_)));
+        assert_eq!(
+            w.predicting_anchor(),
+            Some(1),
+            "60, pinned in slot 1, named"
+        );
+        assert_eq!(w.record(121, false), Reference::Frame(60));
+
+        let mut w = ReferenceWindow::with_anchors(4, 2);
+        feed(&mut w, 0..=120);
+        assert_eq!(
+            w.invalidate(61),
+            Invalidation::KeyFrame,
+            "unacknowledged, both anchors are past 61"
+        );
+    }
+
+    #[test]
+    fn a_recent_frame_further_back_than_the_buffer_is_not_predicted_from_after_a_gap() {
+        // 12 is the pinned anchor and 13 the newest frame every client holds; 14 to 18 are
+        // forgotten for a client that lacks them, and 19, an anchor predicting from 13, is
+        // reported lost: the next frame would predict from 13, seven frames back.
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        w.set_frame_num_range(256);
+        w.set_acknowledged();
+        for id in 0..=12u16 {
+            feed(&mut w, id..=id);
+            assert!(w.acknowledge(id, true));
+        }
+        feed(&mut w, 13..=18);
+        assert!(w.acknowledge(13, true));
+        // 19, an anchor settled from 13; 14 to 18 forgotten.
+        assert_eq!(w.plan_anchor(false), None);
+        assert!(matches!(w.invalidate(14), Invalidation::Forget(_)));
+        assert_eq!(w.record_marked(19, false, Some(1)), Reference::Frame(13));
+        assert!(matches!(w.invalidate(19), Invalidation::Forget(_)));
+        assert_eq!(w.newest_valid(), Some((13, 13)));
+        assert_eq!(
+            w.forget_stale(),
+            Some(Invalidation::Forget(13)),
+            "seven back past six recent"
+        );
+        assert_eq!(w.predicting_anchor(), Some(0), "the pinned anchor, 12");
+        assert_eq!(w.record(20, false), Reference::Frame(12));
+        assert_eq!(w.forget_stale(), None);
+
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        w.set_acknowledged();
+        feed(&mut w, 0..=12);
+        assert_eq!(w.forget_stale(), None, "only H.264 counts frame_num gaps");
+    }
+
+    #[test]
+    fn the_frame_where_frame_num_wraps_is_an_anchor_once_acknowledged() {
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        w.set_frame_num_range(16);
+        feed(&mut w, 0..=15);
+        assert_eq!(w.plan_anchor(false), None, "16 is off the schedule");
+        assert!(w.acknowledge(15, true));
+        assert!(w.plan_anchor(false).is_some(), "frame_num wraps at 16");
+
+        // It predicts from the newest frame every consumer was sent however far back.
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        w.set_frame_num_range(64);
+        feed(&mut w, 0..=0);
+        assert!(w.acknowledge(0, true));
+        let at: Vec<(u16, Reference)> = feed(&mut w, 1..=64)
+            .into_iter()
+            .filter(|f| f.1.is_some())
+            .map(|f| (f.0, f.2))
+            .collect();
+        assert_eq!(
+            at.last(),
+            Some(&(64, Reference::Frame(1))),
+            "the wrap reaches back to frame 1, the anchor every consumer is sent after the key frame"
+        );
+
+        // A frame every consumer was only sent, not yet held, is no reference for the wrap.
+        let mut w = ReferenceWindow::with_anchors(8, 2);
+        w.set_frame_num_range(16);
+        w.set_acknowledged();
+        for id in 0..=15u16 {
+            feed(&mut w, id..=id);
+            assert!(w.acknowledge(id, id <= 13));
+        }
+        assert!(w.plan_anchor(false).is_some());
+        assert_eq!(w.settle(), Some(Invalidation::Forget(14)));
+        assert_eq!(w.record_marked(16, false, Some(1)), Reference::Frame(13));
     }
 }

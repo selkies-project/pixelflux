@@ -1105,8 +1105,8 @@ where
             break;
         }
 
-        for frame_id in std::mem::take(&mut *controls.invalid_frames.lock().unwrap()) {
-            if !gpu.enc().invalidate_reference(frame_id) {
+        for report in std::mem::take(&mut *controls.reference_reports.lock().unwrap()) {
+            if !gpu.enc().take_report(report) {
                 pending_force_idr = true;
             }
         }

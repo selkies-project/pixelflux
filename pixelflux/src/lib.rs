@@ -358,6 +358,10 @@ pub struct RustCaptureSettings {
     /// When true, encoders emit the raw payload without the per-stripe header byte block;
     /// stripe metadata is then carried only on the frame attributes.
     pub omit_stripe_headers: bool,
+    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`), so a
+    /// session keeps two long-term references wherever it keeps one, the newest every client
+    /// holds pinned beside the one the schedule marks.
+    pub acknowledge_references: bool,
     pub video_cbr_mode: bool,
     pub video_bitrate_kbps: i32,
     /// VBV size as a multiple of one frame's bit budget (bitrate/framerate), so it rescales with
@@ -465,6 +469,7 @@ impl Default for RustCaptureSettings {
             recording_socket: String::new(),
             wayland_host_display: String::new(),
             omit_stripe_headers: false,
+            acknowledge_references: false,
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,
             video_vbv_multiplier: 0.0,
@@ -600,6 +605,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .unwrap_or_default(),
         omit_stripe_headers: settings
             .getattr("omit_stripe_headers")
+            .ok()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false),
+        acknowledge_references: settings
+            .getattr("acknowledge_references")
             .ok()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false),
@@ -841,6 +851,13 @@ pub enum ThreadCommand {
     InvalidateReference {
         display_id: u32,
         frame_id: u16,
+    },
+    /// Every client holds frame `frame_id` of one display's capture, or where not `held` was
+    /// sent it.
+    AcknowledgeReference {
+        display_id: u32,
+        frame_id: u16,
+        held: bool,
     },
     /// Live rate-control change for one display's capture (parity with the X11 `rate_dirty`
     /// path). Each field is `None` when that dimension is unchanged.
@@ -1243,14 +1260,15 @@ impl WlFramePool {
 /// encode thread swaps it with Acquire and re-reads the payload, never seeing it half-applied.
 /// `force_idr` is swapped just before each encode, so an on-demand keyframe lands on the
 /// frame ALREADY in flight instead of waiting one pipeline stage for the next publish.
-/// `invalid_frames` are the frames clients reported lost, drained ahead of the same encode.
+/// `reference_reports` are what clients said of frames (lost, or held by every one of them),
+/// drained ahead of the same encode.
 pub struct WlEncodeControls {
     rate_dirty: AtomicBool,
     bitrate_kbps: AtomicI32,
     vbv_mult_milli: AtomicI32,
     fps_bits: AtomicU64,
     force_idr: AtomicBool,
-    invalid_frames: Mutex<Vec<u16>>,
+    reference_reports: Mutex<Vec<encoders::reference::ReferenceReport>>,
     /// Pending per-frame tunables for the encode thread (mutex, not atomics: one struct, set
     /// rarely, read only when the dirty flag says so).
     tunables_dirty: AtomicBool,
@@ -1265,7 +1283,7 @@ impl WlEncodeControls {
             vbv_mult_milli: AtomicI32::new(0),
             fps_bits: AtomicU64::new(0),
             force_idr: AtomicBool::new(false),
-            invalid_frames: Mutex::new(Vec::new()),
+            reference_reports: Mutex::new(Vec::new()),
             tunables_dirty: AtomicBool::new(false),
             tunables: Mutex::new(None),
         }
@@ -1482,12 +1500,15 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         // decodable frame even when the screen is static. A sink whose capture has been
         // torn down is already gone, and its last frames are not recorded.
         let recording_sink = cfg.recording_sink.as_ref().and_then(|w| w.upgrade());
-        for frame_id in std::mem::take(&mut *cfg.controls.invalid_frames.lock().unwrap()) {
-            let forgotten = match video_encoder.as_mut() {
-                Some(encoder) => encoder.invalidate_reference(frame_id),
-                None => encoders::software::invalidate_reference(&mut stripes, frame_id),
+        for report in std::mem::take(&mut *cfg.controls.reference_reports.lock().unwrap()) {
+            let taken = match (video_encoder.as_mut(), report) {
+                (Some(encoder), report) => encoder.take_report(report),
+                (None, encoders::reference::ReferenceReport::Lost(frame_id)) => {
+                    encoders::software::invalidate_reference(&mut stripes, frame_id)
+                }
+                (None, _) => true,
             };
-            if !forgotten {
+            if !taken {
                 cfg.controls.force_idr.store(true, Ordering::Relaxed);
             }
         }
@@ -6186,6 +6207,17 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     cap.invalidate_reference(frame_id);
                 }
             }
+            ThreadCommand::AcknowledgeReference {
+                display_id,
+                frame_id,
+                held,
+            } => {
+                if let Some(idx) = state.node_idx_for_id(display_id)
+                    && let Some(cap) = state.output_nodes[idx].capture.as_mut()
+                {
+                    cap.acknowledge_reference(frame_id, held);
+                }
+            }
             ThreadCommand::UpdateRate {
                 display_id,
                 bitrate_kbps,
@@ -7258,6 +7290,25 @@ impl WaylandBackend {
         })
     }
 
+    /// Every client holds frame `frame_id` of one display's capture, or where not `held` was
+    /// sent it, so a session keeping long-term references pins the newest anchor they all hold
+    /// and predicts its anchors from a frame they were all sent: each client recovers on its own
+    /// from a loss of any depth, without a keyframe.
+    #[pyo3(signature = (frame_id, display_id = 0, held = true))]
+    fn acknowledge_reference(&self, frame_id: u16, display_id: u32, held: bool) -> PyResult<()> {
+        self.send(ThreadCommand::AcknowledgeReference {
+            display_id,
+            frame_id,
+            held,
+        })
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to acknowledge reference: {}",
+                e
+            ))
+        })
+    }
+
     /// Apply a live bitrate (kbps) / VBV (kb) / framerate change to the given display's
     /// running capture.
     #[pyo3(signature = (bitrate_kbps = None, vbv_multiplier = None, fps = None, display_id = 0))]
@@ -7542,6 +7593,11 @@ struct CaptureSettings {
     /// each frame is one Annex-B access unit and its metadata is on the `StripeFrame` attributes.
     #[pyo3(get, set)]
     omit_stripe_headers: bool,
+    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`): NVENC
+    /// keeps two long-term references where it keeps one otherwise, so each client recovers on
+    /// its own from a loss of any depth.
+    #[pyo3(get, set)]
+    acknowledge_references: bool,
     #[pyo3(get, set)]
     encode_node_path: Py<PyAny>,
     /// Compositor render node (Wayland): an explicit path wins; empty with auto_gpu
@@ -7610,6 +7666,7 @@ impl CaptureSettings {
             video_max_qp: 0,
             auto_adjust_screen_capture_size: false,
             omit_stripe_headers: false,
+            acknowledge_references: false,
             encode_node_path: py.None(),
             render_node_path: py.None(),
             auto_gpu: py.None(),
@@ -8012,6 +8069,40 @@ struct ScreenCapture {
 }
 
 impl ScreenCapture {
+    /// Hand what a client said of a frame to the capture: the X11 controls, drained ahead of the
+    /// next encode, or the shared Wayland backend.
+    fn hand_report(&self, py: Python<'_>, report: encoders::reference::ReferenceReport) {
+        use encoders::reference::ReferenceReport;
+        let (backend, controls, did) = {
+            let st = self.inner.lock().unwrap();
+            (st.backend, st.x11_controls(), st.wl_display)
+        };
+        match backend {
+            0 | 1 => {
+                if let Some(c) = controls {
+                    c.reference_reports.lock().unwrap().push(report);
+                }
+            }
+            2 => {
+                if let Some(slot) = WAYLAND_BACKEND.get()
+                    && let Some(be) = slot.lock().unwrap().as_ref()
+                {
+                    let be = be.bind(py).borrow();
+                    let _ = match report {
+                        ReferenceReport::Lost(frame_id) => be.invalidate_reference(frame_id, did),
+                        ReferenceReport::Held(frame_id) => {
+                            be.acknowledge_reference(frame_id, did, true)
+                        }
+                        ReferenceReport::Sent(frame_id) => {
+                            be.acknowledge_reference(frame_id, did, false)
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Stop this capture: signal the capture thread, drop the live controls, and join.
     ///
     /// The path forks on the backend. A **Wayland** capture only tells the shared compositor to
@@ -8543,25 +8634,23 @@ impl ScreenCapture {
     /// one decodes there without a keyframe. An encoder that cannot leave a frame out of its
     /// predictions codes a keyframe instead. Non-blocking, like `request_idr_frame`.
     fn invalidate_reference(&self, py: Python<'_>, frame_id: u16) -> PyResult<()> {
-        let (backend, controls, did) = {
-            let st = self.inner.lock().unwrap();
-            (st.backend, st.x11_controls(), st.wl_display)
+        self.hand_report(py, encoders::reference::ReferenceReport::Lost(frame_id));
+        Ok(())
+    }
+
+    /// Every client holds frame `frame_id`, or where not `held` was sent it (and may yet lose
+    /// it): a session keeping long-term references pins the newest anchor they all hold and
+    /// predicts its anchors from a frame they were all sent, so each client recovers on its own
+    /// from a loss of any depth, without a keyframe. Non-blocking, like `invalidate_reference`.
+    #[pyo3(signature = (frame_id, held = true))]
+    fn acknowledge_reference(&self, py: Python<'_>, frame_id: u16, held: bool) -> PyResult<()> {
+        use encoders::reference::ReferenceReport;
+        let report = if held {
+            ReferenceReport::Held(frame_id)
+        } else {
+            ReferenceReport::Sent(frame_id)
         };
-        match backend {
-            0 | 1 => {
-                if let Some(c) = controls {
-                    c.invalid_frames.lock().unwrap().push(frame_id);
-                }
-            }
-            2 => {
-                if let Some(slot) = WAYLAND_BACKEND.get()
-                    && let Some(be) = slot.lock().unwrap().as_ref()
-                {
-                    let _ = be.bind(py).borrow().invalidate_reference(frame_id, did);
-                }
-            }
-            _ => {}
-        }
+        self.hand_report(py, report);
         Ok(())
     }
 

@@ -252,14 +252,29 @@ impl WlCapture {
     /// lost it: handed to the encode thread where one runs, applied to the calloop's own session
     /// otherwise. An encoder that cannot codes a keyframe instead.
     pub fn invalidate_reference(&mut self, frame_id: u16) {
+        self.take_report(crate::encoders::reference::ReferenceReport::Lost(frame_id));
+    }
+
+    /// Note that every consumer holds frame `frame_id`, or where not `held` was sent it
+    /// (`ReferenceWindow::acknowledge`), handed on as `invalidate_reference` hands a loss.
+    pub fn acknowledge_reference(&mut self, frame_id: u16, held: bool) {
+        use crate::encoders::reference::ReferenceReport;
+        self.take_report(if held {
+            ReferenceReport::Held(frame_id)
+        } else {
+            ReferenceReport::Sent(frame_id)
+        });
+    }
+
+    fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
         if self.encode_pool.is_some() {
             self.encode_controls
-                .invalid_frames
+                .reference_reports
                 .lock()
                 .unwrap()
-                .push(frame_id);
+                .push(report);
         } else if let Some(encoder) = self.video_encoder.as_mut()
-            && !encoder.invalidate_reference(frame_id)
+            && !encoder.take_report(report)
         {
             self.request_idr();
         }

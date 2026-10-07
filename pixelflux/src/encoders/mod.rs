@@ -1322,6 +1322,17 @@ impl FrameEncoder {
         each!(self, enc => enc.invalidate_reference(frame_id))
     }
 
+    /// Apply what the consumers say of a frame: a loss as `invalidate_reference`, a frame every
+    /// one of them holds or was sent to a session keeping long-term references
+    /// (`ReferenceWindow::acknowledge`). False where the session codes a key frame instead.
+    pub fn take_report(&mut self, report: reference::ReferenceReport) -> bool {
+        match (self, report) {
+            (FrameEncoder::Nvenc(enc), report) => enc.take_report(report),
+            (enc, reference::ReferenceReport::Lost(frame_id)) => enc.invalidate_reference(frame_id),
+            _ => true,
+        }
+    }
+
     /// Encode one Wayland dmabuf in place (a zero-copy session).
     pub fn encode_dmabuf(
         &mut self,

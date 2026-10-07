@@ -1236,14 +1236,18 @@ impl X11Pipeline {
         self.pending_force_idr = true;
     }
 
-    /// Leave frame `frame_id` and every frame after it out of the predictions, for a client that
-    /// lost it; an encoder that cannot codes a keyframe instead.
-    pub fn invalidate_reference(&mut self, frame_id: u16) {
-        let forgotten = match self.hw.as_mut() {
-            Some(enc) => enc.invalidate_reference(frame_id),
-            None => invalidate_reference(&mut self.stripes, frame_id),
+    /// Apply what the consumers say of a frame (`FrameEncoder::take_report`): a loss leaves it and
+    /// every frame after it out of the predictions, a key frame where the encoder cannot.
+    pub fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
+        use crate::encoders::reference::ReferenceReport;
+        let taken = match (self.hw.as_mut(), report) {
+            (Some(enc), report) => enc.take_report(report),
+            (None, ReferenceReport::Lost(frame_id)) => {
+                invalidate_reference(&mut self.stripes, frame_id)
+            }
+            (None, _) => true,
         };
-        if !forgotten {
+        if !taken {
             self.pending_force_idr = true;
         }
     }

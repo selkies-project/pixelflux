@@ -722,6 +722,21 @@ so no frame is converted on a CPU core.
     wrap, past which FFmpeg's decoder (Chromium's, Firefox's, and WebKit's on Linux) drops about
     a `frame_num` range of pictures. libx264 counts sixteen values, which the stream carries a
     byte wider, 4096, so that frame comes once in 68 s at 60 fps.
+*   **Share one stream among clients that each recover on their own:** set
+    `acknowledge_references = True` and call `capture.acknowledge_reference(frame_id)` for each
+    frame every client holds, and `capture.acknowledge_reference(frame_id, held=False)` for each
+    every client was sent but may yet lose (a datagram transport's). An NVENC session then keeps
+    two long-term references (anchors) wherever the device has room for them, H.264 and AV1
+    included: the newest anchor every client holds stays pinned while every twelfth frame is
+    marked into the other, and an anchor within an anchor period of the newest frame every client
+    was sent predicts from it and carries `0x08` in the low nibble of its header's type byte, so a
+    consumer sends it to every client, as it would a key frame, and each decodes it. A client
+    left behind resyncs at the next such anchor, and one further behind on its report
+    (`invalidate_reference`), which is predicted past from the pinned anchor however deep the
+    loss (eight seconds of frames at 60 fps are remembered) rather than with a keyframe. In H.264
+    the frame at the `frame_num` wrap is an anchor too, reaching back however far, and the frame
+    after a key frame takes the second long-term index, so the decoder's buffer never passes
+    `max_num_ref_frames` (Chromium's own decoder fails a stream that does).
 
 ### Color conversion
 
@@ -811,7 +826,9 @@ asked for.
     *   **Damage Throttling:** Limits processing during high-motion scenes.
     *   **On-demand keyframes:** `request_idr_frame()` forces an IDR for reconnecting clients.
     *   **Reference invalidation:** `invalidate_reference(frame_id)` has the encoder predict past a
-        frame a client lost, so recovery costs no keyframe.
+        frame a client lost, so recovery costs no keyframe; `acknowledge_reference(frame_id)` pins
+        the long-term references every client holds, so clients sharing a stream each recover
+        on their own (NVENC).
 *   **Self-description:** `stream_info()` reports the capture path, the encoder, the GPU, and why a
     faster path was declined, and `stream_stats()` the encode's counters, so a caller shows its
     user what a session runs on instead of pointing them at a log.

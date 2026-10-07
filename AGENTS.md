@@ -89,7 +89,15 @@ takes reference commands (4.2 on); and the stream declares the decoded picture b
 a fixed eight whatever the level, four under NVENC, whose AV1 frames predict from no more. NVENC keeps long-term
 frames of that buffer as anchors where the device offers them (H.264 one, since its fallback takes the first alone,
 H.265 two), so a loss older than every recent frame, or than a buffer a resize left small (the driver lowers the
-buffer in place but never raises it), is still predicted past. A session that does not
+buffer in place but never raises it), is still predicted past. Where the consumer says which frames every client
+holds or was sent (`acknowledge_references`, `acknowledge_reference`, `ReferenceWindow::acknowledge`), H.264 and AV1
+keep two as well, and several clients share one session with each recovering on its own: the newest anchor all of
+them hold is pinned while the schedule marks the other; an anchor within an anchor period of the newest frame all of
+them were sent first forgets the frames after it, so it predicts from that one (`settle`), and carries
+`FRAME_ANCHOR` in its kind; a frame predicting from an anchor names it (NVENC's H.264 fallback takes the first
+otherwise); and in H.264 the frame at the `frame_num` wrap is an anchor reaching back however far, and the frame after
+a key frame takes the second long-term index: NVENC leaves the frames it forgot out of the buffer it counts, so a
+frame marked into an empty index later would take the decoder past `max_num_ref_frames`. A session that does not
 (x265, kvazaar, SVT-AV1 at a constant quantizer or before 4.2, Tegra's H.264 and AV1, a stateful V4L2 device)
 refuses, and the caller forces an IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
 since FFmpeg's decoder, which Chromium, Firefox, and WebKit decode with on Linux, derives the picture order past that gap a wrap short and drops about a `frame_num` range of pictures after it; libx264's sixteen values go out a byte wider (`encoders::sps::WideFrameNum`), so that frame comes once in 4096. Every full-frame session is chosen by one ladder,

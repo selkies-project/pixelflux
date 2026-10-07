@@ -37,11 +37,12 @@ use libloading::{Library, Symbol};
 use smithay::backend::allocator::{Buffer, Fourcc, dmabuf::Dmabuf};
 
 use super::codec::{
-    Codec, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, Hardware, VIDEO_HEADER_LEN, av1_level,
-    h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier, push_video_header,
+    Codec, FRAME_ANCHOR, FRAME_DELTA, FRAME_INTRA, FRAME_KEY, Hardware, VIDEO_HEADER_LEN,
+    av1_level, h264_dpb_frames, h264_level, h265_dpb_frames, h265_level, h265_tier,
+    push_video_header,
 };
 use super::frame_rate::FrameRate;
-use super::reference::{ANCHORS, Invalidation, Reference, ReferenceWindow};
+use super::reference::{ANCHORS, Invalidation, Reference, ReferenceReport, ReferenceWindow};
 use super::sps::h264_frame_num_range;
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
@@ -724,24 +725,27 @@ fn window_frames(codec: Codec, dpb: u32, anchored: bool) -> u32 {
 
 /// Persistent anchors only where the negotiated API exposes them, the device can invalidate
 /// references and the DPB leaves two recent pictures beside them. AV1 gained the LTR fields in
-/// SDK 13; drivers negotiated down to an older API keep the unanchored path.
+/// SDK 13; drivers negotiated down to an older API keep the unanchored path. H.264 and AV1 keep
+/// one, a frame every forty-eight, unless the consumer `acknowledged` what its clients hold and
+/// the device has room for two: then the newest every client holds is pinned beside the one the
+/// schedule marks.
 fn anchor_count(
     codec: Codec,
     api_major: u32,
     invalidation: bool,
     ltr: Option<i32>,
     dpb: u32,
+    acknowledged: bool,
 ) -> usize {
+    let fits =
+        |n: usize| invalidation && ltr.is_some_and(|l| l >= n as i32) && dpb as usize >= n + 2;
     let count = match codec {
-        Codec::H265 => ANCHORS,
         Codec::Av1 if api_major < 13 => 0,
+        Codec::H265 => ANCHORS,
+        _ if acknowledged && fits(ANCHORS) => ANCHORS,
         _ => 1,
     };
-    if invalidation && ltr.is_some_and(|n| n >= count as i32) && dpb as usize >= count + 2 {
-        count
-    } else {
-        0
-    }
+    if fits(count) { count } else { 0 }
 }
 
 /// The in-place resize headroom for one axis: the requested size lifted to `floor` but never past
@@ -2389,7 +2393,14 @@ impl NvencEncoder {
                 codec_guid,
                 NV_ENC_CAPS::NV_ENC_CAPS_NUM_MAX_LTR_FRAMES,
             );
-            let anchors = anchor_count(codec, nvenc_cur_ver().0, invalidation, ltr, dpb);
+            let anchors = anchor_count(
+                codec,
+                nvenc_cur_ver().0,
+                invalidation,
+                ltr,
+                dpb,
+                settings.acknowledge_references,
+            );
             Self::configure_codec(
                 &mut config,
                 codec,
@@ -2662,7 +2673,12 @@ impl NvencEncoder {
                 engines,
                 references: invalidation.then(|| {
                     if anchors > 0 {
-                        ReferenceWindow::with_anchors(window_frames(codec, dpb, true), anchors)
+                        let mut w =
+                            ReferenceWindow::with_anchors(window_frames(codec, dpb, true), anchors);
+                        if settings.acknowledge_references {
+                            w.set_acknowledged();
+                        }
+                        w
                     } else {
                         ReferenceWindow::new(dpb)
                     }
@@ -2890,6 +2906,30 @@ impl NvencEncoder {
                     == NVENCSTATUS::NV_ENC_SUCCESS
             },
             Invalidation::KeyFrame | Invalidation::Ignored => true,
+        }
+    }
+
+    /// Every consumer holds frame `frame_id`, or where not `held` was sent it
+    /// (`ReferenceWindow::acknowledge`).
+    pub fn acknowledge_reference(&mut self, frame_id: u16, held: bool) {
+        if let Some(references) = &mut self.references {
+            references.acknowledge(frame_id, held);
+        }
+    }
+
+    /// Apply what the consumers say of a frame (`FrameEncoder::take_report`); false where a key
+    /// frame is coded instead.
+    pub fn take_report(&mut self, report: ReferenceReport) -> bool {
+        match report {
+            ReferenceReport::Lost(frame_id) => self.invalidate_reference(frame_id),
+            ReferenceReport::Held(frame_id) => {
+                self.acknowledge_reference(frame_id, true);
+                true
+            }
+            ReferenceReport::Sent(frame_id) => {
+                self.acknowledge_reference(frame_id, false);
+                true
+            }
         }
     }
 
@@ -3535,7 +3575,44 @@ impl NvencEncoder {
         let output_bitstream = self.bitstream_buffers[self.current_buffer_idx];
         self.current_buffer_idx = (self.current_buffer_idx + 1) % self.bitstream_buffers.len();
 
-        let force_idr = force_idr || self.references.as_ref().is_some_and(|r| !r.has_reference());
+        let mut force_idr =
+            force_idr || self.references.as_ref().is_some_and(|r| !r.has_reference());
+        if !force_idr
+            && let Some(references) = &mut self.references
+            && references.plan_anchor(false).is_some()
+        {
+            match references.settle() {
+                Some(Invalidation::Forget(pts)) => {
+                    force_idr = (self.nvenc_funcs.nvEncInvalidateRefFrames.unwrap())(
+                        self.encoder_session,
+                        pts,
+                    ) != NVENCSTATUS::NV_ENC_SUCCESS;
+                }
+                Some(Invalidation::KeyFrame) => force_idr = true,
+                _ => {}
+            }
+        }
+        if !force_idr && let Some(references) = &mut self.references {
+            match references.forget_stale() {
+                Some(Invalidation::Forget(pts)) => {
+                    force_idr = (self.nvenc_funcs.nvEncInvalidateRefFrames.unwrap())(
+                        self.encoder_session,
+                        pts,
+                    ) != NVENCSTATUS::NV_ENC_SUCCESS;
+                }
+                Some(Invalidation::KeyFrame) => force_idr = true,
+                _ => {}
+            }
+        }
+        let anchor = self
+            .references
+            .as_ref()
+            .and_then(|r| r.plan_anchor(force_idr));
+        let named = self
+            .references
+            .as_ref()
+            .filter(|_| !force_idr)
+            .and_then(ReferenceWindow::predicting_anchor);
         let mut pic_params = NV_ENC_PIC_PARAMS {
             version: sv(NvStruct::PicParams),
             inputWidth: self.width,
@@ -3556,28 +3633,23 @@ impl NvencEncoder {
             ..Default::default()
         };
 
-        let anchor = self
-            .references
-            .as_ref()
-            .and_then(|r| r.plan_anchor(force_idr));
-        if let Some(slot) = anchor {
-            match self.codec {
-                Codec::Av1 => {
-                    let p = &mut pic_params.codecPicParams.av1PicParams;
+        macro_rules! long_term {
+            ($p:expr) => {{
+                let p = $p;
+                if let Some(slot) = named {
+                    p.set_ltrUseFrames(1);
+                    p.ltrUseFrameBitmap = 1 << slot;
+                }
+                if let Some(slot) = anchor {
                     p.set_ltrMarkFrame(1);
                     p.ltrMarkFrameIdx = slot as u32;
                 }
-                Codec::H265 => {
-                    let p = &mut pic_params.codecPicParams.hevcPicParams;
-                    p.set_ltrMarkFrame(1);
-                    p.ltrMarkFrameIdx = slot as u32;
-                }
-                _ => {
-                    let p = &mut pic_params.codecPicParams.h264PicParams;
-                    p.set_ltrMarkFrame(1);
-                    p.ltrMarkFrameIdx = slot as u32;
-                }
-            }
+            }};
+        }
+        match self.codec {
+            Codec::Av1 => long_term!(&mut pic_params.codecPicParams.av1PicParams),
+            Codec::H265 => long_term!(&mut pic_params.codecPicParams.hevcPicParams),
+            _ => long_term!(&mut pic_params.codecPicParams.h264PicParams),
         }
         let held_qp = self.held_qp.take();
         let band = self.held_band.take();
@@ -3714,16 +3786,24 @@ impl NvencEncoder {
             NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I => FRAME_INTRA,
             _ => FRAME_DELTA,
         };
+        let mut wire_type = frame_type;
         if let Some(references) = &mut self.references {
             self.last_reference =
                 references.record_marked(frame_number as u16, frame_type != FRAME_DELTA, anchor);
+            if anchor.is_some()
+                && frame_type == FRAME_DELTA
+                && references.acknowledging()
+                && references.is_shared_reference(self.last_reference)
+            {
+                wire_type |= FRAME_ANCHOR;
+            }
         }
 
         if !self.omit_stripe_headers {
             push_video_header(
                 &mut output,
                 self.codec,
-                frame_type,
+                wire_type,
                 frame_number as u16,
                 0,
                 self.width as u16,
@@ -4585,21 +4665,39 @@ mod tests {
 
     #[test]
     fn anchors_require_the_negotiated_api_and_device_capacity() {
-        assert_eq!(anchor_count(Codec::Av1, 12, true, Some(6), 4), 0);
-        assert_eq!(anchor_count(Codec::Av1, 13, false, Some(6), 4), 0);
-        assert_eq!(anchor_count(Codec::Av1, 13, true, None, 4), 0);
-        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(0), 4), 0);
-        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(6), 2), 0);
-        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(1), 3), 1);
-        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(6), 4), 1);
-        for api in [11, 12, 13] {
-            assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 4), 1);
-            assert_eq!(anchor_count(Codec::H265, api, true, Some(8), 4), ANCHORS);
-            for codec in [Codec::H264, Codec::H265] {
-                assert_eq!(anchor_count(codec, api, false, Some(8), 4), 0);
-                assert_eq!(anchor_count(codec, api, true, Some(0), 4), 0);
-                assert_eq!(anchor_count(codec, api, true, Some(8), 2), 0);
+        for acked in [false, true] {
+            assert_eq!(anchor_count(Codec::Av1, 12, true, Some(6), 4, acked), 0);
+            assert_eq!(anchor_count(Codec::Av1, 13, false, Some(6), 4, acked), 0);
+            assert_eq!(anchor_count(Codec::Av1, 13, true, None, 4, acked), 0);
+            assert_eq!(anchor_count(Codec::Av1, 13, true, Some(0), 4, acked), 0);
+            assert_eq!(anchor_count(Codec::Av1, 13, true, Some(6), 2, acked), 0);
+            assert_eq!(anchor_count(Codec::Av1, 13, true, Some(1), 3, acked), 1);
+            for api in [11, 12, 13] {
+                assert_eq!(
+                    anchor_count(Codec::H265, api, true, Some(8), 4, acked),
+                    ANCHORS
+                );
+                for codec in [Codec::H264, Codec::H265] {
+                    assert_eq!(anchor_count(codec, api, false, Some(8), 4, acked), 0);
+                    assert_eq!(anchor_count(codec, api, true, Some(0), 4, acked), 0);
+                    assert_eq!(anchor_count(codec, api, true, Some(8), 2, acked), 0);
+                }
             }
+        }
+        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(6), 4, false), 1);
+        assert_eq!(
+            anchor_count(Codec::Av1, 13, true, Some(6), 4, true),
+            ANCHORS
+        );
+        for api in [11, 12, 13] {
+            assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 4, false), 1);
+            assert_eq!(
+                anchor_count(Codec::H264, api, true, Some(8), 4, true),
+                ANCHORS
+            );
+            // No room for two: the one an unacknowledged session keeps.
+            assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 3, true), 1);
+            assert_eq!(anchor_count(Codec::H264, api, true, Some(1), 4, true), 1);
         }
     }
 
@@ -5469,6 +5567,128 @@ mod gpu_tests {
                     assert_eq!(coded, 1, "{codec:?}: a frame under the limit stands");
                 }
             }
+        }
+    }
+
+    /// Two consumers share a session told which frames both hold: one takes every frame, the other
+    /// misses stretches, first everything but the anchors, then everything, and once it has room
+    /// reports the frame its missing run starts with. The newest anchor both hold stays pinned
+    /// while the schedule marks the other; an anchor an anchor period past a frame both hold
+    /// predicts from it and is flagged so, one further on from the frame before; the one behind
+    /// decodes each frame it is sent as the other does, the first after its report predicting
+    /// from the anchor it holds; and no frame after the first is a key frame. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_acknowledged_anchors_carry_a_consumer_left_behind() {
+        use crate::encoders::codec::parse_video_type;
+        use crate::encoders::reference::Reference;
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        // (frames it has no room for, anchors too, the frame its report goes ahead of, the anchor
+        // the frame after the report predicts from)
+        let stretches = [(13..=40, false, 42, 36u16), (61..=100, true, 102, 60)];
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            s.acknowledge_references = true;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            let anchors = enc
+                .references
+                .as_ref()
+                .map_or(0, ReferenceWindow::anchor_count);
+            if anchors < ANCHORS {
+                println!("{codec:?}: this device or API keeps {anchors} long-term references");
+                continue;
+            }
+            let (mut whole, mut part) = (
+                VideoDecoder::new(codec).unwrap(),
+                VideoDecoder::new(codec).unwrap(),
+            );
+            let mut holds = Vec::new();
+            let mut run = None;
+            let (mut worst, mut sizes) = (0f64, (0usize, 0usize, 0usize, 0usize));
+            for i in 0..=120usize {
+                let stretch = stretches.iter().find(|t| t.0.contains(&i));
+                if let Some(&(_, _, _, from)) = stretches.iter().find(|t| t.2 == i) {
+                    let first = run.take().expect("a missing run");
+                    assert!(enc.take_report(ReferenceReport::Lost(first)), "{codec:?}");
+                    assert_eq!(
+                        enc.references
+                            .as_ref()
+                            .and_then(ReferenceWindow::newest_valid)
+                            .map(|f| f.0),
+                        Some(from),
+                        "{codec:?}: {first} reported lost before {i}"
+                    );
+                }
+                let out = enc
+                    .encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0)
+                    .expect("encode");
+                let (_, kind) = parse_video_type(out[1]).expect("video type byte");
+                assert_eq!(
+                    kind == FRAME_KEY,
+                    i == 0,
+                    "{codec:?}: frame {i} is kind {kind}"
+                );
+                let reference = enc.last_reference();
+                let can = match reference {
+                    Reference::None => true,
+                    Reference::Frame(r) => holds[r as usize],
+                    Reference::Untracked => false,
+                };
+                let anchor = out[1] & FRAME_ANCHOR != 0;
+                if anchor {
+                    assert!(
+                        can,
+                        "{codec:?}: anchor {i} predicts from {reference:?}, held by one"
+                    );
+                }
+                // H.264 marks its second anchor at the frame after the key frame.
+                let scheduled = i % 12 == 0 || (codec == Codec::H264 && i == 1);
+                assert_eq!(
+                    anchor,
+                    i > 0 && scheduled && can,
+                    "{codec:?}: frame {i} predicting from {reference:?}"
+                );
+                let sent = can && stretch.is_none_or(|t| anchor && !t.1);
+                let bits = &out[VIDEO_HEADER_LEN..];
+                assert!(whole.decode(bits).unwrap_or(false), "{codec:?}: frame {i}");
+                if sent {
+                    assert!(
+                        part.decode(bits).unwrap_or(false),
+                        "{codec:?}: frame {i} sent"
+                    );
+                    // OpenH264, the H.264 decoder here, takes the wrong picture for a long-term
+                    // reference named after a frame_num gap, where FFmpeg decodes it exactly.
+                    if codec != Codec::H264 {
+                        let off = luma_apart(&whole.frame().unwrap(), &part.frame().unwrap());
+                        assert!(off < 0.5, "{codec:?}: frame {i} sent is {off:.3} off");
+                        worst = worst.max(off);
+                    }
+                    run = None;
+                    enc.acknowledge_reference(i as u16, true);
+                } else if can {
+                    run = Some(i as u16);
+                }
+                holds.push(sent);
+                if i > 0 {
+                    let bucket = if anchor { &mut sizes.2 } else { &mut sizes.0 };
+                    *bucket += out.len();
+                    if anchor { sizes.3 += 1 } else { sizes.1 += 1 }
+                }
+            }
+            println!(
+                "{codec:?}: worst {worst:.3} apart; {} B a frame, {} B an anchor ({} anchors)",
+                sizes.0 / sizes.1.max(1),
+                sizes.2 / sizes.3.max(1),
+                sizes.3
+            );
         }
     }
 

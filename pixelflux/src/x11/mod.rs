@@ -70,8 +70,8 @@ pub mod nvfbc;
 /// rather than mutating encoder state across the thread boundary from Python.
 ///
 /// 1. **Lifecycle**: `stop` ends the capture loop; `force_idr` requests an on-demand keyframe on the
-///    next processed frame; `invalid_frames` are the frames clients reported lost, which the
-///    next processed frame stops predicting from.
+///    next processed frame; `reference_reports` are what clients said of frames, lost or held
+///    by every one of them, which the next processed frame applies first.
 /// 2. **Rate control** (gated by `rate_dirty`): `bitrate_kbps`, `vbv_mult_milli` (the VBV frame-time
 ///    multiplier * 1000, held as an integer for atomics; `<= 0` selects the policy default), and
 ///    `fps_bits` (the target fps as `f64` bits, so a fractional rate reaches the encoders exactly,
@@ -90,7 +90,7 @@ pub struct Controls {
     /// exit segfaults, exactly as the Wayland branch fences with a Barrier.
     pub finished: AtomicBool,
     pub force_idr: AtomicBool,
-    pub invalid_frames: Mutex<Vec<u16>>,
+    pub reference_reports: Mutex<Vec<crate::encoders::reference::ReferenceReport>>,
     pub rate_dirty: AtomicBool,
     pub bitrate_kbps: AtomicI32,
     pub vbv_mult_milli: AtomicI32,
@@ -115,7 +115,7 @@ impl Controls {
             stop: AtomicBool::new(false),
             finished: AtomicBool::new(false),
             force_idr: AtomicBool::new(false),
-            invalid_frames: Mutex::new(Vec::new()),
+            reference_reports: Mutex::new(Vec::new()),
             rate_dirty: AtomicBool::new(false),
             bitrate_kbps: AtomicI32::new(s.video_bitrate_kbps),
             vbv_mult_milli: AtomicI32::new((s.video_vbv_multiplier * 1000.0).round() as i32),
@@ -932,8 +932,8 @@ fn encode_loop<F>(
             .as_ref()
             .map(|s| s.should_force_idr())
             .unwrap_or(false);
-        for frame_id in std::mem::take(&mut *controls.invalid_frames.lock().unwrap()) {
-            pl.invalidate_reference(frame_id);
+        for report in std::mem::take(&mut *controls.reference_reports.lock().unwrap()) {
+            pl.take_report(report);
         }
         if controls.force_idr.swap(false, Ordering::Relaxed) || sink_idr {
             pl.request_idr();

@@ -46,6 +46,10 @@ pub const WIRE_VIDEO: u8 = 0x04;
 pub const FRAME_KEY: u8 = 0x01;
 pub const FRAME_INTRA: u8 = 0x02;
 pub const FRAME_DELTA: u8 = 0x00;
+/// A bit ORed into a delta frame's kind: the session keeps the frame as a long-term reference and
+/// it predicts from one every client holds (`ReferenceWindow::settle`), so every client can
+/// decode it.
+pub const FRAME_ANCHOR: u8 = 0x08;
 /// Bytes of the two stripe headers.
 pub const JPEG_HEADER_LEN: usize = 6;
 pub const VIDEO_HEADER_LEN: usize = 12;
@@ -474,7 +478,7 @@ pub fn push_jpeg_header(out: &mut Vec<u8>, frame_id: u16, y_start: u16) {
 
 /// The codec and frame kind a video type byte carries.
 pub fn parse_video_type(type_byte: u8) -> Option<(Codec, u8)> {
-    Codec::from_wire_id(type_byte >> 4).map(|c| (c, type_byte & 0x0f))
+    Codec::from_wire_id(type_byte >> 4).map(|c| (c, type_byte & 0x0f & !FRAME_ANCHOR))
 }
 
 /// The frame kind of a key/delta answer an encoder reports without a bitstream parse.
