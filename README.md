@@ -726,17 +726,20 @@ so no frame is converted on a CPU core.
     `acknowledge_references = True` and call `capture.acknowledge_reference(frame_id)` for each
     frame every client holds, and `capture.acknowledge_reference(frame_id, held=False)` for each
     every client was sent but may yet lose (a datagram transport's). An NVENC session then keeps
-    two long-term references (anchors) wherever the device has room for them, H.264 and AV1
-    included: the newest anchor every client holds stays pinned while every twelfth frame is
-    marked into the other, and an anchor within an anchor period of the newest frame every client
-    was sent predicts from it and carries `0x08` in the low nibble of its header's type byte, so a
-    consumer sends it to every client, as it would a key frame, and each decodes it. A client
+    two long-term references (anchors) wherever the device has room for them, AV1 included: the
+    newest anchor every client holds stays pinned while every twelfth frame is marked into the
+    other, and an anchor within an anchor period of the newest frame every client was sent
+    predicts from it and carries `0x08` in the low nibble of its header's type byte, so a
+    consumer sends it to every client, as it would a keyframe, and each decodes it. A client
     left behind resyncs at the next such anchor, and one further behind on its report
     (`invalidate_reference`), which is predicted past from the pinned anchor however deep the
-    loss (eight seconds of frames at 60 fps are remembered) rather than with a keyframe. In H.264
-    the frame at the `frame_num` wrap is an anchor too, reaching back however far, and the frame
-    after a key frame takes the second long-term index, so the decoder's buffer never passes
-    `max_num_ref_frames` (Chromium's own decoder fails a stream that does).
+    loss (eight seconds of frames at 60 fps are remembered) rather than with a keyframe. H.264
+    keeps one anchor, every forty-eighth frame, predicted and flagged the same way, so a loss
+    reaching past both the anchor and the recent frames costs a keyframe: OpenH264's decoder
+    (Firefox's for WebRTC H.264 where no FFmpeg decodes it) reaches only the first long-term
+    index of a CABAC stream, and decodes a frame naming a second against another picture without
+    an error. In H.264 the frame at the `frame_num` wrap is an anchor too, reaching back however
+    far.
 
 ### Color conversion
 

@@ -87,17 +87,18 @@ session's own H.264 or HEVC slice headers or addresses the VP8 buffers and the V
 H.265 through the vendor's external reference set (L4T R32 and R36), SVT-AV1 at a constant rate where the release
 takes reference commands (4.2 on); and the stream declares the decoded picture buffer its level admits, or for AV1
 a fixed eight whatever the level, four under NVENC, whose AV1 frames predict from no more. NVENC keeps long-term
-frames of that buffer as anchors where the device offers them (H.264 one, since its fallback takes the first alone,
-H.265 two), so a loss older than every recent frame, or than a buffer a resize left small (the driver lowers the
-buffer in place but never raises it), is still predicted past. Where the consumer says which frames every client
-holds or was sent (`acknowledge_references`, `acknowledge_reference`, `ReferenceWindow::acknowledge`), H.264 and AV1
-keep two as well, and several clients share one session with each recovering on its own: the newest anchor all of
-them hold is pinned while the schedule marks the other; an anchor within an anchor period of the newest frame all of
-them were sent first forgets the frames after it, so it predicts from that one (`settle`), and carries
-`FRAME_ANCHOR` in its kind; a frame predicting from an anchor names it (NVENC's H.264 fallback takes the first
-otherwise); and in H.264 the frame at the `frame_num` wrap is an anchor reaching back however far, and the frame after
-a key frame takes the second long-term index: NVENC leaves the frames it forgot out of the buffer it counts, so a
-frame marked into an empty index later would take the decoder past `max_num_ref_frames`. A session that does not
+frames of that buffer as anchors where the device offers them (H.264 and AV1 one, H.265 two), so a loss older than
+every recent frame, or than a buffer a resize left small (the driver lowers the buffer in place but never raises it),
+is still predicted past. H.264 keeps one in every case: NVENC's H.264 fallback takes the first alone, and OpenH264's
+decoder, Firefox's for WebRTC H.264 where no FFmpeg decodes it, finds a CABAC stream's long-term picture by a number
+no marking sets, so it reaches the first index alone and decodes a frame naming a second against another picture
+without an error. Where the consumer says which frames every client holds or was sent (`acknowledge_references`,
+`acknowledge_reference`, `ReferenceWindow::acknowledge`), AV1 keeps two as well, and several clients share one session
+with each recovering on its own: of two anchors, the newest all of them hold is pinned while the schedule marks the
+other; an anchor within an anchor period of the newest frame all of them were sent first forgets the frames after it,
+so it predicts from that one (`settle`), and carries `FRAME_ANCHOR` in its kind; a frame predicting from an anchor
+names it (NVENC's H.264 fallback takes the first otherwise); and in H.264 the frame at the `frame_num` wrap is an
+anchor reaching back however far. A session that does not
 (x265, kvazaar, SVT-AV1 at a constant quantizer or before 4.2, Tegra's H.264 and AV1, a stateful V4L2 device)
 refuses, and the caller forces an IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
 since FFmpeg's decoder, which Chromium, Firefox, and WebKit decode with on Linux, derives the picture order past that gap a wrap short and drops about a `frame_num` range of pictures after it; libx264's sixteen values go out a byte wider (`encoders::sps::WideFrameNum`), so that frame comes once in 4096. Every full-frame session is chosen by one ladder,

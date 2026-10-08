@@ -358,9 +358,10 @@ pub struct RustCaptureSettings {
     /// When true, encoders emit the raw payload without the per-stripe header byte block;
     /// stripe metadata is then carried only on the frame attributes.
     pub omit_stripe_headers: bool,
-    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`), so a
-    /// session keeps two long-term references wherever it keeps one, the newest every client
-    /// holds pinned beside the one the schedule marks.
+    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`), so an
+    /// anchor predicts from a frame every client was sent, and where a session keeps two
+    /// long-term references (H.265, and AV1, which keeps one otherwise) the newest every client
+    /// holds stays pinned beside the one the schedule marks. H.264 keeps one.
     pub acknowledge_references: bool,
     pub video_cbr_mode: bool,
     pub video_bitrate_kbps: i32,
@@ -7593,9 +7594,11 @@ struct CaptureSettings {
     /// each frame is one Annex-B access unit and its metadata is on the `StripeFrame` attributes.
     #[pyo3(get, set)]
     omit_stripe_headers: bool,
-    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`): NVENC
-    /// keeps two long-term references where it keeps one otherwise, so each client recovers on
-    /// its own from a loss of any depth.
+    /// The consumer acknowledges the frames every client holds (`acknowledge_reference`): an
+    /// NVENC anchor predicts from a frame every client was sent, and where the session keeps two
+    /// long-term references (H.265, and AV1, which keeps one otherwise) the newest every client
+    /// holds stays pinned, so each client recovers on its own from a loss of any depth. H.264
+    /// keeps one.
     #[pyo3(get, set)]
     acknowledge_references: bool,
     #[pyo3(get, set)]

@@ -725,10 +725,14 @@ fn window_frames(codec: Codec, dpb: u32, anchored: bool) -> u32 {
 
 /// Persistent anchors only where the negotiated API exposes them, the device can invalidate
 /// references and the DPB leaves two recent pictures beside them. AV1 gained the LTR fields in
-/// SDK 13; drivers negotiated down to an older API keep the unanchored path. H.264 and AV1 keep
-/// one, a frame every forty-eight, unless the consumer `acknowledged` what its clients hold and
-/// the device has room for two: then the newest every client holds is pinned beside the one the
-/// schedule marks.
+/// SDK 13; drivers negotiated down to an older API keep the unanchored path. AV1 keeps one, a
+/// frame every forty-eight, unless the consumer `acknowledged` what its clients hold and the
+/// device has room for two: then the newest every client holds is pinned beside the one the
+/// schedule marks. H.264 keeps one whatever the consumer says: OpenH264's decoder, Firefox's for
+/// WebRTC H.264 where it has no FFmpeg that decodes it, finds a long-term picture of a CABAC
+/// stream by a number no marking sets, so of two it reaches only the first, and decodes a frame
+/// naming the second against another picture without an error; and a key frame marked
+/// long-term leaves a second index past `MaxLongTermFrameIdx` besides.
 fn anchor_count(
     codec: Codec,
     api_major: u32,
@@ -742,7 +746,7 @@ fn anchor_count(
     let count = match codec {
         Codec::Av1 if api_major < 13 => 0,
         Codec::H265 => ANCHORS,
-        _ if acknowledged && fits(ANCHORS) => ANCHORS,
+        Codec::Av1 if acknowledged && fits(ANCHORS) => ANCHORS,
         _ => 1,
     };
     if fits(count) { count } else { 0 }
@@ -3833,13 +3837,10 @@ impl NvencEncoder {
         };
         let mut wire_type = frame_type;
         if let Some(references) = &mut self.references {
+            let shared = references.acknowledging() && references.predicts_from_shared();
             self.last_reference =
                 references.record_marked(frame_number as u16, frame_type != FRAME_DELTA, anchor);
-            if anchor.is_some()
-                && frame_type == FRAME_DELTA
-                && references.acknowledging()
-                && references.is_shared_reference(self.last_reference)
-            {
+            if anchor.is_some() && frame_type == FRAME_DELTA && shared {
                 wire_type |= FRAME_ANCHOR;
             }
         }
@@ -4767,15 +4768,13 @@ mod tests {
             ANCHORS
         );
         for api in [11, 12, 13] {
-            assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 4, false), 1);
-            assert_eq!(
-                anchor_count(Codec::H264, api, true, Some(8), 4, true),
-                ANCHORS
-            );
-            // No room for two: the one an unacknowledged session keeps.
-            assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 3, true), 1);
-            assert_eq!(anchor_count(Codec::H264, api, true, Some(1), 4, true), 1);
+            for acked in [false, true] {
+                assert_eq!(anchor_count(Codec::H264, api, true, Some(8), 4, acked), 1);
+            }
         }
+        // No room for two: the one an unacknowledged session keeps.
+        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(8), 3, true), 1);
+        assert_eq!(anchor_count(Codec::Av1, 13, true, Some(1), 4, true), 1);
     }
 
     /// AV1's persistent reference must be enabled in its own codec arm; merely keeping an
@@ -5648,12 +5647,13 @@ mod gpu_tests {
     }
 
     /// Two consumers share a session told which frames both hold: one takes every frame, the other
-    /// misses stretches, first everything but the anchors, then everything, and once it has room
-    /// reports the frame its missing run starts with. The newest anchor both hold stays pinned
-    /// while the schedule marks the other; an anchor an anchor period past a frame both hold
-    /// predicts from it and is flagged so, one further on from the frame before; the one behind
-    /// decodes each frame it is sent as the other does, the first after its report predicting
-    /// from the anchor it holds; and no frame after the first is a key frame. Ignored by default.
+    /// misses stretches, everything but the anchors and, where there are two, then everything,
+    /// and once it has room reports the frame its missing run starts with. Of two anchors, the
+    /// newest both hold stays pinned while the schedule marks the other; an anchor an anchor
+    /// period past a frame both hold predicts from it and is flagged so, one further on from the
+    /// frame before; the one behind decodes each frame it is sent as the other does, the first
+    /// after its report predicting from the anchor it holds; and no frame after the first is a
+    /// key frame. H.264 keeps one anchor, a frame every forty-eight. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_acknowledged_anchors_carry_a_consumer_left_behind() {
@@ -5662,8 +5662,9 @@ mod gpu_tests {
         use crate::webcam::decode::{Decoder as _, VideoDecoder};
         let (w, h) = (1280usize, 720usize);
         // (frames it has no room for, anchors too, the frame its report goes ahead of, the anchor
-        // the frame after the report predicts from)
-        let stretches = [(13..=40, false, 42, 36u16), (61..=100, true, 102, 60)];
+        // the frame after the report predicts from), for two anchors and for one
+        let pinned = [(13..=40, false, 42, 36u16), (61..=100, true, 102, 60)];
+        let alone = [(49..=90, false, 92, 48u16), (97..=150, false, 152, 144)];
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;
@@ -5679,10 +5680,14 @@ mod gpu_tests {
                 .references
                 .as_ref()
                 .map_or(0, ReferenceWindow::anchor_count);
-            if anchors < ANCHORS {
-                println!("{codec:?}: this device or API keeps {anchors} long-term references");
-                continue;
-            }
+            let (stretches, period, last) = match anchors {
+                ANCHORS => (&pinned, 12, 120),
+                1 => (&alone, 48, 160),
+                _ => {
+                    println!("{codec:?}: this device or API keeps no long-term reference");
+                    continue;
+                }
+            };
             let (mut whole, mut part) = (
                 VideoDecoder::new(codec).unwrap(),
                 VideoDecoder::new(codec).unwrap(),
@@ -5690,7 +5695,7 @@ mod gpu_tests {
             let mut holds = Vec::new();
             let mut run = None;
             let (mut worst, mut sizes) = (0f64, (0usize, 0usize, 0usize, 0usize));
-            for i in 0..=120usize {
+            for i in 0..=last {
                 let stretch = stretches.iter().find(|t| t.0.contains(&i));
                 if let Some(&(_, _, _, from)) = stretches.iter().find(|t| t.2 == i) {
                     let first = run.take().expect("a missing run");
@@ -5726,11 +5731,9 @@ mod gpu_tests {
                         "{codec:?}: anchor {i} predicts from {reference:?}, held by one"
                     );
                 }
-                // H.264 marks its second anchor at the frame after the key frame.
-                let scheduled = i % 12 == 0 || (codec == Codec::H264 && i == 1);
                 assert_eq!(
                     anchor,
-                    i > 0 && scheduled && can,
+                    i > 0 && i % period == 0 && can,
                     "{codec:?}: frame {i} predicting from {reference:?}"
                 );
                 let sent = can && stretch.is_none_or(|t| anchor && !t.1);
@@ -5741,13 +5744,9 @@ mod gpu_tests {
                         part.decode(bits).unwrap_or(false),
                         "{codec:?}: frame {i} sent"
                     );
-                    // OpenH264, the H.264 decoder here, takes the wrong picture for a long-term
-                    // reference named after a frame_num gap, where FFmpeg decodes it exactly.
-                    if codec != Codec::H264 {
-                        let off = luma_apart(&whole.frame().unwrap(), &part.frame().unwrap());
-                        assert!(off < 0.5, "{codec:?}: frame {i} sent is {off:.3} off");
-                        worst = worst.max(off);
-                    }
+                    let off = luma_apart(&whole.frame().unwrap(), &part.frame().unwrap());
+                    assert!(off < 0.5, "{codec:?}: frame {i} sent is {off:.3} off");
+                    worst = worst.max(off);
                     run = None;
                     enc.acknowledge_reference(i as u16, true);
                 } else if can {
