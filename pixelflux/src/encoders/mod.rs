@@ -1147,6 +1147,24 @@ impl FrameEncoder {
         }
     }
 
+    /// Hash the next host frame's bands of `rows` rows where the encoder holds it, beside its
+    /// encode (NVENC: `NvencEncoder::hash_next_upload`); false where it cannot, which leaves the
+    /// hash to the caller.
+    pub fn hash_next_upload(&mut self, rows: u32) -> bool {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.hash_next_upload(rows),
+            _ => false,
+        }
+    }
+
+    /// The band hashes `hash_next_upload` asked for, once the frame is coded.
+    pub fn take_upload_hashes(&mut self) -> Option<Vec<u64>> {
+        match self {
+            FrameEncoder::Nvenc(enc) => enc.take_upload_hashes(),
+            _ => None,
+        }
+    }
+
     /// The quality index (the H.26x quantizer scale `video_crf` uses) the last frame was coded at,
     /// where the session reports its quantizer: what a constant-rate session's picture is worth
     /// against the paint-over quality.

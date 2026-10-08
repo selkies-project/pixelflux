@@ -1000,6 +1000,25 @@ fn hash_bands(
         .collect()
 }
 
+/// The bands that changed by hashes taken where the frame was uploaded (`hash_next_upload`),
+/// read through each band's state as the CPU's own hashes are (`StripeState::hash_dirty`).
+fn hashed_bands(
+    bands: &mut Vec<StripeState>,
+    hashes: &[u64],
+    threshold: u32,
+    duration: i32,
+) -> Vec<bool> {
+    if bands.len() != hashes.len() {
+        bands.clear();
+        bands.resize_with(hashes.len(), StripeState::default);
+    }
+    bands
+        .iter_mut()
+        .zip(hashes)
+        .map(|(band, &hash)| band.hash_dirty(hash, threshold, duration))
+        .collect()
+}
+
 /// The damage a band hash (`hash_bands`) reads: the fraction of the bands that changed. No bands
 /// read yet, before a capture's first hash, is all new.
 fn band_damage(dirty: &[bool]) -> Damage {
@@ -1455,6 +1474,11 @@ impl X11Pipeline {
                 let force_idr = d.force_idr;
                 let enc = self.hw.as_mut().unwrap();
                 d.prepare(enc);
+                // A Turbo paint-over reads the bands the frame before changed: hashed on the
+                // device where NVENC uploads the frame, beside its encode, else on a thread
+                // beside it (`hash_beside`).
+                let beside = hashed.is_none() && turbo && self.settings.use_paint_over_quality;
+                let on_device = beside && d.send && enc.hash_next_upload(DAMAGE_BAND_ROWS as u32);
                 let mut encode = || {
                     if d.send {
                         enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr)
@@ -1465,7 +1489,21 @@ impl X11Pipeline {
                 let res = if let Some(dirty) = hashed {
                     self.turbo_dirty = dirty;
                     encode()
-                } else if turbo && self.settings.use_paint_over_quality {
+                } else if on_device {
+                    let res = encode();
+                    self.turbo_dirty = match enc.take_upload_hashes() {
+                        Some(hashes) => hashed_bands(&mut self.bands, &hashes, threshold, duration),
+                        None => hash_bands(
+                            &mut self.bands,
+                            argb,
+                            stride,
+                            height as usize,
+                            threshold,
+                            duration,
+                        ),
+                    };
+                    res
+                } else if beside {
                     let (res, dirty) = hash_beside(
                         &mut self.bands,
                         argb,

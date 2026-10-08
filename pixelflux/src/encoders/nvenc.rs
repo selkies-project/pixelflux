@@ -1521,6 +1521,21 @@ impl BandHash {
         height: u32,
         rows: u32,
     ) -> Option<Vec<u64>> {
+        let words = self.launch(cuda, src, pitch, width, height, rows)?;
+        self.read(cuda, words)
+    }
+
+    /// The kernel alone, queued on the default stream behind whatever produced the frame: the
+    /// words `read` copies back, or None where it did not launch.
+    unsafe fn launch(
+        &mut self,
+        cuda: &CudaFunctions,
+        src: CUdeviceptr,
+        pitch: usize,
+        width: u32,
+        height: u32,
+        rows: u32,
+    ) -> Option<usize> {
         let bands = height.div_ceil(rows.max(1)) as usize;
         let words = bands * HASH_SEGMENTS as usize;
         if words > self.capacity {
@@ -1544,7 +1559,6 @@ impl BandHash {
             &mut r as *mut _ as *mut c_void,
             &mut out as *mut _ as *mut c_void,
         ];
-        let mut sums = vec![0u64; words];
         ((cuda.cuLaunchKernel)(
             self.kernel,
             bands as u32,
@@ -1557,9 +1571,15 @@ impl BandHash {
             ptr::null_mut(),
             params.as_mut_ptr(),
             ptr::null_mut(),
-        ) == CUresult::CUDA_SUCCESS
-            && (cuda.cuMemcpyDtoH_v2)(sums.as_mut_ptr() as *mut c_void, self.sums, words * 8)
-                == CUresult::CUDA_SUCCESS)
+        ) == CUresult::CUDA_SUCCESS)
+            .then_some(words)
+    }
+
+    /// The hashes a `launch` of `words` left, a word a band: the copy back waits for the kernel.
+    unsafe fn read(&mut self, cuda: &CudaFunctions, words: usize) -> Option<Vec<u64>> {
+        let mut sums = vec![0u64; words];
+        ((cuda.cuMemcpyDtoH_v2)(sums.as_mut_ptr() as *mut c_void, self.sums, words * 8)
+            == CUresult::CUDA_SUCCESS)
             .then(|| {
                 sums.chunks(HASH_SEGMENTS as usize)
                     .map(|band| band.iter().fold(0u64, |a, &b| a.wrapping_add(b)))
@@ -1672,6 +1692,12 @@ pub struct NvencEncoder {
     /// The band hash (`band_hashes`), loaded by the first frame that asks for one; `Some(None)`
     /// where the driver refused it.
     band_hash: Option<Option<BandHash>>,
+    /// The bands of rows the next host upload is hashed in on the device (`hash_next_upload`),
+    /// the words that hash left for the frame being coded, and its hashes once read back
+    /// (`take_upload_hashes`).
+    upload_hash: Option<u32>,
+    upload_words: Option<usize>,
+    upload_hashes: Option<Vec<u64>>,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -2686,6 +2712,9 @@ impl NvencEncoder {
                 last_reference: Reference::Untracked,
                 blit_semaphore: ptr::null_mut(),
                 band_hash: None,
+                upload_hash: None,
+                upload_words: None,
+                upload_hashes: None,
             })
         }
     }
@@ -3750,6 +3779,22 @@ impl NvencEncoder {
         if res != NVENCSTATUS::NV_ENC_SUCCESS {
             return Err(format!("Encode Picture failed: {:?}", res));
         }
+        // A host upload's band hash asked for (`hash_next_upload`), queued once its encode is, so
+        // it runs on the CUDA cores beside the encode engine and holds nothing up.
+        if let Some(rows) = self.upload_hash.take() {
+            let (src, pitch, width, height) = (
+                self.input_device_ptr,
+                self.input_pitch,
+                self.width,
+                self.height,
+            );
+            let cuda = &self.cuda;
+            self.upload_words = self
+                .band_hash
+                .get_or_insert_with(|| BandHash::new(cuda))
+                .as_mut()
+                .and_then(|h| h.launch(cuda, src, pitch, width, height, rows));
+        }
 
         let mut negotiated = Negotiated::new(NV_ENC_LOCK_BITSTREAM {
             version: sv(NvStruct::LockBitstream),
@@ -4347,6 +4392,12 @@ impl NvencEncoder {
             if result.is_err() {
                 (self.cuda.cuStreamSynchronize)(ptr::null_mut());
             }
+            self.upload_hash = None;
+            if let Some(words) = self.upload_words.take()
+                && let Some(Some(hash)) = self.band_hash.as_mut()
+            {
+                self.upload_hashes = hash.read(&self.cuda, words);
+            }
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
@@ -4579,6 +4630,32 @@ impl NvencEncoder {
             (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
             result
         }
+    }
+
+    /// Hash the next host frame's bands of `rows` rows on the device as it encodes, for
+    /// `take_upload_hashes` to read after: the change detection a Turbo frame's paint-over
+    /// reads, for the cost of a kernel beside the encode instead of a CPU pass over the frame.
+    /// False where the driver refuses the kernel, which leaves the hash to the caller.
+    pub fn hash_next_upload(&mut self, rows: u32) -> bool {
+        self.upload_hashes = None;
+        self.upload_words = None;
+        let available = unsafe {
+            let _ = (self.cuda.cuCtxPushCurrent_v2)(self.cuda_context);
+            let cuda = &self.cuda;
+            let loaded = self
+                .band_hash
+                .get_or_insert_with(|| BandHash::new(cuda))
+                .is_some();
+            (self.cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+            loaded
+        };
+        self.upload_hash = available.then_some(rows);
+        available
+    }
+
+    /// The band hashes of the host frame last coded where `hash_next_upload` asked for them.
+    pub fn take_upload_hashes(&mut self) -> Option<Vec<u64>> {
+        self.upload_hashes.take()
     }
 
     /// The hash of each band of `rows` rows of the `width`x`height` packed frame at
@@ -7666,6 +7743,57 @@ mod gpu_tests {
             (cu.cuMemFree_v2)(external);
             (cu.cuCtxPopCurrent_v2)(ptr::null_mut());
         }
+    }
+
+    /// On a real GPU: a host frame asked to be hashed is hashed where it was uploaded, beside its
+    /// encode, its band hashes taken with the frame: one a band, the same for the same picture,
+    /// different only in the band a caret changed, and none for a frame that did not ask; and
+    /// what that costs the encode. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_an_uploaded_frame_is_hashed_beside_its_encode() {
+        let (w, h, rows) = (1920usize, 1080usize, 32u32);
+        let mut enc = host_session(&settings(w as i32, h as i32, 60.0)).expect("NVENC init");
+        let mut picture = frame(w, h, 3);
+        let encode = |enc: &mut NvencEncoder, picture: &[u8], n: u64, hash: bool| {
+            if hash {
+                assert!(enc.hash_next_upload(rows), "the driver takes the band hash");
+            }
+            let out = enc.encode_cpu_packed(picture, w * 4, false, n, 23, n == 0);
+            assert!(out.is_ok_and(|o| !o.is_empty()), "frame {n} encodes");
+            enc.take_upload_hashes()
+        };
+        let first = encode(&mut enc, &picture, 0, true).expect("hashes come with the frame");
+        assert_eq!(first.len(), h.div_ceil(rows as usize));
+        assert_eq!(
+            encode(&mut enc, &picture, 1, true),
+            Some(first.clone()),
+            "one picture, one hash"
+        );
+        assert_eq!(encode(&mut enc, &picture, 2, false), None, "none unasked");
+        for y in 200..220 {
+            for x in 300..302 {
+                picture[(y * w + x) * 4..][..3].copy_from_slice(&[0, 0, 0]);
+            }
+        }
+        let caret = encode(&mut enc, &picture, 3, true).unwrap();
+        let changed: Vec<usize> = (0..first.len()).filter(|&i| first[i] != caret[i]).collect();
+        assert_eq!(changed, vec![200 / rows as usize], "a 2x20 caret");
+
+        let mut timed = |hash: bool, from: u64| {
+            let t = std::time::Instant::now();
+            for n in from..from + 120 {
+                picture[(n as usize % h) * w * 4] ^= 0xff;
+                encode(&mut enc, &picture, n, hash);
+            }
+            t.elapsed().as_secs_f64() * 1e3 / 120.0
+        };
+        let (plain, hashed) = (timed(false, 4), timed(true, 124));
+        let (plain2, hashed2) = (timed(false, 244), timed(true, 364));
+        eprintln!(
+            "1080p host encode: {:.3} / {:.3} ms plain, {:.3} / {:.3} ms with the device hash",
+            plain, plain2, hashed, hashed2
+        );
     }
 
     /// On a real GPU: the band hash reads a caret as the one band it is in and two pixels

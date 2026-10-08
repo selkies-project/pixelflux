@@ -1156,12 +1156,22 @@ impl StripeState {
     ///
     /// Returns `true` whenever the stripe is considered dirty (always true while inside a block).
     pub fn content_dirty(&mut self, bytes: &[u8], threshold: u32, duration: i32) -> bool {
+        self.dirty_by(|| fast_hash(bytes), threshold, duration)
+    }
+
+    /// `content_dirty` for a stripe hashed elsewhere (on the GPU, where the frame was uploaded):
+    /// the same state, read off `hash`.
+    pub fn hash_dirty(&mut self, hash: u64, threshold: u32, duration: i32) -> bool {
+        self.dirty_by(|| hash, threshold, duration)
+    }
+
+    fn dirty_by(&mut self, fast_hash: impl FnOnce() -> u64, threshold: u32, duration: i32) -> bool {
         if self.in_damage_block {
             self.damage_block_frames_remaining -= 1;
             if self.damage_block_frames_remaining == 1 {
-                self.last_hash = fast_hash(bytes);
+                self.last_hash = fast_hash();
             } else if self.damage_block_frames_remaining <= 0 {
-                let h = fast_hash(bytes);
+                let h = fast_hash();
                 if h != self.last_hash {
                     self.damage_block_frames_remaining = duration;
                 } else {
@@ -1172,7 +1182,7 @@ impl StripeState {
             }
             return true;
         }
-        let h = fast_hash(bytes);
+        let h = fast_hash();
         let changed = h != self.last_hash;
         self.last_hash = h;
         if changed {
@@ -2403,6 +2413,24 @@ mod tests {
             2,
             "frame number"
         );
+    }
+
+    /// A stripe hashed elsewhere reads as one hashed here: the same changes, damage blocks and
+    /// their renewal for the same sequence of hashes, whatever produced them.
+    #[test]
+    fn hash_dirty_reads_as_content_dirty() {
+        let frames: Vec<Vec<u8>> = [1u8, 1, 2, 1, 1, 1, 1, 1, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7]
+            .iter()
+            .map(|&v| vec![v; 256])
+            .collect();
+        let (mut here, mut there) = (StripeState::default(), StripeState::default());
+        for frame in &frames {
+            assert_eq!(
+                here.content_dirty(frame, 2, 3),
+                there.hash_dirty(super::fast_hash(frame), 2, 3)
+            );
+            assert_eq!(here.in_damage_block, there.in_damage_block);
+        }
     }
 
     /// With `threshold = 2` and `duration = 3`, a first change reads dirty and two consecutive

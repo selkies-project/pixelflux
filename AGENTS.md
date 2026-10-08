@@ -291,7 +291,9 @@ only that a frame is new; how much of it changed comes from a hash of its bands 
 (`band_hash`, in the convert's module, read back as one word a band), the XShm path's band damage
 computed where the frame lies, so a caret reads as the small change it is and directly rendered GL,
 which the X server's DAMAGE may never report, as motion. Under Turbo the cleanup reads the frame
-before's, hashed after its delivery, as the XShm path's reads the hash run beside the encode. The NvFBC
+before's, hashed after its delivery, as the XShm path's reads the hash run beside the encode: on the
+device where NVENC uploads the frame (`hash_next_upload`, the same kernel), else on a thread beside
+it (`hash_beside`). The NvFBC
 structures are hand-written FFI checked against the SDK by the layout and version assertions
 in that module, and `libnvidia-fbc.so.1` is
 loaded at run time like NVENC's library. The hardware checks are `#[ignore]`d
