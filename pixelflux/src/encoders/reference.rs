@@ -709,6 +709,9 @@ pub struct ReferenceSlots {
     next_pts: u64,
     age: KeyAge,
     key_pts: u64,
+    acknowledged: bool,
+    common: VecDeque<u64>,
+    sent: VecDeque<u64>,
 }
 
 /// How many recent frames are remembered by id, about eight seconds at 60 frames a second: a
@@ -779,12 +782,107 @@ impl ReferenceSlots {
             next_pts: 0,
             age: KeyAge::default(),
             key_pts: 0,
+            acknowledged: false,
+            common: VecDeque::new(),
+            sent: VecDeque::new(),
         }
     }
 
     /// The timestamp the next frame is encoded with.
     pub fn next_pts(&self) -> u64 {
         self.next_pts
+    }
+
+    /// Note that every consumer holds `frame_id`, or where not `held` was sent it, as
+    /// `ReferenceWindow::acknowledge` does: the anchor buffer holding the newest frame they all
+    /// hold is then pinned, and one they were all sent is kept until they hold it
+    /// (`PENDING_PERIODS`). False for a frame not remembered or from before the key frame.
+    pub fn acknowledge(&mut self, frame_id: u16, held: bool) -> bool {
+        self.acknowledged = true;
+        let Some(&(_, pts)) = self.recent.iter().rev().find(|f| f.0 == frame_id) else {
+            return false;
+        };
+        if pts < self.key_pts {
+            return false;
+        }
+        let noted = if held {
+            &mut self.common
+        } else {
+            &mut self.sent
+        };
+        if let Err(at) = noted.binary_search(&pts) {
+            noted.insert(at, pts);
+        }
+        while noted.len() > RECENT_FRAMES {
+            noted.pop_front();
+        }
+        true
+    }
+
+    fn is_common(&self, pts: u64) -> bool {
+        pts == self.key_pts || self.common.binary_search(&pts).is_ok()
+    }
+
+    fn is_shared(&self, pts: u64) -> bool {
+        self.is_common(pts) || self.sent.binary_search(&pts).is_ok()
+    }
+
+    /// The buffers holding anchors: VP8's GOLDEN and ALTREF, VP9's last `RING`.
+    fn anchor_slots(&self) -> std::ops::Range<usize> {
+        if self.count > 3 {
+            RING as usize..self.count
+        } else {
+            1..3
+        }
+    }
+
+    /// How many frames apart an acknowledged session's schedule marks an anchor.
+    fn anchor_every(&self) -> u64 {
+        if self.count > 3 {
+            RING
+        } else {
+            ANCHOR_PERIOD / 2
+        }
+    }
+
+    /// The anchor buffer an acknowledged session refreshes next, if any: an empty or lost one
+    /// first, then the oldest, never the one holding the newest frame every consumer holds, nor
+    /// one holding a frame they were all sent and do not hold yet, marked within
+    /// `PENDING_PERIODS` anchor periods.
+    fn anchor_target(&self) -> Option<usize> {
+        let pinned = self
+            .anchor_slots()
+            .filter_map(|i| {
+                self.slots[i]
+                    .filter(|f| !f.2 && self.is_common(f.1))
+                    .map(|f| (i, f.1))
+            })
+            .max_by_key(|&(_, pts)| pts)
+            .map(|(i, _)| i);
+        self.anchor_slots()
+            .filter(|&i| Some(i) != pinned)
+            .filter(|&i| {
+                !self.slots[i].is_some_and(|(_, pts, lost)| {
+                    !lost
+                        && self.is_shared(pts)
+                        && !self.is_common(pts)
+                        && self.next_pts - pts < PENDING_PERIODS * self.anchor_every()
+                })
+            })
+            .min_by_key(|&i| self.slots[i].map_or((0, 0), |(_, pts, lost)| (u8::from(!lost), pts)))
+    }
+
+    /// Whether a frame coded under `plan` is an anchor on the schedule predicting from a buffer
+    /// holding a frame every consumer was sent, so each can decode it (`FRAME_ANCHOR`). One
+    /// predicting past a loss is not flagged: a consumer it reaches takes it as the end of its
+    /// run, while a flagged one would wait for room behind the consumer's queue.
+    pub fn shared_anchor(&self, plan: SlotPlan) -> bool {
+        plan.predict_from != 0
+            && (self.next_pts - self.key_pts).is_multiple_of(self.anchor_every())
+            && self.anchor_slots().any(|i| plan.refresh.refreshes(1 << i))
+            && self
+                .slot(plan.predict_from)
+                .is_some_and(|(_, pts, lost)| !lost && self.is_shared(pts))
     }
 
     /// Whether a frame not coded as a key frame has a buffer left to predict from.
@@ -818,6 +916,22 @@ impl ReferenceSlots {
         }
         let predict_from = 1 << newest;
         let since_key = self.next_pts - self.key_pts;
+        if self.acknowledged {
+            // A frame predicting past a loss from an anchor, the newest picture every consumer
+            // can be given, is an anchor too, as on the schedule.
+            let recent = if self.count > 3 {
+                1 << (since_key % RING)
+            } else {
+                SlotRefresh::LAST
+            };
+            let anchor = since_key.is_multiple_of(self.anchor_every())
+                || self.anchor_slots().contains(&newest);
+            let target = if anchor { self.anchor_target() } else { None };
+            return SlotPlan {
+                predict_from,
+                refresh: SlotRefresh(recent | target.map_or(0, |i| 1 << i)),
+            };
+        }
         let refresh = if self.count > 3 {
             1 << (since_key % RING)
                 | if since_key.is_multiple_of(RING) {
@@ -854,6 +968,8 @@ impl ReferenceSlots {
         let reference = match plan.predict_from {
             0 => {
                 self.key_pts = pts;
+                self.common.clear();
+                self.sent.clear();
                 Reference::None
             }
             from => self.slots[from.trailing_zeros() as usize]
@@ -1178,6 +1294,44 @@ mod tests {
         assert_eq!(plan.predict_from, 1 << 6);
         assert_eq!(s.record(20, plan), Reference::Frame(8));
         assert_eq!(s.record(21, s.plan(false)), Reference::Frame(20));
+    }
+
+    #[test]
+    fn acknowledged_slots_keep_an_anchor_until_every_consumer_holds_it() {
+        // VP8, every consumer sent each frame and holding the key frame alone: GOLDEN takes 12 and
+        // keeps it, ALTREF keeping the key frame they hold, until 12 is four anchor periods old.
+        let mut w = ReferenceSlots::new();
+        w.record(0, w.plan(true));
+        assert!(w.acknowledge(0, true));
+        let mut marks = Vec::new();
+        for id in 1..=72u16 {
+            let plan = w.plan(false);
+            if plan.refresh.0 & (SlotRefresh::GOLDEN | SlotRefresh::ALTREF) != 0 {
+                marks.push((id, plan.refresh.0, w.shared_anchor(plan)));
+            }
+            w.record(id, plan);
+            assert!(w.acknowledge(id, false));
+        }
+        let golden = SlotRefresh::LAST | SlotRefresh::GOLDEN;
+        assert_eq!(marks, [(12, golden, true), (60, golden, true)]);
+        // Once they hold 60 it is pinned, and the schedule takes ALTREF.
+        assert!(w.acknowledge(60, true));
+        let plan = w.plan(false);
+        assert_eq!(plan.refresh.0, SlotRefresh::LAST);
+        for id in 73..=84u16 {
+            let plan = w.plan(false);
+            if id == 84 {
+                assert_eq!(plan.refresh.0, SlotRefresh::LAST | SlotRefresh::ALTREF);
+            }
+            w.record(id, plan);
+        }
+        // A frame predicting past a loss from an anchor is an anchor too, unflagged off the
+        // schedule.
+        w.invalidate(80);
+        let plan = w.plan(false);
+        assert_eq!(plan.predict_from, SlotRefresh::GOLDEN);
+        assert_eq!(plan.refresh.0, SlotRefresh::LAST | SlotRefresh::ALTREF);
+        assert!(!w.shared_anchor(plan));
     }
 
     /// A loss up to twelve frames deep, at any point of the schedule, still finds a buffer

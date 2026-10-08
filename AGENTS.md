@@ -102,7 +102,11 @@ eight anchor periods); an anchor within an anchor period of the newest frame all
 frames after it, so it predicts from that one (`settle`), and carries `FRAME_ANCHOR` in its kind; a frame predicting from an anchor
 names it (NVENC's H.264 fallback takes the first otherwise); an AV1 anchor slot holding no frame, or a lost one,
 counts among the recent frames, as NVENC lends it to them (`lend_free_anchors`), so the window names the frame the
-device predicts from; and in H.264 the frame at the `frame_num` wrap is an anchor reaching back however far. A session that does not
+device predicts from; and in H.264 the frame at the `frame_num` wrap is an anchor reaching back however far. libvpx and
+SVT-AV1 keep their anchor buffers alike once told (`ReferenceSlots::acknowledge`): the one holding the newest frame all
+of them hold is pinned, one they were all sent is kept until they hold it, a frame predicting past a loss from an
+anchor refreshes another, and an anchor on the schedule predicting from a frame all of them were sent carries
+`FRAME_ANCHOR`. A session that does not
 (x265, kvazaar, SVT-AV1 at a constant quantizer or before 4.2, Tegra's H.264 and AV1, a stateful V4L2 device)
 refuses, and the caller forces an IDR instead; an H.264 session answers a loss covering the frame at its `frame_num` wrap with a key frame itself,
 since FFmpeg's decoder, which Chromium, Firefox, and WebKit decode with on Linux, derives the picture order past that gap a wrap short and drops about a `frame_num` range of pictures after it; libx264's sixteen values go out a byte wider (`encoders::sps::WideFrameNum`), so that frame comes once in 4096. Every full-frame session is chosen by one ladder,

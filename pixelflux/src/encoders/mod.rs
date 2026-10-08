@@ -1387,6 +1387,22 @@ impl FrameEncoder {
     pub fn take_report(&mut self, report: reference::ReferenceReport) -> bool {
         match (self, report) {
             (FrameEncoder::Nvenc(enc), report) => enc.take_report(report),
+            (FrameEncoder::Vpx(enc), reference::ReferenceReport::Held(id)) => {
+                enc.acknowledge_reference(id, true);
+                true
+            }
+            (FrameEncoder::Vpx(enc), reference::ReferenceReport::Sent(id)) => {
+                enc.acknowledge_reference(id, false);
+                true
+            }
+            (FrameEncoder::Av1(enc), reference::ReferenceReport::Held(id)) => {
+                enc.acknowledge_reference(id, true);
+                true
+            }
+            (FrameEncoder::Av1(enc), reference::ReferenceReport::Sent(id)) => {
+                enc.acknowledge_reference(id, false);
+                true
+            }
             (enc, reference::ReferenceReport::Lost(frame_id)) => enc.invalidate_reference(frame_id),
             _ => true,
         }

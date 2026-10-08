@@ -28,8 +28,8 @@ use std::ptr;
 use codec_sys::vpx::*;
 
 use super::codec::{
-    Codec, VIDEO_HEADER_LEN, frame_type_from_key, push_video_header, vp8_is_key, vp9_is_key,
-    vpx_level,
+    Codec, FRAME_ANCHOR, VIDEO_HEADER_LEN, frame_type_from_key, push_video_header, vp8_is_key,
+    vp9_is_key, vpx_level,
 };
 use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{Pending, Planes, Quality, RateSettings, encode_threads};
@@ -397,6 +397,12 @@ impl VpxEncoder {
         true
     }
 
+    /// Every consumer holds frame `frame_id`, or where not `held` was sent it
+    /// (`ReferenceSlots::acknowledge`).
+    pub fn acknowledge_reference(&mut self, frame_id: u16, held: bool) {
+        self.references.acknowledge(frame_id, held);
+    }
+
     /// The quality index the rate control last coded a frame at, held frames aside.
     pub fn last_quality(&self) -> Option<u32> {
         self.last_quality
@@ -724,13 +730,18 @@ impl VpxEncoder {
             } else {
                 self.plan
             };
+            let anchor = if self.references.shared_anchor(plan) {
+                FRAME_ANCHOR
+            } else {
+                0
+            };
             self.last_reference = self.references.record(id, plan);
             if !self.omit_headers {
                 output.reserve(VIDEO_HEADER_LEN + bytes.len());
                 push_video_header(
                     &mut output,
                     self.codec,
-                    frame_type_from_key(is_key),
+                    frame_type_from_key(is_key) | anchor,
                     id,
                     0,
                     self.planes.width as u16,

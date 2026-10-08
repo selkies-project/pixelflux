@@ -24,8 +24,8 @@ use std::sync::{Condvar, Mutex};
 use codec_sys::svtav1::*;
 
 use super::codec::{
-    Codec, VIDEO_HEADER_LEN, VPX_QINDEX, av1_is_key, frame_type_from_key, push_video_header,
-    vpx_level,
+    Codec, FRAME_ANCHOR, VIDEO_HEADER_LEN, VPX_QINDEX, av1_is_key, frame_type_from_key,
+    push_video_header, vpx_level,
 };
 use super::reference::{Reference, ReferenceSlots, SlotPlan, SlotRefresh};
 use super::session::{Pending, Planes, Quality, RateSettings, encode_threads};
@@ -353,6 +353,14 @@ impl SvtAv1Encoder {
         true
     }
 
+    /// Every consumer holds frame `frame_id`, or where not `held` was sent it
+    /// (`ReferenceSlots::acknowledge`), where the session names its references.
+    pub fn acknowledge_reference(&mut self, frame_id: u16, held: bool) {
+        if let Some(references) = self.references.as_mut() {
+            references.acknowledge(frame_id, held);
+        }
+    }
+
     /// Encode the next frame at the quantizer the quality index `crf` selects, leaving the
     /// session's own quantizer for the frame after: the cleanup of a still screen, at a constant
     /// rate, where a held key picture is planned with a raised target (`holds_quantizer`). A
@@ -498,7 +506,11 @@ impl SvtAv1Encoder {
             unsafe { svt_av1_enc_release_out_buffer(&mut packet) };
             let id = self.pending.take(packet_pts).unwrap_or(frame_number as u16);
             let is_key = av1_is_key(&bytes);
+            let mut anchor = 0;
             if let Some(references) = self.references.as_mut() {
+                if !is_key && references.shared_anchor(plan) {
+                    anchor = FRAME_ANCHOR;
+                }
                 self.last_reference =
                     references.record(id, if is_key { SlotPlan::KEY } else { plan });
                 if is_key {
@@ -514,7 +526,7 @@ impl SvtAv1Encoder {
                 push_video_header(
                     &mut output,
                     Codec::Av1,
-                    frame_type_from_key(is_key),
+                    frame_type_from_key(is_key) | anchor,
                     id,
                     0,
                     self.planes.width as u16,
