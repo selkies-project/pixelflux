@@ -880,9 +880,9 @@ mod tests {
 
     /// A probe forked while other threads open and close SVT-AV1 sessions still finds the
     /// encoder. The threads beside it stop opening sessions while one is pending, as nothing
-    /// opens one beside the import-time probe: forked while they ran on between sessions, a
-    /// child ran out its minute (Tests run 37637999563), a fork inheriting locks their threads
-    /// held and no thread of its own releases.
+    /// opens one beside the import-time probe: a child forked while they run between sessions
+    /// inherits locks their threads hold and no thread of its own releases, and runs out its
+    /// minute.
     #[test]
     fn the_av1_probe_survives_sessions_opening_beside_it() {
         use std::sync::atomic::{AtomicBool, Ordering};
