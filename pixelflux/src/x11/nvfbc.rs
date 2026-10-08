@@ -1612,42 +1612,99 @@ mod gpu_tests {
         assert!(status.screenSize.w > 0 && status.screenSize.h > 0);
     }
 
-    /// Whether two captures of the same X screen can hold NvFBC sessions at once, which is what
-    /// a second Selkies display on X11 needs to be zero-copy as well. A driver that allows only
-    /// one leaves the second capture on the XShm path, which is a correct outcome but a slower
-    /// one, so the answer is worth knowing rather than assuming. Ignored by default.
+    /// The luma of the next frame `gpu` captures, waiting up to two seconds for a new one, as
+    /// encoded and decoded.
+    fn captured_luma(gpu: &mut GpuCapture, dec: &mut VideoDecoder, n: &mut u64) -> f64 {
+        let mut frame = gpu.nvfbc.grab(Duration::from_millis(200)).expect("grab");
+        for _ in 0..10 {
+            if frame.is_new {
+                break;
+            }
+            frame = gpu.nvfbc.grab(Duration::from_millis(200)).expect("grab");
+        }
+        let pitch = frame_pitch(frame.byte_size, frame.width, frame.height);
+        let pkt = gpu
+            .encoder
+            .encode_cuda_pitch(frame.device_ptr, pitch, false, *n, 25, *n == 0)
+            .expect("encode in place");
+        *n += 1;
+        decoded_mean(dec, &pkt[VIDEO_HEADER_LEN..])[0]
+    }
+
+    /// Whether two captures of the same X screen hold NvFBC sessions at once, which is what a
+    /// second Selkies display on X11 needs to be zero-copy as well: each on its own thread, as
+    /// the displays run them (a handle's contexts belong to the thread that made it, and two on
+    /// one thread capture stale frames and break each other), each shows a repaint, and the
+    /// first keeps capturing once the second closes. A driver that allows only one leaves the
+    /// second capture on the XShm path, a correct outcome but a slower one, so the answer is
+    /// worth knowing rather than assuming. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_nvfbc_two_sessions_on_one_screen() {
+        const FIRST: (u8, u8, u8) = (0x20, 0x40, 0xc0);
+        const SECOND: (u8, u8, u8) = (0xd0, 0x50, 0x18);
+        const THIRD: (u8, u8, u8) = (0x30, 0xc0, 0x30);
+        if !paint_root(FIRST) {
+            println!("no X root this host can paint (xsetroot, $DISPLAY); nothing to capture");
+            return;
+        }
         let Some(mut first) = open(&settings(crate::encoders::codec::Codec::H264)) else {
             println!("the NvFBC path declined the first capture on this host; nothing to compare");
             return;
         };
-        let second = open(&settings(crate::encoders::codec::Codec::H264));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (tell, seen) = std::sync::mpsc::channel::<Option<f64>>();
+        let second = std::thread::spawn(move || {
+            let Some(mut gpu) = open(&settings(crate::encoders::codec::Codec::H264)) else {
+                let _ = tell.send(None);
+                return;
+            };
+            let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
+            let mut n = 0;
+            let _ = tell.send(Some(captured_luma(&mut gpu, &mut dec, &mut n)));
+            while wait.recv().is_ok() {
+                let _ = tell.send(Some(captured_luma(&mut gpu, &mut dec, &mut n)));
+            }
+        });
+        let opened = seen.recv().expect("the second capture's thread").is_some();
         println!(
             "a second concurrent NvFBC capture of the same screen: {}",
-            if second.is_some() {
+            if opened {
                 "opens"
             } else {
                 "is declined, and falls back to XShm"
             }
         );
-        // The first must keep working whatever the second did.
-        let f = first
-            .nvfbc
-            .grab(Duration::from_millis(200))
-            .expect("first still captures");
-        let pitch = frame_pitch(f.byte_size, f.width, f.height);
-        first
-            .encoder
-            .encode_cuda_pitch(f.device_ptr, pitch, false, 0, 25, true)
-            .expect("first still encodes");
-        drop(second);
-        let f = first
-            .nvfbc
-            .grab(Duration::from_millis(200))
-            .expect("first survives the second");
-        assert!(f.width > 0);
+        let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
+        let mut n = 0;
+        captured_luma(&mut first, &mut dec, &mut n);
+        assert!(paint_root(SECOND));
+        let want = painted_ycbcr(SECOND)[0];
+        let got = captured_luma(&mut first, &mut dec, &mut n);
+        assert!(
+            (got - want).abs() <= 8.0,
+            "the first captured {got:.1} beside the second, painted {want:.1}"
+        );
+        if opened {
+            go.send(()).expect("the second capture's thread");
+            let got = seen
+                .recv()
+                .expect("the second capture's thread")
+                .expect("a capture");
+            assert!(
+                (got - want).abs() <= 8.0,
+                "the second captured {got:.1}, painted {want:.1}"
+            );
+        }
+        drop(go);
+        second.join().expect("the second capture's thread");
+        assert!(paint_root(THIRD));
+        let want = painted_ycbcr(THIRD)[0];
+        let got = captured_luma(&mut first, &mut dec, &mut n);
+        assert!(
+            (got - want).abs() <= 8.0,
+            "the first captured {got:.1} once the second closed, painted {want:.1}"
+        );
     }
 
     /// The whole zero-copy path against a real X server and GPU: the driver composites the root
