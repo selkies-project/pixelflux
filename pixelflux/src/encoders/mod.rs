@@ -291,7 +291,14 @@ pub fn software_encoder(codec: Codec) -> Option<SoftwareEncoder> {
 fn encodes_in_child(codec: Codec) -> bool {
     survives_in_child(|| {
         // The child converts on a pool of its own: the parent's rayon workers do not exist in it.
-        let Ok(pool) = rayon::ThreadPoolBuilder::new().num_threads(1).build() else {
+        // The pool is this thread, since a thread the child started would wait on the lock the
+        // standard library takes to set a thread up, which a parent thread may have held at the
+        // fork.
+        let Ok(pool) = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .use_current_thread()
+            .build()
+        else {
             return;
         };
         pool.install(|| {
@@ -913,6 +920,27 @@ mod tests {
                 probing.store(false, Ordering::Release);
                 found
             });
+            stop.store(true, Ordering::Relaxed);
+            assert!(found);
+        });
+    }
+
+    /// A probe forked while other threads start and stop still finds the encoder: a thread the
+    /// child started would wait on the lock the standard library holds while it sets a thread
+    /// up, which another thread of the parent may have held at the fork.
+    #[test]
+    fn the_av1_probe_survives_threads_starting_beside_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for _ in 0..16 {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::thread::spawn(|| {}).join();
+                    }
+                });
+            }
+            let found = (0..200).all(|_| encodes_in_child(Codec::Av1));
             stop.store(true, Ordering::Relaxed);
             assert!(found);
         });
