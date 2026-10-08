@@ -23,8 +23,8 @@
 //! still copying them as they came, and the read has to land on the stop bit, so a field it
 //! stepped over wrongly refuses the write instead of corrupting the set.
 //!
-//! x264's `frame_num` is widened here too (`WideFrameNum`), the one write that reaches past the
-//! set into every slice header.
+//! x264's and NVENC's `frame_num` are widened here too (`WideFrameNum`), the one write that
+//! reaches past the set into every slice header.
 
 /// What a stream says about the color it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,17 +635,18 @@ impl NoReorder {
 /// slice moves by one byte and keeps the alignment its entropy coding and trailing bits rest on.
 const WIDER_FRAME_NUM: u32 = 8;
 
-/// An x264 stream with `frame_num` widened by a byte, in its sequence parameter sets and every
-/// slice header.
+/// An x264 or NVENC stream with `frame_num` widened by a byte, in its sequence parameter sets and
+/// every slice header.
 ///
-/// x264 sizes the counter to its decoded picture buffer, sixteen values for eight references, and
-/// a loss covering the frame where it wraps costs a key frame (`ReferenceWindow`): past a gap
-/// across the wrap, FFmpeg's decoder drops about a range of pictures. Widened, the wrap comes once
-/// in 4096 frames. The field's low bits stay x264's, and the byte ahead of them counts x264's wraps
-/// since the key frame.
+/// x264 sizes the counter to its decoded picture buffer, sixteen values for eight references,
+/// NVENC to 256, and a loss covering the frame where it wraps costs a key frame
+/// (`ReferenceWindow`): past a gap across the wrap, FFmpeg's decoder drops about a range of
+/// pictures. Widened, the wrap comes once in 4096 or 65536 frames. The field's low bits stay the
+/// encoder's, and the byte ahead of them counts its wraps since the key frame.
 #[derive(Default)]
 pub struct WideFrameNum {
-    /// `log2_max_frame_num` as x264 wrote the last set, None where that set went out as it came.
+    /// `log2_max_frame_num` as the encoder wrote the last set, None where that set went out as it
+    /// came.
     narrow: Option<u32>,
     /// The widened `frame_num` of the last slice.
     frame_num: u32,
@@ -663,7 +664,11 @@ impl WideFrameNum {
             .iter()
             .position(|&b| b != 0)
             .map_or(payload.len(), |one| one + 1);
-        let nal = &payload[code..];
+        self.push_unit(&payload[..code], &payload[code..], out)
+    }
+
+    /// `push` for a NAL unit apart from the start code it goes out behind.
+    pub fn push_unit(&mut self, start: &[u8], nal: &[u8], out: &mut Vec<u8>) -> bool {
         let widened = match nal.first().map(|h| h & 0x1f) {
             Some(7) => {
                 let wide = if self.failed { None } else { widen_sps(nal) };
@@ -679,7 +684,8 @@ impl WideFrameNum {
                     None => {
                         self.failed = true;
                         self.narrow = None;
-                        out.extend_from_slice(payload);
+                        out.extend_from_slice(start);
+                        out.extend_from_slice(nal);
                         return false;
                     }
                 },
@@ -687,13 +693,8 @@ impl WideFrameNum {
             },
             _ => None,
         };
-        match widened {
-            Some(nal) => {
-                out.extend_from_slice(&payload[..code]);
-                out.extend_from_slice(&nal);
-            }
-            None => out.extend_from_slice(payload),
-        }
+        out.extend_from_slice(start);
+        out.extend_from_slice(widened.as_deref().unwrap_or(nal));
         true
     }
 }
@@ -719,8 +720,9 @@ fn widen_sps(nal: &[u8]) -> Option<(u32, Vec<u8>)> {
     Some((minus4 + 4, out))
 }
 
-/// A slice under a widened set, and its widened `frame_num`: x264's `narrow` bits numbered on from
-/// `last`, the widened value of the slice before it, with the byte above them inserted ahead.
+/// A slice under a widened set, and its widened `frame_num`: the encoder's `narrow` bits numbered
+/// on from `last`, the widened value of the slice before it, with the byte above them inserted
+/// ahead.
 fn widen_slice(nal: &[u8], narrow: u32, idr: bool, last: u32) -> Option<(u32, Vec<u8>)> {
     let mut rbsp = unescape(nal.get(1..)?);
     let mut r = Reader::new(&rbsp);

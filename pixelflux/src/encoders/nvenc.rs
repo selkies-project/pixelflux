@@ -43,7 +43,7 @@ use super::codec::{
 };
 use super::frame_rate::FrameRate;
 use super::reference::{ANCHORS, Invalidation, Reference, ReferenceReport, ReferenceWindow};
-use super::sps::h264_frame_num_range;
+use super::sps::{WideFrameNum, h264_frame_num_range};
 use crate::RustCaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
@@ -1691,6 +1691,10 @@ pub struct NvencEncoder {
     /// reference, and nothing is tracked.
     references: Option<ReferenceWindow>,
     last_reference: Reference,
+    /// The H.264 stream's `frame_num` a byte wider, where the session tracks its references: the
+    /// frame where the counter wraps, which a loss covering it costs a key frame for, comes once
+    /// in 65536 frames instead of 256.
+    frame_num: WideFrameNum,
     /// The X server's blit semaphore imported into this context (`blit_semaphore_fd`), which
     /// `encode_after_blit` queues each frame's wait on; null until one is made.
     blit_semaphore: CUexternalSemaphore,
@@ -2718,6 +2722,7 @@ impl NvencEncoder {
                     }
                 }),
                 last_reference: Reference::Untracked,
+                frame_num: WideFrameNum::default(),
                 blit_semaphore: ptr::null_mut(),
                 band_hash: None,
                 upload_hash: None,
@@ -3864,7 +3869,19 @@ impl NvencEncoder {
 
         if data_size > 0 && !data_ptr.is_null() {
             let slice = std::slice::from_raw_parts(data_ptr, data_size);
-            output.extend_from_slice(slice);
+            if self.codec == Codec::H264 && self.references.is_some() {
+                let mut widened = true;
+                for nal in crate::encoders::codec::annexb_nals(slice) {
+                    widened &= self.frame_num.push_unit(&[0, 0, 0, 1], nal, &mut output);
+                }
+                if !widened && let Some(references) = &mut self.references {
+                    // Its slices no longer match the set they went out under: the next frame
+                    // is a key frame.
+                    references.reset();
+                }
+            } else {
+                output.extend_from_slice(slice);
+            }
         }
         if frame_type == FRAME_KEY
             && self.codec == Codec::H264
@@ -6163,15 +6180,15 @@ mod gpu_tests {
         }
     }
 
-    /// An H.264 loss covering the frame carrying `frame_num` 0 is answered with a key frame:
-    /// predicted past, the frames after it reach FFmpeg's decoder as a gap across the counter's
-    /// wrap, and it drops about a range of pictures after it. Ignored by default.
+    /// NVENC counts H.264's `frame_num` in 256 values and the stream in 65536 (`WideFrameNum`): a
+    /// loss covering frame 256, where NVENC's own count wraps, is predicted past rather than
+    /// answered with a key frame, and the decoder that lost it shows the next frame as one that
+    /// saw it does. Ignored by default.
     #[test]
     #[ignore]
-    fn gpu_answers_a_loss_at_the_frame_num_wrap_with_a_key_frame() {
+    fn gpu_predicts_past_a_loss_at_the_devices_frame_num_wrap() {
         use crate::encoders::reference::Reference;
         use crate::encoders::sps::h264_frame_num_range;
-        use crate::webcam::decode::{Decoder as _, VideoDecoder};
         let (w, h) = (1280usize, 720usize);
         let mut s = settings(w as i32, h as i32, 60.0);
         s.omit_stripe_headers = true;
@@ -6188,42 +6205,25 @@ mod gpu_tests {
             return;
         }
         let range = h264_frame_num_range(&first).expect("the key frame carries the SPS") as usize;
-        println!("frame_num wraps after {range} frames");
+        assert_eq!(range, 65536, "NVENC's 256 values, a byte wider");
         let mut frames = vec![first];
-        for i in 1..=range {
-            let (out, reference) = encode(&mut enc, i);
-            assert_ne!(reference, Reference::None, "frame {i} is no key frame");
-            frames.push(out);
+        for i in 1..=258 {
+            frames.push(encode(&mut enc, i).0);
         }
         assert!(
-            enc.invalidate_reference(range as u16),
-            "the wrap frame is reported lost"
+            enc.invalidate_reference(256),
+            "the device's wrap frame is reported lost"
         );
-        let (out, reference) = encode(&mut enc, range + 1);
-        assert_eq!(
-            reference,
-            Reference::None,
-            "the loss at the wrap costs the key frame"
-        );
-        let mut lossy = VideoDecoder::new(Codec::H264).unwrap();
-        for f in &frames[..range] {
-            assert!(lossy.decode(f).expect("decode"));
-        }
+        let (out, reference) = encode(&mut enc, 259);
         assert!(
-            lossy.decode(&out).expect("decode past the wrap"),
-            "the decoder that never saw the wrap frame shows the next one"
+            matches!(reference, Reference::Frame(r) if r < 256),
+            "{reference:?} past the loss"
         );
-        assert_eq!(
-            encode(&mut enc, range + 2).1,
-            Reference::Frame(range as u16 + 1)
-        );
+        frames.push(out);
+        let off = apart_without(Codec::H264, &frames, 256..259);
         assert!(
-            enc.invalidate_reference(range as u16 + 2),
-            "the count restarted at the key frame"
-        );
-        assert_eq!(
-            encode(&mut enc, range + 3).1,
-            Reference::Frame(range as u16 + 1)
+            off < 0.5,
+            "past the loss at the wrap the frame decodes {off:.2} off"
         );
     }
 
