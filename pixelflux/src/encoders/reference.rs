@@ -27,6 +27,11 @@ const ANCHOR_ALONE_EVERY: u64 = 48;
 /// misses it cannot be predicted past.
 const SETTLE_SLACK: u64 = 4;
 
+/// The schedule keeps an anchor every consumer was sent until they all hold it, for up to
+/// `PENDING_PERIODS` anchor periods: a consumer slower to report than a period, as one on a
+/// narrow link is, would otherwise never see an anchor pinned past the key frame.
+const PENDING_PERIODS: u64 = 4;
+
 /// What the consumers say of a frame, applied in the order they said it ahead of an encode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceReport {
@@ -199,8 +204,9 @@ impl ReferenceWindow {
 
     /// The anchor the next frame is marked into, if any: the first for a key frame or while none
     /// is held, and on the schedule after it the one that is empty, lost, or older, never the one
-    /// pinned (`acknowledge`) where there are two. Acknowledged, an H.264 frame where `frame_num`
-    /// wraps is an anchor too.
+    /// pinned (`acknowledge`) where there are two, nor one every consumer was sent and is yet to
+    /// hold (`PENDING_PERIODS`). Acknowledged, an H.264 frame where `frame_num` wraps is an anchor
+    /// too.
     pub fn plan_anchor(&self, key: bool) -> Option<u8> {
         if self.anchors.is_empty() {
             return None;
@@ -208,17 +214,25 @@ impl ReferenceWindow {
         if key || !self.has_reference() || self.anchors.iter().all(Option::is_none) {
             return Some(0);
         }
-        if !(self.next_pts - self.key_pts).is_multiple_of(self.anchor_period())
-            && !self.wraps_next()
-        {
+        let wraps = self.wraps_next();
+        if !(self.next_pts - self.key_pts).is_multiple_of(self.anchor_period()) && !wraps {
             return None;
         }
         let rank = |a: &Option<(u16, u64, bool)>| {
             a.map_or((0, 0), |(_, pts, lost)| (u8::from(!lost), pts))
         };
         let pinned = self.pinned_anchor();
+        let pending = |a: &Option<(u16, u64, bool)>| {
+            a.is_some_and(|(_, pts, lost)| {
+                !lost
+                    && self.is_shared(pts)
+                    && !self.is_common(pts)
+                    && self.next_pts - pts < PENDING_PERIODS * self.anchor_period()
+            })
+        };
         (0..self.anchors.len())
             .filter(|&i| self.anchors.len() == 1 || Some(i) != pinned)
+            .filter(|&i| wraps || !pending(&self.anchors[i]))
             .min_by_key(|&i| rank(&self.anchors[i]))
             .map(|i| i as u8)
     }
@@ -1656,8 +1670,8 @@ mod tests {
 
     #[test]
     fn only_an_anchor_every_consumer_holds_is_pinned() {
-        // Sent to every consumer as it is marked, 12 is not pinned until all hold it: 24 is
-        // marked over it, the key frame they hold staying.
+        // Sent to every consumer as it is marked, 12 is not pinned until all hold it, and the
+        // schedule keeps it meanwhile: 24 is not marked over it, the key frame they hold staying.
         let mut w = ReferenceWindow::with_anchors(4, 2);
         feed(&mut w, 0..=0);
         assert!(w.acknowledge(0, true));
@@ -1666,13 +1680,26 @@ mod tests {
             assert!(w.acknowledge(id, false));
         }
         let anchors: Vec<u16> = w.anchor_frames().map(|a| a.0).collect();
-        assert!(anchors.contains(&0) && anchors.contains(&24), "{anchors:?}");
-        assert!(w.acknowledge(24, true));
+        assert!(anchors.contains(&0) && anchors.contains(&12), "{anchors:?}");
+        assert!(w.acknowledge(12, true));
         assert_eq!(
             feed(&mut w, 25..=36).last().map(|f| f.1),
             Some(Some(0)),
-            "24 pinned"
+            "12 pinned"
         );
+        // 36, sent to every consumer and never held, is kept for four anchor periods.
+        let mut marks = Vec::new();
+        for id in 25..=96u16 {
+            if id > 36 {
+                marks.extend(
+                    feed(&mut w, id..=id)
+                        .into_iter()
+                        .filter_map(|f| f.1.map(|s| (id, s))),
+                );
+            }
+            assert!(w.acknowledge(id, false));
+        }
+        assert_eq!(marks, [(84, 0)]);
     }
 
     #[test]
