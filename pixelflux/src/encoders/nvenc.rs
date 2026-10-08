@@ -1115,9 +1115,10 @@ const SLICE_MODE_COUNT: u32 = 3;
 /// for as 1x1 in `configure_codec`.
 const SLICES_PER_FRAME: u32 = 4;
 
-/// The frames an AV1 frame predicts from, LAST, LAST2, LAST3, and GOLDEN (`numFwdRefs` tops out
-/// at four). With SDK 13 and LTR support, one persistent anchor survives beside the recent
-/// frames and lets an invalidation reach further back.
+/// The frames an AV1 session keeps, as many as a frame predicts from, LAST, LAST2, LAST3, and
+/// GOLDEN (`numFwdRefs` tops out at four). The device keeps eight as well, predicting past a loss
+/// from further back, but takes 112 MiB more a session at the resize headroom. With SDK 13
+/// and LTR support, the anchors among them let an invalidation reach further back.
 const AV1_REFERENCES: u32 = 4;
 
 /// Output bitstream buffers per session: one, because `submit_frame` locks, copies, and unlocks
@@ -2707,6 +2708,9 @@ impl NvencEncoder {
                             ReferenceWindow::with_anchors(window_frames(codec, dpb, true), anchors);
                         if settings.acknowledge_references {
                             w.set_acknowledged();
+                        }
+                        if codec == Codec::Av1 {
+                            w.lend_free_anchors();
                         }
                         w
                     } else {
@@ -5764,6 +5768,70 @@ mod gpu_tests {
                 sizes.0 / sizes.1.max(1),
                 sizes.2 / sizes.3.max(1),
                 sizes.3
+            );
+        }
+    }
+
+    /// With the second anchor lost, a loss of the two newest frames is predicted past from the
+    /// newest frame the device still holds, and the window names it: on AV1 one past the recent
+    /// frames beside two anchors, held in the long-term slot the lost anchor lends. A decoder
+    /// given the frames up to it, and none after, decodes the next frame as one given every frame
+    /// does. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_lost_anchor_lends_its_slot_to_the_recent_frames() {
+        let (w, h) = (1280usize, 720usize);
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(w as i32, h as i32, 60.0);
+            s.codec = codec;
+            s.acknowledge_references = true;
+            s.omit_stripe_headers = true;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            if !enc
+                .references
+                .as_ref()
+                .is_some_and(ReferenceWindow::anchored)
+            {
+                println!("{codec:?}: this device or API keeps no long-term reference");
+                continue;
+            }
+            let mut frames = Vec::new();
+            let mut from = 0;
+            for i in 0..=22usize {
+                match i {
+                    16 => assert!(enc.take_report(ReferenceReport::Lost(12)), "{codec:?}"),
+                    21 => assert!(enc.take_report(ReferenceReport::Lost(19)), "{codec:?}"),
+                    _ => {}
+                }
+                let out = enc
+                    .encode_cpu_argb(&moving_frame(w, h, i), w * 4, i as u64, 25, i == 0)
+                    .expect("encode");
+                if i <= 11 || (16..=17).contains(&i) {
+                    enc.acknowledge_reference(i as u16, true);
+                }
+                frames.push(out);
+                if i == 21 {
+                    let Reference::Frame(r) = enc.last_reference() else {
+                        panic!("{codec:?}: {:?} past the loss", enc.last_reference());
+                    };
+                    from = r as usize;
+                }
+            }
+            if codec == Codec::Av1 {
+                assert_eq!(from, 18, "{codec:?}: past the loss of 19 and 20");
+            }
+            let keep: Vec<usize> = (0..=11).chain(16..=from).chain([21, 22]).collect();
+            let off = apart_keeping(codec, &frames, &keep);
+            println!("{codec:?}: past the loss from {from}, {off:?} apart");
+            assert!(
+                off.is_some_and(|off| off < 0.5),
+                "{codec:?}: given the frames up to {from}, frame 22 decodes {off:?} apart"
             );
         }
     }

@@ -103,6 +103,7 @@ pub enum Invalidation {
 pub struct ReferenceWindow {
     frames: VecDeque<(u16, u64, bool)>,
     capacity: usize,
+    lends: bool,
     anchors: Vec<Option<(u16, u64, bool)>>,
     recent: VecDeque<(u16, u64, bool)>,
     next_pts: u64,
@@ -147,6 +148,7 @@ impl ReferenceWindow {
         Self {
             frames: VecDeque::new(),
             capacity: capacity.max(1) as usize,
+            lends: false,
             anchors: Vec::new(),
             recent: VecDeque::new(),
             next_pts: 0,
@@ -166,6 +168,23 @@ impl ReferenceWindow {
         w.anchors = vec![None; count.clamp(1, ANCHORS)];
         w.set_capacity(capacity);
         w
+    }
+
+    /// An anchor holding no frame, or a lost one, lends its share of the buffer to the recent
+    /// frames, as NVENC's AV1 encoder does with a long-term slot it holds nothing in.
+    pub fn lend_free_anchors(&mut self) {
+        self.lends = true;
+    }
+
+    /// The recent frames the buffer holds: its share beside the anchors, and that of each anchor
+    /// lending its own (`lend_free_anchors`).
+    fn recent_capacity(&self) -> usize {
+        let free = self
+            .anchors
+            .iter()
+            .filter(|a| a.is_none_or(|a| a.2))
+            .count();
+        self.capacity + if self.lends { free } else { 0 }
     }
 
     /// Whether the window keeps anchors.
@@ -394,7 +413,7 @@ impl ReferenceWindow {
     /// take their share of it.
     pub fn set_capacity(&mut self, capacity: u32) {
         self.capacity = capacity.saturating_sub(self.anchors.len() as u32).max(1) as usize;
-        while self.frames.len() > self.capacity {
+        while self.frames.len() > self.recent_capacity() {
             self.frames.pop_front();
         }
     }
@@ -475,12 +494,10 @@ impl ReferenceWindow {
         };
         match anchor.and_then(|slot| self.anchors.get_mut(slot as usize)) {
             Some(slot) => *slot = Some((frame_id, pts, false)),
-            None => {
-                self.frames.push_back((frame_id, pts, false));
-                if self.frames.len() > self.capacity {
-                    self.frames.pop_front();
-                }
-            }
+            None => self.frames.push_back((frame_id, pts, false)),
+        }
+        while self.frames.len() > self.recent_capacity() {
+            self.frames.pop_front();
         }
         self.recent.push_back((frame_id, pts, false));
         if self.recent.len() > RECENT_FRAMES {
