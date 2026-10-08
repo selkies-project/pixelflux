@@ -73,15 +73,16 @@ pub mod svtav1 {
     pub const HAS_EVENTS: bool = cfg!(svtav1_events);
 
     /// What a picture carries to a running encoder besides its pixels, where the release takes it
-    /// (`HAS_EVENTS`): the constant-rate target in bits per second from that picture on, and the
-    /// ids of the anchors to store the picture as, to release, and to predict it from alone; zero
-    /// leaves each out.
+    /// (`HAS_EVENTS`): the constant-rate target in bits per second and the preset from that
+    /// picture on, and the ids of the anchors to store the picture as, to release, and to predict
+    /// it from alone; zero leaves each out.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
     pub struct Events {
         pub target_bit_rate: u32,
         pub store: u32,
         pub clear: u32,
         pub predict_from: u32,
+        pub preset: i8,
     }
 
     /// `svt_av1_enc_send_picture`, with `events` attached where the release takes them.
@@ -110,9 +111,15 @@ pub mod svtav1 {
             };
             let mut ids = [events.store, events.clear, events.predict_from]
                 .map(|pic_id| SvtAv1RefFrameCmd { pic_id });
-            let mut nodes = Vec::with_capacity(4);
+            let mut preset = SvtAv1PresetInfo {
+                enc_mode: events.preset,
+            };
+            let mut nodes = Vec::with_capacity(5);
             if events.target_bit_rate != 0 {
                 nodes.push(node(RATE_CHANGE_EVENT, &mut rate));
+            }
+            if events.preset != 0 {
+                nodes.push(node(PRESET_CHANGE_EVENT, &mut preset));
             }
             for (node_type, cmd) in [REF_STORE_EVENT, REF_CLEAR_EVENT, REF_USE_EVENT]
                 .into_iter()

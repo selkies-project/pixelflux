@@ -185,8 +185,9 @@ in display order; the unit tests hold each encoder to it. Every session takes th
 it names (`encoders::frame_rate`: 59.94 is 60000/1001), never a whole number, so its rate control and the timing its
 stream declares hold to the rate the capture is paced at. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
-ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, x265
-ultrafast with wavefront threads), NVENC at preset P3 with two-pass quarter-resolution rate control
+ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, a frame
+predicting from an anchor alone at preset 10, since preset 11 leaves some blocks the picture changed since the anchor
+as they stood in it (`ANCHOR_PRESET`), x265 ultrafast with wavefront threads), NVENC at preset P3 with two-pass quarter-resolution rate control
 (`gpu_bench_tuning` measures the alternatives), and VA-API at the fastest quality level the driver takes, on the low-power entry point where the driver lists one, except H.264 on Skylake and Broxton, whose low-power encoder codes a picture as one slice whatever it is handed and reports nothing of it (told by the kernel's PCI id; the full entry point first, the low-power one in a single slice where the driver build carries no other); the VP8, VP9, and AV1 quantizer tables in `codec.rs`,
 and the hardware ones, were measured at those settings and must be re-measured whenever they change
 (`encoders::codec` documents the method; `cleanup_bench` with `PF_BENCH_SSIM=1` measures it). VP9 carries 4:4:4 as profile 1 (libvpx 1.13 on) at the same limited range as its 4:2:0, so the decoder hint the

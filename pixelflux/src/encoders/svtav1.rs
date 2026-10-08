@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Software AV1 through SVT-AV1 at preset 11 in its real-time mode, one frame in and one
+//! Software AV1 through SVT-AV1 at preset 11 in its real-time mode (`PRESET`), one frame in and one
 //! packet out (two frames deep before 2.3), with rate control either constant-rate at the
 //! session's bitrate and VBV or a constant quantizer. A new bitrate reaches the running
 //! encoder with the next picture where the release takes one (`HAS_EVENTS`); a quality,
@@ -13,7 +13,7 @@
 //! A constant-rate session on such a release names its references: it predicts every frame
 //! from the one before in a flat structure and has the library store anchors on the schedule
 //! of `ReferenceSlots`, its GOLDEN and ALTREF, so a frame a client lost is predicted past from
-//! an anchor older than it. Any other session leaves the references to the library, and a
+//! an anchor older than it, at `ANCHOR_PRESET`. Any other session leaves the references to the library, and a
 //! frame a client lost costs the key frame the caller codes on the refusal, which SVT-AV1
 //! before 2.0 codes only from a re-open as well.
 
@@ -35,6 +35,18 @@ use crate::RustCaptureSettings;
 /// below ten it codes every other frame of a scrolling text desktop with the lower third of
 /// the picture wrong, at three times the bytes of level ten.
 const RTC_MIN_LEVEL: u32 = 10;
+
+/// The preset frames are coded at: in the real-time mode, a quarter less encode time than preset
+/// 10 for more bytes at a fixed quantizer, which the quantizer table absorbs; the presets above
+/// it are no faster.
+const PRESET: i8 = 11;
+
+/// The preset a frame predicting from an anchor alone is coded at. At preset 11 the library keeps
+/// some blocks the picture changed since the anchor as they stand in the anchor, a stale copy
+/// every client shows (test_slow_page's bar, 14 frames back, left where it was in a 64-pixel
+/// block); preset 10 codes them. A session naming its references opens at it, since the library
+/// takes a preset change only toward a faster one, and codes every other frame at `PRESET`.
+const ANCHOR_PRESET: i8 = 10;
 
 /// The highest constant-rate target the library takes, at open and live alike.
 const MAX_BITRATE_BPS: u64 = 100_000_000;
@@ -76,6 +88,8 @@ pub struct SvtAv1Encoder {
     fresh: bool,
     /// The change the next picture carries to the running encoder.
     events: Events,
+    /// The preset the running encoder codes the next picture at unless told otherwise.
+    preset: i8,
     /// The buffers of a session that names its references, LAST the library's own.
     references: Option<ReferenceSlots>,
     /// The anchors the library holds, by the id each was stored under.
@@ -134,6 +148,7 @@ impl SvtAv1Encoder {
             omit_headers: settings.omit_stripe_headers,
             fresh: true,
             events: Events::default(),
+            preset: PRESET,
             references: None,
             anchors: Vec::new(),
             last_reference: Reference::Untracked,
@@ -176,7 +191,8 @@ impl SvtAv1Encoder {
         let tracks = HAS_EVENTS && rate.cbr;
         {
             let cfg = &mut *self.config;
-            cfg.enc_mode = 11;
+            cfg.enc_mode = if tracks { ANCHOR_PRESET } else { PRESET };
+            self.preset = cfg.enc_mode;
             cfg.source_width = self.planes.width as u32;
             cfg.source_height = self.planes.height as u32;
             cfg.frame_rate_numerator = rate.fps.num;
@@ -210,9 +226,7 @@ impl SvtAv1Encoder {
                 set_managed_refs(cfg, MANAGED_REFS);
             }
         }
-        // Preset 11 in the real-time mode: a quarter less encode time than preset 10 for more
-        // bytes at a fixed quantizer, which the quantizer table absorbs; the presets above it
-        // are no faster. `lp` is a level of parallelism, 0..=6, not a thread count.
+        // `lp` is a level of parallelism, 0..=6, not a thread count.
         if HAS_RTC {
             self.set("rtc", "1")?;
         }
@@ -444,6 +458,11 @@ impl SvtAv1Encoder {
                 .find(|a| !kept.contains(a) && *a != from);
             self.events.store = stored;
             self.events.predict_from = from;
+            let preset = if from != 0 { ANCHOR_PRESET } else { PRESET };
+            if preset != self.preset {
+                self.events.preset = preset;
+                self.preset = preset;
+            }
             self.events.clear = if key { 0 } else { released.unwrap_or(0) };
         }
         {

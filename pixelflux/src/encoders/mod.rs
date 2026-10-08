@@ -2266,6 +2266,99 @@ mod software_tests {
         );
     }
 
+    /// A constant-rate AV1 session predicting a frame from an anchor alone codes what the picture
+    /// changed since the anchor: test_slow_page's scene at 1280x720, a 160-pixel bar moving 12
+    /// pixels a frame over flat color, with the frame four back reported lost every 13, decodes
+    /// within 20 levels of its source in every 64-pixel block above its noise, where preset 11
+    /// left blocks of the bar standing where they were in the anchor, 41 off.
+    #[test]
+    fn an_anchor_prediction_leaves_no_block_as_it_stood_in_the_anchor() {
+        use super::reference::ReferenceReport;
+        if !codec_sys::svtav1::HAS_EVENTS {
+            return;
+        }
+        let (w, h) = (1280usize, 720usize);
+        let mut noise = vec![0u8; w * 240 * 4];
+        let mut seed = 1u64;
+        for b in noise.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = seed as u8;
+        }
+        let scene = |t: usize| {
+            let bar = (t * 12) % (w - 160);
+            let mut f = vec![0u8; w * h * 4];
+            for (i, px) in f.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let (x, y) = (i % w, i / w);
+                let bgr: [u8; 3] = if y >= 480 {
+                    let n = ((t % 4) * w * 240 + (y - 480) * w + x) * 4 % noise.len();
+                    [noise[n], noise[n + 1], noise[n + 2]]
+                } else if (96..160).contains(&y) {
+                    [if ((x + t * 4) / 16 + (y - 96) / 16).is_multiple_of(2) {
+                        255
+                    } else {
+                        0
+                    }; 3]
+                } else if y >= 160 && (bar..bar + 160).contains(&x) {
+                    [0x28, 0x3c, 0xdc]
+                } else {
+                    [0x78, 0x28, 0x1e]
+                };
+                px[..3].copy_from_slice(&bgr);
+            }
+            f
+        };
+        let mut s = settings(Codec::Av1);
+        s.width = w as i32;
+        s.height = h as i32;
+        s.target_fps = 60.0;
+        s.video_cbr_mode = true;
+        s.video_bitrate_kbps = 8000;
+        let mut enc = session(Codec::Av1, &s, false);
+        let mut dec = VideoDecoder::new(Codec::Av1).unwrap();
+        let (mut previous, mut anchored) = (None, 0);
+        for t in 0..84usize {
+            if t > 10 && t % 13 == 0 {
+                assert!(enc.take_report(ReferenceReport::Lost(t as u16 - 4)));
+            }
+            let src = scene(t);
+            let out = enc
+                .encode_host(&src, w * 4, false, t as u64, 25, t == 0)
+                .unwrap();
+            let id = u16::from_be_bytes([out[2], out[3]]);
+            let reference = u16::from_be_bytes([out[10], out[11]]);
+            assert_eq!(id as usize, t);
+            if reference != id && Some(reference) != previous {
+                anchored += 1;
+            }
+            previous = Some(id);
+            assert!(decode_one(&mut dec, &out), "frame {id}");
+            let pic = dec.frame().unwrap();
+            for (bx, by) in (0..480)
+                .step_by(64)
+                .flat_map(|y| (0..w).step_by(64).map(move |x| (x, y)))
+            {
+                let (mut sum, mut n) = (0f64, 0);
+                for y in (by..(by + 64).min(480)).step_by(2) {
+                    for x in (bx..bx + 64).step_by(2) {
+                        let i = (y * w + x) * 4;
+                        let (b, g, r) = (src[i] as f64, src[i + 1] as f64, src[i + 2] as f64);
+                        let luma = 16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * b) * 219.0 / 255.0;
+                        sum += (pic.y[y * pic.y_stride + x] as f64 - luma).abs();
+                        n += 1;
+                    }
+                }
+                let off = sum / n as f64;
+                assert!(
+                    off <= 20.0,
+                    "frame {id} (from {reference}): the block at ({bx}, {by}) is {off:.1} off its source"
+                );
+            }
+        }
+        assert!(anchored >= 5, "{anchored} frames predicted from an anchor");
+    }
+
     /// The byte order a session is built for reaches the conversion: a red picture handed as
     /// B,G,R,A and as R,G,B,A decodes to the same red on both.
     #[test]
