@@ -32,6 +32,14 @@ const SETTLE_SLACK: u64 = 4;
 /// narrow link is, would otherwise never see an anchor pinned past the key frame.
 const PENDING_PERIODS: u64 = 4;
 
+/// A lone anchor every consumer holds is not marked over while the newest frame they were all
+/// sent runs more than `HOLD_LAG` frames ahead of the newest they all hold, as when a consumer's
+/// link goes dark: a consumer reporting its loss once it is back is predicted past only from an
+/// anchor it holds. Past `HOLD_MAX` frames it is marked over all the same, a consumer that far
+/// behind taking a key frame.
+const HOLD_LAG: u64 = ANCHOR_ALONE_EVERY / 2;
+const HOLD_MAX: u64 = 8 * ANCHOR_ALONE_EVERY;
+
 /// What the consumers say of a frame, applied in the order they said it ahead of an encode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceReport {
@@ -205,8 +213,8 @@ impl ReferenceWindow {
     /// The anchor the next frame is marked into, if any: the first for a key frame or while none
     /// is held, and on the schedule after it the one that is empty, lost, or older, never the one
     /// pinned (`acknowledge`) where there are two, nor one every consumer was sent and is yet to
-    /// hold (`PENDING_PERIODS`). Acknowledged, an H.264 frame where `frame_num` wraps is an anchor
-    /// too.
+    /// hold (`PENDING_PERIODS`), nor a lone one they all hold while frames they were all sent go
+    /// unheld (`HOLD_LAG`). Acknowledged, an H.264 frame where `frame_num` wraps is an anchor too.
     pub fn plan_anchor(&self, key: bool) -> Option<u8> {
         if self.anchors.is_empty() {
             return None;
@@ -217,6 +225,21 @@ impl ReferenceWindow {
         let wraps = self.wraps_next();
         if !(self.next_pts - self.key_pts).is_multiple_of(self.anchor_period()) && !wraps {
             return None;
+        }
+        if self.anchors.len() == 1
+            && self.acknowledged
+            && !wraps
+            && let Some((_, pts, false)) = self.anchors[0]
+            && self.is_common(pts)
+        {
+            let held = self
+                .common
+                .back()
+                .map_or(self.key_pts, |&c| c.max(self.key_pts));
+            let sent = self.sent.back().map_or(held, |&s| s.max(held));
+            if sent - held > HOLD_LAG && self.next_pts - pts < HOLD_MAX {
+                return None;
+            }
         }
         let rank = |a: &Option<(u16, u64, bool)>| {
             a.map_or((0, 0), |(_, pts, lost)| (u8::from(!lost), pts))
@@ -1642,10 +1665,13 @@ mod tests {
             "and 14 from 13, a recent frame"
         );
 
-        // A lone anchor predicts from the one it is marked over.
+        // A lone anchor predicts from the one it is marked over, every consumer holding frames
+        // since that the window let go.
         let mut w = ReferenceWindow::with_anchors(8, 1);
         feed(&mut w, 0..=47);
-        assert!(w.acknowledge(0, true));
+        for id in 0..=30u16 {
+            assert!(w.acknowledge(id, true));
+        }
         assert_eq!(w.plan_anchor(false), Some(0));
         assert_eq!(w.settle(), Some(Invalidation::Forget(1)));
         assert!(w.predicts_from_shared());
@@ -1700,6 +1726,28 @@ mod tests {
             assert!(w.acknowledge(id, false));
         }
         assert_eq!(marks, [(84, 0)]);
+    }
+
+    #[test]
+    fn a_lone_anchor_every_consumer_holds_stays_while_one_lags() {
+        // Every consumer is sent each frame and holds each up to 60, then one holds nothing more,
+        // as through an outage: the anchor at 48 stays, as one marked over it would be one that
+        // consumer lacks, until it is HOLD_MAX old.
+        let mut w = ReferenceWindow::with_anchors(8, 1);
+        let mut marks = Vec::new();
+        for id in 0..=480u16 {
+            marks.extend(
+                feed(&mut w, id..=id)
+                    .into_iter()
+                    .filter_map(|f| f.1.map(|s| (id, s))),
+            );
+            assert!(w.acknowledge(id, id <= 60));
+        }
+        assert_eq!(
+            marks,
+            [(0, 0), (48, 0), (432, 0)],
+            "past HOLD_MAX it is marked over, the anchor after it kept as one sent is"
+        );
     }
 
     #[test]

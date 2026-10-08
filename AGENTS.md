@@ -96,9 +96,10 @@ no marking sets, so it reaches the first index alone and decodes a frame naming 
 without an error. Where the consumer says which frames every client holds or was sent (`acknowledge_references`,
 `acknowledge_reference`, `ReferenceWindow::acknowledge`), AV1 keeps two as well, and several clients share one session
 with each recovering on its own: of two anchors, the newest all of them hold is pinned while the schedule marks the
-other, keeping one all of them were sent until they hold it (for up to four anchor periods); an anchor within an
-anchor period of the newest frame all of them were sent first forgets the frames after it, so it predicts from that
-one (`settle`), and carries `FRAME_ANCHOR` in its kind; a frame predicting from an anchor
+other, keeping one all of them were sent until they hold it (for up to four anchor periods), and a lone anchor all
+of them hold is not marked over while frames all of them were sent go unheld, as through a client's outage (for up to
+eight anchor periods); an anchor within an anchor period of the newest frame all of them were sent first forgets the
+frames after it, so it predicts from that one (`settle`), and carries `FRAME_ANCHOR` in its kind; a frame predicting from an anchor
 names it (NVENC's H.264 fallback takes the first otherwise); an AV1 anchor slot holding no frame, or a lost one,
 counts among the recent frames, as NVENC lends it to them (`lend_free_anchors`), so the window names the frame the
 device predicts from; and in H.264 the frame at the `frame_num` wrap is an anchor reaching back however far. A session that does not
