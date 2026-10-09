@@ -3359,6 +3359,7 @@ fn render_node_tick(
     let output_scale_val = output.current_scale().fractional_scale();
     let (width, height) = match node.capture.as_ref() {
         Some(c) => (c.settings.width, c.settings.height),
+        None if node.owner.is_some() => node.view_size,
         None => output
             .current_mode()
             .map(|m| (m.size.w, m.size.h))
@@ -9978,10 +9979,11 @@ fn start_computer_use(bind: String, token: Option<String>) -> PyResult<()> {
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
 }
 
-/// PNG of one display's framebuffer with the cursor drawn in, the same image the
+/// PNG of one display's framebuffer, the same image the
 /// Computer-Use server serves: the in-process Wayland compositor's output when one runs
 /// (`display` 0 is the primary, else a live output id), otherwise the root of the X server
-/// named by DISPLAY. No capture has to be running.
+/// named by DISPLAY. No capture has to be running. Wayland preserves the current
+/// compositor or host cursor policy; X11 draws the cursor into the image.
 #[pyfunction]
 #[pyo3(signature = (display = 0))]
 fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {

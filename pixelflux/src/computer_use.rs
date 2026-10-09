@@ -96,7 +96,7 @@ impl ScreenshotFrame {
             return Err("Screenshot render produced an invalid framebuffer".to_string());
         }
         if matches!(self.format, ScreenshotPixelFormat::Bgra) {
-            for px in self.pixels.chunks_exact_mut(4) {
+            for px in self.pixels.as_chunks_mut::<4>().0 {
                 px.swap(0, 2);
             }
         }
@@ -1488,7 +1488,7 @@ mod tests {
         for format in [ScreenshotPixelFormat::Rgba, ScreenshotPixelFormat::Bgra] {
             let mut pixels = rgba.clone();
             if matches!(format, ScreenshotPixelFormat::Bgra) {
-                for px in pixels.chunks_exact_mut(4) {
+                for px in pixels.as_chunks_mut::<4>().0 {
                     px.swap(0, 2);
                 }
             }
