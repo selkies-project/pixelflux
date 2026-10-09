@@ -2422,6 +2422,11 @@ impl NvencEncoder {
                 Codec::Av1 => AV1_REFERENCES,
                 _ => h264_dpb_frames(level, width, height),
             };
+            let dpb = if codec == Codec::Av1 {
+                dpb
+            } else {
+                dpb.min(crate::encoders::reference_frames(settings))
+            };
             let ltr = query_cap(
                 &function_list,
                 encoder_session,
@@ -6255,6 +6260,46 @@ mod gpu_tests {
             .expect("encode 1080p");
         assert_eq!(pkt[1] & 0x0f, FRAME_KEY);
         assert_eq!(wire_dims(&pkt), (1920, 1080));
+    }
+
+    /// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
+    /// picture buffer of one, H.264 and H.265 alike, and keeps no anchor; AV1 keeps its eight.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_sessions_keep_the_reference_frames_they_are_given() {
+        use crate::encoders::sps::h264_max_num_ref_frames;
+        for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+            let mut s = settings(1280, 720, 60.0);
+            s.codec = codec;
+            s.omit_stripe_headers = true;
+            s.acknowledge_references = true;
+            s.video_reference_frames = 1;
+            let mut enc = match host_session(&s) {
+                Ok(enc) => enc,
+                Err(e) => {
+                    println!("{codec:?}: {e}");
+                    continue;
+                }
+            };
+            let key = enc
+                .encode_cpu_argb(&frame(1280, 720, 10), 1280 * 4, 0, 25, true)
+                .expect("encode");
+            let anchors = enc
+                .references
+                .as_ref()
+                .map_or(0, ReferenceWindow::anchor_count);
+            match codec {
+                Codec::Av1 => assert_eq!(enc.dpb, AV1_REFERENCES, "AV1"),
+                _ => {
+                    assert_eq!(enc.dpb, 1, "{codec:?}");
+                    assert_eq!(anchors, 0, "{codec:?}");
+                }
+            }
+            if codec == Codec::H264 {
+                assert_eq!(h264_max_num_ref_frames(&key), Some(1));
+            }
+        }
     }
 
     /// Every H.264 session bounds reordering at zero, 4:2:0 and 4:4:4, and so does the IDR an

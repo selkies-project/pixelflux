@@ -452,6 +452,14 @@ pub(crate) const QP_HYSTERESIS_LIMIT: u32 = 60;
 /// # Returns
 ///
 /// VBV buffer size in bits, clamped to `[1, u32::MAX]`.
+/// The most frames an H.264 or H.265 session keeps for reference (`video_reference_frames`).
+pub fn reference_frames(settings: &RustCaptureSettings) -> u32 {
+    match settings.video_reference_frames {
+        0 => reference::REFERENCE_FRAMES,
+        n => n.min(reference::REFERENCE_FRAMES),
+    }
+}
+
 pub fn vbv_bits(bitrate_bps: u32, fps: f64, keyframe_interval_s: f64, multiplier: f64) -> u32 {
     let frame_bits = bitrate_bps as f64 / fps.max(1.0);
     let mult = if multiplier > 0.0 {

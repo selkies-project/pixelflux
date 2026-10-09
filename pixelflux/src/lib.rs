@@ -363,6 +363,11 @@ pub struct RustCaptureSettings {
     /// long-term references (H.265, and AV1, which keeps one otherwise) the newest every client
     /// holds stays pinned beside the one the schedule marks. H.264 keeps one.
     pub acknowledge_references: bool,
+    /// The most frames an H.264 or H.265 stream keeps for reference (its decoded picture
+    /// buffer), 0 for as many as the level admits up to `REFERENCE_FRAMES`: a decoder that holds
+    /// its whole buffer before it shows a picture (GStreamer's hardware decoders in WebKitGTK and
+    /// WPE) shows each that many frames later.
+    pub video_reference_frames: u32,
     pub video_cbr_mode: bool,
     pub video_bitrate_kbps: i32,
     /// VBV size as a multiple of one frame's bit budget (bitrate/framerate), so it rescales with
@@ -471,6 +476,7 @@ impl Default for RustCaptureSettings {
             wayland_host_display: String::new(),
             omit_stripe_headers: false,
             acknowledge_references: false,
+            video_reference_frames: 0,
             video_cbr_mode: false,
             video_bitrate_kbps: 4000,
             video_vbv_multiplier: 0.0,
@@ -614,6 +620,11 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<RustCapt
             .ok()
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false),
+        video_reference_frames: settings
+            .getattr("video_reference_frames")
+            .ok()
+            .and_then(|v| v.extract::<u32>().ok())
+            .unwrap_or(0),
         video_cbr_mode: settings.getattr("video_cbr_mode")?.extract()?,
         video_bitrate_kbps: settings.getattr("video_bitrate_kbps")?.extract()?,
         video_vbv_multiplier: settings
@@ -7601,6 +7612,10 @@ struct CaptureSettings {
     /// keeps one.
     #[pyo3(get, set)]
     acknowledge_references: bool,
+    /// The most frames an H.264 or H.265 stream keeps for reference, 0 for the level's: a
+    /// decoder that holds its whole buffer before showing a picture shows each that much later.
+    #[pyo3(get, set)]
+    video_reference_frames: u32,
     #[pyo3(get, set)]
     encode_node_path: Py<PyAny>,
     /// Compositor render node (Wayland): an explicit path wins; empty with auto_gpu
@@ -7670,6 +7685,7 @@ impl CaptureSettings {
             auto_adjust_screen_capture_size: false,
             omit_stripe_headers: false,
             acknowledge_references: false,
+            video_reference_frames: 0,
             encode_node_path: py.None(),
             render_node_path: py.None(),
             auto_gpu: py.None(),

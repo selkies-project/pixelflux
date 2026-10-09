@@ -1150,8 +1150,10 @@ impl VaapiEncoder {
             _ => 0,
         };
         let dpb = match codec {
-            Codec::H264 => super::codec::h264_dpb_frames(dpb_level, width, height),
-            Codec::H265 => super::codec::h265_dpb_frames(dpb_level, width, height),
+            Codec::H264 => super::codec::h264_dpb_frames(dpb_level, width, height)
+                .min(super::reference_frames(settings)),
+            Codec::H265 => super::codec::h265_dpb_frames(dpb_level, width, height)
+                .min(super::reference_frames(settings)),
             _ => REFERENCE_FRAMES,
         };
         let mut arm = match codec {
@@ -1318,7 +1320,7 @@ impl VaapiEncoder {
         me.arm = arm;
         me.references = me.arm.tracks_references(packed).then(|| match me.arm {
             Arm::Vp8(_) => References::Slots(ReferenceSlots::new()),
-            Arm::H264(_) if me.device.keeps_h264_anchors() => {
+            Arm::H264(_) if me.device.keeps_h264_anchors() && dpb >= 3 => {
                 let mut w = ReferenceWindow::with_anchors(dpb, 1);
                 if settings.acknowledge_references {
                     w.set_acknowledged();

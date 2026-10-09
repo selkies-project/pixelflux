@@ -729,6 +729,46 @@ fn h264_keeps_a_long_term_anchor_where_the_driver_takes_one() {
     });
 }
 
+/// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
+/// picture buffer of one in H.264 and H.265, and keeps no anchor even where the driver takes one.
+#[test]
+fn a_session_keeps_the_reference_frames_it_is_given() {
+    let mut driver = Driver::generous();
+    driver.vendor = Some(c"Mesa Gallium driver for AMD Radeon Pro VII (radeonsi, vega20)");
+    mock::reset(driver);
+    let mut s = settings(Codec::H264, false);
+    s.video_reference_frames = 1;
+    let mut enc = open(Codec::H264, &s).unwrap();
+    let first = encode(&mut enc, 0, true);
+    assert_eq!(h264_max_num_ref_frames(&first[VIDEO_HEADER_LEN..]), Some(1));
+    let rbsp = mock::with(|d| {
+        let header = d
+            .last_packed()
+            .into_iter()
+            .find(|p| p.0 == VAEncPackedHeaderSlice)
+            .unwrap()
+            .1;
+        nal(&header, 5, false)
+    });
+    let mut r = Reader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    assert_eq!((r.ue(), r.ue(), r.ue(), r.u(16)), (0, 7, 0, 0));
+    r.ue();
+    assert_eq!(r.u(1), 0, "no_output_of_prior_pics_flag");
+    assert_eq!(
+        r.u(1),
+        0,
+        "no long-term key frame: one frame leaves no room for an anchor"
+    );
+    let mut s = settings(Codec::H265, false);
+    s.video_reference_frames = 1;
+    let mut enc = open(Codec::H265, &s).unwrap();
+    encode(&mut enc, 0, true);
+    assert_eq!(enc.negotiated.dpb, 1, "sps_max_dec_pic_buffering_minus1");
+}
+
 /// HEVC lists the frames the decoder keeps in every slice header's reference picture set,
 /// the one it predicts from marked as used, and drops a lost frame from the set.
 #[test]

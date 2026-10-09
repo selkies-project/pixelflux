@@ -402,6 +402,9 @@ pub struct H264EncoderWrapper {
     /// The frames the decoder holds, so a lost one can be left out of the predictions and
     /// each frame can name what it predicts from.
     references: ReferenceWindow,
+    /// The most frames the decoded picture buffer keeps, 0 for the level's
+    /// (`video_reference_frames`), kept for a reopen.
+    reference_frames: u32,
     last_reference: Reference,
     /// The stream's `frame_num`, widened from x264's sixteen values to 4096.
     frame_num: WideFrameNum,
@@ -502,12 +505,14 @@ impl H264EncoderWrapper {
             vbv_kbit,
             min_qp,
             max_qp,
+            0,
             None,
         )
     }
 
     /// `new` at `bit_depth` bits per sample: 10 opens a High 10 session, or High 4:4:4
-    /// Predictive at 10 bits, which reads its planes as 16-bit samples.
+    /// Predictive at 10 bits, which reads its planes as 16-bit samples; its decoded picture
+    /// buffer keeps at most `reference_frames`, 0 for the level's (`video_reference_frames`).
     #[allow(clippy::too_many_arguments)]
     pub fn with_depth(
         width: i32,
@@ -522,6 +527,7 @@ impl H264EncoderWrapper {
         vbv_kbit: i32,
         min_qp: i32,
         max_qp: i32,
+        reference_frames: u32,
     ) -> Option<Self> {
         Self::open(
             width,
@@ -536,6 +542,7 @@ impl H264EncoderWrapper {
             vbv_kbit,
             min_qp,
             max_qp,
+            reference_frames,
             None,
         )
     }
@@ -545,7 +552,7 @@ impl H264EncoderWrapper {
     pub fn ten_bit() -> bool {
         static TEN_BIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *TEN_BIT.get_or_init(|| {
-            Self::with_depth(64, 64, 25, false, 10, 30.0, 1, false, 0, 0, 0, 0).is_some()
+            Self::with_depth(64, 64, 25, false, 10, 30.0, 1, false, 0, 0, 0, 0, 0).is_some()
         })
     }
 
@@ -567,6 +574,7 @@ impl H264EncoderWrapper {
         vbv_kbit: i32,
         min_qp: i32,
         max_qp: i32,
+        reference_frames: u32,
         key: Option<(i32, i32)>,
     ) -> Option<Self> {
         unsafe {
@@ -599,6 +607,10 @@ impl H264EncoderWrapper {
                 width as u32,
                 height as u32,
             );
+            let dpb = match reference_frames {
+                0 => dpb,
+                n => dpb.min(n),
+            };
             param.i_dpb_size = dpb as i32;
             if cbr_mode {
                 let bk = bitrate_kbps.saturating_abs();
@@ -682,6 +694,7 @@ impl H264EncoderWrapper {
                     min_qp,
                     max_qp,
                     references: ReferenceWindow::new(dpb),
+                    reference_frames,
                     last_reference: Reference::Untracked,
                     frame_num: WideFrameNum::default(),
                     held_qp: None,
@@ -755,6 +768,7 @@ impl H264EncoderWrapper {
                 vbv_kbit,
                 self.min_qp,
                 self.max_qp,
+                self.reference_frames,
             ) {
                 *self = fresh;
             }
@@ -820,6 +834,7 @@ impl H264EncoderWrapper {
             self.current_vbv,
             self.min_qp,
             self.max_qp,
+            self.reference_frames,
             Some((budget, level)),
         );
         let Some(mut fresh) = fresh else { return false };
@@ -1749,6 +1764,7 @@ pub fn encode_cpu(
                         video_vbv,
                         settings.video_min_qp,
                         settings.video_max_qp,
+                        settings.video_reference_frames,
                     );
                     force_idr = true;
                 } else if let Some(ref mut enc) = stripe_state.h264_encoder {
@@ -2976,7 +2992,7 @@ mod tests {
             let (y, c) = (plane(&luma), plane(&chroma));
             let bytes = (depth as usize).div_ceil(8);
             let mut enc = H264EncoderWrapper::with_depth(
-                w as i32, h as i32, 25, false, depth, 30.0, 1, false, 0, 0, 0, 0,
+                w as i32, h as i32, 25, false, depth, 30.0, 1, false, 0, 0, 0, 0, 0,
             )
             .expect("x264 init");
             let encode = |enc: &mut H264EncoderWrapper, id: u16| {
@@ -3025,7 +3041,7 @@ mod tests {
         let (w, h) = (64usize, 64usize);
         for (i444, profile) in [(false, 110u8), (true, 244u8)] {
             let mut enc = H264EncoderWrapper::with_depth(
-                w as i32, h as i32, 25, i444, 10, 30.0, 1, false, 0, 0, 0, 0,
+                w as i32, h as i32, 25, i444, 10, 30.0, 1, false, 0, 0, 0, 0, 0,
             )
             .expect("x264 init");
             assert_eq!(enc.bit_depth, 10);
@@ -3552,6 +3568,55 @@ mod qp_bound_sweep {
         let (out, reference) = encode(&mut enc, 20);
         assert_eq!(reference, Reference::None);
         assert_eq!(h264_frame_type(&out), FRAME_KEY);
+    }
+
+    /// A session told to keep one reference frame (`video_reference_frames`) declares a decoded
+    /// picture buffer of one, and a loss of the frame before the last is a key frame.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_keeps_the_reference_frames_it_is_given() {
+        use crate::encoders::codec::{FRAME_KEY, h264_frame_type};
+        use crate::encoders::sps::h264_max_num_ref_frames;
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let mut enc = H264EncoderWrapper::with_depth(
+            W as i32, H as i32, 20, false, 8, 60.0, 1, false, 0, 0, 0, 0, 1,
+        )
+        .expect("x264 init");
+        let mut frames = Vec::new();
+        for i in 0..4usize {
+            let mut out = Vec::new();
+            assert!(enc.encode_with_headers(
+                &text_luma(i),
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                i as u16,
+                0,
+                i == 0,
+                true,
+                &mut out
+            ));
+            frames.push(out);
+        }
+        assert_eq!(h264_max_num_ref_frames(&frames[0]), Some(1));
+        assert!(enc.invalidate_reference(3));
+        let mut out = Vec::new();
+        assert!(enc.encode_with_headers(
+            &text_luma(4),
+            &u,
+            &v,
+            W as i32,
+            (W / 2) as i32,
+            (W / 2) as i32,
+            4,
+            0,
+            false,
+            true,
+            &mut out
+        ));
+        assert_eq!(h264_frame_type(&out), FRAME_KEY, "nothing older is held");
     }
 
     /// x264 counts `frame_num` in sixteen values and the stream in 4096 (`WideFrameNum`): a loss
