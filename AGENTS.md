@@ -97,7 +97,8 @@ without an error. Where the consumer says which frames every client holds or was
 `acknowledge_reference`, `ReferenceWindow::acknowledge`), AV1 keeps two as well, and several clients share one session
 with each recovering on its own: of two anchors, the newest all of them hold is pinned while the schedule marks the
 other, keeping one all of them were sent until they hold it (for up to four anchor periods), and a lone anchor all
-of them hold is not marked over while frames all of them were sent go unheld, as through a client's outage (for up to
+of them hold is not marked over while frames all of them were sent go unheld, as through a client's outage, nor
+while no recent frame is one all of them were sent, since it would predict from the one it marks over (for up to
 eight anchor periods); an anchor within an anchor period of the newest frame all of them were sent first forgets the
 frames after it, so it predicts from that one (`settle`), and carries `FRAME_ANCHOR` in its kind; a frame predicting from an anchor
 names it (NVENC's H.264 fallback takes the first otherwise); an AV1 anchor slot holding no frame, or a lost one,

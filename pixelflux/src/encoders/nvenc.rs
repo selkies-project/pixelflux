@@ -5674,7 +5674,9 @@ mod gpu_tests {
     /// period past a frame both hold predicts from it and is flagged so, one further on from the
     /// frame before; the one behind decodes each frame it is sent as the other does, the first
     /// after its report predicting from the anchor it holds; and no frame after the first is a
-    /// key frame. H.264 keeps one anchor, a frame every forty-eight. Ignored by default.
+    /// key frame. H.264 keeps one anchor, a frame every forty-eight, and marks none while the one
+    /// behind holds no recent frame, which then predicts past from the one it holds. Ignored by
+    /// default.
     #[test]
     #[ignore]
     fn gpu_acknowledged_anchors_carry_a_consumer_left_behind() {
@@ -5685,7 +5687,7 @@ mod gpu_tests {
         // (frames it has no room for, anchors too, the frame its report goes ahead of, the anchor
         // the frame after the report predicts from), for two anchors and for one
         let pinned = [(13..=40, false, 42, 36u16), (61..=100, true, 102, 60)];
-        let alone = [(49..=90, false, 92, 48u16), (97..=150, false, 152, 144)];
+        let alone = [(49..=90, false, 92, 48u16), (97..=150, false, 152, 96)];
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             let mut s = settings(w as i32, h as i32, 60.0);
             s.codec = codec;

@@ -214,7 +214,8 @@ impl ReferenceWindow {
     /// is held, and on the schedule after it the one that is empty, lost, or older, never the one
     /// pinned (`acknowledge`) where there are two, nor one every consumer was sent and is yet to
     /// hold (`PENDING_PERIODS`), nor a lone one they all hold while frames they were all sent go
-    /// unheld (`HOLD_LAG`). Acknowledged, an H.264 frame where `frame_num` wraps is an anchor too.
+    /// unheld (`HOLD_LAG`) or while it would predict from the one it marks over (`reaches_back`).
+    /// Acknowledged, an H.264 frame where `frame_num` wraps is an anchor too.
     pub fn plan_anchor(&self, key: bool) -> Option<u8> {
         if self.anchors.is_empty() {
             return None;
@@ -224,6 +225,9 @@ impl ReferenceWindow {
         }
         let wraps = self.wraps_next();
         if !(self.next_pts - self.key_pts).is_multiple_of(self.anchor_period()) && !wraps {
+            return None;
+        }
+        if self.anchors.len() == 1 && self.acknowledged && !wraps && self.reaches_back() {
             return None;
         }
         if self.anchors.len() == 1
@@ -258,6 +262,23 @@ impl ReferenceWindow {
             .filter(|&i| wraps || !pending(&self.anchors[i]))
             .min_by_key(|&i| rank(&self.anchors[i]))
             .map(|i| i as u8)
+    }
+
+    /// Whether an anchor marked now would predict from an older one (`settle`): no recent frame
+    /// held is one every consumer was sent, as while one of them lags, and the newest anchor is
+    /// under `HOLD_MAX` frames old. A lone anchor so marked costs every consumer the bits of a
+    /// prediction from an anchor period back, and the one it would mark over serves the one
+    /// lagging as well.
+    fn reaches_back(&self) -> bool {
+        self.newest_valid()
+            .is_some_and(|(_, pts)| !self.is_shared(pts))
+            && !self.frames.iter().any(|f| !f.2 && self.is_shared(f.1))
+            && self
+                .anchor_frames()
+                .filter(|a| !a.2)
+                .map(|a| a.1)
+                .max()
+                .is_some_and(|pts| self.next_pts - pts < HOLD_MAX)
     }
 
     /// How many frames apart the schedule marks anchors.
@@ -1819,17 +1840,15 @@ mod tests {
             "and 14 from 13, a recent frame"
         );
 
-        // A lone anchor predicts from the one it is marked over, every consumer holding frames
-        // since that the window let go.
+        // A lone anchor is not marked while it would predict from the one it marks over, every
+        // consumer holding frames since that the window let go: they all hold that one.
         let mut w = ReferenceWindow::with_anchors(8, 1);
         feed(&mut w, 0..=47);
         for id in 0..=30u16 {
             assert!(w.acknowledge(id, true));
         }
-        assert_eq!(w.plan_anchor(false), Some(0));
-        assert_eq!(w.settle(), Some(Invalidation::Forget(1)));
-        assert!(w.predicts_from_shared());
-        assert_eq!(w.record_marked(48, false, Some(0)), Reference::Frame(0));
+        assert_eq!(w.plan_anchor(false), None);
+        assert_eq!(w.record_marked(48, false, None), Reference::Frame(47));
 
         // Every consumer was sent the newest frame, which none holds yet: nothing to settle, and
         // nothing pinned on it.
@@ -1902,6 +1921,31 @@ mod tests {
             [(0, 0), (48, 0), (432, 0)],
             "past HOLD_MAX it is marked over, the anchor after it kept as one sent is"
         );
+    }
+
+    #[test]
+    fn a_lone_anchor_is_not_marked_from_the_one_it_marks_over() {
+        // Every consumer holds each frame nine frames late, past the seven recent frames: each
+        // anchor due would predict from the key frame, so none is marked until that is HOLD_MAX
+        // old. Held in time, one is marked every period.
+        for (late, want) in [
+            (9u16, vec![(0, 0), (384, 0)]),
+            (0, vec![(0, 0), (48, 0), (96, 0)]),
+        ] {
+            let mut w = ReferenceWindow::with_anchors(8, 1);
+            let mut marks = Vec::new();
+            for id in 0..=(if late > 0 { 480 } else { 100 }) {
+                marks.extend(
+                    feed(&mut w, id..=id)
+                        .into_iter()
+                        .filter_map(|f| f.1.map(|s| (id, s))),
+                );
+                if id >= late {
+                    assert!(w.acknowledge(id - late, true));
+                }
+            }
+            assert_eq!(marks, want, "held {late} frames late");
+        }
     }
 
     #[test]
