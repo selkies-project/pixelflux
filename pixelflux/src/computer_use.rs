@@ -28,8 +28,8 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::mpsc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -392,7 +392,9 @@ impl CuBackend for CuWaylandBackend {
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
                 mpsc::RecvTimeoutError::Timeout => "Screenshot timed out".to_string(),
-                mpsc::RecvTimeoutError::Disconnected => "Screenshot compositor disconnected".to_string(),
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "Screenshot compositor disconnected".to_string()
+                }
             })??;
         if Instant::now() >= deadline {
             return Err("Screenshot timed out".to_string());

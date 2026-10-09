@@ -1982,7 +1982,9 @@ fn reap_dead_host(state: &mut AppState) {
             Some("host compositor connection lost; capture stopped".to_string()),
         );
     }
-    state.pending_screenshots.fail_all("Host compositor connection lost");
+    state
+        .pending_screenshots
+        .fail_all("Host compositor connection lost");
     state.host = None;
     state.host_mode_refusals.clear();
     // Nothing will answer the requests still in flight: their geometry readers get
@@ -3123,7 +3125,9 @@ fn read_back_rgba_result(
     dst: &mut [u8],
     check_error: bool,
 ) -> Result<(), String> {
-    if check_error && (width <= 0 || height <= 0 || dst.len() < width as usize * height as usize * 4) {
+    if check_error
+        && (width <= 0 || height <= 0 || dst.len() < width as usize * height as usize * 4)
+    {
         return Err("Screenshot readback buffer is too small".to_string());
     }
     let error = renderer
@@ -3156,16 +3160,23 @@ fn screenshot_frame(
     height: i32,
     format: computer_use::ScreenshotPixelFormat,
 ) -> Result<computer_use::ScreenshotFrame, String> {
-    let expected = usize::try_from(width).ok()
+    let expected = usize::try_from(width)
+        .ok()
         .zip(usize::try_from(height).ok())
         .filter(|(w, h)| *w > 0 && *h > 0)
         .and_then(|(w, h)| w.checked_mul(h))
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| "Screenshot dimensions are invalid".to_string())?;
-    let pixels = pixels.get(..expected)
+    let pixels = pixels
+        .get(..expected)
         .ok_or_else(|| "Screenshot readback produced incomplete pixels".to_string())?
         .to_vec();
-    Ok(computer_use::ScreenshotFrame { pixels, width: width as u32, height: height as u32, format })
+    Ok(computer_use::ScreenshotFrame {
+        pixels,
+        width: width as u32,
+        height: height as u32,
+        format,
+    })
 }
 
 /// Reject truncated host mappings instead of retaining pixels from an earlier frame.
@@ -3179,13 +3190,20 @@ fn validate_host_screenshot(
     }
     let src_bpp = match frame.format {
         f if f == wl_shm::Format::Bgr888 as u32 || f == wl_shm::Format::Rgb888 as u32 => 3,
-        f if f == wl_shm::Format::Xrgb8888 as u32 || f == wl_shm::Format::Argb8888 as u32
-            || f == wl_shm::Format::Xbgr8888 as u32 || f == wl_shm::Format::Abgr8888 as u32 => 4,
+        f if f == wl_shm::Format::Xrgb8888 as u32
+            || f == wl_shm::Format::Argb8888 as u32
+            || f == wl_shm::Format::Xbgr8888 as u32
+            || f == wl_shm::Format::Abgr8888 as u32 =>
+        {
+            4
+        }
         _ => return Err("Screenshot host pixel format is unsupported".to_string()),
     };
-    let row = (width as usize).checked_mul(src_bpp)
+    let row = (width as usize)
+        .checked_mul(src_bpp)
         .ok_or_else(|| "Screenshot host dimensions overflow".to_string())?;
-    let required = (height as usize - 1).checked_mul(frame.stride)
+    let required = (height as usize - 1)
+        .checked_mul(frame.stride)
         .and_then(|n| n.checked_add(row))
         .and_then(|n| n.checked_add(frame.offset));
     if frame.stride < row || required.is_none_or(|n| n > (*frame.map).as_ref().len()) {
@@ -3215,12 +3233,24 @@ mod screenshot_frame_tests {
     #[test]
     fn screenshot_rejects_invalid_dimensions_and_short_pixels() {
         for (width, height) in [(0, 1), (1, 0), (-1, 2), (2, -1), (2, 2)] {
-            assert!(screenshot_frame(&[0; 12], width, height, ScreenshotPixelFormat::Rgba).is_err());
+            assert!(
+                screenshot_frame(&[0; 12], width, height, ScreenshotPixelFormat::Rgba).is_err()
+            );
         }
     }
 
-    fn host_frame(bytes: usize, stride: usize, offset: usize, format: wl_shm::Format) -> HostCpuFrame {
-        HostCpuFrame { map: Arc::new(vec![0u8; bytes]), offset, stride, format: format as u32 }
+    fn host_frame(
+        bytes: usize,
+        stride: usize,
+        offset: usize,
+        format: wl_shm::Format,
+    ) -> HostCpuFrame {
+        HostCpuFrame {
+            map: Arc::new(vec![0u8; bytes]),
+            offset,
+            stride,
+            format: format as u32,
+        }
     }
 
     #[test]
@@ -3228,9 +3258,16 @@ mod screenshot_frame_tests {
         for (format, row) in [(wl_shm::Format::Argb8888, 8), (wl_shm::Format::Bgr888, 6)] {
             let stride = row + 4;
             let required = 3 + stride + row;
-            assert!(validate_host_screenshot(&host_frame(required, stride, 3, format), 2, 2).is_ok());
-            assert!(validate_host_screenshot(&host_frame(required - 1, stride, 3, format), 2, 2).is_err());
-            assert!(validate_host_screenshot(&host_frame(required, row - 1, 3, format), 2, 2).is_err());
+            assert!(
+                validate_host_screenshot(&host_frame(required, stride, 3, format), 2, 2).is_ok()
+            );
+            assert!(
+                validate_host_screenshot(&host_frame(required - 1, stride, 3, format), 2, 2)
+                    .is_err()
+            );
+            assert!(
+                validate_host_screenshot(&host_frame(required, row - 1, 3, format), 2, 2).is_err()
+            );
         }
     }
 
@@ -3668,12 +3705,15 @@ fn render_node_tick(
             if take_screenshot && let Some(renderer) = state.gles_renderer.as_mut() {
                 let mut shot = host_enc_dmabuf.clone().unwrap_or(src);
                 screenshot_result = Some((|| {
-                    let fb = renderer.bind(&mut shot)
+                    let fb = renderer
+                        .bind(&mut shot)
                         .map_err(|e| format!("Screenshot bind failed: {e:?}"))?;
                     let rect = Rectangle::new((0, 0).into(), (width, height).into());
-                    let mapping = renderer.copy_framebuffer(&fb, rect, Fourcc::Abgr8888)
+                    let mapping = renderer
+                        .copy_framebuffer(&fb, rect, Fourcc::Abgr8888)
                         .map_err(|e| format!("Screenshot copy failed: {e:?}"))?;
-                    let data = renderer.map_texture(&mapping)
+                    let data = renderer
+                        .map_texture(&mapping)
                         .map_err(|e| format!("Screenshot map failed: {e:?}"))?;
                     let expected = width as usize * height as usize * 4;
                     if data.len() != expected {
@@ -3928,9 +3968,11 @@ fn render_node_tick(
                                         c.pool_content_gen[id] = c.content_gen;
                                     } else {
                                         render_success = false;
+                                        c.needs_full_render = true;
                                     }
                                     screenshot_result = Some(result);
-                                } else if render_success && c.pool_content_gen[id] != c.content_gen {
+                                } else if render_success && c.pool_content_gen[id] != c.content_gen
+                                {
                                     read_back_rgba(renderer, &mut frame, width, height, buf);
                                     c.pool_content_gen[id] = c.content_gen;
                                 }
@@ -4146,29 +4188,33 @@ fn render_node_tick(
         }
     }
 
-    if take_screenshot && let Some(request) = state.pending_screenshots.take(node.id, Instant::now()) {
+    if take_screenshot
+        && let Some(request) = state.pending_screenshots.take(node.id, Instant::now())
+    {
         if render_success && !host_mode && !state.use_gpu {
             screenshot_result = Some(Ok(()));
         }
         let result = screenshot_result
             .unwrap_or_else(|| Err("Screenshot render produced no pixels".to_string()))
             .and_then(|()| {
-            if !render_success {
-                return Err("Screenshot render failed".to_string());
-            }
-            let pixels = if host_mode {
-                node.frame_buffer.as_slice()
-            } else {
-                pool_slot.as_ref().map(|(_, buf)| buf.as_slice())
-                    .unwrap_or(&node.frame_buffer)
-            };
-            let format = if state.use_gpu && !host_cpu_frame {
-                computer_use::ScreenshotPixelFormat::Rgba
-            } else {
-                computer_use::ScreenshotPixelFormat::Bgra
-            };
-            screenshot_frame(pixels, width, height, format)
-        });
+                if !render_success {
+                    return Err("Screenshot render failed".to_string());
+                }
+                let pixels = if host_mode {
+                    node.frame_buffer.as_slice()
+                } else {
+                    pool_slot
+                        .as_ref()
+                        .map(|(_, buf)| buf.as_slice())
+                        .unwrap_or(&node.frame_buffer)
+                };
+                let format = if state.use_gpu && !host_cpu_frame {
+                    computer_use::ScreenshotPixelFormat::Rgba
+                } else {
+                    computer_use::ScreenshotPixelFormat::Bgra
+                };
+                screenshot_frame(pixels, width, height, format)
+            });
         let result = if request.canceled.load(Ordering::Acquire) {
             Err("Screenshot canceled".to_string())
         } else if Instant::now() >= request.deadline {
@@ -4858,7 +4904,9 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     let Some(_) = state.node_idx_for_id(id) else {
         return false;
     };
-    state.pending_screenshots.fail_display(id, "Screenshot output was removed");
+    state
+        .pending_screenshots
+        .fail_display(id, "Screenshot output was removed");
     stop_capture_on_display(state, id);
     if let Some(host) = state.host.as_ref() {
         host.idle_output(id);
@@ -4892,7 +4940,9 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     // output unmaps it; destroying that node takes its views with it, captures
     // and encoders included.
     for view in state.view_ids_of(id) {
-        state.pending_screenshots.fail_display(view, "Screenshot output was removed");
+        state
+            .pending_screenshots
+            .fail_display(view, "Screenshot output was removed");
         stop_capture_on_display(state, view);
         wayland_owners().lock().unwrap().remove(&view);
         if let Some(vidx) = state.node_idx_for_id(view) {
@@ -6444,10 +6494,20 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         .store(true, Ordering::Release);
                 }
             }
-            ThreadCommand::CuScreenshot { display_id, resp, canceled, deadline } => {
+            ThreadCommand::CuScreenshot {
+                display_id,
+                resp,
+                canceled,
+                deadline,
+            } => {
                 if state.node_idx_for_id(display_id).is_some() {
                     state.pending_screenshots.enqueue(
-                        wayland::frontend::ScreenshotRequest { display_id, resp, canceled, deadline },
+                        wayland::frontend::ScreenshotRequest {
+                            display_id,
+                            resp,
+                            canceled,
+                            deadline,
+                        },
                         Instant::now(),
                     );
                 } else {

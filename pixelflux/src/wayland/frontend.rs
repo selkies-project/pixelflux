@@ -525,12 +525,19 @@ impl ScreenshotQueue {
 
     pub fn take(&mut self, display_id: u32, now: Instant) -> Option<ScreenshotRequest> {
         self.prune(now);
-        let index = self.requests.iter().position(|r| r.display_id == display_id)?;
+        let index = self
+            .requests
+            .iter()
+            .position(|r| r.display_id == display_id)?;
         Some(self.requests.remove(index))
     }
 
     pub fn fail_display(&mut self, display_id: u32, reason: &str) {
-        if let Some(index) = self.requests.iter().position(|r| r.display_id == display_id) {
+        if let Some(index) = self
+            .requests
+            .iter()
+            .position(|r| r.display_id == display_id)
+        {
             let request = self.requests.remove(index);
             let _ = request.resp.send(Err(reason.to_string()));
         }
@@ -546,15 +553,30 @@ impl ScreenshotQueue {
 #[cfg(test)]
 mod screenshot_queue_tests {
     use super::{ScreenshotQueue, ScreenshotRequest};
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use std::time::{Duration, Instant};
 
-    fn request(display_id: u32, deadline: Instant) -> (
+    fn request(
+        display_id: u32,
+        deadline: Instant,
+    ) -> (
         ScreenshotRequest,
         mpsc::Receiver<Result<crate::computer_use::ScreenshotFrame, String>>,
     ) {
         let (resp, rx) = mpsc::channel();
-        (ScreenshotRequest { display_id, resp, canceled: Arc::new(AtomicBool::new(false)), deadline }, rx)
+        (
+            ScreenshotRequest {
+                display_id,
+                resp,
+                canceled: Arc::new(AtomicBool::new(false)),
+                deadline,
+            },
+            rx,
+        )
     }
 
     #[test]
@@ -566,8 +588,18 @@ mod screenshot_queue_tests {
         queue.enqueue(first, now);
         queue.enqueue(second, now);
         assert!(second_rx.recv().unwrap().err().unwrap().contains("busy"));
-        assert!(matches!(first_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
-        assert!(queue.take(7, now).unwrap().resp.send(Err("first reply".to_string())).is_ok());
+        assert!(matches!(
+            first_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(
+            queue
+                .take(7, now)
+                .unwrap()
+                .resp
+                .send(Err("first reply".to_string()))
+                .is_ok()
+        );
         assert_eq!(first_rx.recv().unwrap().err().unwrap(), "first reply");
     }
 
@@ -605,8 +637,14 @@ mod screenshot_queue_tests {
         flag.store(true, Ordering::Release);
         queue.prune(now + Duration::from_secs(1));
         assert!(queue.is_empty());
-        assert_eq!(canceled_rx.recv().unwrap().err().unwrap(), "Screenshot canceled");
-        assert_eq!(expired_rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        assert_eq!(
+            canceled_rx.recv().unwrap().err().unwrap(),
+            "Screenshot canceled"
+        );
+        assert_eq!(
+            expired_rx.recv().unwrap().err().unwrap(),
+            "Screenshot timed out"
+        );
         let (fresh, _) = request(0, now + Duration::from_secs(3));
         queue.enqueue(fresh, now + Duration::from_secs(1));
         assert!(queue.contains(0));
@@ -648,7 +686,10 @@ mod screenshot_queue_tests {
         queue.fail_display(2, "removed");
         assert_eq!(removed_rx.recv().unwrap().err().unwrap(), "removed");
         assert!(queue.contains(3));
-        assert!(matches!(other_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            other_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         let (reused, _) = request(2, now + Duration::from_secs(1));
         queue.enqueue(reused, now);
         assert!(queue.contains(2));
