@@ -29,9 +29,10 @@ use std::io::Cursor;
 use std::io::Read;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::input::keyboard::xkb;
 
@@ -60,13 +61,94 @@ fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
 /// as base64 PNG, so this encodes a flat RGBA buffer (with its dimensions) through the `image`
 /// crate and returns the PNG bytes for that response payload.
 pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, data.to_vec())
+    let img = ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, data)
         .ok_or("Failed to create image buffer")?;
     let mut png = Vec::new();
     img.write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
         .map_err(|e| format!("PNG encode error: {}", e))?;
     Ok(png)
 }
+
+pub(crate) const MAX_SCREENSHOT_REQUESTS: usize = 4;
+const MAX_SCREENSHOT_REQUESTS_PER_DISPLAY: usize = 2;
+
+#[derive(Clone, Copy)]
+pub enum ScreenshotPixelFormat {
+    Rgba,
+    Bgra,
+}
+
+/// An owned copy of one rendered output, independent of the streaming buffer pool.
+/// Channel conversion and PNG compression run in the requesting thread.
+pub struct ScreenshotFrame {
+    pub pixels: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub format: ScreenshotPixelFormat,
+}
+
+impl ScreenshotFrame {
+    fn encode_png(mut self) -> Result<Vec<u8>, String> {
+        let expected = (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|n| n.checked_mul(4));
+        if self.width == 0 || self.height == 0 || expected != Some(self.pixels.len()) {
+            return Err("Screenshot render produced an invalid framebuffer".to_string());
+        }
+        if matches!(self.format, ScreenshotPixelFormat::Bgra) {
+            for px in self.pixels.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        encode_png_rgba(&self.pixels, self.width, self.height)
+    }
+}
+
+/// Bound raw snapshots and PNG work together, including callers still compressing a reply.
+/// Two requests per output allow a readback while its previous response is compressed;
+/// four across all outputs bound concurrent frame copies without allocating worker threads.
+#[derive(Default)]
+struct ScreenshotAdmission {
+    counts: Mutex<HashMap<u32, usize>>,
+}
+
+impl ScreenshotAdmission {
+    fn acquire(&self, display: u32) -> Result<ScreenshotPermit<'_>, String> {
+        let mut counts = self.counts.lock().unwrap();
+        if counts.values().sum::<usize>() >= MAX_SCREENSHOT_REQUESTS
+            || counts.get(&display).copied().unwrap_or(0) >= MAX_SCREENSHOT_REQUESTS_PER_DISPLAY
+        {
+            return Err("Screenshot busy".to_string());
+        }
+        *counts.entry(display).or_default() += 1;
+        Ok(ScreenshotPermit {
+            admission: self,
+            display,
+            canceled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+}
+
+struct ScreenshotPermit<'a> {
+    admission: &'a ScreenshotAdmission,
+    display: u32,
+    canceled: Arc<AtomicBool>,
+}
+
+impl Drop for ScreenshotPermit<'_> {
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::Release);
+        let mut counts = self.admission.counts.lock().unwrap();
+        if let Some(count) = counts.get_mut(&self.display) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.display);
+            }
+        }
+    }
+}
+
+static SCREENSHOT_ADMISSION: OnceLock<ScreenshotAdmission> = OnceLock::new();
 
 fn scancode_for_keyname(name: &str) -> Option<u32> {
     Some(match name.to_lowercase().as_str() {
@@ -293,16 +375,29 @@ impl CuBackend for CuWaylandBackend {
     }
 
     fn screenshot_png(&self, display: u32) -> Result<Vec<u8>, String> {
+        let permit = SCREENSHOT_ADMISSION
+            .get_or_init(ScreenshotAdmission::default)
+            .acquire(display)?;
+        let deadline = Instant::now() + REPLY_TIMEOUT;
         let (resp_tx, resp_rx) = mpsc::channel();
         self.tx
             .send(ThreadCommand::CuScreenshot {
                 display_id: display,
                 resp: resp_tx,
+                canceled: Arc::clone(&permit.canceled),
+                deadline,
             })
             .map_err(|_| "Failed to request screenshot".to_string())?;
-        resp_rx
-            .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|_| "Screenshot failed".to_string())?
+        let frame = resp_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => "Screenshot timed out".to_string(),
+                mpsc::RecvTimeoutError::Disconnected => "Screenshot compositor disconnected".to_string(),
+            })??;
+        if Instant::now() >= deadline {
+            return Err("Screenshot timed out".to_string());
+        }
+        frame.encode_png()
     }
 
     fn cursor_pos(&self) -> Result<(f64, f64), String> {
@@ -1371,8 +1466,86 @@ mod record_path_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::cu_listeners;
+    use super::{
+        ScreenshotAdmission, ScreenshotFrame, ScreenshotPixelFormat, cu_listeners, encode_png_rgba,
+    };
+    use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn screenshot_png_preserves_channels_alpha_and_encoding() {
+        let rgba: Vec<u8> = (0..4 * 17 * 11).map(|n| (n * 37) as u8).collect();
+        let mut previous_png = Vec::new();
+        image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(17, 11, rgba.clone())
+            .unwrap()
+            .write_to(&mut Cursor::new(&mut previous_png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(encode_png_rgba(&rgba, 17, 11).unwrap(), previous_png);
+        for format in [ScreenshotPixelFormat::Rgba, ScreenshotPixelFormat::Bgra] {
+            let mut pixels = rgba.clone();
+            if matches!(format, ScreenshotPixelFormat::Bgra) {
+                for px in pixels.chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+            }
+            let png = ScreenshotFrame {
+                pixels,
+                width: 17,
+                height: 11,
+                format,
+            }
+            .encode_png()
+            .unwrap();
+            assert_eq!(png, previous_png);
+            let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+            assert_eq!(decoded.dimensions(), (17, 11));
+            assert_eq!(decoded.into_raw(), rgba);
+        }
+    }
+
+    #[test]
+    fn screenshot_rejects_incomplete_oversized_and_overflowing_frames() {
+        for (width, height, len) in [
+            (0, 1, 0),
+            (1, 0, 0),
+            (2, 2, 15),
+            (2, 2, 17),
+            (u32::MAX, u32::MAX, 0),
+        ] {
+            assert!(
+                ScreenshotFrame {
+                    pixels: vec![0; len],
+                    width,
+                    height,
+                    format: ScreenshotPixelFormat::Rgba,
+                }
+                .encode_png()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_capacity_spans_readback_and_encoding_until_release() {
+        let admission = ScreenshotAdmission::default();
+        let first = admission.acquire(0).unwrap();
+        let canceled = Arc::clone(&first.canceled);
+        let second = admission.acquire(0).unwrap();
+        assert!(admission.acquire(0).is_err());
+        let third = admission.acquire(1).unwrap();
+        let fourth = admission.acquire(2).unwrap();
+        assert!(admission.acquire(3).is_err());
+        assert!(!canceled.load(Ordering::Acquire));
+        drop(first);
+        assert!(canceled.load(Ordering::Acquire));
+        let replacement = admission.acquire(3).unwrap();
+        assert!(admission.acquire(0).is_err());
+        drop((second, third, fourth, replacement));
+        assert!(admission.counts.lock().unwrap().is_empty());
+        assert!(admission.acquire(0).is_ok());
+    }
 
     #[test]
     fn bare_port_binds_loopback_only() {

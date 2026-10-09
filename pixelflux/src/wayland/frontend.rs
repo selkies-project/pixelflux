@@ -459,9 +459,204 @@ pub fn window_output_id(window: &Window) -> u32 {
         .unwrap_or(0)
 }
 
-/// A queued computer-use screenshot as `(display id, reply)`; the reply carries the
-/// encoded image or the reason it could not be produced.
-pub type ScreenshotRequest = (u32, std::sync::mpsc::Sender<Result<Vec<u8>, String>>);
+/// A screenshot waiting for its output to render; pixels are owned by the receiver.
+pub(crate) struct ScreenshotRequest {
+    pub display_id: u32,
+    pub resp: std::sync::mpsc::Sender<Result<crate::computer_use::ScreenshotFrame, String>>,
+    pub canceled: Arc<AtomicBool>,
+    pub deadline: Instant,
+}
+
+impl ScreenshotRequest {
+    fn inactive_reason(&self, now: Instant) -> Option<&'static str> {
+        if self.canceled.load(Ordering::Acquire) {
+            Some("Screenshot canceled")
+        } else if now >= self.deadline {
+            Some("Screenshot timed out")
+        } else {
+            None
+        }
+    }
+}
+
+/// Bounded admission on the compositor: one pending readback per output.
+#[derive(Default)]
+pub(crate) struct ScreenshotQueue {
+    requests: Vec<ScreenshotRequest>,
+}
+
+impl ScreenshotQueue {
+    pub fn enqueue(&mut self, request: ScreenshotRequest, now: Instant) {
+        self.prune(now);
+        let error = request.inactive_reason(now).or_else(|| {
+            if self.requests.len() >= crate::computer_use::MAX_SCREENSHOT_REQUESTS
+                || self.contains(request.display_id)
+            {
+                Some("Screenshot busy: a readback is already pending or the queue is full")
+            } else {
+                None
+            }
+        });
+        if let Some(error) = error {
+            let _ = request.resp.send(Err(error.to_string()));
+        } else {
+            self.requests.push(request);
+        }
+    }
+
+    pub fn prune(&mut self, now: Instant) {
+        self.requests.retain(|request| {
+            if let Some(error) = request.inactive_reason(now) {
+                let _ = request.resp.send(Err(error.to_string()));
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn contains(&self, display_id: u32) -> bool {
+        self.requests.iter().any(|r| r.display_id == display_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    pub fn take(&mut self, display_id: u32, now: Instant) -> Option<ScreenshotRequest> {
+        self.prune(now);
+        let index = self.requests.iter().position(|r| r.display_id == display_id)?;
+        Some(self.requests.remove(index))
+    }
+
+    pub fn fail_display(&mut self, display_id: u32, reason: &str) {
+        if let Some(index) = self.requests.iter().position(|r| r.display_id == display_id) {
+            let request = self.requests.remove(index);
+            let _ = request.resp.send(Err(reason.to_string()));
+        }
+    }
+
+    pub fn fail_all(&mut self, reason: &str) {
+        for request in self.requests.drain(..) {
+            let _ = request.resp.send(Err(reason.to_string()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod screenshot_queue_tests {
+    use super::{ScreenshotQueue, ScreenshotRequest};
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc};
+    use std::time::{Duration, Instant};
+
+    fn request(display_id: u32, deadline: Instant) -> (
+        ScreenshotRequest,
+        mpsc::Receiver<Result<crate::computer_use::ScreenshotFrame, String>>,
+    ) {
+        let (resp, rx) = mpsc::channel();
+        (ScreenshotRequest { display_id, resp, canceled: Arc::new(AtomicBool::new(false)), deadline }, rx)
+    }
+
+    #[test]
+    fn screenshot_duplicate_does_not_replace_the_waiter() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let (first, first_rx) = request(7, now + Duration::from_secs(1));
+        let (second, second_rx) = request(7, now + Duration::from_secs(1));
+        queue.enqueue(first, now);
+        queue.enqueue(second, now);
+        assert!(second_rx.recv().unwrap().err().unwrap().contains("busy"));
+        assert!(matches!(first_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(queue.take(7, now).unwrap().resp.send(Err("first reply".to_string())).is_ok());
+        assert_eq!(first_rx.recv().unwrap().err().unwrap(), "first reply");
+    }
+
+    #[test]
+    fn screenshot_outputs_have_independent_bounded_slots() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let mut receivers = Vec::new();
+        for display in 0..crate::computer_use::MAX_SCREENSHOT_REQUESTS as u32 {
+            let (request, rx) = request(display, now + Duration::from_secs(1));
+            queue.enqueue(request, now);
+            receivers.push(rx);
+        }
+        let (overflow, rx) = request(99, now + Duration::from_secs(1));
+        queue.enqueue(overflow, now);
+        assert!(rx.recv().unwrap().err().unwrap().contains("busy"));
+        assert_eq!(queue.take(2, now).unwrap().display_id, 2);
+        assert!(queue.contains(0));
+        assert!(queue.contains(1));
+        assert!(queue.contains(3));
+        let (replacement, _) = request(99, now + Duration::from_secs(1));
+        queue.enqueue(replacement, now);
+        assert!(queue.contains(99));
+    }
+
+    #[test]
+    fn screenshot_canceled_and_expired_requests_release_slots() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let (canceled, canceled_rx) = request(0, now + Duration::from_secs(2));
+        let flag = canceled.canceled.clone();
+        let (expired, expired_rx) = request(1, now + Duration::from_secs(1));
+        queue.enqueue(canceled, now);
+        queue.enqueue(expired, now);
+        flag.store(true, Ordering::Release);
+        queue.prune(now + Duration::from_secs(1));
+        assert!(queue.is_empty());
+        assert_eq!(canceled_rx.recv().unwrap().err().unwrap(), "Screenshot canceled");
+        assert_eq!(expired_rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        let (fresh, _) = request(0, now + Duration::from_secs(3));
+        queue.enqueue(fresh, now + Duration::from_secs(1));
+        assert!(queue.contains(0));
+    }
+
+    #[test]
+    fn screenshot_inactive_requests_never_enter_the_queue() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let (expired, rx) = request(0, now);
+        queue.enqueue(expired, now);
+        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        let (canceled, rx) = request(0, now + Duration::from_secs(1));
+        canceled.canceled.store(true, Ordering::Release);
+        queue.enqueue(canceled, now);
+        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot canceled");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn screenshot_timeout_is_checked_again_before_handoff() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let (pending, rx) = request(4, now + Duration::from_secs(1));
+        queue.enqueue(pending, now);
+        assert!(queue.take(4, now + Duration::from_secs(1)).is_none());
+        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn screenshot_output_removal_does_not_cancel_other_outputs() {
+        let now = Instant::now();
+        let mut queue = ScreenshotQueue::default();
+        let (removed, removed_rx) = request(2, now + Duration::from_secs(1));
+        let (other, other_rx) = request(3, now + Duration::from_secs(1));
+        queue.enqueue(removed, now);
+        queue.enqueue(other, now);
+        queue.fail_display(2, "removed");
+        assert_eq!(removed_rx.recv().unwrap().err().unwrap(), "removed");
+        assert!(queue.contains(3));
+        assert!(matches!(other_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let (reused, _) = request(2, now + Duration::from_secs(1));
+        queue.enqueue(reused, now);
+        assert!(queue.contains(2));
+        queue.fail_all("disconnected");
+        assert!(queue.is_empty());
+        assert_eq!(other_rx.recv().unwrap().err().unwrap(), "disconnected");
+    }
+}
 
 /// Where the seat's pointer is, as `PointerShare::read` returns it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -681,9 +876,8 @@ pub struct AppState {
     pub pointer_constraints_state: PointerConstraintsState,
     pub render_node_path: String,
     pub auto_gpu_selected: bool,
-    /// Computer-use screenshot request; served from that output's next render (the id
-    /// was validated live when the request was queued).
-    pub pending_screenshot: Option<ScreenshotRequest>,
+    /// Screenshot readbacks waiting for their output's next render.
+    pub(crate) pending_screenshots: ScreenshotQueue,
     /// The command channel, drained in place (wakeups arrive on a separate ping channel) so
     /// the render tick can apply every queued command BEFORE starting a long render/encode —
     /// queued input is never starved behind the tick it arrived during.
