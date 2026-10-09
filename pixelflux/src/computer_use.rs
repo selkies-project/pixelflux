@@ -1080,7 +1080,11 @@ pub fn register_wayland_backend(
 /// process. The recorder uses it to attach to (or start) a capture without any Python client.
 pub(crate) fn wayland_command_sender()
 -> Option<smithay::reexports::calloop::channel::Sender<ThreadCommand>> {
-    WAYLAND_BACKEND.lock().unwrap().as_ref().map(|be| be.tx.clone())
+    WAYLAND_BACKEND
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|be| be.tx.clone())
 }
 
 /// Start the CU server if `PIXELFLUX_CU` names a bind (the standalone fallback;
