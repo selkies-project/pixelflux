@@ -77,7 +77,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
     backend::{
         allocator::{
-            Fourcc, Modifier,
+            Buffer as _, Fourcc, Modifier,
             dmabuf::{Dmabuf, DmabufFlags},
             gbm::GbmDevice,
         },
