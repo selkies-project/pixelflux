@@ -313,8 +313,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wayland implementation: every primitive is a `ThreadCommand` on the compositor's calloop
 /// channel, so injection and readback serialize naturally with rendering and encoding.
+#[derive(Clone)]
 pub struct CuWaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+    wake_tx: smithay::reexports::calloop::channel::Sender<()>,
 }
 
 impl CuBackend for CuWaylandBackend {
@@ -388,6 +390,7 @@ impl CuBackend for CuWaylandBackend {
                 deadline,
             })
             .map_err(|_| "Failed to request screenshot".to_string())?;
+        let _ = self.wake_tx.send(());
         let frame = resp_rx
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .map_err(|error| match error {
@@ -930,8 +933,7 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
     }
 }
 
-static WAYLAND_TX: Mutex<Option<smithay::reexports::calloop::channel::Sender<ThreadCommand>>> =
-    Mutex::new(None);
+static WAYLAND_BACKEND: Mutex<Option<CuWaylandBackend>> = Mutex::new(None);
 
 /// Body of `POST /record_start`. All fields are optional; unset ones fall back to the
 /// `PIXELFLUX_RECORD_*` environment variables and built-in defaults.
@@ -1067,15 +1069,18 @@ pub(crate) fn app_wayland_socket_path() -> Option<String> {
 
 /// Make the Wayland compositor the preferred CU backend: once a live calloop sender is
 /// registered, every subsequent request routes to it instead of an X11 connection.
-pub fn register_wayland_backend(tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>) {
-    *WAYLAND_TX.lock().unwrap() = Some(tx);
+pub fn register_wayland_backend(
+    tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
+    wake_tx: smithay::reexports::calloop::channel::Sender<()>,
+) {
+    *WAYLAND_BACKEND.lock().unwrap() = Some(CuWaylandBackend { tx, wake_tx });
 }
 
 /// The registered compositor's command channel, if a Wayland compositor is running in this
 /// process. The recorder uses it to attach to (or start) a capture without any Python client.
 pub(crate) fn wayland_command_sender()
 -> Option<smithay::reexports::calloop::channel::Sender<ThreadCommand>> {
-    WAYLAND_TX.lock().unwrap().clone()
+    WAYLAND_BACKEND.lock().unwrap().as_ref().map(|be| be.tx.clone())
 }
 
 /// Start the CU server if `PIXELFLUX_CU` names a bind (the standalone fallback;
@@ -1291,8 +1296,8 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// otherwise a fresh private connection to `DISPLAY`. The X11 connection is per-request so a
 /// restarted X server never leaves the CU thread holding a dead connection.
 pub(crate) fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
-    if let Some(tx) = WAYLAND_TX.lock().unwrap().clone() {
-        return Ok(Box::new(CuWaylandBackend { tx }));
+    if let Some(backend) = WAYLAND_BACKEND.lock().unwrap().clone() {
+        return Ok(Box::new(backend));
     }
     crate::x11::computer_use::CuX11Backend::connect().map(|be| Box::new(be) as Box<dyn CuBackend>)
 }

@@ -5223,6 +5223,7 @@ fn create_view_on(
 struct WaylandThreadConfig {
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
     wake_rx: smithay::reexports::calloop::channel::Channel<()>,
+    wake_tx: smithay::reexports::calloop::channel::Sender<()>,
     command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     initial_width: i32,
     initial_height: i32,
@@ -5357,6 +5358,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let WaylandThreadConfig {
         command_rx,
         wake_rx,
+        wake_tx,
         command_tx,
         initial_width,
         initial_height,
@@ -6566,6 +6568,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             {
                 state.space.refresh();
                 render_pass(state, TickTrigger::Input);
+            } else if !state.pending_screenshots.is_empty() {
+                // A screenshot must not wait out the frame timer's idle deadline.
+                // Commands, including input, have already been drained above.
+                state.space.refresh();
+                render_pass(state, TickTrigger::Timer);
             }
         })
         .unwrap();
@@ -6750,7 +6757,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         )
         .unwrap();
 
-    crate::computer_use::register_wayland_backend(command_tx.clone());
+    crate::computer_use::register_wayland_backend(command_tx.clone(), wake_tx);
     crate::computer_use::spawn_cu_from_env();
     crate::wayland::ficlient::arm(crate::computer_use::app_wayland_socket_path());
 
@@ -6930,6 +6937,7 @@ impl WaylandBackend {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
         let (wake_tx, wake_rx) = smithay::reexports::calloop::channel::channel();
         let cu_tx = tx.clone();
+        let cu_wake_tx = wake_tx.clone();
         let pointer = Arc::new(crate::wayland::frontend::PointerShare::default());
         let pointer_share = pointer.clone();
         thread::spawn(move || {
@@ -6937,6 +6945,7 @@ impl WaylandBackend {
             run_wayland_thread(WaylandThreadConfig {
                 command_rx: rx,
                 wake_rx,
+                wake_tx: cu_wake_tx,
                 command_tx: cu_tx,
                 initial_width: width,
                 initial_height: height,
