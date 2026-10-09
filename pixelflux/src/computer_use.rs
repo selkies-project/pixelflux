@@ -1502,7 +1502,10 @@ mod tests {
 
     #[test]
     fn screenshot_png_preserves_channels_alpha_and_encoding() {
-        let rgba: Vec<u8> = (0..4 * 17 * 11).map(|n| (n * 37) as u8).collect();
+        let mut rgba: Vec<u8> = (0..4 * 17 * 11).map(|n| (n * 37) as u8).collect();
+        rgba[3] = 0;
+        rgba[7] = 128;
+        rgba[11] = 255;
         let mut previous_png = Vec::new();
         image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(17, 11, rgba.clone())
             .unwrap()
