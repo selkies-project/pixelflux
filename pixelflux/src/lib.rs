@@ -6568,9 +6568,11 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             {
                 state.space.refresh();
                 render_pass(state, TickTrigger::Input);
-            } else if !state.pending_screenshots.is_empty() {
-                // A screenshot must not wait out the frame timer's idle deadline.
-                // Commands, including input, have already been drained above.
+            } else if !state.pending_screenshots.is_empty()
+                && state.output_nodes.iter().all(|n| n.capture.is_none())
+            {
+                // With no active capture, serve the screenshot without the idle wait.
+                // Active captures retain their frame cadence; input was drained above.
                 state.space.refresh();
                 render_pass(state, TickTrigger::Timer);
             }
