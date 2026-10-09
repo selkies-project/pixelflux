@@ -446,6 +446,8 @@ For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat`
 
 On Wayland, PNG compression runs in the requesting thread outside the Python GIL, after the compositor hands it an owned copy of the rendered output. Requests are bounded through compression: up to four across all displays and two per display, with at most one queued readback per display. A call that exceeds either limit returns `Screenshot busy`; it does not replace another caller's pending capture. A timed-out caller cancels its pending readback, and removing an output fails its pending capture.
 
+PNGs contain 8-bit RGBA pixels. Unused alpha bytes in opaque host formats become fully opaque; alpha-bearing formats retain their alpha. Losslessness refers to the rendered screenshot, not to the precision of an application's original data.
+
 ## Recording Sink
 
 The capture session can output the raw video stream directly to a Unix domain socket for external recording: Annex-B for H.264 and H.265, an OBU stream for AV1, and IVF for VP8 and VP9.

@@ -72,10 +72,12 @@ pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
 pub(crate) const MAX_SCREENSHOT_REQUESTS: usize = 4;
 const MAX_SCREENSHOT_REQUESTS_PER_DISPLAY: usize = 2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScreenshotPixelFormat {
     Rgba,
     Bgra,
+    Rgbx,
+    Bgrx,
 }
 
 /// An owned copy of one rendered output, independent of the streaming buffer pool.
@@ -95,9 +97,22 @@ impl ScreenshotFrame {
         if self.width == 0 || self.height == 0 || expected != Some(self.pixels.len()) {
             return Err("Screenshot render produced an invalid framebuffer".to_string());
         }
-        if matches!(self.format, ScreenshotPixelFormat::Bgra) {
+        let swap = matches!(
+            self.format,
+            ScreenshotPixelFormat::Bgra | ScreenshotPixelFormat::Bgrx
+        );
+        let opaque = matches!(
+            self.format,
+            ScreenshotPixelFormat::Rgbx | ScreenshotPixelFormat::Bgrx
+        );
+        if swap || opaque {
             for px in self.pixels.as_chunks_mut::<4>().0 {
-                px.swap(0, 2);
+                if swap {
+                    px.swap(0, 2);
+                }
+                if opaque {
+                    px[3] = 255;
+                }
             }
         }
         encode_png_rgba(&self.pixels, self.width, self.height)
@@ -1534,6 +1549,31 @@ mod tests {
                 }
                 .encode_png()
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_opaque_formats_ignore_unused_alpha_bytes() {
+        for format in [ScreenshotPixelFormat::Rgbx, ScreenshotPixelFormat::Bgrx] {
+            let mut pixels = vec![11, 22, 33, 0, 44, 55, 66, 128, 77, 88, 99, 255];
+            if format == ScreenshotPixelFormat::Bgrx {
+                for px in pixels.as_chunks_mut::<4>().0 {
+                    px.swap(0, 2);
+                }
+            }
+            let png = ScreenshotFrame {
+                pixels,
+                width: 3,
+                height: 1,
+                format,
+            }
+            .encode_png()
+            .unwrap();
+            let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
+            assert_eq!(
+                decoded.into_raw(),
+                [11, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255]
             );
         }
     }
