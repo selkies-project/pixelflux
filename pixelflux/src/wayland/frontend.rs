@@ -587,7 +587,14 @@ mod screenshot_queue_tests {
         let (second, second_rx) = request(7, now + Duration::from_secs(1));
         queue.enqueue(first, now);
         queue.enqueue(second, now);
-        assert!(second_rx.recv().unwrap().err().unwrap().contains("busy"));
+        assert!(
+            second_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap()
+                .contains("busy")
+        );
         assert!(matches!(
             first_rx.try_recv(),
             Err(mpsc::TryRecvError::Empty)
@@ -600,7 +607,14 @@ mod screenshot_queue_tests {
                 .send(Err("first reply".to_string()))
                 .is_ok()
         );
-        assert_eq!(first_rx.recv().unwrap().err().unwrap(), "first reply");
+        assert_eq!(
+            first_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "first reply"
+        );
     }
 
     #[test]
@@ -615,7 +629,13 @@ mod screenshot_queue_tests {
         }
         let (overflow, rx) = request(99, now + Duration::from_secs(1));
         queue.enqueue(overflow, now);
-        assert!(rx.recv().unwrap().err().unwrap().contains("busy"));
+        assert!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap()
+                .contains("busy")
+        );
         assert_eq!(queue.take(2, now).unwrap().display_id, 2);
         assert!(queue.contains(0));
         assert!(queue.contains(1));
@@ -638,11 +658,19 @@ mod screenshot_queue_tests {
         queue.prune(now + Duration::from_secs(1));
         assert!(queue.is_empty());
         assert_eq!(
-            canceled_rx.recv().unwrap().err().unwrap(),
+            canceled_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
             "Screenshot canceled"
         );
         assert_eq!(
-            expired_rx.recv().unwrap().err().unwrap(),
+            expired_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
             "Screenshot timed out"
         );
         let (fresh, _) = request(0, now + Duration::from_secs(3));
@@ -656,11 +684,23 @@ mod screenshot_queue_tests {
         let mut queue = ScreenshotQueue::default();
         let (expired, rx) = request(0, now);
         queue.enqueue(expired, now);
-        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "Screenshot timed out"
+        );
         let (canceled, rx) = request(0, now + Duration::from_secs(1));
         canceled.canceled.store(true, Ordering::Release);
         queue.enqueue(canceled, now);
-        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot canceled");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "Screenshot canceled"
+        );
         assert!(queue.is_empty());
     }
 
@@ -671,7 +711,13 @@ mod screenshot_queue_tests {
         let (pending, rx) = request(4, now + Duration::from_secs(1));
         queue.enqueue(pending, now);
         assert!(queue.take(4, now + Duration::from_secs(1)).is_none());
-        assert_eq!(rx.recv().unwrap().err().unwrap(), "Screenshot timed out");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "Screenshot timed out"
+        );
         assert!(queue.is_empty());
     }
 
@@ -684,7 +730,14 @@ mod screenshot_queue_tests {
         queue.enqueue(removed, now);
         queue.enqueue(other, now);
         queue.fail_display(2, "removed");
-        assert_eq!(removed_rx.recv().unwrap().err().unwrap(), "removed");
+        assert_eq!(
+            removed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "removed"
+        );
         assert!(queue.contains(3));
         assert!(matches!(
             other_rx.try_recv(),
@@ -695,7 +748,14 @@ mod screenshot_queue_tests {
         assert!(queue.contains(2));
         queue.fail_all("disconnected");
         assert!(queue.is_empty());
-        assert_eq!(other_rx.recv().unwrap().err().unwrap(), "disconnected");
+        assert_eq!(
+            other_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .err()
+                .unwrap(),
+            "disconnected"
+        );
     }
 }
 
