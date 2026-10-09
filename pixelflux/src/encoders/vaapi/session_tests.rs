@@ -605,6 +605,130 @@ fn h264_names_the_newest_surviving_frame_in_its_slice_header() {
     });
 }
 
+/// On a driver that codes a picture from the reference it is named (radeonsi), an H.264 session
+/// keeps a long-term anchor: the key frame goes out marked long-term under index 0, the anchor
+/// the schedule marks later under the same index by memory management operation 6, and a frame
+/// predicting past a loss older than the recent frames names it in its reference list
+/// modification and in `RefPicList0`, both long-term, as `ReferenceFrames` lists it.
+#[test]
+fn h264_keeps_a_long_term_anchor_where_the_driver_takes_one() {
+    let mut driver = Driver::generous();
+    driver.vendor = Some(c"Mesa Gallium driver for AMD Radeon Pro VII (radeonsi, vega20)");
+    mock::reset(driver);
+    let mut enc = session(Codec::H264, false);
+    let slice_header = |kind: u8| {
+        mock::with(|d| {
+            let header = d
+                .last_packed()
+                .into_iter()
+                .find(|p| p.0 == VAEncPackedHeaderSlice)
+                .unwrap()
+                .1;
+            nal(&header, kind, false)
+        })
+    };
+    encode(&mut enc, 0, true);
+    let rbsp = slice_header(5);
+    let mut r = Reader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    assert_eq!((r.ue(), r.ue(), r.ue(), r.u(16)), (0, 7, 0, 0));
+    r.ue();
+    assert_eq!(r.u(1), 0, "no_output_of_prior_pics_flag");
+    assert_eq!(
+        r.u(1),
+        1,
+        "long_term_reference_flag: the key frame is the first anchor"
+    );
+
+    encode(&mut enc, 1, false);
+    assert_eq!(enc.last_reference(), Reference::Frame(0));
+    let rbsp = slice_header(1);
+    let mut r = Reader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    assert_eq!((r.ue(), r.ue(), r.ue(), r.u(16), r.u(1)), (0, 5, 0, 1, 0));
+    assert_eq!(
+        (r.u(1), r.ue(), r.ue(), r.ue()),
+        (1, 2, 0, 3),
+        "the key frame named by its long-term index"
+    );
+    assert_eq!(r.u(1), 0, "adaptive_ref_pic_marking_mode_flag");
+
+    for t in 2..=48u64 {
+        encode(&mut enc, t, false);
+    }
+    let rbsp = slice_header(1);
+    let mut r = Reader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    assert_eq!((r.ue(), r.ue(), r.ue(), r.u(16), r.u(1)), (0, 5, 0, 48, 0));
+    assert_eq!(
+        r.u(1),
+        0,
+        "48 predicts from 47, the newest short-term frame"
+    );
+    assert_eq!(
+        (r.u(1), r.ue(), r.ue(), r.ue()),
+        (1, 6, 0, 0),
+        "48 marked long-term under index 0, the key frame leaving"
+    );
+    mock::with(|d| {
+        let pic: VAEncPictureParameterBufferH264 =
+            d.last_param(VAEncPictureParameterBufferType).unwrap();
+        assert_eq!(
+            (pic.CurrPic.flags, pic.CurrPic.frame_idx),
+            (VA_PICTURE_H264_LONG_TERM_REFERENCE, 0)
+        );
+    });
+
+    for t in 49..=60u64 {
+        encode(&mut enc, t, false);
+    }
+    assert!(enc.invalidate_reference(50));
+    encode(&mut enc, 61, false);
+    assert_eq!(
+        enc.last_reference(),
+        Reference::Frame(48),
+        "a loss older than the recent frames is predicted past from the anchor"
+    );
+    let rbsp = slice_header(1);
+    let mut r = Reader {
+        bytes: &rbsp,
+        pos: 0,
+    };
+    assert_eq!((r.ue(), r.ue(), r.ue(), r.u(16), r.u(1)), (0, 5, 0, 61, 0));
+    assert_eq!((r.u(1), r.ue(), r.ue(), r.ue()), (1, 2, 0, 3));
+    assert_eq!(r.u(1), 0, "adaptive_ref_pic_marking_mode_flag");
+    mock::with(|d| {
+        let pic: VAEncPictureParameterBufferH264 =
+            d.last_param(VAEncPictureParameterBufferType).unwrap();
+        let long_term: Vec<u32> = pic
+            .ReferenceFrames
+            .iter()
+            .filter(|r| r.flags == VA_PICTURE_H264_LONG_TERM_REFERENCE)
+            .map(|r| r.frame_idx)
+            .collect();
+        assert_eq!(long_term, [0], "the anchor, by its long-term index");
+        let short_term = pic
+            .ReferenceFrames
+            .iter()
+            .filter(|r| r.flags == VA_PICTURE_H264_SHORT_TERM_REFERENCE)
+            .count();
+        assert_eq!(short_term, REFERENCE_FRAMES as usize - 1);
+        let slices = d.last_buffers(VAEncSliceParameterBufferType);
+        let slice: VAEncSliceParameterBufferH264 =
+            unsafe { ptr::read_unaligned(slices[0].as_ptr() as *const _) };
+        assert_eq!(
+            (slice.RefPicList0[0].flags, slice.RefPicList0[0].frame_idx),
+            (VA_PICTURE_H264_LONG_TERM_REFERENCE, 0)
+        );
+    });
+}
+
 /// HEVC lists the frames the decoder keeps in every slice header's reference picture set,
 /// the one it predicts from marked as used, and drops a lost frame from the set.
 #[test]

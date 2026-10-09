@@ -88,7 +88,9 @@ H.265 through the vendor's external reference set (L4T R32 and R36), SVT-AV1 at 
 takes reference commands (4.2 on); and the stream declares the decoded picture buffer its level admits, or for AV1
 a fixed eight whatever the level, four under NVENC, as many as a frame predicts from (eight work there too, at 112
 MiB more a session). NVENC keeps long-term
-frames of that buffer as anchors where the device offers them (H.264 and AV1 one, H.265 two), so a loss older than
+frames of that buffer as anchors where the device offers them (H.264 and AV1 one, H.265 two), and VA-API one in
+H.264 where the driver codes from the long-term reference it is named (radeonsi's VCE, measured; the session writes the
+marking and the list modification into its own slice headers, `keeps_h264_anchors`), so a loss older than
 every recent frame, or than a buffer a resize left small (the driver lowers the buffer in place but never raises it),
 is still predicted past. H.264 keeps one in every case: NVENC's H.264 fallback takes the first alone, and OpenH264's
 decoder, Firefox's for WebRTC H.264 where no FFmpeg decodes it, finds a CABAC stream's long-term picture by a number

@@ -9,7 +9,7 @@
 //! the driver-facing sequence of a session is checked where no VA-API device exists.
 
 use std::cell::RefCell;
-use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr;
 
 use va_sys::*;
@@ -52,6 +52,8 @@ pub(crate) struct Driver {
     pub regions: Vec<(Option<Rect>, Option<Rect>)>,
     /// Every surface destroyed.
     pub destroyed: Vec<VASurfaceID>,
+    /// The vendor string the driver answers, where not the stood-in one.
+    pub vendor: Option<&'static CStr>,
     next_id: u32,
     in_picture: Option<(VAContextID, VASurfaceID, Vec<usize>)>,
     coded_out: Vec<u8>,
@@ -327,7 +329,9 @@ unsafe extern "C" fn terminate(_dpy: VADisplay) -> VAStatus {
 }
 
 unsafe extern "C" fn vendor(_dpy: VADisplay) -> *const c_char {
-    c"stood-in driver for pixelflux tests".as_ptr()
+    with(|d| d.vendor)
+        .unwrap_or(c"stood-in driver for pixelflux tests")
+        .as_ptr()
 }
 
 unsafe extern "C" fn max_profiles(_dpy: VADisplay) -> c_int {

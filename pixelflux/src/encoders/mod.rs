@@ -1387,6 +1387,7 @@ impl FrameEncoder {
     pub fn take_report(&mut self, report: reference::ReferenceReport) -> bool {
         match (self, report) {
             (FrameEncoder::Nvenc(enc), report) => enc.take_report(report),
+            (FrameEncoder::Vaapi(enc), report) => enc.take_report(report),
             (FrameEncoder::Vpx(enc), reference::ReferenceReport::Held(id)) => {
                 enc.acknowledge_reference(id, true);
                 true

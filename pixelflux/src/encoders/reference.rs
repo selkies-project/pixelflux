@@ -452,6 +452,15 @@ impl ReferenceWindow {
             .map(|i| i as u8)
     }
 
+    /// The anchor holding the frame at `pts`, where one does, lost or not: an encoder that writes
+    /// its own headers lists it long-term under that index while the decoder holds it.
+    pub fn anchor_slot(&self, pts: u64) -> Option<u8> {
+        self.anchors
+            .iter()
+            .position(|a| a.is_some_and(|a| a.1 == pts))
+            .map(|i| i as u8)
+    }
+
     /// How many values the stream's `frame_num` takes before it wraps; 0 for a codec without
     /// that counter.
     pub fn set_frame_num_range(&mut self, range: u32) {

@@ -54,7 +54,10 @@ use super::codec::{
     h265_frame_type, push_video_header, vp8_is_key, vp9_is_key,
 };
 use super::frame_rate::FrameRate;
-use super::reference::{REFERENCE_FRAMES, Reference, ReferenceSlots, ReferenceWindow, SlotPlan};
+use super::reference::{
+    Invalidation, REFERENCE_FRAMES, Reference, ReferenceReport, ReferenceSlots, ReferenceWindow,
+    SlotPlan,
+};
 use super::session::{RateSettings, check_host_frame};
 use super::sps::{NoReorder, h264_frame_num_range};
 use crate::RustCaptureSettings;
@@ -403,6 +406,13 @@ impl Device {
     /// and on a low-power encoder that codes no other cut.
     fn one_slice_h264(&self, entrypoint: VAEntrypoint) -> bool {
         self.vce || (self.whole_picture_vdenc && entrypoint == VAEntrypointEncSliceLP)
+    }
+
+    /// Whether an H.264 session keeps a long-term anchor (`ReferenceWindow::with_anchors`): the
+    /// driver codes a picture from the reference it is named, as radeonsi's VCE was measured to
+    /// (`vaapi_predicts_past_a_lost_frame`, `vaapi_predicts_from_an_anchor`); others are not yet.
+    fn keeps_h264_anchors(&self) -> bool {
+        self.vendor.contains("radeonsi")
     }
 
     /// Whether the driver's rate control stops coding in a buffer of a frame or two, as Intel's
@@ -799,6 +809,12 @@ pub(super) struct Frame<'a> {
     /// Every frame the decoder holds, oldest first, with the surface each was reconstructed
     /// into and whether a client lost it.
     pub held: &'a [(u64, VASurfaceID, bool)],
+    /// Whether the session keeps long-term anchors, its key frame the first.
+    pub anchored: bool,
+    /// The long-term index the frame is marked under, an anchor (`ReferenceWindow::plan_anchor`).
+    pub anchor: Option<u8>,
+    /// The anchors among `held`, by timestamp, with the long-term index each is marked under.
+    pub long_term: &'a [(u64, u8)],
     /// The quantizer, in the codec's domain, of a constant-quantizer session.
     pub qp: u32,
     /// VP8's buffer plan.
@@ -1302,6 +1318,13 @@ impl VaapiEncoder {
         me.arm = arm;
         me.references = me.arm.tracks_references(packed).then(|| match me.arm {
             Arm::Vp8(_) => References::Slots(ReferenceSlots::new()),
+            Arm::H264(_) if me.device.keeps_h264_anchors() => {
+                let mut w = ReferenceWindow::with_anchors(dpb, 1);
+                if settings.acknowledge_references {
+                    w.set_acknowledged();
+                }
+                References::Window(w)
+            }
             _ => References::Window(ReferenceWindow::new(dpb)),
         });
         if let Some(References::Window(w)) = &mut me.references
@@ -1575,6 +1598,26 @@ impl VaapiEncoder {
     /// The frame the last encoded frame predicted from.
     pub fn last_reference(&self) -> Reference {
         self.last_reference
+    }
+
+    /// Apply what the consumers say of a frame: a loss as `invalidate_reference`, a frame every
+    /// one of them holds or was sent (`ReferenceWindow::acknowledge`, `ReferenceSlots::acknowledge`).
+    pub fn take_report(&mut self, report: ReferenceReport) -> bool {
+        let (frame_id, held) = match report {
+            ReferenceReport::Lost(frame_id) => return self.invalidate_reference(frame_id),
+            ReferenceReport::Held(frame_id) => (frame_id, true),
+            ReferenceReport::Sent(frame_id) => (frame_id, false),
+        };
+        match &mut self.references {
+            Some(References::Window(w)) => {
+                w.acknowledge(frame_id, held);
+            }
+            Some(References::Slots(s)) => {
+                s.acknowledge(frame_id, held);
+            }
+            None => {}
+        }
+        true
     }
 
     /// Leave frame `frame_id` and every frame after it out of the predictions. False where the
@@ -2132,7 +2175,21 @@ impl VaapiEncoder {
             Some(References::Slots(s)) => s.has_reference(),
             None => !self.fresh,
         };
-        let key = force_idr || self.sequence_start || !has_reference;
+        let mut key = force_idr || self.sequence_start || !has_reference;
+        let (mut anchor, mut shared) = (None, false);
+        if let Some(References::Window(w)) = &mut self.references
+            && w.anchored()
+        {
+            if !key && w.plan_anchor(false).is_some() && w.settle() == Some(Invalidation::KeyFrame)
+            {
+                key = true;
+            }
+            if !key && w.forget_stale() == Some(Invalidation::KeyFrame) {
+                key = true;
+            }
+            anchor = w.plan_anchor(key);
+            shared = w.acknowledging() && w.predicts_from_shared();
+        }
         let pts = match &self.references {
             Some(References::Window(w)) => w.next_pts(),
             Some(References::Slots(s)) => s.next_pts(),
@@ -2144,6 +2201,15 @@ impl VaapiEncoder {
                 .filter_map(|(_, p, lost)| self.surfaces_of.get(&p).map(|&s| (p, s, lost)))
                 .collect(),
             _ => Vec::new(),
+        };
+        let (anchored, long_term): (bool, Vec<(u64, u8)>) = match &self.references {
+            Some(References::Window(w)) if w.anchored() => (
+                true,
+                held.iter()
+                    .filter_map(|h| w.anchor_slot(h.0).map(|slot| (h.0, slot)))
+                    .collect(),
+            ),
+            _ => (false, Vec::new()),
         };
         let (reference, key_pts, slots, slot_surfaces) = match &self.references {
             Some(References::Window(w)) => (
@@ -2187,7 +2253,12 @@ impl VaapiEncoder {
                 .iter()
                 .find(|s| !slot_surfaces.contains(s))
                 .ok_or("no VP8 reconstruction surface is free")?,
-            _ => self.recon[(pts % self.recon.len() as u64) as usize],
+            Some(References::Window(_)) => *self
+                .recon
+                .iter()
+                .find(|s| !held.iter().any(|h| h.1 == **s))
+                .ok_or("no reconstruction surface is free")?,
+            None => self.recon[(pts % self.recon.len() as u64) as usize],
         };
         let qp = if self.rate.cbr {
             self.qp
@@ -2202,6 +2273,9 @@ impl VaapiEncoder {
             coded: self.coded,
             reference,
             held: &held,
+            anchored,
+            anchor,
+            long_term: &long_term,
             qp,
             slots,
             slot_surfaces,
@@ -2250,7 +2324,7 @@ impl VaapiEncoder {
             w.set_frame_num_range(range);
         }
         self.last_reference = match &mut self.references {
-            Some(References::Window(w)) => w.record(frame_id, is_key),
+            Some(References::Window(w)) => w.record_marked(frame_id, is_key, anchor),
             Some(References::Slots(s)) => {
                 let plan = if is_key { s.plan(true) } else { slots };
                 s.record(frame_id, plan)
@@ -2271,16 +2345,25 @@ impl VaapiEncoder {
                     .collect();
                 self.surfaces_of.retain(|p, _| held.contains(p));
             }
-            _ => self
+            Some(References::Window(w)) => {
+                let held: Vec<u64> = w.held().map(|(_, p, _)| p).collect();
+                self.surfaces_of.retain(|p, _| held.contains(p));
+            }
+            None => self
                 .surfaces_of
                 .retain(|&p, _| p + self.recon.len() as u64 > pts),
         }
         if !self.omit_headers {
             let mut header = Vec::with_capacity(VIDEO_HEADER_LEN);
+            let anchor_flag = if anchor.is_some() && !is_key && shared {
+                super::codec::FRAME_ANCHOR
+            } else {
+                0
+            };
             push_video_header(
                 &mut header,
                 self.codec,
-                frame_type,
+                frame_type | anchor_flag,
                 frame_id,
                 0,
                 self.negotiated.width as u16,
@@ -2713,6 +2796,172 @@ mod tests {
             SLICES as usize
         };
         assert_eq!(slices, wanted);
+    }
+
+    /// A 1280x720 BGRA picture that moves: a bar crossing 12 pixels a frame, a checkerboard band
+    /// 4, and fresh noise below row 480.
+    fn moving_picture(t: usize) -> Vec<u8> {
+        let (w, h) = (1280usize, 720usize);
+        let noise = |n: usize| {
+            let mut x = (n as u64 ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^= x >> 31;
+            x as u8
+        };
+        let bar = (t * 12) % (w - 160);
+        let mut f = vec![0u8; w * h * 4];
+        for (i, px) in f.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % w, i / w);
+            let bgr: [u8; 3] = if y >= 480 {
+                let n = (t % 4) * w * 240 + (y - 480) * w + x;
+                [noise(3 * n), noise(3 * n + 1), noise(3 * n + 2)]
+            } else if (96..160).contains(&y) {
+                [if ((x + t * 4) / 16 + (y - 96) / 16).is_multiple_of(2) {
+                    255
+                } else {
+                    0
+                }; 3]
+            } else if y >= 160 && (bar..bar + 160).contains(&x) {
+                [0x28, 0x3c, 0xdc]
+            } else {
+                [0x78, 0x28, 0x1e]
+            };
+            px[..3].copy_from_slice(&bgr);
+            px[3] = 0xff;
+        }
+        f
+    }
+
+    /// Encode `moving_picture` for 120 frames, reporting a loss `depth` frames back every
+    /// `every` frames from frame `from`, and decode it twice, once without the frames lost:
+    /// the frames predicted past a loss, those from an anchor among them, the key frames after
+    /// the first, how far the second decoder's pictures come from the first's at most, and the
+    /// worst average distance of a picture from its source.
+    fn predict_past_losses(
+        codec: Codec,
+        from: usize,
+        every: usize,
+        depth: usize,
+    ) -> Option<(usize, usize, usize, f64, f64)> {
+        use crate::webcam::decode::{Decoder as _, VideoDecoder};
+        let (w, h) = (1280usize, 720usize);
+        let settings = RustCaptureSettings {
+            width: w as i32,
+            height: h as i32,
+            codec,
+            target_fps: 60.0,
+            video_cbr_mode: true,
+            video_bitrate_kbps: 8000,
+            omit_stripe_headers: true,
+            ..Default::default()
+        };
+        let mut enc = match VaapiEncoder::new(&settings, codec, Input::Host { rgba: false }) {
+            Ok(enc) => enc,
+            Err(e) => {
+                println!("{codec:?}: {e}");
+                return None;
+            }
+        };
+        println!("{codec:?} on {}", enc.vendor());
+        let (mut whole, mut lossy) = (
+            VideoDecoder::new(codec).expect("decoder"),
+            VideoDecoder::new(codec).expect("decoder"),
+        );
+        let reported = |r: usize| r >= from && (r - from).is_multiple_of(every);
+        let (mut past, mut anchored, mut keys, mut apart, mut worst) = (0, 0, 0, 0f64, 0f64);
+        for t in 0..120usize {
+            if reported(t) {
+                assert!(enc.invalidate_reference((t - depth) as u16), "{codec:?}");
+            }
+            let from_anchor = matches!(&enc.references,
+                Some(References::Window(win)) if win.predicting_anchor().is_some());
+            let src = moving_picture(t);
+            let out = enc
+                .encode_host(&src, w * 4, false, t as u64, 25, t == 0)
+                .expect("encode");
+            match enc.last_reference() {
+                Reference::None if t > 0 => keys += 1,
+                Reference::Frame(r) if r as usize + 1 != t => {
+                    past += 1;
+                    anchored += usize::from(from_anchor);
+                }
+                _ => {}
+            }
+            assert!(whole.decode(&out).expect("decode"), "{codec:?}: frame {t}");
+            if (t + 1..=t + depth).any(reported) {
+                continue;
+            }
+            assert!(
+                lossy.decode(&out).expect("decode"),
+                "{codec:?}: lossy frame {t}"
+            );
+            let (a, b) = (whole.frame().unwrap(), lossy.frame().unwrap());
+            let mut sum = 0f64;
+            for y in (0..480).step_by(2) {
+                for x in (0..w).step_by(2) {
+                    let i = (y * w + x) * 4;
+                    let (bb, g, r) = (src[i] as f64, src[i + 1] as f64, src[i + 2] as f64);
+                    let luma = 16.0 + (0.2126 * r + 0.7152 * g + 0.0722 * bb) * 219.0 / 255.0;
+                    let (pa, pb) = (
+                        a.y[y * a.y_stride + x] as f64,
+                        b.y[y * b.y_stride + x] as f64,
+                    );
+                    sum += (pb - luma).abs();
+                    apart = apart.max((pa - pb).abs());
+                }
+            }
+            worst = worst.max(sum / (240.0 * (w / 2) as f64));
+        }
+        println!(
+            "{codec:?}: {past} frames predicted past a loss ({anchored} from an anchor), {keys} key frames; the lossy decoder at most {apart:.0} levels from the whole one, {worst:.1} on average from the source at worst"
+        );
+        Some((past, anchored, keys, apart, worst))
+    }
+
+    /// On a VA-API device (`cargo test vaapi_ -- --ignored --nocapture`): a loss reported every
+    /// thirteen frames, four frames deep, is predicted past from the frame before it: a decoder
+    /// that never saw the lost frames shows every later picture as one that saw them all does.
+    #[test]
+    #[ignore]
+    fn vaapi_predicts_past_a_lost_frame() {
+        for codec in [Codec::H264, Codec::H265] {
+            if let Some((past, _, keys, apart, worst)) = predict_past_losses(codec, 13, 13, 4) {
+                assert!(past >= 5, "{codec:?}: {past} predicted past a loss");
+                assert_eq!(keys, 0, "{codec:?}");
+                assert!(
+                    apart < 2.0,
+                    "{codec:?}: the decoder without the lost frames is {apart} off"
+                );
+                assert!(worst < 20.0, "{codec:?}: {worst} off the source");
+            }
+        }
+    }
+
+    /// On a VA-API device that keeps an H.264 anchor (`keeps_h264_anchors`): a loss older than
+    /// the recent frames, twelve frames deep after the anchors at 48 and 96, is predicted past
+    /// from the long-term anchor, and one four frames deep covering the anchor at 48 from the
+    /// recent frame before it, the lost anchor still listed long-term while the decoder holds it;
+    /// either way the decoder that never saw the lost frames shows every later picture as one
+    /// that saw them all does. (Deeper, a gap FFmpeg fills would push that frame out of a
+    /// browser's decoder, and the window codes a key frame: `forget_stale`.)
+    #[test]
+    #[ignore]
+    fn vaapi_predicts_from_an_anchor() {
+        for (from, every, depth, want) in [(70, 40, 12, 2), (52, 1000, 4, 0)] {
+            if let Some((past, anchored, keys, apart, worst)) =
+                predict_past_losses(Codec::H264, from, every, depth)
+            {
+                assert!(
+                    past >= 1 && anchored == want.min(past),
+                    "{anchored} of {past} from an anchor"
+                );
+                assert_eq!(keys, 0);
+                assert!(
+                    apart < 2.0,
+                    "the decoder without the lost frames is {apart} off"
+                );
+                assert!(worst < 20.0, "{worst} off the source");
+            }
+        }
     }
 
     /// A node the kernel answers no DRM query on is not VCE.

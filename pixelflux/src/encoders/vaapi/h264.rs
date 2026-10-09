@@ -232,8 +232,11 @@ impl Arm {
 
     /// The picture: its frame number and order count since the key frame, the decoded picture
     /// buffer as `ReferenceFrames`, and every slice with its packed header, whose reference
-    /// list modification moves any reference but the newest held frame, which the default
-    /// list puts first, to the front by its distance in frame numbers.
+    /// list modification moves any reference but the newest short-term frame, which the
+    /// default list puts first, to the front: a short-term one by its distance in frame numbers,
+    /// an anchor by its long-term index. In a session keeping anchors the key frame is marked
+    /// long-term under index 0 and each anchor after it under its index (memory management
+    /// operation 6), the one it is marked over leaving the buffer.
     pub(super) fn picture(
         &mut self,
         n: &Negotiated,
@@ -247,10 +250,18 @@ impl Arm {
                 .idr_pic_id
                 .wrapping_add(if frame.pts == 0 { 0 } else { 1 });
         }
+        let long_term = |pts: u64| frame.long_term.iter().find(|l| l.0 == pts).map(|l| l.1);
         let picture = |pts: u64, surface: VASurfaceID| VAPictureH264 {
             picture_id: surface,
-            frame_idx: ((pts - frame.key_pts) % self.frame_num_range() as u64) as u32,
-            flags: VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+            frame_idx: long_term(pts).map_or(
+                ((pts - frame.key_pts) % self.frame_num_range() as u64) as u32,
+                u32::from,
+            ),
+            flags: if long_term(pts).is_some() {
+                VA_PICTURE_H264_LONG_TERM_REFERENCE
+            } else {
+                VA_PICTURE_H264_SHORT_TERM_REFERENCE
+            },
             TopFieldOrderCnt: 2 * (pts - frame.key_pts) as i32,
             BottomFieldOrderCnt: 2 * (pts - frame.key_pts) as i32,
             va_reserved: [0; 4],
@@ -264,11 +275,20 @@ impl Arm {
             va_reserved: [0; 4],
         };
 
+        let marked = if frame.key && frame.anchored {
+            Some(0)
+        } else {
+            frame.anchor
+        };
         let mut pic: VAEncPictureParameterBufferH264 = unsafe { std::mem::zeroed() };
         pic.CurrPic = VAPictureH264 {
             picture_id: frame.recon,
-            frame_idx: frame_num,
-            flags: 0,
+            frame_idx: marked.map_or(frame_num, u32::from),
+            flags: if marked.is_some() {
+                VA_PICTURE_H264_LONG_TERM_REFERENCE
+            } else {
+                0
+            },
             TopFieldOrderCnt: poc,
             BottomFieldOrderCnt: poc,
             va_reserved: [0; 4],
@@ -330,21 +350,34 @@ impl Arm {
                 if !frame.key {
                     w.flag(false);
                     let (ref_pts, _) = frame.reference.unwrap();
-                    let ref_frame_num =
-                        ((ref_pts - frame.key_pts) % self.frame_num_range() as u64) as u32;
-                    let newest = held.first().map(|h| h.0) == Some(ref_pts);
-                    w.flag(!newest);
-                    if !newest {
-                        let diff = (frame_num + self.frame_num_range() - ref_frame_num)
-                            % self.frame_num_range();
-                        w.ue(0);
-                        w.ue(diff - 1);
+                    if let Some(index) = long_term(ref_pts) {
+                        w.flag(true);
+                        w.ue(2);
+                        w.ue(index as u32);
                         w.ue(3);
+                    } else {
+                        let ref_frame_num =
+                            ((ref_pts - frame.key_pts) % self.frame_num_range() as u64) as u32;
+                        let newest = held.iter().find(|h| long_term(h.0).is_none()).map(|h| h.0)
+                            == Some(ref_pts);
+                        w.flag(!newest);
+                        if !newest {
+                            let diff = (frame_num + self.frame_num_range() - ref_frame_num)
+                                % self.frame_num_range();
+                            w.ue(0);
+                            w.ue(diff - 1);
+                            w.ue(3);
+                        }
                     }
                 }
                 if frame.key {
                     w.flag(false);
-                    w.flag(false);
+                    w.flag(frame.anchored);
+                } else if let Some(index) = frame.anchor {
+                    w.flag(true);
+                    w.ue(6);
+                    w.ue(index as u32);
+                    w.ue(0);
                 } else {
                     w.flag(false);
                 }
