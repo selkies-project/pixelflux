@@ -523,10 +523,11 @@ Stop/restart invalidates waiting requests and results still being compressed; bu
 inactive, unsupported, invalid buffer and timeout failures return distinct error messages.
 Compression already running is not interrupted, but its canceled result is discarded.
 
-`scene_id` and `source_id` are `None`: a sample identifies those pixels, not continuity of an
-output/source or proof that a browser displayed them. Stripe callbacks do not announce batch
-completion. Automatic static refinement still requires transport and presentation ordering;
-these tokens alone must not be used to keep a PNG over newer video.
+When scene tracking is disabled or unavailable, `scene_id` and `source_id` are `None`:
+a sample alone identifies captured pixels, not continuity of an output/source. Even enabled
+scene tracking does not prove that a browser displayed them. Stripe callbacks do not announce
+batch completion. Automatic static refinement still requires transport and presentation
+ordering; these tokens alone must not be used to keep a PNG over newer video.
 
 ## Recording Sink
 
