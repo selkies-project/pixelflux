@@ -132,7 +132,7 @@ impl CaptureSamples {
         self.pending.load(Ordering::Acquire)
     }
 
-    fn check(&self, expected_run: u64) -> Result<(), String> {
+    pub(crate) fn check(&self, expected_run: u64) -> Result<(), String> {
         if expected_run != self.run_id {
             return Err("Capture snapshot stale run".into());
         }

@@ -89,13 +89,15 @@ pub(crate) fn encode_png_rgb16(
     let mut info = png::Info::with_size(width, height);
     info.color_type = png::ColorType::Rgb;
     info.bit_depth = png::BitDepth::Sixteen;
-    info.sbit = Some(vec![significant_bits; 3].into());
     let mut bytes = Vec::new();
     {
         let encoder = png::Encoder::with_info(&mut bytes, info)
             .map_err(|error| format!("PNG encode error: {error}"))?;
         let mut writer = encoder
             .write_header()
+            .map_err(|error| format!("PNG encode error: {error}"))?;
+        writer
+            .write_chunk(png::chunk::sBIT, &[significant_bits; 3])
             .map_err(|error| format!("PNG encode error: {error}"))?;
         writer
             .write_image_data(data)

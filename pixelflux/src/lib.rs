@@ -2291,6 +2291,7 @@ fn start_capture_on_display(
         return;
     };
     let stream_report = report::StreamReport::new("wayland");
+    let sample_guard = stream_report.samples.guard();
     report::wayland_reports()
         .lock()
         .unwrap()
@@ -2730,7 +2731,7 @@ fn start_capture_on_display(
     state.render_cursor_on_framebuffer = settings.capture_cursor;
 
     let mut cap = wayland::frontend::WlCapture {
-        sample_guard: stream_report.samples.guard(),
+        sample_guard,
         settings: settings.clone(),
         callback: cb.clone(),
         video_encoder,
@@ -8631,6 +8632,7 @@ impl ScreenCapture {
         let snapshot = py
             .detach(|| ticket.finish())
             .map_err(PyRuntimeError::new_err)?;
+        run.check(expected_run).map_err(PyRuntimeError::new_err)?;
         let result = pyo3::types::PyDict::new(py);
         result.set_item("png", pyo3::types::PyBytes::new(py, &snapshot.png))?;
         result.set_item("run_id", snapshot.stamp.run_id)?;
