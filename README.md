@@ -490,6 +490,30 @@ its overlays. NvFBC, DRI3 and external Wayland host snapshots report unsupported
 paths remain selected normally. The new operation preserves eight bits, independently of
 the depth-30 standalone screenshot above. It does not force a keyframe or bypass video pacing.
 
+Local Wayland captures optionally expose conservative scene identity. After the capture has
+started, `scene_tracking_supported` reports support from both the local capturer and the
+realized encoder, even while tracking is off. NVENC and VA-API full-frame sessions, and
+software H.264/JPEG stripes, preserve the association. Other full-frame encoders do not.
+`capture.set_scene_tracking(True)` enables it live; `scene_tracking_enabled` reports the
+setting. The default is off. X11 and external Wayland host captures reject enabling it
+without changing their capture backend. An encoder demotion that loses the association
+disables tracking. While tracking is off, it adds no pixel hashes, buffer copies, or GPU
+readbacks to the capture path.
+
+While enabled, known local composition samples carry `source_id` and `scene_id` in both
+`StripeFrame` and the snapshot dict. Compare them only together with `sample_run_id`
+(`run_id` in the snapshot) and the producing process. Source identity changes with layout,
+pixel format, cursor policy, or recovery from an uncertain render; scene identity advances
+on compositor damage or repaint. An identical repaint can advance it. A quiet successful
+render retains its scene. Render failure, held reconfiguration, and unknown damage retire
+continuity, and disabling then re-enabling never reuses a source identity in that run.
+
+These fields are frozen before encoding, so delayed callbacks and PNG completion retain
+their original scene. Unsupported encoder associations still return `None`; consumers must
+reject missing identity and retire pending presentation work when tracking or the run changes.
+Scene identity does not certify stripe completeness, browser presentation, or an atomic
+transition between video and a lossless image.
+
 One request per run and four process-wide remain admitted through compression, with a separate
 128 MiB budget for copied raw pixels. These limits are independent of the Computer-Use
 screenshot limits. PNG encoding releases the Python GIL and runs off the capture thread.

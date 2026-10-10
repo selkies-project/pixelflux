@@ -5,7 +5,7 @@
  */
 
 //! Process-local identities for captured samples and bounded copies of active buffers.
-//! A sample identifies pixels, not scene continuity or delivery to a consumer.
+//! Scene continuity is opt-in; a sample does not certify delivery to a consumer.
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -92,6 +92,7 @@ impl Pending {
 /// One active capture run. Requests never retain a borrowed streaming buffer.
 pub struct CaptureSamples {
     pub run_id: u64,
+    pub(crate) scene: crate::capture_scene::SceneTracker,
     sequence: AtomicU64,
     status: AtomicU8,
     pending: AtomicBool,
@@ -109,6 +110,7 @@ impl Default for CaptureSamples {
             run_id: NEXT_RUN
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .expect("capture run identity exhausted"),
+            scene: crate::capture_scene::SceneTracker::default(),
             sequence: AtomicU64::new(1),
             status: AtomicU8::new(STARTING),
             pending: AtomicBool::new(false),
@@ -137,6 +139,7 @@ impl CaptureSamples {
 
     pub fn stop(&self) {
         self.status.store(STOPPED, Ordering::Release);
+        self.scene.stop();
         self.reject("Capture snapshot inactive");
     }
 
@@ -160,7 +163,23 @@ impl CaptureSamples {
             run_id: self.run_id,
             sample_seq,
             captured_ns,
+            source_id: None,
+            scene_id: None,
         })
+    }
+
+    pub(crate) fn next_scene(
+        &self,
+        captured_ns: i64,
+        layout: crate::capture_scene::SceneLayout,
+        changed: bool,
+    ) -> Option<SampleStamp> {
+        let mut stamp = self.next(captured_ns)?;
+        if let Some(scene) = self.scene.observe(layout, changed) {
+            stamp.source_id = Some(scene.source_id);
+            stamp.scene_id = Some(scene.scene_id);
+        }
+        Some(stamp)
     }
 
     pub fn has_pending(&self) -> bool {
@@ -535,6 +554,55 @@ mod tests {
         assert_eq!(decoded.as_raw(), &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
         assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn queued_snapshot_keeps_its_scene_when_the_live_source_is_retired() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        run.scene.set_supported(true);
+        run.scene.set_encoder_supported(true);
+        run.scene.set_enabled(true).unwrap();
+        let geometry = crate::capture_scene::SceneLayout {
+            output_id: 1,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            scale_bits: 1.0_f64.to_bits(),
+            format: 1,
+            cursor: false,
+        };
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        let captured = run.next_scene(123, geometry, false).unwrap();
+        assert!(captured.source_id.is_some() && captured.scene_id.is_some());
+        run.copy_requested(
+            captured,
+            &[1, 2, 3, 255],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
+        run.scene.set_enabled(false).unwrap();
+        assert!(
+            run.next_scene(124, geometry, true)
+                .unwrap()
+                .scene_id
+                .is_none()
+        );
+        run.scene.set_enabled(true).unwrap();
+        let replacement = run.next_scene(125, geometry, false).unwrap();
+        assert_ne!(replacement.source_id, captured.source_id);
+        let result = ticket.finish().unwrap();
+        assert_eq!(result.stamp, captured);
+        assert_eq!(
+            image::load_from_memory(&result.png)
+                .unwrap()
+                .to_rgba8()
+                .as_raw(),
+            &[1, 2, 3, 255]
+        );
     }
 
     #[test]

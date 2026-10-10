@@ -141,6 +141,7 @@ pub mod encoders;
 pub mod log;
 
 pub mod capture_sample;
+mod capture_scene;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
 /// When a capture is due a frame, shared by the X11 and Wayland backends.
@@ -1759,6 +1760,10 @@ pub(crate) fn log_stream_settings(
     n_stripes: usize,
     video_encoder: Option<&FrameEncoder>,
 ) {
+    report::sample_association(video_encoder.map_or_else(
+        || matches!(settings.codec, Codec::Jpeg | Codec::H264),
+        FrameEncoder::preserves_sample_identity,
+    ));
     let backend = video_encoder.map(|enc| (enc.backend_name(), enc.is_hardware()));
     let fixed_rate = video_encoder.and_then(FrameEncoder::fixed_rate_control);
     let holds = video_encoder.map_or_else(
@@ -2846,6 +2851,7 @@ fn start_capture_on_display(
     // otherwise produces no damage, no first frame, and no IDR in either path.
     cap.request_idr();
 
+    cap.report.samples.scene.set_supported(!host_capture);
     node.capture = Some(cap);
     // The start reprogrammed this output, and until a client answers at the new size the
     // compositor paints its clear color over whatever the client does not cover — a
@@ -3410,6 +3416,9 @@ fn render_node_tick(
             .unwrap_or((0, 0)),
     };
     if width <= 0 || height <= 0 {
+        if let Some(c) = node.capture.as_ref() {
+            c.report.samples.scene.invalidate();
+        }
         return false;
     }
     if node.frame_buffer.len() < (width as usize) * (height as usize) * 4 {
@@ -3532,6 +3541,7 @@ fn render_node_tick(
     // The picture's capture time for the stats: compositing is this path's capture.
     let composite_ns = wayland::host::now_ns();
     let mut render_success = false;
+    let mut scene_damage_known = false;
     let mut screenshot_result = None;
     let mut deferred_screenshot = None;
     let mut render_sync = None;
@@ -3541,8 +3551,12 @@ fn render_node_tick(
         .as_ref()
         .map(|c| c.needs_full_render)
         .unwrap_or(!node.target_seeded);
+    let scene_rebuilt = needs_full || !node.target_seeded;
 
     if state.host.is_some() && !host_mode {
+        if let Some(c) = node.capture.as_ref() {
+            c.report.samples.scene.invalidate();
+        }
         // No host output backs this display (start_capture already warned):
         // produce nothing rather than the compositor's own empty content.
         if let Some((id, buf)) = pool_slot.take()
@@ -3973,6 +3987,7 @@ fn render_node_tick(
                         ) {
                             Ok(result) => {
                                 render_success = true;
+                                scene_damage_known = true;
                                 if let Some(damage) = result.damage {
                                     damage_rects = damage.clone();
                                     node.undrawn_ticks = 0;
@@ -4212,6 +4227,7 @@ fn render_node_tick(
                 ) {
                     Ok(result) => {
                         render_success = true;
+                        scene_damage_known = changed.is_some();
                         if let Some(c) = cap.as_deref_mut() {
                             c.needs_full_render = false;
                         }
@@ -4256,13 +4272,43 @@ fn render_node_tick(
     if render_success {
         node.target_seeded = true;
     }
-    let sample = if render_success && !hold_frame && !host_mode {
-        node.capture
-            .as_ref()
-            .and_then(|c| c.report.samples.next(composite_ns))
-    } else {
-        None
-    };
+    let sample = node.capture.as_ref().and_then(|c| {
+        let samples = &c.report.samples;
+        if scene_rebuilt || !render_success || hold_frame || !scene_damage_known || host_mode {
+            samples.scene.invalidate();
+        }
+        if !render_success || hold_frame || host_mode {
+            return None;
+        }
+        if !scene_damage_known {
+            return samples.next(composite_ns);
+        }
+        let format = if state.use_gpu {
+            node.offscreen_buffer
+                .as_ref()
+                .map(|(_, d)| d.format().code as u32)
+        } else {
+            Some(Fourcc::Argb8888 as u32)
+        };
+        let Some(format) = format else {
+            samples.scene.invalidate();
+            return samples.next(composite_ns);
+        };
+        samples.next_scene(
+            composite_ns,
+            capture_scene::SceneLayout {
+                output_id: node.owner.unwrap_or(node.id),
+                x: node.pos.0,
+                y: node.pos.1,
+                width,
+                height,
+                scale_bits: output_scale_val.to_bits(),
+                format,
+                cursor: state.render_cursor_on_framebuffer,
+            },
+            !damage_rects.is_empty(),
+        )
+    });
     let snapshot_layout = capture_sample::SampleLayout {
         x: node.pos.0,
         y: node.pos.1,
@@ -4544,6 +4590,7 @@ fn render_node_tick(
                                 };
                                 match rebuilt {
                                     Some(enc) => {
+                                        report::sample_association(enc.preserves_sample_identity());
                                         cap.video_encoder = Some(enc);
                                         cap.pending_force_idr = true;
                                         cap.hw_rebuilt = true;
@@ -4556,6 +4603,7 @@ fn render_node_tick(
                                             "[Wayland] zero-copy HW encoder unrecoverable; demoting to readback encode."
                                         );
                                         report::capture("readback", false);
+                                        report::sample_association(false);
                                         report::capture_reason(
                                             "the zero-copy encoder failed repeatedly and was given up",
                                         );
@@ -6972,6 +7020,10 @@ struct StripeFrame {
     sample_run_id: Option<u64>,
     #[pyo3(get)]
     sample_seq: Option<u64>,
+    #[pyo3(get)]
+    source_id: Option<u64>,
+    #[pyo3(get)]
+    scene_id: Option<u64>,
 }
 
 impl StripeFrame {
@@ -7001,6 +7053,8 @@ impl StripeFrame {
             reference_frame_id: reference.frame_id(),
             sample_run_id: sample.map(|s| s.run_id),
             sample_seq: sample.map(|s| s.sample_seq),
+            source_id: sample.and_then(|s| s.source_id),
+            scene_id: sample.and_then(|s| s.scene_id),
         }
     }
 }
@@ -8667,6 +8721,29 @@ impl ScreenCapture {
         self.sample_run().map(|r| r.run_id)
     }
 
+    /// Whether this active capture can track local Wayland scene continuity.
+    #[getter]
+    fn scene_tracking_supported(&self) -> bool {
+        self.sample_run().is_some_and(|run| run.scene.supported())
+    }
+
+    /// Whether scene tracking is enabled for this active capture.
+    #[getter]
+    fn scene_tracking_enabled(&self) -> bool {
+        self.sample_run().is_some_and(|run| run.scene.enabled())
+    }
+
+    /// Enable conservative damage-based scene identity without changing the capture backend.
+    fn set_scene_tracking(&self, enabled: bool) -> PyResult<()> {
+        use pyo3::exceptions::PyRuntimeError;
+        let run = self
+            .sample_run()
+            .ok_or_else(|| PyRuntimeError::new_err("Scene tracking inactive"))?;
+        run.scene
+            .set_enabled(enabled)
+            .map_err(PyRuntimeError::new_err)
+    }
+
     /// Copy a next sample of this active capture and encode it off the capture thread.
     /// The returned sample may be skipped by video encoding; it does not certify scene
     /// continuity, a complete stripe batch, or presentation by a remote consumer.
@@ -8707,8 +8784,8 @@ impl ScreenCapture {
         result.set_item("coordinate_space", snapshot.layout.coordinate_space)?;
         result.set_item("cursor_composited", snapshot.layout.cursor_composited)?;
         result.set_item("preserved_rgb_bits", 8)?;
-        result.set_item("scene_id", py.None())?;
-        result.set_item("source_id", py.None())?;
+        result.set_item("scene_id", snapshot.stamp.scene_id)?;
+        result.set_item("source_id", snapshot.stamp.source_id)?;
         Ok(result.into_any().unbind())
     }
 

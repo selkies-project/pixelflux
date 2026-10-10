@@ -184,6 +184,15 @@ fn record(change: impl FnOnce(&mut StreamInfo)) {
     });
 }
 
+/// Whether the realized encoder preserves captured-sample association.
+pub fn sample_association(supported: bool) {
+    CURRENT.with(|current| {
+        if let Some(report) = current.borrow().as_ref() {
+            report.samples.scene.set_encoder_supported(supported);
+        }
+    });
+}
+
 /// The capture path taken. A zero-copy path needs no reason, so the ones collected from the
 /// paths declined ahead of it are dropped.
 pub fn capture(path: &'static str, zero_copy: bool) {

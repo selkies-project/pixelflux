@@ -358,3 +358,10 @@ new fallback, or a new reason a path is declined records itself beside its log l
 tally per delivered frame, never a callback into Python.
 
 Update this file when certain details change.
+
+Local Wayland scene continuity is opt-in (`ScreenCapture.set_scene_tracking`), gated by the
+realized capture and encoder capabilities. Scene/source metadata is frozen in `SampleStamp`
+before encoding and survives queued delivery unchanged; the counters are scoped to the capture
+run and producing process. Unknown damage or render failure retires continuity. The default
+off path adds no pixel hashing, copied buffers, or GPU readbacks. These tags do not certify
+stripe completeness or browser presentation; those are transport and presenter contracts.

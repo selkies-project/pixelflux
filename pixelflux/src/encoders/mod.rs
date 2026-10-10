@@ -140,6 +140,8 @@ mod sample_output_tests {
             run_id: 7,
             sample_seq: sequence,
             captured_ns: sequence as i64,
+            source_id: Some(sequence + 100),
+            scene_id: Some(sequence + 200),
         }
     }
 
@@ -1541,8 +1543,12 @@ impl FrameEncoder {
         output.into_units(encoded, self.last_reference())
     }
 
+    pub(crate) fn preserves_sample_identity(&self) -> bool {
+        matches!(self, FrameEncoder::Nvenc(_) | FrameEncoder::Vaapi(_))
+    }
+
     fn tagged_output(&self, data: Vec<u8>, sample: Option<SampleStamp>) -> TaggedOutput {
-        let sample = if matches!(self, FrameEncoder::Nvenc(_) | FrameEncoder::Vaapi(_)) {
+        let sample = if self.preserves_sample_identity() {
             sample
         } else {
             None
