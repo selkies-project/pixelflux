@@ -475,11 +475,12 @@ capture policy and does not change it to serve a request.
 
 Matching encoded stripes carry `sample_run_id` and `sample_seq` attributes. A sample skipped
 by the encoder can still produce a snapshot; a repeated encoded image retains its original
-sample. Unavailable association is `None`; full-frame software HEVC, VP8, VP9, SVT-AV1 and
-V4L2M2M do not yet export a verified association. These attributes do not change the video header.
+sample. Unavailable association is `None`; full-frame software HEVC, VP8, VP9, SVT-AV1,
+Tegra and V4L2M2M do not yet export a verified association. These attributes do not change
+the video header.
 Run and sample identifiers must be scoped to the producing process by any transport.
-An old run's delayed unit can arrive through a replacement capture's callback with its old
-identifier. A grab already in progress when the request arrives can complete afterward and
+Queued callbacks from an old run can arrive after a replacement is requested.
+A grab already in progress when the request arrives can complete afterward and
 satisfy it. `capture_ns` is a CPU-side monotonic stamp, not a presentation timestamp or proof
 that a GPU fence had completed at that instant.
 
@@ -491,6 +492,8 @@ the depth-30 standalone screenshot above. It does not force a keyframe or bypass
 One request per run and four process-wide remain admitted through compression, with a separate
 128 MiB budget for copied raw pixels. These limits are independent of the Computer-Use
 screenshot limits. PNG encoding releases the Python GIL and runs off the capture thread.
+Calls from a video delivery callback are rejected, including calls targeting another capture.
+Request snapshots from a worker, and let the callback return without waiting for that worker.
 Stop/restart invalidates waiting requests and results still being compressed; busy, stale run,
 inactive, unsupported, invalid buffer and timeout failures return distinct error messages.
 Compression already running is not interrupted, but its canceled result is discarded.

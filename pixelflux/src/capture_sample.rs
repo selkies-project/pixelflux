@@ -14,6 +14,38 @@ use std::time::{Duration, Instant};
 use crate::computer_use::{ScreenshotFrame, ScreenshotPixelFormat};
 use crate::encoders::sample::SampleStamp;
 
+thread_local! {
+    static DELIVERY_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct DeliveryThreadGuard {
+    previous: bool,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl DeliveryThreadGuard {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: DELIVERY_THREAD.replace(true),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for DeliveryThreadGuard {
+    fn drop(&mut self) {
+        DELIVERY_THREAD.set(self.previous);
+    }
+}
+
+pub(crate) fn check_snapshot_caller() -> Result<(), String> {
+    if DELIVERY_THREAD.get() {
+        Err("Capture snapshot cannot wait on a delivery thread; request it from another thread".into())
+    } else {
+        Ok(())
+    }
+}
+
 const STARTING: u8 = 0;
 const SUPPORTED: u8 = 1;
 const UNSUPPORTED: u8 = 2;
@@ -373,6 +405,22 @@ impl Drop for SnapshotTicket {
 mod tests {
     use super::*;
     static ADMISSION_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn delivery_thread_rejects_waiting_and_restores_callers_after_drop() {
+        assert!(check_snapshot_caller().is_ok());
+        {
+            let _delivery = DeliveryThreadGuard::enter();
+            assert!(check_snapshot_caller().unwrap_err().contains("delivery thread"));
+            {
+                let _nested = DeliveryThreadGuard::enter();
+                assert!(check_snapshot_caller().is_err());
+            }
+            assert!(check_snapshot_caller().is_err());
+            assert!(std::thread::spawn(check_snapshot_caller).join().unwrap().is_ok());
+        }
+        assert!(check_snapshot_caller().is_ok());
+    }
 
     fn active() -> Arc<CaptureSamples> {
         let run = Arc::new(CaptureSamples::default());

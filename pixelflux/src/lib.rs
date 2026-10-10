@@ -2768,6 +2768,7 @@ fn start_capture_on_display(
         // only drains the channel: the recorder already consumed the frames at the
         // delivery-layer tap, upstream of this per-consumer handoff.
         let join = thread::spawn(move || {
+            let _delivery = capture_sample::DeliveryThreadGuard::enter();
             // The predecessor capture's deliver thread finishes first, off the
             // event loop: encoded stripes reach Python in capture order across
             // a reconfigure, and a stale pre-teardown stripe can never land
@@ -8623,6 +8624,7 @@ impl ScreenCapture {
                 "timeout_s must be greater than zero and at most 30 seconds",
             ));
         }
+        capture_sample::check_snapshot_caller().map_err(PyRuntimeError::new_err)?;
         let run = self
             .sample_run()
             .ok_or_else(|| PyRuntimeError::new_err("Capture snapshot inactive"))?;
@@ -8781,6 +8783,7 @@ impl ScreenCapture {
         // queue, and no frame is ever dropped.
         let (deliver_tx, deliver_rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
         let deliver_handle = thread::spawn(move || {
+            let _delivery = capture_sample::DeliveryThreadGuard::enter();
             crate::boost_thread_priority(-10);
             while let Ok(frame) = deliver_rx.recv() {
                 if PY_SHUTDOWN.load(Ordering::Relaxed) {

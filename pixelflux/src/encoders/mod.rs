@@ -1352,7 +1352,7 @@ impl FrameEncoder {
             }
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => {
-                enc.encode_host_tagged(pixels, stride, rgba, frame_number, qp, force_idr, sample)
+                enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
             }
             FrameEncoder::V4l2m2m(enc) => {
                 enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
@@ -1527,7 +1527,6 @@ impl FrameEncoder {
     }
 
     fn tagged_output(&self, data: Vec<u8>, sample: Option<SampleStamp>) -> TaggedOutput {
-        // Sessions that resolve output PTS need per-unit metadata before carrying samples.
         let sample = if matches!(self, FrameEncoder::Nvenc(_) | FrameEncoder::Vaapi(_)) {
             sample
         } else {
@@ -1541,12 +1540,11 @@ impl FrameEncoder {
             output.units = Some(
                 enc.delivered_units()
                     .iter()
-                    .enumerate()
-                    .map(|(index, &(frame_id, reference, end))| UnitSample {
+                    .map(|&(frame_id, reference, end)| UnitSample {
                         frame_id,
                         reference,
                         end,
-                        sample: enc.delivered_sample(index),
+                        sample: None,
                     })
                     .collect(),
             );

@@ -37,7 +37,6 @@ use super::codec::{
     h264_frame_type, h265_dpb_frames, h265_frame_type, push_video_header,
 };
 use super::reference::{Reference, ReferenceWindow};
-use super::sample::{SampleStamp, SubmissionSamples};
 use crate::RustCaptureSettings;
 
 const V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE: u32 = 9;
@@ -824,8 +823,6 @@ pub struct TegraEncoder {
     in_flight: VecDeque<(u64, Reference)>,
     /// The units the last call handed back, in order, as `delivered_units` describes them.
     units: Vec<(u16, Reference, usize)>,
-    unit_samples: Vec<Option<SampleStamp>>,
-    samples: SubmissionSamples,
     last_reference: Reference,
     /// Frames between the key frames the session asks for itself, and how many since the last.
     keyframe_every: u64,
@@ -907,8 +904,6 @@ impl TegraEncoder {
             },
             in_flight: VecDeque::new(),
             units: Vec::new(),
-            unit_samples: Vec::new(),
-            samples: SubmissionSamples::new(OUTPUT_BUFFERS + CAPTURE_BUFFERS),
             last_reference: Reference::Untracked,
             keyframe_every: 0,
             since_key: 0,
@@ -1352,10 +1347,6 @@ impl TegraEncoder {
         &self.units
     }
 
-    pub fn delivered_sample(&self, index: usize) -> Option<SampleStamp> {
-        self.unit_samples.get(index).copied().flatten()
-    }
-
     /// Leave frame `frame_id` and every frame after it out of the predictions. The encoder
     /// learns of it with the next frame's reference set, which the window now leaves it out of,
     /// or which is empty, making that frame a key frame. False where the session does not name
@@ -1626,28 +1617,12 @@ impl TegraEncoder {
         _qp: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
-        self.encode_host_tagged(pixels, stride, _rgba, frame_number, _qp, force_idr, None)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_host_tagged(
-        &mut self,
-        pixels: &[u8],
-        stride: usize,
-        _rgba: bool,
-        frame_number: u64,
-        _qp: u32,
-        force_idr: bool,
-        sample: Option<SampleStamp>,
-    ) -> Result<Vec<u8>, String> {
         let height = self.height as usize;
         let needed = stride * (height - 1) + self.row_bytes;
         if stride < self.row_bytes || pixels.len() < needed {
             return Err("input buffer too small".into());
         }
-        self.samples.stage(None);
         self.fill_staging(pixels, stride)?;
-        self.samples.stage(sample);
         self.submit(frame_number, force_idr, false)
     }
 
@@ -1675,7 +1650,6 @@ impl TegraEncoder {
         force_idr: bool,
         repeat: bool,
     ) -> Result<Vec<u8>, String> {
-        let submission = self.samples.reserve(frame_number as u16)?;
         let slot = if self.queued < OUTPUT_BUFFERS {
             self.queued
         } else {
@@ -1684,7 +1658,7 @@ impl TegraEncoder {
         self.convert_to_nv12(slot)?;
 
         if let Some(layout) = self.rps {
-            self.queue_references(layout, slot, submission, force_idr)?;
+            self.queue_references(layout, slot, frame_number, force_idr)?;
         } else if force_idr {
             self.set_control(CID_FORCE_IDR_FRAME, 1, "force IDR")?;
         }
@@ -1701,7 +1675,7 @@ impl TegraEncoder {
             2,
         );
         buffer.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-        buffer.timestamp = SubmissionSamples::timestamp(submission);
+        buffer.timestamp = [frame_number as i64, 0];
         // The references were stored under the slot's index (`config_store`), and the buffer
         // names that store in `reserved2`, as the vendor's own encoder does. Left zero, every
         // frame reads store 0, and the first one queued elsewhere fails the session.
@@ -1709,11 +1683,10 @@ impl TegraEncoder {
             buffer.reserved2 = slot as u32;
         }
         self.ioctl(VIDIOC_QBUF, &mut buffer, "QBUF output")?;
-        self.samples.submitted(submission);
         self.queued = (self.queued + 1).min(OUTPUT_BUFFERS);
         self.outstanding += 1;
         if !repeat {
-            self.held = Some((submission, slot));
+            self.held = Some((frame_number, slot));
         }
         if self.outstanding >= self.wait_from {
             let mut poll = libc::pollfd {
@@ -1772,7 +1745,6 @@ impl TegraEncoder {
         let mut out = Vec::new();
         self.last_reference = Reference::Untracked;
         self.units.clear();
-        self.unit_samples.clear();
         loop {
             let mut planes = [Plane::default(); 1];
             let mut buffer = self.buffer(
@@ -1802,16 +1774,17 @@ impl TegraEncoder {
             }
             let index = buffer.index as usize;
             let length = planes[0].bytesused as usize;
-            let number = SubmissionSamples::from_timestamp(buffer.timestamp)
-                .ok_or("invalid encoder output timestamp")?;
-            let sample = self.samples.take(number);
             self.outstanding = self.outstanding.saturating_sub(1);
-            if self.held.is_some_and(|(queued, _)| queued == number) {
+            if self
+                .held
+                .is_some_and(|(number, _)| number == buffer.timestamp[0] as u64)
+            {
                 self.held = None;
             }
             if length > 0 {
                 let (data, _) = self.capture[index];
                 let unit = unsafe { std::slice::from_raw_parts(data as *const u8, length) };
+                let number = buffer.timestamp[0] as u64;
                 let reference = self.reference_of(number);
                 let frame_type = self.frame_type(unit);
                 if frame_type == FRAME_KEY {
@@ -1841,7 +1814,6 @@ impl TegraEncoder {
                     out.extend_from_slice(bytes);
                 }
                 self.units.push((number as u16, reference, out.len()));
-                self.unit_samples.push(sample);
             }
             self.ioctl(VIDIOC_QBUF, &mut buffer, "QBUF capture")?;
         }
