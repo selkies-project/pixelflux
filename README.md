@@ -481,8 +481,9 @@ the video header.
 Run and sample identifiers must be scoped to the producing process by any transport.
 Queued callbacks from an old run can arrive after a replacement is requested.
 A grab already in progress when the request arrives can complete afterward and
-satisfy it. `capture_ns` is a CPU-side monotonic stamp, not a presentation timestamp or proof
-that a GPU fence had completed at that instant.
+satisfy it. `capture_ns` preserves the video pipeline's CPU-side monotonic stamp: local
+Wayland composition starts there, while XShm stamps after grabbing and compositing overlays.
+It is not a presentation timestamp or proof that a GPU fence had completed at that instant.
 
 The snapshot uses the active XShm RGB8 buffer or the local Wayland composition, including
 its overlays. NvFBC, DRI3 and external Wayland host snapshots report unsupported; their video

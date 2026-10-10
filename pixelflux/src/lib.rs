@@ -4265,7 +4265,7 @@ fn render_node_tick(
     let sample = if render_success && !hold_frame && !host_mode {
         node.capture
             .as_ref()
-            .and_then(|c| c.report.samples.next(wayland::host::now_ns()))
+            .and_then(|c| c.report.samples.next(composite_ns))
     } else {
         None
     };
