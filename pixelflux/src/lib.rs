@@ -4240,7 +4240,6 @@ fn render_node_tick(
             screenshot_result = Some(Ok(()));
         }
         if !host_mode
-            && force_legacy_screenshot
             && matches!(&screenshot_result, Some(Ok(())))
             && let Some((_, buf)) = pool_slot.as_ref()
         {
@@ -4276,23 +4275,6 @@ fn render_node_tick(
         coordinate_space: "wayland-layout-logical",
     };
     let mut capture_snapshot_serviced = false;
-    if take_capture_snapshot
-        && !force_legacy_screenshot
-        && let Some(sample) = sample
-        && let Some((_, pixels)) = pool_slot.as_ref()
-        && let Some(cap) = node.capture.as_ref()
-        && matches!(&screenshot_result, Some(Ok(())))
-    {
-        cap.report.samples.copy_requested(
-            sample,
-            pixels,
-            width as usize * 4,
-            (width as u32, height as u32),
-            screenshot_format,
-            snapshot_layout,
-        );
-        capture_snapshot_serviced = true;
-    }
     // Views share one output, so its clients are driven once a frame, by the
     // fastest display capturing that screen (ties go to the lowest number) -- a
     // client asked to draw once per view would render as many times a frame as
