@@ -36,7 +36,10 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as XtestExt;
 use x11rb::rust_connection::RustConnection;
 
-use crate::computer_use::{CuBackend, CuButton, encode_png_rgba};
+use super::pixel_format::ScreenshotFormat;
+use crate::computer_use::{
+    CuBackend, CuButton, ScreenshotOptions, encode_png_rgb16, encode_png_rgba,
+};
 
 /// One wheel "click" of scroll per unit of CU `scroll_amount`, capped so a hostile amount
 /// cannot flood the server with press/release pairs.
@@ -423,6 +426,15 @@ impl CuBackend for CuX11Backend {
     }
 
     fn screenshot_png(&self, display: u32) -> Result<Vec<u8>, String> {
+        self.screenshot_png_with_options(display, ScreenshotOptions::default())
+    }
+
+    fn screenshot_png_with_options(
+        &self,
+        display: u32,
+        options: ScreenshotOptions,
+    ) -> Result<Vec<u8>, String> {
+        options.validate()?;
         // One X server, one root: only display 0 exists on this backend.
         if display != 0 {
             return Err(format!("Unknown display: {display}"));
@@ -434,18 +446,54 @@ impl CuBackend for CuX11Backend {
             .map_err(|e| format!("get_image: {e}"))?
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
-        let mut data = img.data;
-        let expected = w as usize * h as usize * 4;
-        if data.len() != expected {
+        let setup = self.conn.setup();
+        let screen = setup
+            .roots
+            .iter()
+            .find(|screen| screen.root == self.root)
+            .ok_or("Screenshot root is not present in the connection setup")?;
+        if img.depth != screen.root_depth || img.visual != screen.root_visual {
+            return Err("Screenshot reply does not match the root visual".to_string());
+        }
+        let visual = screen
+            .allowed_depths
+            .iter()
+            .filter(|depth| depth.depth == img.depth)
+            .flat_map(|depth| &depth.visuals)
+            .find(|visual| visual.visual_id == img.visual)
+            .ok_or("Screenshot root visual was not advertised")?;
+        let storage = setup
+            .pixmap_formats
+            .iter()
+            .find(|format| format.depth == img.depth)
+            .ok_or("Screenshot root pixmap format was not advertised")?;
+        let format = ScreenshotFormat::new(
+            img.depth,
+            storage.bits_per_pixel,
+            storage.scanline_pad,
+            setup.image_byte_order,
+            visual.class,
+            [visual.red_mask, visual.green_mask, visual.blue_mask],
+        )?;
+        if options.min_rgb_bits > format.rgb_bits {
             return Err(format!(
-                "unexpected image size {} for {}x{} (only 32-bpp roots are supported)",
-                data.len(),
-                w,
-                h
+                "Screenshot source preserves only {} RGB bits, requested at least {}",
+                format.rgb_bits, options.min_rgb_bits
             ));
         }
+        let draw_cursor = options.cursor.unwrap_or(true);
+        if format.rgb_bits == 10 {
+            if draw_cursor {
+                return Err("Native RGB10 screenshots require cursor=False; high-precision cursor composition is not supported".to_string());
+            }
+            let rgb16 = format.rgb16(&img.data, w as u32, h as u32)?;
+            return encode_png_rgb16(&rgb16, w as u32, h as u32, format.rgb_bits);
+        }
+        let mut data = img.data;
+        format.normalize_bgra8(&mut data, w as u32, h as u32)?;
         // The agent needs to see the pointer; the stream's cursor settings do not apply here.
-        if self.has_xfixes
+        if draw_cursor
+            && self.has_xfixes
             && let Some(c) = self
                 .conn
                 .xfixes_get_cursor_image()

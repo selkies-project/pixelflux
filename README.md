@@ -442,7 +442,92 @@ For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat`
 
 ## Screenshots
 
-`screenshot_png(display=0)` returns a PNG of one display with the cursor drawn in, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture.
+`screenshot_png(display=0)` returns a PNG of one display, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture. Wayland preserves the current compositor or host capture cursor policy; the X11 screenshot draws the cursor into the image.
+
+On Wayland, PNG compression runs in the requesting thread outside the Python GIL, after the compositor hands it an owned copy of the rendered output. Requests are bounded through compression: up to four across all displays and two per display, with at most one queued readback per display. A call that exceeds either limit returns `Screenshot busy`; it does not replace another caller's pending capture. A timed-out caller cancels its pending readback, and removing an output fails its pending capture.
+
+Eight-bit outputs produce RGBA8 PNGs. Unused alpha bytes in opaque host formats become fully opaque; alpha-bearing formats retain their alpha. Losslessness refers to the rendered screenshot, not to the precision of an application's original data.
+
+The independent X11 screenshot also accepts a validated depth-30 TrueColor root:
+
+```python
+png = pixelflux.screenshot_png(min_rgb_bits=10, cursor=False)
+```
+
+Its RGB10 codes are preserved in RGB16 PNG samples, with `sBIT=10`. Visual masks, image
+byte order, storage depth and buffer size are checked before conversion. A source below
+`min_rgb_bits` is rejected; selecting a 10-bit video encoder does not satisfy that requirement.
+High-precision cursor composition is unsupported, so a depth-30 screenshot requires
+`cursor=False`. The default `cursor=None` preserves each backend's cursor policy. Wayland
+screenshots remain eight-bit and reject both a higher minimum precision and a cursor override.
+
+### Experimental capture-bound snapshots
+
+After the first callback, `capture.capture_run_id` names the active capture run within this
+process. `capture.snapshot_png(expected_run=run_id, timeout_s=5.0)` waits for a next sample of
+that run to be stamped and returns a dict containing `png`, `run_id`, `sample_seq`, `capture_ns`, `width`,
+`height`, `origin_x`, `origin_y`, `scale`, `coordinate_space`, `cursor_composited`, and
+`preserved_rgb_bits`. The origin is in X11 root pixels or Wayland layout logical coordinates,
+as named by `coordinate_space`. `cursor_composited` describes PixelFlux's cursor layer:
+`False` for verified exclusion, `True` after verified composition, and `None` when unknown.
+It does not describe cursors drawn as application content. The operation inherits the active
+capture policy and does not change it to serve a request.
+
+Matching encoded stripes carry `sample_run_id` and `sample_seq` attributes. A sample skipped
+by the encoder can still produce a snapshot; a repeated encoded image retains its original
+sample. Unavailable association is `None`; full-frame software HEVC, VP8, VP9, SVT-AV1,
+Tegra and V4L2M2M do not yet export a verified association. These attributes do not change
+the video header.
+Run and sample identifiers must be scoped to the producing process by any transport.
+Queued callbacks from an old run can arrive after a replacement is requested.
+A grab already in progress when the request arrives can complete afterward and
+satisfy it. `capture_ns` preserves the video pipeline's CPU-side monotonic stamp: local
+Wayland composition starts there, while XShm stamps after grabbing and compositing overlays.
+It is not a presentation timestamp or proof that a GPU fence had completed at that instant.
+
+The snapshot uses the active XShm RGB8 buffer or the local Wayland composition, including
+its overlays. NvFBC, DRI3 and external Wayland host snapshots report unsupported; their video
+paths remain selected normally. The new operation preserves eight bits, independently of
+the depth-30 standalone screenshot above. It does not force a keyframe or bypass video pacing.
+
+Local Wayland captures optionally expose conservative scene identity. After the capture has
+started, `scene_tracking_supported` reports support from both the local capturer and the
+realized encoder, even while tracking is off. NVENC and VA-API full-frame sessions, and
+software H.264/JPEG stripes, preserve the association. Other full-frame encoders do not.
+`capture.set_scene_tracking(True)` enables it live; `scene_tracking_enabled` reports the
+setting. The default is off. X11 and external Wayland host captures reject enabling it
+without changing their capture backend. An encoder demotion that loses the association
+disables tracking. While tracking is off, it adds no pixel hashes, buffer copies, or GPU
+readbacks to the capture path.
+
+While enabled, known local composition samples carry `source_id` and `scene_id` in both
+`StripeFrame` and the snapshot dict. Compare them only together with `sample_run_id`
+(`run_id` in the snapshot) and the producing process. Source identity changes with layout,
+pixel format, cursor policy, or recovery from an uncertain render; scene identity advances
+on compositor damage or repaint. An identical repaint can advance it. A quiet successful
+render retains its scene. Render failure, held reconfiguration, and unknown damage retire
+continuity, and disabling then re-enabling never reuses a source identity in that run.
+
+These fields are frozen before encoding, so delayed callbacks and PNG completion retain
+their original scene. Unsupported encoder associations still return `None`; consumers must
+reject missing identity and retire pending presentation work when tracking or the run changes.
+Scene identity does not certify stripe completeness, browser presentation, or an atomic
+transition between video and a lossless image.
+
+One request per run and four process-wide remain admitted through compression, with a separate
+128 MiB budget for copied raw pixels. These limits are independent of the Computer-Use
+screenshot limits. PNG encoding releases the Python GIL and runs off the capture thread.
+Calls from a video delivery callback are rejected, including calls targeting another capture.
+Request snapshots from a worker, and let the callback return without waiting for that worker.
+Stop/restart invalidates waiting requests and results still being compressed; busy, stale run,
+inactive, unsupported, invalid buffer and timeout failures return distinct error messages.
+Compression already running is not interrupted, but its canceled result is discarded.
+
+When scene tracking is disabled or unavailable, `scene_id` and `source_id` are `None`:
+a sample alone identifies captured pixels, not continuity of an output/source. Even enabled
+scene tracking does not prove that a browser displayed them. Stripe callbacks do not announce
+batch completion. Automatic static refinement still requires transport and presentation
+ordering; these tokens alone must not be used to keep a PNG over newer video.
 
 ## Recording Sink
 

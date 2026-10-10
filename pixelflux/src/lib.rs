@@ -65,6 +65,7 @@ use pyo3::types::{PyAny, PyModule};
 use smithay::backend::egl::fence::EGLFence;
 use smithay::desktop::utils::{OutputPresentationFeedback, send_frames_surface_tree};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, ImageCopyCaptureState};
@@ -76,7 +77,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
     backend::{
         allocator::{
-            Fourcc, Modifier,
+            Buffer as _, Fourcc, Modifier,
             dmabuf::{Dmabuf, DmabufFlags},
             gbm::GbmDevice,
         },
@@ -139,6 +140,8 @@ pub mod encoders;
 /// The debug switch behind every backend's tagged line.
 pub mod log;
 
+pub mod capture_sample;
+mod capture_scene;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
 /// When a capture is due a frame, shared by the X11 and Wayland backends.
@@ -287,8 +290,8 @@ pub(crate) fn alloc_render_target<T: std::os::fd::AsFd>(
 /// The returned dmabuf is the one handle the GLES renderer binds as its framebuffer AND a hardware
 /// encoder (NVENC through CUDA, or VAAPI) imports to read those pixels directly, which only works if
 /// the buffer is described precisely enough (fd, stride, DRM modifier) for the importer to interpret
-/// it. One ARGB8888 plane is all that is carried because the compositor's offscreen target is exactly
-/// that single-plane format.
+/// it. The render targets and host capture slots have one plane; retain the BO's format so an
+/// opaque host slot is not imported as a buffer with alpha.
 pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier();
@@ -300,7 +303,7 @@ pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
 
     let mut builder = Dmabuf::builder(
         (width as i32, height as i32),
-        Fourcc::Argb8888,
+        bo.format(),
         drm_modifier,
         DmabufFlags::empty(),
     );
@@ -885,11 +888,12 @@ pub enum ThreadCommand {
         display_id: u32,
         tunables: LiveTunables,
     },
-    /// One-shot PNG of one output's next rendered frame (0 = primary); an unknown
-    /// display id replies with an error immediately.
+    /// Owned pixels from one output's next render, compressed by the requesting thread.
     CuScreenshot {
         display_id: u32,
-        resp: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+        resp: std::sync::mpsc::Sender<Result<computer_use::ScreenshotFrame, String>>,
+        canceled: Arc<AtomicBool>,
+        deadline: Instant,
     },
     CuCursorPosition {
         resp: std::sync::mpsc::Sender<(f64, f64)>,
@@ -1165,6 +1169,7 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
 /// encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
 /// overlay animation); the IDR request travels separately via the controls atomic.
 pub struct WlFrame {
+    sample: Option<encoders::sample::SampleStamp>,
     /// Pool slot id; travels with the buffer so recycle returns it to the right slot.
     id: usize,
     buf: Vec<u8>,
@@ -1550,36 +1555,40 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 // conversion runs here.
                 let encode_start_ns = wayland::host::now_ns();
                 let outcome = if decision.send {
-                    encoder.encode_host(
+                    encoder.encode_host_tagged(
                         &f.buf,
                         (w * 4) as usize,
                         cfg.use_gpu,
                         f.frame_id as u64,
                         decision.target_qp,
                         force_idr,
+                        f.sample,
                     )
                 } else {
-                    encoder.push_held(f.frame_id as u64)
+                    encoder.push_held_tagged(f.frame_id as u64)
                 };
                 match outcome {
                     Ok(data) => {
                         hw_error_streak = 0;
                         hw_rebuilt = false;
-                        if !data.is_empty() {
+                        if !data.data.is_empty() {
                             let encode_end_ns = wayland::host::now_ns();
-                            for (data, id, reference) in encoder.delivered_units(data, f.frame_id) {
+                            for unit in encoder.delivered_units_tagged(data, f.frame_id) {
                                 out.push(EncodedStripe {
-                                    data: Arc::new(data),
+                                    sample: unit.sample,
+                                    data: Arc::new(unit.data),
                                     codec: settings.codec,
                                     stripe_y_start: 0,
                                     stripe_height: height,
-                                    frame_id: id as i32,
+                                    frame_id: unit.frame_id as i32,
                                     timing: FrameTiming {
-                                        capture_ns: f.captured_ns,
+                                        capture_ns: unit
+                                            .sample
+                                            .map_or(f.captured_ns, |s| s.captured_ns),
                                         encode_start_ns,
                                         encode_end_ns,
                                     },
-                                    reference,
+                                    reference: unit.reference,
                                 });
                             }
                         }
@@ -1654,6 +1663,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 false,
                 force_idr_all,
             );
+            for stripe in &mut out {
+                stripe.sample = f.sample;
+            }
             FrameTiming::stamp(&mut out, f.captured_ns, encode_start_ns);
         }
 
@@ -1748,6 +1760,10 @@ pub(crate) fn log_stream_settings(
     n_stripes: usize,
     video_encoder: Option<&FrameEncoder>,
 ) {
+    report::sample_association(video_encoder.map_or_else(
+        || matches!(settings.codec, Codec::Jpeg | Codec::H264),
+        FrameEncoder::preserves_sample_identity,
+    ));
     let backend = video_encoder.map(|enc| (enc.backend_name(), enc.is_hardware()));
     let fixed_rate = video_encoder.and_then(FrameEncoder::fixed_rate_control);
     let holds = video_encoder.map_or_else(
@@ -1980,6 +1996,9 @@ fn reap_dead_host(state: &mut AppState) {
             Some("host compositor connection lost; capture stopped".to_string()),
         );
     }
+    state
+        .pending_screenshots
+        .fail_all("Host compositor connection lost");
     state.host = None;
     state.host_mode_refusals.clear();
     // Nothing will answer the requests still in flight: their geometry readers get
@@ -2277,6 +2296,7 @@ fn start_capture_on_display(
         return;
     };
     let stream_report = report::StreamReport::new("wayland");
+    let sample_guard = stream_report.samples.guard();
     report::wayland_reports()
         .lock()
         .unwrap()
@@ -2331,6 +2351,7 @@ fn start_capture_on_display(
     // when the verdict arrives (`reconcile_host_layouts`), the same way a failed GBM
     // resize falls back to the live mode.
     let host_capture = !settings.wayland_host_display.is_empty();
+    stream_report.samples.supported(!host_capture);
     reap_dead_host(state);
     if host_capture && state.host.is_none() {
         // Capture buffers come from the same render node the encoder imports
@@ -2715,6 +2736,7 @@ fn start_capture_on_display(
     state.render_cursor_on_framebuffer = settings.capture_cursor;
 
     let mut cap = wayland::frontend::WlCapture {
+        sample_guard,
         settings: settings.clone(),
         callback: cb.clone(),
         video_encoder,
@@ -2751,6 +2773,7 @@ fn start_capture_on_display(
         // only drains the channel: the recorder already consumed the frames at the
         // delivery-layer tap, upstream of this per-consumer handoff.
         let join = thread::spawn(move || {
+            let _delivery = capture_sample::DeliveryThreadGuard::enter();
             // The predecessor capture's deliver thread finishes first, off the
             // event loop: encoded stripes reach Python in capture order across
             // a reconfigure, and a stale pre-teardown stripe can never land
@@ -2780,6 +2803,7 @@ fn start_capture_on_display(
                                         s.frame_id,
                                         s.timing,
                                         s.reference,
+                                        s.sample,
                                     ),
                                 ) {
                                     Ok(f) => {
@@ -2827,6 +2851,7 @@ fn start_capture_on_display(
     // otherwise produces no damage, no first frame, and no IDR in either path.
     cap.request_idr();
 
+    cap.report.samples.scene.set_supported(!host_capture);
     node.capture = Some(cap);
     // The start reprogrammed this output, and until a client answers at the new size the
     // compositor paints its clear color over whatever the client does not cover — a
@@ -3106,7 +3131,26 @@ fn read_back_rgba(
     height: i32,
     dst: &mut [u8],
 ) {
-    let read = renderer
+    if let Err(e) = read_back_rgba_result(renderer, target, width, height, dst, false) {
+        eprintln!("[Wayland] Readback failed: {e}");
+    }
+}
+
+/// Screenshot reads also check GL errors before any pixels can be handed to the caller.
+fn read_back_rgba_result(
+    renderer: &mut GlesRenderer,
+    target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
+    width: i32,
+    height: i32,
+    dst: &mut [u8],
+    check_error: bool,
+) -> Result<(), String> {
+    if check_error
+        && (width <= 0 || height <= 0 || dst.len() < width as usize * height as usize * 4)
+    {
+        return Err("Screenshot readback buffer is too small".to_string());
+    }
+    let error = renderer
         .render(target, (width, height).into(), Transform::Normal)
         .and_then(|mut frame| {
             frame.with_context(|gl| unsafe {
@@ -3119,10 +3163,169 @@ fn read_back_rgba(
                     smithay::backend::renderer::gles::ffi::UNSIGNED_BYTE,
                     dst.as_mut_ptr() as *mut std::ffi::c_void,
                 );
+                if check_error { gl.GetError() } else { 0 }
             })
-        });
-    if let Err(e) = read {
-        eprintln!("[Wayland] Readback failed: {e:?}");
+        })
+        .map_err(|e| format!("Screenshot readback failed: {e:?}"))?;
+    if error != 0 {
+        return Err(format!("Screenshot readback GL error: 0x{error:x}"));
+    }
+    Ok(())
+}
+
+/// Copy exactly one complete frame, excluding any scratch-buffer capacity from an older size.
+fn screenshot_frame(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+    format: computer_use::ScreenshotPixelFormat,
+) -> Result<computer_use::ScreenshotFrame, String> {
+    let expected = usize::try_from(width)
+        .ok()
+        .zip(usize::try_from(height).ok())
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .and_then(|(w, h)| w.checked_mul(h))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "Screenshot dimensions are invalid".to_string())?;
+    let pixels = pixels
+        .get(..expected)
+        .ok_or_else(|| "Screenshot readback produced incomplete pixels".to_string())?
+        .to_vec();
+    Ok(computer_use::ScreenshotFrame {
+        pixels: pixels.into(),
+        width: width as u32,
+        height: height as u32,
+        format,
+    })
+}
+
+/// Reject truncated host mappings instead of retaining pixels from an earlier frame.
+fn validate_host_screenshot(
+    frame: &wayland::host::HostCpuFrame,
+    width: i32,
+    height: i32,
+) -> Result<computer_use::ScreenshotPixelFormat, String> {
+    if width <= 0 || height <= 0 {
+        return Err("Screenshot host dimensions are invalid".to_string());
+    }
+    let src_bpp = match frame.format {
+        f if f == wl_shm::Format::Bgr888 as u32 || f == wl_shm::Format::Rgb888 as u32 => 3,
+        f if f == wl_shm::Format::Xrgb8888 as u32
+            || f == wl_shm::Format::Argb8888 as u32
+            || f == wl_shm::Format::Xbgr8888 as u32
+            || f == wl_shm::Format::Abgr8888 as u32 =>
+        {
+            4
+        }
+        _ => return Err("Screenshot host pixel format is unsupported".to_string()),
+    };
+    let row = (width as usize)
+        .checked_mul(src_bpp)
+        .ok_or_else(|| "Screenshot host dimensions overflow".to_string())?;
+    let required = (height as usize - 1)
+        .checked_mul(frame.stride)
+        .and_then(|n| n.checked_add(row))
+        .and_then(|n| n.checked_add(frame.offset));
+    if frame.stride < row || required.is_none_or(|n| n > (*frame.map).as_ref().len()) {
+        return Err("Screenshot host frame is incomplete".to_string());
+    }
+    Ok(
+        if frame.format == wl_shm::Format::Xrgb8888 as u32
+            || frame.format == wl_shm::Format::Xbgr8888 as u32
+        {
+            computer_use::ScreenshotPixelFormat::Bgrx
+        } else {
+            computer_use::ScreenshotPixelFormat::Bgra
+        },
+    )
+}
+
+#[cfg(test)]
+mod screenshot_frame_tests {
+    use super::{screenshot_frame, validate_host_screenshot};
+    use crate::computer_use::ScreenshotPixelFormat;
+    use crate::wayland::host::HostCpuFrame;
+    use smithay::reexports::wayland_server::protocol::wl_shm;
+    use std::sync::Arc;
+
+    #[test]
+    fn screenshot_owns_only_the_current_frame_pixels() {
+        let mut source = vec![1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99];
+        let frame = screenshot_frame(&source, 2, 1, ScreenshotPixelFormat::Bgra).unwrap();
+        source.fill(0);
+        assert_eq!(frame.pixels.as_ref(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert!(matches!(frame.format, ScreenshotPixelFormat::Bgra));
+    }
+
+    #[test]
+    fn screenshot_rejects_invalid_dimensions_and_short_pixels() {
+        for (width, height) in [(0, 1), (1, 0), (-1, 2), (2, -1), (2, 2)] {
+            assert!(
+                screenshot_frame(&[0; 12], width, height, ScreenshotPixelFormat::Rgba).is_err()
+            );
+        }
+    }
+
+    fn host_frame(
+        bytes: usize,
+        stride: usize,
+        offset: usize,
+        format: wl_shm::Format,
+    ) -> HostCpuFrame {
+        HostCpuFrame {
+            map: Arc::new(vec![0u8; bytes]),
+            offset,
+            stride,
+            format: format as u32,
+        }
+    }
+
+    #[test]
+    fn screenshot_validates_host_rows_offset_and_truncation() {
+        for (format, row) in [(wl_shm::Format::Argb8888, 8), (wl_shm::Format::Bgr888, 6)] {
+            let stride = row + 4;
+            let required = 3 + stride + row;
+            assert!(
+                validate_host_screenshot(&host_frame(required, stride, 3, format), 2, 2).is_ok()
+            );
+            assert!(
+                validate_host_screenshot(&host_frame(required - 1, stride, 3, format), 2, 2)
+                    .is_err()
+            );
+            assert!(
+                validate_host_screenshot(&host_frame(required, row - 1, 3, format), 2, 2).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_retains_host_alpha_semantics_after_bgra_conversion() {
+        for (source, expected) in [
+            (wl_shm::Format::Xrgb8888, ScreenshotPixelFormat::Bgrx),
+            (wl_shm::Format::Xbgr8888, ScreenshotPixelFormat::Bgrx),
+            (wl_shm::Format::Argb8888, ScreenshotPixelFormat::Bgra),
+            (wl_shm::Format::Abgr8888, ScreenshotPixelFormat::Bgra),
+            (wl_shm::Format::Rgb888, ScreenshotPixelFormat::Bgra),
+            (wl_shm::Format::Bgr888, ScreenshotPixelFormat::Bgra),
+        ] {
+            assert_eq!(
+                validate_host_screenshot(&host_frame(16, 8, 0, source), 2, 2).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_rejects_unsupported_host_formats_and_dimensions() {
+        let mut frame = host_frame(16, 8, 0, wl_shm::Format::Argb8888);
+        assert!(validate_host_screenshot(&frame, 0, 2).is_err());
+        assert!(validate_host_screenshot(&frame, 2, 0).is_err());
+        frame.offset = usize::MAX;
+        assert!(validate_host_screenshot(&frame, 2, 2).is_err());
+        frame.offset = 0;
+        frame.format = u32::MAX;
+        assert!(validate_host_screenshot(&frame, 2, 2).is_err());
     }
 }
 
@@ -3181,10 +3384,13 @@ fn render_node_tick(
     node: &mut wayland::frontend::OutputNode,
     trigger: TickTrigger,
 ) -> bool {
-    let take_screenshot = state
-        .pending_screenshot
+    state.pending_screenshots.prune(Instant::now());
+    let take_capture_snapshot = node
+        .capture
         .as_ref()
-        .is_some_and(|(id, _)| *id == node.id);
+        .is_some_and(|c| c.report.samples.has_pending());
+    let force_legacy_screenshot = state.pending_screenshots.contains(node.id);
+    let take_screenshot = force_legacy_screenshot || take_capture_snapshot;
     let copy_frame_wanted = state.copy_frame_pending_for(&node.output);
     if node.capture.is_none() && !take_screenshot && !copy_frame_wanted {
         return false;
@@ -3192,7 +3398,7 @@ fn render_node_tick(
 
     // Per-display frame pacing under the one shared timer, and under input.
     if let Some(cap) = node.capture.as_ref()
-        && !take_screenshot
+        && !force_legacy_screenshot
         && !cap.pace.due(trigger, capture_period(cap), Instant::now())
     {
         return false;
@@ -3203,12 +3409,16 @@ fn render_node_tick(
     let output_scale_val = output.current_scale().fractional_scale();
     let (width, height) = match node.capture.as_ref() {
         Some(c) => (c.settings.width, c.settings.height),
+        None if node.owner.is_some() => node.view_size,
         None => output
             .current_mode()
             .map(|m| (m.size.w, m.size.h))
             .unwrap_or((0, 0)),
     };
     if width <= 0 || height <= 0 {
+        if let Some(c) = node.capture.as_ref() {
+            c.report.samples.scene.invalidate();
+        }
         return false;
     }
     if node.frame_buffer.len() < (width as usize) * (height as usize) * 4 {
@@ -3331,6 +3541,9 @@ fn render_node_tick(
     // The picture's capture time for the stats: compositing is this path's capture.
     let composite_ns = wayland::host::now_ns();
     let mut render_success = false;
+    let mut scene_damage_known = false;
+    let mut screenshot_result = None;
+    let mut deferred_screenshot = None;
     let mut render_sync = None;
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node
@@ -3338,8 +3551,12 @@ fn render_node_tick(
         .as_ref()
         .map(|c| c.needs_full_render)
         .unwrap_or(!node.target_seeded);
+    let scene_rebuilt = needs_full || !node.target_seeded;
 
     if state.host.is_some() && !host_mode {
+        if let Some(c) = node.capture.as_ref() {
+            c.report.samples.scene.invalidate();
+        }
         // No host output backs this display (start_capture already warned):
         // produce nothing rather than the compositor's own empty content.
         if let Some((id, buf)) = pool_slot.take()
@@ -3355,7 +3572,11 @@ fn render_node_tick(
     let mut new_stamp: Option<i64> = None;
     // Host software frames arrive BGRA, so anything reading this display's frame buffer
     // back has to know it is not the GLES readback's RGBA.
-    let mut host_cpu_frame = false;
+    let mut screenshot_format = if state.use_gpu {
+        computer_use::ScreenshotPixelFormat::Rgba
+    } else {
+        computer_use::ScreenshotPixelFormat::Bgra
+    };
     if host_mode {
         const RETAINED_OK: u8 = 0;
         const RETAINED_NONE: u8 = 1;
@@ -3464,7 +3685,15 @@ fn render_node_tick(
                 if gpu_encoder {
                     return RETAINED_CPU_FRAME;
                 }
-                host_cpu_frame = true;
+                if take_screenshot {
+                    screenshot_result = Some(if (f.width, f.height) == (width, height) {
+                        validate_host_screenshot(cpu, width, height).map(|format| {
+                            screenshot_format = format;
+                        })
+                    } else {
+                        Err("Screenshot host frame has stale dimensions".to_string())
+                    });
+                }
                 if let Some((_, ref mut buf)) = pool_slot {
                     cpu.write_bgra(f.width, f.height, buf);
                     if wm_active {
@@ -3504,6 +3733,9 @@ fn render_node_tick(
         // trail); anchored watermarks are stamped once onto each fresh blit and
         // ride along with retained re-encodes.
         if let Some(src) = host_enc_dmabuf.clone() {
+            if take_screenshot && matches!(src.format().code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
+                screenshot_format = computer_use::ScreenshotPixelFormat::Rgbx;
+            }
             if wm_active && let Some(renderer) = state.gles_renderer.as_mut() {
                 if wm_animated {
                     if let Some((_, target)) = node.offscreen_buffer.as_mut() {
@@ -3540,22 +3772,24 @@ fn render_node_tick(
             }
             if take_screenshot && let Some(renderer) = state.gles_renderer.as_mut() {
                 let mut shot = host_enc_dmabuf.clone().unwrap_or(src);
-                match renderer.bind(&mut shot) {
-                    Ok(fb) => {
-                        let rect = Rectangle::new((0, 0).into(), (width, height).into());
-                        match renderer.copy_framebuffer(&fb, rect, Fourcc::Abgr8888) {
-                            Ok(mapping) => match renderer.map_texture(&mapping) {
-                                Ok(data) => {
-                                    let n = data.len().min(node.frame_buffer.len());
-                                    node.frame_buffer[..n].copy_from_slice(&data[..n]);
-                                }
-                                Err(e) => eprintln!("[HostCapture] screenshot map: {e:?}"),
-                            },
-                            Err(e) => eprintln!("[HostCapture] screenshot copy: {e:?}"),
-                        }
+                screenshot_result = Some((|| {
+                    let fb = renderer
+                        .bind(&mut shot)
+                        .map_err(|e| format!("Screenshot bind failed: {e:?}"))?;
+                    let rect = Rectangle::new((0, 0).into(), (width, height).into());
+                    let mapping = renderer
+                        .copy_framebuffer(&fb, rect, Fourcc::Abgr8888)
+                        .map_err(|e| format!("Screenshot copy failed: {e:?}"))?;
+                    let data = renderer
+                        .map_texture(&mapping)
+                        .map_err(|e| format!("Screenshot map failed: {e:?}"))?;
+                    let expected = width as usize * height as usize * 4;
+                    if data.len() != expected {
+                        return Err("Screenshot readback produced incomplete pixels".to_string());
                     }
-                    Err(e) => eprintln!("[HostCapture] screenshot bind: {e:?}"),
-                };
+                    node.frame_buffer[..expected].copy_from_slice(data);
+                    Ok(())
+                })());
             }
         }
         if wm_drawn && let Some(rect) = node.overlay_state.damage_rect(width, height) {
@@ -3753,6 +3987,7 @@ fn render_node_tick(
                         ) {
                             Ok(result) => {
                                 render_success = true;
+                                scene_damage_known = true;
                                 if let Some(damage) = result.damage {
                                     damage_rects = damage.clone();
                                     node.undrawn_ticks = 0;
@@ -3794,23 +4029,29 @@ fn render_node_tick(
                                 // lag the offscreen target whenever the encoder held the
                                 // other slot across a tick; one catch-up readback keeps
                                 // every published buffer current.
-                                if render_success && c.pool_content_gen[id] != c.content_gen {
+                                if render_success && take_screenshot {
+                                    let result = read_back_rgba_result(
+                                        renderer, &mut frame, width, height, buf, true,
+                                    );
+                                    if result.is_ok() {
+                                        c.pool_content_gen[id] = c.content_gen;
+                                    } else {
+                                        render_success = false;
+                                        c.needs_full_render = true;
+                                    }
+                                    screenshot_result = Some(result);
+                                } else if render_success && c.pool_content_gen[id] != c.content_gen
+                                {
                                     read_back_rgba(renderer, &mut frame, width, height, buf);
                                     c.pool_content_gen[id] = c.content_gen;
                                 }
                             }
                         }
-                        if pool_slot.is_none() && take_screenshot {
-                            read_back_rgba(
-                                renderer,
-                                &mut frame,
-                                width,
-                                height,
-                                &mut node.frame_buffer,
-                            );
-                        }
                     }
                     Err(e) => eprintln!("Failed to bind buffer: {:?}", e),
+                }
+                if render_success && pool_slot.is_none() && take_screenshot {
+                    deferred_screenshot = Some(dmabuf.clone());
                 }
             }
         }
@@ -3986,6 +4227,7 @@ fn render_node_tick(
                 ) {
                     Ok(result) => {
                         render_success = true;
+                        scene_damage_known = changed.is_some();
                         if let Some(c) = cap.as_deref_mut() {
                             c.needs_full_render = false;
                         }
@@ -4009,9 +4251,76 @@ fn render_node_tick(
         }
     }
 
+    if take_screenshot && render_success {
+        if !host_mode && !state.use_gpu {
+            screenshot_result = Some(Ok(()));
+        }
+        if !host_mode
+            && matches!(&screenshot_result, Some(Ok(())))
+            && let Some((_, buf)) = pool_slot.as_ref()
+        {
+            let expected = width as usize * height as usize * 4;
+            if let Some(pixels) = buf.get(..expected) {
+                node.frame_buffer[..expected].copy_from_slice(pixels);
+            } else {
+                screenshot_result = Some(Err(
+                    "Screenshot readback produced incomplete pixels".to_string()
+                ));
+            }
+        }
+    }
     if render_success {
         node.target_seeded = true;
     }
+    let sample = node.capture.as_ref().and_then(|c| {
+        let samples = &c.report.samples;
+        if scene_rebuilt || !render_success || hold_frame || !scene_damage_known || host_mode {
+            samples.scene.invalidate();
+        }
+        if !render_success || hold_frame || host_mode {
+            return None;
+        }
+        if !scene_damage_known {
+            return samples.next(composite_ns);
+        }
+        let format = if state.use_gpu {
+            node.offscreen_buffer
+                .as_ref()
+                .map(|(_, d)| d.format().code as u32)
+        } else {
+            Some(Fourcc::Argb8888 as u32)
+        };
+        let Some(format) = format else {
+            samples.scene.invalidate();
+            return samples.next(composite_ns);
+        };
+        samples.next_scene(
+            composite_ns,
+            capture_scene::SceneLayout {
+                output_id: node.owner.unwrap_or(node.id),
+                x: node.pos.0,
+                y: node.pos.1,
+                width,
+                height,
+                scale_bits: output_scale_val.to_bits(),
+                format,
+                cursor: state.render_cursor_on_framebuffer,
+            },
+            !damage_rects.is_empty(),
+        )
+    });
+    let snapshot_layout = capture_sample::SampleLayout {
+        x: node.pos.0,
+        y: node.pos.1,
+        scale: output_scale_val,
+        cursor_composited: if state.render_cursor_on_framebuffer {
+            None
+        } else {
+            Some(false)
+        },
+        coordinate_space: "wayland-layout-logical",
+    };
+    let mut capture_snapshot_serviced = false;
     // Views share one output, so its clients are driven once a frame, by the
     // fastest display capturing that screen (ties go to the lowest number) -- a
     // client asked to draw once per view would render as many times a frame as
@@ -4110,12 +4419,9 @@ fn render_node_tick(
                 cap.request_idr();
             }
             if cap.encode_pool.is_some() {
-                if take_screenshot && let Some((_, ref buf)) = pool_slot {
-                    let n = buf.len().min(node.frame_buffer.len());
-                    node.frame_buffer[..n].copy_from_slice(&buf[..n]);
-                }
                 if let Some((id, buf)) = pool_slot.take() {
                     let frame = WlFrame {
+                        sample,
                         id,
                         buf,
                         frame_id: cap.frame_counter,
@@ -4229,13 +4535,17 @@ fn render_node_tick(
                                 cap.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                                 if let Some(ref tx) = cap.deliver_tx {
                                     let stripes = vec![EncodedStripe {
+                                        sample,
                                         data: Arc::new(data),
                                         codec: cap.settings.codec,
                                         stripe_y_start: 0,
                                         stripe_height: height,
                                         frame_id: cap.frame_counter as i32,
                                         timing: FrameTiming {
-                                            capture_ns: new_stamp.unwrap_or(composite_ns),
+                                            capture_ns: sample
+                                                .map_or(new_stamp.unwrap_or(composite_ns), |s| {
+                                                    s.captured_ns
+                                                }),
                                             encode_start_ns,
                                             encode_end_ns: wayland::host::now_ns(),
                                         },
@@ -4280,6 +4590,7 @@ fn render_node_tick(
                                 };
                                 match rebuilt {
                                     Some(enc) => {
+                                        report::sample_association(enc.preserves_sample_identity());
                                         cap.video_encoder = Some(enc);
                                         cap.pending_force_idr = true;
                                         cap.hw_rebuilt = true;
@@ -4292,6 +4603,7 @@ fn render_node_tick(
                                             "[Wayland] zero-copy HW encoder unrecoverable; demoting to readback encode."
                                         );
                                         report::capture("readback", false);
+                                        report::sample_association(false);
                                         report::capture_reason(
                                             "the zero-copy encoder failed repeatedly and was given up",
                                         );
@@ -4330,40 +4642,118 @@ fn render_node_tick(
                 }
             }
         }
-        if take_screenshot && let Some((_, resp)) = state.pending_screenshot.take() {
-            if !node.frame_buffer.is_empty() {
-                let w = width as u32;
-                let h = height as u32;
-                // A host software frame was written BGRA into the frame buffer, so it
-                // needs the swap even when the local renderer is GLES.
-                let png = if state.use_gpu && !host_cpu_frame {
-                    crate::computer_use::encode_png_rgba(&node.frame_buffer, w, h)
-                } else {
-                    let mut rgba = node.frame_buffer.clone();
-                    for px in rgba.as_chunks_mut::<4>().0 {
-                        px.swap(0, 2);
-                    }
-                    crate::computer_use::encode_png_rgba(&rgba, w, h)
-                };
-                match png {
-                    Ok(data) => {
-                        let _ = resp.send(Ok(data));
-                    }
-                    Err(e) => {
-                        let _ = resp.send(Err(format!("PNG encode error: {e}")));
-                        eprintln!("[ComputerUse] PNG encode error: {}", e);
-                    }
-                }
-            } else {
-                let _ = resp.send(Err("Screenshot render produced no pixels".to_string()));
-            }
-        }
     }
     if let Some((id, buf)) = pool_slot.take()
         && let Some(cap) = node.capture.as_ref()
         && let Some(ref pool) = cap.encode_pool
     {
         pool.cancel(id, buf);
+    }
+    let mut shared_legacy_frame = None;
+    if let Some(mut target) = deferred_screenshot {
+        state.pending_screenshots.prune(Instant::now());
+        let legacy_pending = force_legacy_screenshot && state.pending_screenshots.contains(node.id);
+        if let Some(renderer) = state.gles_renderer.as_mut() {
+            if take_capture_snapshot
+                && !legacy_pending
+                && let Some(sample) = sample
+                && let Some(cap) = node.capture.as_ref()
+            {
+                cap.report.samples.fill_requested(
+                    sample,
+                    (width as u32, height as u32),
+                    screenshot_format,
+                    snapshot_layout,
+                    |pixels| {
+                        let mut frame = renderer
+                            .bind(&mut target)
+                            .map_err(|error| format!("Screenshot bind failed: {error:?}"))?;
+                        read_back_rgba_result(renderer, &mut frame, width, height, pixels, true)
+                    },
+                );
+                capture_snapshot_serviced = true;
+            } else if legacy_pending {
+                screenshot_result = Some((|| {
+                    let mut frame = renderer
+                        .bind(&mut target)
+                        .map_err(|error| format!("Screenshot bind failed: {error:?}"))?;
+                    read_back_rgba_result(
+                        renderer,
+                        &mut frame,
+                        width,
+                        height,
+                        &mut node.frame_buffer,
+                        true,
+                    )
+                })());
+                if take_capture_snapshot
+                    && screenshot_format == computer_use::ScreenshotPixelFormat::Rgba
+                    && screenshot_result.as_ref().is_some_and(Result::is_ok)
+                    && let Some(sample) = sample
+                    && let Some(cap) = node.capture.as_ref()
+                {
+                    shared_legacy_frame = cap.report.samples.share_rgba_requested(
+                        sample,
+                        &node.frame_buffer,
+                        (width as u32, height as u32),
+                        snapshot_layout,
+                    );
+                    capture_snapshot_serviced = true;
+                }
+            }
+        } else {
+            screenshot_result = Some(Err("Screenshot renderer unavailable".to_string()));
+        }
+    }
+    if take_capture_snapshot
+        && !capture_snapshot_serviced
+        && let Some(cap) = node.capture.as_ref()
+    {
+        if let Some(sample) = sample {
+            match &screenshot_result {
+                Some(Ok(())) => cap.report.samples.copy_requested(
+                    sample,
+                    &node.frame_buffer,
+                    width as usize * 4,
+                    (width as u32, height as u32),
+                    screenshot_format,
+                    snapshot_layout,
+                ),
+                Some(Err(error)) => cap.report.samples.reject(error),
+                None => cap
+                    .report
+                    .samples
+                    .reject("Capture snapshot readback unavailable"),
+            }
+        } else if !hold_frame {
+            cap.report
+                .samples
+                .reject("Capture snapshot render failed or source unsupported");
+        }
+    }
+    if take_screenshot
+        && let Some(request) = state.pending_screenshots.take(node.id, Instant::now())
+    {
+        let result = screenshot_result
+            .unwrap_or_else(|| Err("Screenshot render produced no pixels".to_string()))
+            .and_then(|()| {
+                if !render_success {
+                    return Err("Screenshot render failed".to_string());
+                }
+                if let Some(frame) = shared_legacy_frame {
+                    Ok(frame)
+                } else {
+                    screenshot_frame(&node.frame_buffer, width, height, screenshot_format)
+                }
+            });
+        let result = if request.canceled.load(Ordering::Acquire) {
+            Err("Screenshot canceled".to_string())
+        } else if Instant::now() >= request.deadline {
+            Err("Screenshot timed out".to_string())
+        } else {
+            result
+        };
+        let _ = request.resp.send(result);
     }
     false
 }
@@ -4721,6 +5111,9 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     let Some(_) = state.node_idx_for_id(id) else {
         return false;
     };
+    state
+        .pending_screenshots
+        .fail_display(id, "Screenshot output was removed");
     stop_capture_on_display(state, id);
     if let Some(host) = state.host.as_ref() {
         host.idle_output(id);
@@ -4754,6 +5147,9 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     // output unmaps it; destroying that node takes its views with it, captures
     // and encoders included.
     for view in state.view_ids_of(id) {
+        state
+            .pending_screenshots
+            .fail_display(view, "Screenshot output was removed");
         stop_capture_on_display(state, view);
         wayland_owners().lock().unwrap().remove(&view);
         if let Some(vidx) = state.node_idx_for_id(view) {
@@ -5033,6 +5429,7 @@ fn create_view_on(
 struct WaylandThreadConfig {
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
     wake_rx: smithay::reexports::calloop::channel::Channel<()>,
+    wake_tx: smithay::reexports::calloop::channel::Sender<()>,
     command_tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     initial_width: i32,
     initial_height: i32,
@@ -5167,6 +5564,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let WaylandThreadConfig {
         command_rx,
         wake_rx,
+        wake_tx,
         command_tx,
         initial_width,
         initial_height,
@@ -5416,7 +5814,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         render_cursor_on_framebuffer: false,
         render_node_path,
         auto_gpu_selected,
-        pending_screenshot: None,
+        pending_screenshots: wayland::frontend::ScreenshotQueue::default(),
         command_rx: None,
         last_input_at: None,
         pointer_motion_at: None,
@@ -6305,9 +6703,22 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         .store(true, Ordering::Release);
                 }
             }
-            ThreadCommand::CuScreenshot { display_id, resp } => {
+            ThreadCommand::CuScreenshot {
+                display_id,
+                resp,
+                canceled,
+                deadline,
+            } => {
                 if state.node_idx_for_id(display_id).is_some() {
-                    state.pending_screenshot = Some((display_id, resp));
+                    state.pending_screenshots.enqueue(
+                        wayland::frontend::ScreenshotRequest {
+                            display_id,
+                            resp,
+                            canceled,
+                            deadline,
+                        },
+                        Instant::now(),
+                    );
                 } else {
                     let _ = resp.send(Err(format!("Unknown display: {display_id}")));
                 }
@@ -6363,6 +6774,13 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             {
                 state.space.refresh();
                 render_pass(state, TickTrigger::Input);
+            } else if !state.pending_screenshots.is_empty()
+                && state.output_nodes.iter().all(|n| n.capture.is_none())
+            {
+                // With no active capture, serve the screenshot without the idle wait.
+                // Active captures retain their frame cadence; input was drained above.
+                state.space.refresh();
+                render_pass(state, TickTrigger::Timer);
             }
         })
         .unwrap();
@@ -6479,7 +6897,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 
             let any_capturing = state.output_nodes.iter().any(|n| n.capture.is_some());
             let any_copy_frame = state.copy_sessions.iter().any(|cs| cs.pending.is_some());
-            if !any_capturing && state.pending_screenshot.is_none() && !any_copy_frame {
+            state.pending_screenshots.prune(Instant::now());
+            if !any_capturing && state.pending_screenshots.is_empty() && !any_copy_frame {
                 // No render/encode work, but committed clients still need their
                 // frame callbacks: a vsynced client (FIFO Vulkan present, games, a
                 // nested compositor's own clients) otherwise blocks in its swap
@@ -6546,7 +6965,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         )
         .unwrap();
 
-    crate::computer_use::register_wayland_backend(command_tx.clone());
+    crate::computer_use::register_wayland_backend(command_tx.clone(), wake_tx);
     crate::computer_use::spawn_cu_from_env();
     crate::wayland::ficlient::arm(crate::computer_use::app_wayland_socket_path());
 
@@ -6597,12 +7016,21 @@ struct StripeFrame {
     /// where the encoder does not track its references.
     #[pyo3(get)]
     reference_frame_id: i32,
+    #[pyo3(get)]
+    sample_run_id: Option<u64>,
+    #[pyo3(get)]
+    sample_seq: Option<u64>,
+    #[pyo3(get)]
+    source_id: Option<u64>,
+    #[pyo3(get)]
+    scene_id: Option<u64>,
 }
 
 impl StripeFrame {
     /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
+    #[allow(clippy::too_many_arguments)]
     fn new_owned_meta(
         data: Arc<Vec<u8>>,
         data_type: i32,
@@ -6611,6 +7039,7 @@ impl StripeFrame {
         frame_id: i32,
         timing: FrameTiming,
         reference: Reference,
+        sample: Option<encoders::sample::SampleStamp>,
     ) -> Self {
         Self {
             data,
@@ -6622,6 +7051,10 @@ impl StripeFrame {
             encode_start_ns: timing.encode_start_ns,
             encode_end_ns: timing.encode_end_ns,
             reference_frame_id: reference.frame_id(),
+            sample_run_id: sample.map(|s| s.run_id),
+            sample_seq: sample.map(|s| s.sample_seq),
+            source_id: sample.and_then(|s| s.source_id),
+            scene_id: sample.and_then(|s| s.scene_id),
         }
     }
 }
@@ -6647,6 +7080,7 @@ impl StripeFrame {
             frame_id,
             FrameTiming::default(),
             Reference::Untracked,
+            None,
         )
     }
 
@@ -6726,6 +7160,7 @@ impl WaylandBackend {
         let (tx, rx) = smithay::reexports::calloop::channel::channel();
         let (wake_tx, wake_rx) = smithay::reexports::calloop::channel::channel();
         let cu_tx = tx.clone();
+        let cu_wake_tx = wake_tx.clone();
         let pointer = Arc::new(crate::wayland::frontend::PointerShare::default());
         let pointer_share = pointer.clone();
         thread::spawn(move || {
@@ -6733,6 +7168,7 @@ impl WaylandBackend {
             run_wayland_thread(WaylandThreadConfig {
                 command_rx: rx,
                 wake_rx,
+                wake_tx: cu_wake_tx,
                 command_tx: cu_tx,
                 initial_width: width,
                 initial_height: height,
@@ -7517,6 +7953,7 @@ fn stripe_frame_from_buffer(
         frame_id,
         FrameTiming::default(),
         Reference::Untracked,
+        None,
     )
 }
 
@@ -8088,6 +8525,21 @@ struct ScreenCapture {
 }
 
 impl ScreenCapture {
+    fn sample_run(&self) -> Option<Arc<capture_sample::CaptureSamples>> {
+        let st = self.inner.lock().unwrap();
+        match st.backend {
+            0 | 1 => st.x11_controls().map(|c| c.report.samples.clone()),
+            2 if wayland_owners().lock().unwrap().get(&st.wl_display) == Some(&self.id) => {
+                report::wayland_reports()
+                    .lock()
+                    .unwrap()
+                    .get(&st.wl_display)
+                    .map(|r| r.samples.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Hand what a client said of a frame to the capture: the X11 controls, drained ahead of the
     /// next encode, or the shared Wayland backend.
     fn hand_report(&self, py: Python<'_>, report: encoders::reference::ReferenceReport) {
@@ -8136,9 +8588,11 @@ impl ScreenCapture {
         let (handle, deliver_handle, same_thread, backend, controls, wl_display, cursor_ref) = {
             let mut st = self.inner.lock().unwrap();
             if let Some(c) = &st.controls {
+                c.report.samples.stop();
                 c.stop.store(true, Ordering::Relaxed);
             }
             if let Some(c) = st.starting.take() {
+                c.report.samples.stop();
                 c.stop.store(true, Ordering::Relaxed);
             }
             let cur = Some(thread::current().id());
@@ -8195,6 +8649,9 @@ impl ScreenCapture {
                 && let Some(slot) = WAYLAND_BACKEND.get()
                 && let Some(be) = slot.lock().unwrap().as_ref()
             {
+                if let Some(report) = report::wayland_reports().lock().unwrap().get(&did) {
+                    report.samples.stop();
+                }
                 let _ = be.bind(py).borrow().stop_capture(did);
             }
         } else {
@@ -8258,6 +8715,80 @@ impl ScreenCapture {
         }
     }
 
+    /// Process-local run identity, available once the active backend has started.
+    #[getter]
+    fn capture_run_id(&self) -> Option<u64> {
+        self.sample_run().map(|r| r.run_id)
+    }
+
+    /// Whether this active capture can track local Wayland scene continuity.
+    #[getter]
+    fn scene_tracking_supported(&self) -> bool {
+        self.sample_run().is_some_and(|run| run.scene.supported())
+    }
+
+    /// Whether scene tracking is enabled for this active capture.
+    #[getter]
+    fn scene_tracking_enabled(&self) -> bool {
+        self.sample_run().is_some_and(|run| run.scene.enabled())
+    }
+
+    /// Enable conservative damage-based scene identity without changing the capture backend.
+    fn set_scene_tracking(&self, enabled: bool) -> PyResult<()> {
+        use pyo3::exceptions::PyRuntimeError;
+        let run = self
+            .sample_run()
+            .ok_or_else(|| PyRuntimeError::new_err("Scene tracking inactive"))?;
+        run.scene
+            .set_enabled(enabled)
+            .map_err(PyRuntimeError::new_err)
+    }
+
+    /// Copy a next sample of this active capture and encode it off the capture thread.
+    /// The returned sample may be skipped by video encoding; it does not certify scene
+    /// continuity, a complete stripe batch, or presentation by a remote consumer.
+    #[pyo3(signature = (expected_run, timeout_s = 5.0))]
+    fn snapshot_png(
+        &self,
+        py: Python<'_>,
+        expected_run: u64,
+        timeout_s: f64,
+    ) -> PyResult<Py<PyAny>> {
+        use pyo3::exceptions::{PyRuntimeError, PyValueError};
+        if !timeout_s.is_finite() || timeout_s <= 0.0 || timeout_s > 30.0 {
+            return Err(PyValueError::new_err(
+                "timeout_s must be greater than zero and at most 30 seconds",
+            ));
+        }
+        capture_sample::check_snapshot_caller().map_err(PyRuntimeError::new_err)?;
+        let run = self
+            .sample_run()
+            .ok_or_else(|| PyRuntimeError::new_err("Capture snapshot inactive"))?;
+        let ticket = run
+            .begin(expected_run, Duration::from_secs_f64(timeout_s))
+            .map_err(PyRuntimeError::new_err)?;
+        let snapshot = py
+            .detach(|| ticket.finish())
+            .map_err(PyRuntimeError::new_err)?;
+        run.check(expected_run).map_err(PyRuntimeError::new_err)?;
+        let result = pyo3::types::PyDict::new(py);
+        result.set_item("png", pyo3::types::PyBytes::new(py, &snapshot.png))?;
+        result.set_item("run_id", snapshot.stamp.run_id)?;
+        result.set_item("sample_seq", snapshot.stamp.sample_seq)?;
+        result.set_item("capture_ns", snapshot.stamp.captured_ns)?;
+        result.set_item("width", snapshot.width)?;
+        result.set_item("height", snapshot.height)?;
+        result.set_item("origin_x", snapshot.layout.x)?;
+        result.set_item("origin_y", snapshot.layout.y)?;
+        result.set_item("scale", snapshot.layout.scale)?;
+        result.set_item("coordinate_space", snapshot.layout.coordinate_space)?;
+        result.set_item("cursor_composited", snapshot.layout.cursor_composited)?;
+        result.set_item("preserved_rgb_bits", 8)?;
+        result.set_item("scene_id", snapshot.stamp.scene_id)?;
+        result.set_item("source_id", snapshot.stamp.source_id)?;
+        Ok(result.into_any().unbind())
+    }
+
     /// Begin capture: `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
     ///
     /// The backend is chosen from the settings (`want_wayland`). A **Wayland** start delegates to
@@ -8317,6 +8848,9 @@ impl ScreenCapture {
                 read_node("encode_node_path").unwrap_or_default(),
                 cursor_size,
             )?;
+            if let Some(report) = report::wayland_reports().lock().unwrap().get(&display_id) {
+                report.samples.stop();
+            }
             be.bind(py).borrow().start_capture(callback, settings)?;
             wayland_owners().lock().unwrap().insert(display_id, self.id);
             {
@@ -8385,6 +8919,7 @@ impl ScreenCapture {
         // queue, and no frame is ever dropped.
         let (deliver_tx, deliver_rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
         let deliver_handle = thread::spawn(move || {
+            let _delivery = capture_sample::DeliveryThreadGuard::enter();
             crate::boost_thread_priority(-10);
             while let Ok(frame) = deliver_rx.recv() {
                 if PY_SHUTDOWN.load(Ordering::Relaxed) {
@@ -8402,6 +8937,7 @@ impl ScreenCapture {
                                 s.frame_id,
                                 s.timing,
                                 s.reference,
+                                s.sample,
                             ),
                         ) {
                             Ok(f) => {
@@ -9775,15 +10311,31 @@ fn start_computer_use(bind: String, token: Option<String>) -> PyResult<()> {
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
 }
 
-/// PNG of one display's framebuffer with the cursor drawn in, the same image the
+/// PNG of one display's framebuffer, the same image the
 /// Computer-Use server serves: the in-process Wayland compositor's output when one runs
 /// (`display` 0 is the primary, else a live output id), otherwise the root of the X server
-/// named by DISPLAY. No capture has to be running.
+/// named by DISPLAY. No capture has to be running. Wayland preserves the current
+/// compositor or host cursor policy; X11 draws the cursor into the image.
 #[pyfunction]
-#[pyo3(signature = (display = 0))]
-fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (display = 0, *, min_rgb_bits = 8, cursor = None))]
+fn screenshot_png(
+    py: Python<'_>,
+    display: u32,
+    min_rgb_bits: u8,
+    cursor: Option<bool>,
+) -> PyResult<Py<PyAny>> {
     let png = py
-        .detach(|| crate::computer_use::resolve_backend().and_then(|b| b.screenshot_png(display)))
+        .detach(|| {
+            crate::computer_use::resolve_backend().and_then(|b| {
+                b.screenshot_png_with_options(
+                    display,
+                    computer_use::ScreenshotOptions {
+                        min_rgb_bits,
+                        cursor,
+                    },
+                )
+            })
+        })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
     Ok(pyo3::types::PyBytes::new(py, &png).into_any().unbind())
 }
@@ -10181,6 +10733,7 @@ mod wl_frame_pool_tests {
 
     fn frame(id: usize, buf: Vec<u8>, n: u16) -> WlFrame {
         WlFrame {
+            sample: None,
             id,
             buf,
             frame_id: n,

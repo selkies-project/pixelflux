@@ -1451,6 +1451,7 @@ dependencies = [
  "nvcodec-sys",
  "openh264",
  "openh264-sys2",
+ "png",
  "pyo3",
  "rayon",
  "reis",

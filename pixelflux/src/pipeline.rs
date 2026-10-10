@@ -1405,13 +1405,23 @@ impl X11Pipeline {
     ///
     /// Vec of [`EncodedStripe`] — empty when nothing changed.
     pub fn process(&mut self, argb: &[u8], stride: usize) -> Vec<EncodedStripe> {
+        self.process_tagged(argb, stride, None)
+    }
+
+    pub fn process_tagged(
+        &mut self,
+        argb: &[u8],
+        stride: usize,
+        sample: Option<crate::encoders::sample::SampleStamp>,
+    ) -> Vec<EncodedStripe> {
         let width = self.settings.width;
         let height = self.settings.height;
         let requested = self.pending_force_idr;
         let threshold = self.settings.damage_block_threshold;
         let duration = self.settings.damage_block_duration as i32;
 
-        let out = if self.hw.is_some() {
+        let synchronous = self.hw.is_none();
+        let mut out = if self.hw.is_some() {
             let turbo = self.settings.video_streaming_mode;
             let damage = if turbo {
                 band_damage(&self.turbo_dirty)
@@ -1481,9 +1491,17 @@ impl X11Pipeline {
                 let on_device = beside && d.send && enc.hash_next_upload(DAMAGE_BAND_ROWS as u32);
                 let mut encode = || {
                     if d.send {
-                        enc.encode_host(argb, stride, false, fc, d.target_qp, force_idr)
+                        enc.encode_host_tagged(
+                            argb,
+                            stride,
+                            false,
+                            fc,
+                            d.target_qp,
+                            force_idr,
+                            sample,
+                        )
                     } else {
-                        enc.push_held(fc)
+                        enc.push_held_tagged(fc)
                     }
                 };
                 let res = if let Some(dirty) = hashed {
@@ -1520,20 +1538,21 @@ impl X11Pipeline {
                     encode()
                 };
                 match res {
-                    Ok(data) if !data.is_empty() => {
+                    Ok(data) if !data.data.is_empty() => {
                         self.hw_error_streak = 0;
                         self.hw_rebuilt = false;
                         let codec = self.settings.codec;
-                        enc.delivered_units(data, self.frame_counter)
+                        enc.delivered_units_tagged(data, self.frame_counter)
                             .into_iter()
-                            .map(|(data, id, reference)| EncodedStripe {
-                                data: Arc::new(data),
+                            .map(|unit| EncodedStripe {
+                                sample: unit.sample,
+                                data: Arc::new(unit.data),
                                 codec,
                                 stripe_y_start: 0,
                                 stripe_height: height,
-                                frame_id: id as i32,
+                                frame_id: unit.frame_id as i32,
                                 timing: Default::default(),
-                                reference,
+                                reference: unit.reference,
                             })
                             .collect()
                     }
@@ -1657,6 +1676,11 @@ impl X11Pipeline {
         // error or skip would never self-heal, leaving a joining consumer with an
         // undecodable stream. A rebuilt or demoted encoder arms one the same way, which
         // is what the second read of the flag picks up.
+        if synchronous {
+            for stripe in &mut out {
+                stripe.sample = sample;
+            }
+        }
         self.pending_force_idr = (requested || self.pending_force_idr) && out.is_empty();
         self.frame_counter = self.frame_counter.wrapping_add(1);
         out
