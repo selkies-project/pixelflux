@@ -3533,6 +3533,7 @@ fn render_node_tick(
     let composite_ns = wayland::host::now_ns();
     let mut render_success = false;
     let mut screenshot_result = None;
+    let mut deferred_screenshot = None;
     let mut render_sync = None;
     let mut damage_rects: Vec<Rectangle<i32, Physical>> = Vec::new();
     let needs_full = node
@@ -4031,18 +4032,11 @@ fn render_node_tick(
                                 }
                             }
                         }
-                        if render_success && pool_slot.is_none() && take_screenshot {
-                            screenshot_result = Some(read_back_rgba_result(
-                                renderer,
-                                &mut frame,
-                                width,
-                                height,
-                                &mut node.frame_buffer,
-                                true,
-                            ));
-                        }
                     }
                     Err(e) => eprintln!("Failed to bind buffer: {:?}", e),
+                }
+                if render_success && pool_slot.is_none() && take_screenshot {
+                    deferred_screenshot = Some(dmabuf.clone());
                 }
             }
         }
@@ -4246,6 +4240,7 @@ fn render_node_tick(
             screenshot_result = Some(Ok(()));
         }
         if !host_mode
+            && force_legacy_screenshot
             && matches!(&screenshot_result, Some(Ok(())))
             && let Some((_, buf)) = pool_slot.as_ref()
         {
@@ -4269,6 +4264,35 @@ fn render_node_tick(
     } else {
         None
     };
+    let snapshot_layout = capture_sample::SampleLayout {
+        x: node.pos.0,
+        y: node.pos.1,
+        scale: output_scale_val,
+        cursor_composited: if state.render_cursor_on_framebuffer {
+            None
+        } else {
+            Some(false)
+        },
+        coordinate_space: "wayland-layout-logical",
+    };
+    let mut capture_snapshot_serviced = false;
+    if take_capture_snapshot
+        && !force_legacy_screenshot
+        && let Some(sample) = sample
+        && let Some((_, pixels)) = pool_slot.as_ref()
+        && let Some(cap) = node.capture.as_ref()
+        && matches!(&screenshot_result, Some(Ok(())))
+    {
+        cap.report.samples.copy_requested(
+            sample,
+            pixels,
+            width as usize * 4,
+            (width as u32, height as u32),
+            screenshot_format,
+            snapshot_layout,
+        );
+        capture_snapshot_serviced = true;
+    }
     // Views share one output, so its clients are driven once a frame, by the
     // fastest display capturing that screen (ties go to the lowest number) -- a
     // client asked to draw once per view would render as many times a frame as
@@ -4595,7 +4619,52 @@ fn render_node_tick(
     {
         pool.cancel(id, buf);
     }
-    if take_capture_snapshot && let Some(cap) = node.capture.as_ref() {
+    if let Some(mut target) = deferred_screenshot {
+        state.pending_screenshots.prune(Instant::now());
+        let legacy_pending =
+            force_legacy_screenshot && state.pending_screenshots.contains(node.id);
+        if let Some(renderer) = state.gles_renderer.as_mut() {
+            if take_capture_snapshot
+                && !legacy_pending
+                && let Some(sample) = sample
+                && let Some(cap) = node.capture.as_ref()
+            {
+                cap.report.samples.fill_requested(
+                    sample,
+                    (width as u32, height as u32),
+                    screenshot_format,
+                    snapshot_layout,
+                    |pixels| {
+                        let mut frame = renderer
+                            .bind(&mut target)
+                            .map_err(|error| format!("Screenshot bind failed: {error:?}"))?;
+                        read_back_rgba_result(renderer, &mut frame, width, height, pixels, true)
+                    },
+                );
+                capture_snapshot_serviced = true;
+            } else if legacy_pending {
+                screenshot_result = Some((|| {
+                    let mut frame = renderer
+                        .bind(&mut target)
+                        .map_err(|error| format!("Screenshot bind failed: {error:?}"))?;
+                    read_back_rgba_result(
+                        renderer,
+                        &mut frame,
+                        width,
+                        height,
+                        &mut node.frame_buffer,
+                        true,
+                    )
+                })());
+            }
+        } else {
+            screenshot_result = Some(Err("Screenshot renderer unavailable".to_string()));
+        }
+    }
+    if take_capture_snapshot
+        && !capture_snapshot_serviced
+        && let Some(cap) = node.capture.as_ref()
+    {
         if let Some(sample) = sample {
             match &screenshot_result {
                 Some(Ok(())) => cap.report.samples.copy_requested(
@@ -4604,17 +4673,7 @@ fn render_node_tick(
                     width as usize * 4,
                     (width as u32, height as u32),
                     screenshot_format,
-                    capture_sample::SampleLayout {
-                        x: node.pos.0,
-                        y: node.pos.1,
-                        scale: output_scale_val,
-                        cursor_composited: if state.render_cursor_on_framebuffer {
-                            None
-                        } else {
-                            Some(false)
-                        },
-                        coordinate_space: "wayland-layout-logical",
-                    },
+                    snapshot_layout,
                 ),
                 Some(Err(error)) => cap.report.samples.reject(error),
                 None => cap

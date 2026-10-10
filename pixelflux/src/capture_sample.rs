@@ -245,6 +245,48 @@ impl CaptureSamples {
         format: ScreenshotPixelFormat,
         layout: SampleLayout,
     ) {
+        self.fulfill_requested(stamp, size, format, layout, |bytes| {
+            let (width, height) = size;
+            let row_bytes = width as usize * 4;
+            let required = stride
+                .checked_mul(height.saturating_sub(1) as usize)
+                .and_then(|n| n.checked_add(row_bytes))
+                .ok_or("Capture snapshot size overflow")?;
+            if stride < row_bytes || pixels.len() < required {
+                return Err("Capture snapshot invalid buffer".into());
+            }
+            let mut owned = Vec::with_capacity(bytes);
+            for row in pixels.chunks(stride).take(height as usize) {
+                owned.extend_from_slice(&row[..row_bytes]);
+            }
+            Ok(owned)
+        });
+    }
+
+    /// Fill an admitted snapshot directly without retaining a streaming buffer.
+    pub fn fill_requested(
+        &self,
+        stamp: SampleStamp,
+        size: (u32, u32),
+        format: ScreenshotPixelFormat,
+        layout: SampleLayout,
+        fill: impl FnOnce(&mut [u8]) -> Result<(), String>,
+    ) {
+        self.fulfill_requested(stamp, size, format, layout, |bytes| {
+            let mut pixels = vec![0; bytes];
+            fill(&mut pixels)?;
+            Ok(pixels)
+        });
+    }
+
+    fn fulfill_requested(
+        &self,
+        stamp: SampleStamp,
+        size: (u32, u32),
+        format: ScreenshotPixelFormat,
+        layout: SampleLayout,
+        pixels: impl FnOnce(usize) -> Result<Vec<u8>, String>,
+    ) {
         if !self.has_pending() {
             return;
         }
@@ -272,18 +314,11 @@ impl CaptureSamples {
             let bytes = row_bytes
                 .checked_mul(height as usize)
                 .ok_or("Capture snapshot size overflow")?;
-            let required = stride
-                .checked_mul(height.saturating_sub(1) as usize)
-                .and_then(|n| n.checked_add(row_bytes))
-                .ok_or("Capture snapshot size overflow")?;
-            if width == 0 || height == 0 || stride < row_bytes || pixels.len() < required {
+            if width == 0 || height == 0 {
                 return Err("Capture snapshot invalid buffer".into());
             }
             let budget = RawBudget::acquire(bytes)?;
-            let mut owned = Vec::with_capacity(bytes);
-            for row in pixels.chunks(stride).take(height as usize) {
-                owned.extend_from_slice(&row[..row_bytes]);
-            }
+            let owned = pixels(bytes)?;
             request.check()?;
             self.check(stamp.run_id)?;
             Ok(RawSnapshot {
@@ -474,6 +509,138 @@ mod tests {
         assert_eq!(decoded.as_raw(), &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
         assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_fill_owns_exact_pixels_and_their_sample() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        let sample = run.next(123).unwrap();
+        run.fill_requested(
+            sample,
+            (2, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+            |pixels| {
+                assert_eq!(pixels.len(), 8);
+                assert_eq!(RAW_BYTES.load(Ordering::Acquire), 8);
+                pixels.copy_from_slice(&[1, 2, 3, 255, 4, 5, 6, 127]);
+                Ok(())
+            },
+        );
+        let result = ticket.finish().unwrap();
+        assert_eq!(result.stamp, sample);
+        assert_eq!((result.width, result.height), (2, 1));
+        assert_eq!(result.layout.x, 120);
+        let decoded = image::load_from_memory(&result.png).unwrap().to_rgba8();
+        assert_eq!(decoded.as_raw(), &[1, 2, 3, 255, 4, 5, 6, 127]);
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_fill_skips_unadmitted_or_invalid_requests() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let no_fill = |_: &mut [u8]| -> Result<(), String> {
+            panic!("an invalid request must not run the writer")
+        };
+        run.fill_requested(
+            run.next(1).unwrap(),
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+            no_fill,
+        );
+        for error in ["canceled", "timed out", "stale", "invalid buffer"] {
+            let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+            let mut sample = run.next(2).unwrap();
+            let mut size = (1, 1);
+            match error {
+                "canceled" => ticket.canceled.store(true, Ordering::Release),
+                "timed out" => {
+                    run.request.lock().unwrap().as_mut().unwrap().deadline = Instant::now();
+                }
+                "stale" => sample.run_id = active().run_id,
+                _ => size = (0, 1),
+            }
+            run.fill_requested(sample, size, ScreenshotPixelFormat::Rgba, layout(), no_fill);
+            assert!(ticket.finish().err().unwrap().contains(error));
+            assert!(!run.has_pending());
+            assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+            assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        }
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        let budget = RawBudget::acquire(MAX_RAW_BYTES).unwrap();
+        run.fill_requested(
+            run.next(3).unwrap(),
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+            no_fill,
+        );
+        assert!(ticket.finish().err().unwrap().contains("raw byte budget"));
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), MAX_RAW_BYTES);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        drop(budget);
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_fill_waits_past_samples_already_in_flight() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let old = run.next(1).unwrap();
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        run.fill_requested(old, (1, 1), ScreenshotPixelFormat::Rgba, layout(), |_| {
+            panic!("an old sample must leave the request pending")
+        });
+        assert!(run.has_pending());
+        let new = run.next(2).unwrap();
+        run.fill_requested(new, (1, 1), ScreenshotPixelFormat::Rgba, layout(), |pixels| {
+            pixels.fill(255);
+            Ok(())
+        });
+        assert_eq!(ticket.finish().unwrap().stamp, new);
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn direct_fill_errors_and_stop_release_resources() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        for stop in [false, true] {
+            let run = active();
+            let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+            run.fill_requested(
+                run.next(1).unwrap(),
+                (1, 1),
+                ScreenshotPixelFormat::Rgba,
+                layout(),
+                |pixels| {
+                    assert_eq!(RAW_BYTES.load(Ordering::Acquire), 4);
+                    assert!(
+                        run.begin(run.run_id, Duration::from_secs(1))
+                            .err()
+                            .unwrap()
+                            .contains("busy")
+                    );
+                    pixels.fill(255);
+                    if stop {
+                        run.stop();
+                        Ok(())
+                    } else {
+                        Err("readback failed".into())
+                    }
+                },
+            );
+            let error = ticket.finish().err().unwrap();
+            assert!(error.contains(if stop { "inactive" } else { "readback failed" }));
+            assert!(!run.has_pending());
+            assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+            assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        }
     }
 
     #[test]
