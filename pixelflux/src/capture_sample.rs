@@ -598,10 +598,16 @@ mod tests {
         });
         assert!(run.has_pending());
         let new = run.next(2).unwrap();
-        run.fill_requested(new, (1, 1), ScreenshotPixelFormat::Rgba, layout(), |pixels| {
-            pixels.fill(255);
-            Ok(())
-        });
+        run.fill_requested(
+            new,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+            |pixels| {
+                pixels.fill(255);
+                Ok(())
+            },
+        );
         assert_eq!(ticket.finish().unwrap().stamp, new);
         assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
         assert_eq!(REQUESTS.load(Ordering::Acquire), 0);

@@ -4621,8 +4621,7 @@ fn render_node_tick(
     }
     if let Some(mut target) = deferred_screenshot {
         state.pending_screenshots.prune(Instant::now());
-        let legacy_pending =
-            force_legacy_screenshot && state.pending_screenshots.contains(node.id);
+        let legacy_pending = force_legacy_screenshot && state.pending_screenshots.contains(node.id);
         if let Some(renderer) = state.gles_renderer.as_mut() {
             if take_capture_snapshot
                 && !legacy_pending
