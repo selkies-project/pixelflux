@@ -1260,6 +1260,7 @@ where
                 Ok(data) if !data.is_empty() => {
                     encode_errors = 0;
                     let stripes = vec![EncodedStripe {
+                        sample: controls.report.samples.next(grabbed_ns),
                         data: Arc::new(data),
                         codec: gpu.settings.codec,
                         stripe_y_start: 0,

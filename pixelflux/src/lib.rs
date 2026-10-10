@@ -150,6 +150,7 @@ pub mod recorder;
 pub mod recording_sink;
 /// What each capture streams and how it got there, as values a caller reads.
 pub mod report;
+pub mod capture_sample;
 /// Kernel uinput devices, the first rung of host-capture input injection.
 pub mod uinput;
 /// Headless Wayland compositor and cursor rendering.
@@ -1167,6 +1168,7 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
 /// encode thread: the pixels plus the per-frame inputs of the encode dispatch (damage,
 /// overlay animation); the IDR request travels separately via the controls atomic.
 pub struct WlFrame {
+    sample: Option<encoders::sample::SampleStamp>,
     /// Pool slot id; travels with the buffer so recycle returns it to the right slot.
     id: usize,
     buf: Vec<u8>,
@@ -1552,36 +1554,38 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 // conversion runs here.
                 let encode_start_ns = wayland::host::now_ns();
                 let outcome = if decision.send {
-                    encoder.encode_host(
+                    encoder.encode_host_tagged(
                         &f.buf,
                         (w * 4) as usize,
                         cfg.use_gpu,
                         f.frame_id as u64,
                         decision.target_qp,
                         force_idr,
+                        f.sample,
                     )
                 } else {
-                    encoder.push_held(f.frame_id as u64)
+                    encoder.push_held_tagged(f.frame_id as u64)
                 };
                 match outcome {
                     Ok(data) => {
                         hw_error_streak = 0;
                         hw_rebuilt = false;
-                        if !data.is_empty() {
+                        if !data.data.is_empty() {
                             let encode_end_ns = wayland::host::now_ns();
-                            for (data, id, reference) in encoder.delivered_units(data, f.frame_id) {
+                            for unit in encoder.delivered_units_tagged(data, f.frame_id) {
                                 out.push(EncodedStripe {
-                                    data: Arc::new(data),
+                                    sample: unit.sample,
+                                    data: Arc::new(unit.data),
                                     codec: settings.codec,
                                     stripe_y_start: 0,
                                     stripe_height: height,
-                                    frame_id: id as i32,
+                                    frame_id: unit.frame_id as i32,
                                     timing: FrameTiming {
-                                        capture_ns: f.captured_ns,
+                                        capture_ns: unit.sample.map_or(f.captured_ns, |s| s.captured_ns),
                                         encode_start_ns,
                                         encode_end_ns,
                                     },
-                                    reference,
+                                    reference: unit.reference,
                                 });
                             }
                         }
@@ -1656,6 +1660,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                 false,
                 force_idr_all,
             );
+            for stripe in &mut out {
+                stripe.sample = f.sample;
+            }
             FrameTiming::stamp(&mut out, f.captured_ns, encode_start_ns);
         }
 
@@ -2336,6 +2343,7 @@ fn start_capture_on_display(
     // when the verdict arrives (`reconcile_host_layouts`), the same way a failed GBM
     // resize falls back to the live mode.
     let host_capture = !settings.wayland_host_display.is_empty();
+    stream_report.samples.supported(!host_capture);
     reap_dead_host(state);
     if host_capture && state.host.is_none() {
         // Capture buffers come from the same render node the encoder imports
@@ -2720,6 +2728,7 @@ fn start_capture_on_display(
     state.render_cursor_on_framebuffer = settings.capture_cursor;
 
     let mut cap = wayland::frontend::WlCapture {
+        sample_guard: stream_report.samples.guard(),
         settings: settings.clone(),
         callback: cb.clone(),
         video_encoder,
@@ -2785,6 +2794,7 @@ fn start_capture_on_display(
                                         s.frame_id,
                                         s.timing,
                                         s.reference,
+                                s.sample,
                                     ),
                                 ) {
                                     Ok(f) => {
@@ -3365,7 +3375,9 @@ fn render_node_tick(
     trigger: TickTrigger,
 ) -> bool {
     state.pending_screenshots.prune(Instant::now());
-    let take_screenshot = state.pending_screenshots.contains(node.id);
+    let take_capture_snapshot = node.capture.as_ref().is_some_and(|c| c.report.samples.has_pending());
+    let force_legacy_screenshot = state.pending_screenshots.contains(node.id);
+    let take_screenshot = force_legacy_screenshot || take_capture_snapshot;
     let copy_frame_wanted = state.copy_frame_pending_for(&node.output);
     if node.capture.is_none() && !take_screenshot && !copy_frame_wanted {
         return false;
@@ -3373,7 +3385,7 @@ fn render_node_tick(
 
     // Per-display frame pacing under the one shared timer, and under input.
     if let Some(cap) = node.capture.as_ref()
-        && !take_screenshot
+        && !force_legacy_screenshot
         && !cap.pace.due(trigger, capture_period(cap), Instant::now())
     {
         return false;
@@ -4243,6 +4255,11 @@ fn render_node_tick(
     if render_success {
         node.target_seeded = true;
     }
+    let sample = if render_success && !hold_frame && !host_mode {
+        node.capture.as_ref().and_then(|c| c.report.samples.next(wayland::host::now_ns()))
+    } else {
+        None
+    };
     // Views share one output, so its clients are driven once a frame, by the
     // fastest display capturing that screen (ties go to the lowest number) -- a
     // client asked to draw once per view would render as many times a frame as
@@ -4343,6 +4360,7 @@ fn render_node_tick(
             if cap.encode_pool.is_some() {
                 if let Some((id, buf)) = pool_slot.take() {
                     let frame = WlFrame {
+                        sample,
                         id,
                         buf,
                         frame_id: cap.frame_counter,
@@ -4456,13 +4474,14 @@ fn render_node_tick(
                                 cap.encode_stats.stripes.fetch_add(1, Ordering::Relaxed);
                                 if let Some(ref tx) = cap.deliver_tx {
                                     let stripes = vec![EncodedStripe {
+                                        sample,
                                         data: Arc::new(data),
                                         codec: cap.settings.codec,
                                         stripe_y_start: 0,
                                         stripe_height: height,
                                         frame_id: cap.frame_counter as i32,
                                         timing: FrameTiming {
-                                            capture_ns: new_stamp.unwrap_or(composite_ns),
+                                            capture_ns: sample.map_or(new_stamp.unwrap_or(composite_ns), |s| s.captured_ns),
                                             encode_start_ns,
                                             encode_end_ns: wayland::host::now_ns(),
                                         },
@@ -4563,6 +4582,25 @@ fn render_node_tick(
         && let Some(ref pool) = cap.encode_pool
     {
         pool.cancel(id, buf);
+    }
+    if take_capture_snapshot && let Some(cap) = node.capture.as_ref() {
+        if let Some(sample) = sample {
+            match &screenshot_result {
+                Some(Ok(())) => cap.report.samples.copy_requested(
+                    sample, &node.frame_buffer, width as usize * 4,
+                    (width as u32, height as u32), screenshot_format,
+                    capture_sample::SampleLayout {
+                        x: node.pos.0, y: node.pos.1, scale: output_scale_val,
+                        cursor_composited: state.render_cursor_on_framebuffer,
+                        coordinate_space: "wayland-layout-logical",
+                    },
+                ),
+                Some(Err(error)) => cap.report.samples.reject(error),
+                None => cap.report.samples.reject("Capture snapshot readback unavailable"),
+            }
+        } else if !hold_frame {
+            cap.report.samples.reject("Capture snapshot render failed or source unsupported");
+        }
     }
     if take_screenshot
         && let Some(request) = state.pending_screenshots.take(node.id, Instant::now())
@@ -6845,12 +6883,17 @@ struct StripeFrame {
     /// where the encoder does not track its references.
     #[pyo3(get)]
     reference_frame_id: i32,
+    #[pyo3(get)]
+    sample_run_id: Option<u64>,
+    #[pyo3(get)]
+    sample_seq: Option<u64>,
 }
 
 impl StripeFrame {
     /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
+    #[allow(clippy::too_many_arguments)]
     fn new_owned_meta(
         data: Arc<Vec<u8>>,
         data_type: i32,
@@ -6859,6 +6902,7 @@ impl StripeFrame {
         frame_id: i32,
         timing: FrameTiming,
         reference: Reference,
+        sample: Option<encoders::sample::SampleStamp>,
     ) -> Self {
         Self {
             data,
@@ -6870,6 +6914,8 @@ impl StripeFrame {
             encode_start_ns: timing.encode_start_ns,
             encode_end_ns: timing.encode_end_ns,
             reference_frame_id: reference.frame_id(),
+            sample_run_id: sample.map(|s| s.run_id),
+            sample_seq: sample.map(|s| s.sample_seq),
         }
     }
 }
@@ -6895,6 +6941,7 @@ impl StripeFrame {
             frame_id,
             FrameTiming::default(),
             Reference::Untracked,
+        None,
         )
     }
 
@@ -7767,6 +7814,7 @@ fn stripe_frame_from_buffer(
         frame_id,
         FrameTiming::default(),
         Reference::Untracked,
+        None,
     )
 }
 
@@ -8338,6 +8386,18 @@ struct ScreenCapture {
 }
 
 impl ScreenCapture {
+    fn sample_run(&self) -> Option<Arc<capture_sample::CaptureSamples>> {
+        let st = self.inner.lock().unwrap();
+        match st.backend {
+            0 | 1 => st.x11_controls().map(|c| c.report.samples.clone()),
+            2 if wayland_owners().lock().unwrap().get(&st.wl_display) == Some(&self.id) => {
+                report::wayland_reports().lock().unwrap().get(&st.wl_display)
+                    .map(|r| r.samples.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Hand what a client said of a frame to the capture: the X11 controls, drained ahead of the
     /// next encode, or the shared Wayland backend.
     fn hand_report(&self, py: Python<'_>, report: encoders::reference::ReferenceReport) {
@@ -8386,9 +8446,11 @@ impl ScreenCapture {
         let (handle, deliver_handle, same_thread, backend, controls, wl_display, cursor_ref) = {
             let mut st = self.inner.lock().unwrap();
             if let Some(c) = &st.controls {
+                c.report.samples.stop();
                 c.stop.store(true, Ordering::Relaxed);
             }
             if let Some(c) = st.starting.take() {
+                c.report.samples.stop();
                 c.stop.store(true, Ordering::Relaxed);
             }
             let cur = Some(thread::current().id());
@@ -8445,6 +8507,9 @@ impl ScreenCapture {
                 && let Some(slot) = WAYLAND_BACKEND.get()
                 && let Some(be) = slot.lock().unwrap().as_ref()
             {
+                if let Some(report) = report::wayland_reports().lock().unwrap().get(&did) {
+                    report.samples.stop();
+                }
                 let _ = be.bind(py).borrow().stop_capture(did);
             }
         } else {
@@ -8508,6 +8573,43 @@ impl ScreenCapture {
         }
     }
 
+    /// Process-local run identity, available once the active backend has started.
+    #[getter]
+    fn capture_run_id(&self) -> Option<u64> {
+        self.sample_run().map(|r| r.run_id)
+    }
+
+    /// Copy a next sample of this active capture and encode it off the capture thread.
+    /// The returned sample may be skipped by video encoding; it does not certify scene
+    /// continuity, a complete stripe batch, or presentation by a remote consumer.
+    #[pyo3(signature = (expected_run, timeout_s = 5.0))]
+    fn snapshot_png(&self, py: Python<'_>, expected_run: u64, timeout_s: f64) -> PyResult<Py<PyAny>> {
+        use pyo3::exceptions::{PyRuntimeError, PyValueError};
+        if !timeout_s.is_finite() || timeout_s <= 0.0 || timeout_s > 30.0 {
+            return Err(PyValueError::new_err("timeout_s must be greater than zero and at most 30 seconds"));
+        }
+        let run = self.sample_run().ok_or_else(|| PyRuntimeError::new_err("Capture snapshot inactive"))?;
+        let ticket = run.begin(expected_run, Duration::from_secs_f64(timeout_s))
+            .map_err(PyRuntimeError::new_err)?;
+        let snapshot = py.detach(|| ticket.finish()).map_err(PyRuntimeError::new_err)?;
+        let result = pyo3::types::PyDict::new(py);
+        result.set_item("png", pyo3::types::PyBytes::new(py, &snapshot.png))?;
+        result.set_item("run_id", snapshot.stamp.run_id)?;
+        result.set_item("sample_seq", snapshot.stamp.sample_seq)?;
+        result.set_item("capture_ns", snapshot.stamp.captured_ns)?;
+        result.set_item("width", snapshot.width)?;
+        result.set_item("height", snapshot.height)?;
+        result.set_item("origin_x", snapshot.layout.x)?;
+        result.set_item("origin_y", snapshot.layout.y)?;
+        result.set_item("scale", snapshot.layout.scale)?;
+        result.set_item("coordinate_space", snapshot.layout.coordinate_space)?;
+        result.set_item("cursor_composited", snapshot.layout.cursor_composited)?;
+        result.set_item("preserved_rgb_bits", 8)?;
+        result.set_item("scene_id", py.None())?;
+        result.set_item("source_id", py.None())?;
+        Ok(result.into_any().unbind())
+    }
+
     /// Begin capture: `callback(frame)` is invoked per encoded stripe with a `StripeFrame`.
     ///
     /// The backend is chosen from the settings (`want_wayland`). A **Wayland** start delegates to
@@ -8567,6 +8669,9 @@ impl ScreenCapture {
                 read_node("encode_node_path").unwrap_or_default(),
                 cursor_size,
             )?;
+            if let Some(report) = report::wayland_reports().lock().unwrap().get(&display_id) {
+                report.samples.stop();
+            }
             be.bind(py).borrow().start_capture(callback, settings)?;
             wayland_owners().lock().unwrap().insert(display_id, self.id);
             {
@@ -8652,6 +8757,7 @@ impl ScreenCapture {
                                 s.frame_id,
                                 s.timing,
                                 s.reference,
+                                s.sample,
                             ),
                         ) {
                             Ok(f) => {
@@ -10031,10 +10137,12 @@ fn start_computer_use(bind: String, token: Option<String>) -> PyResult<()> {
 /// named by DISPLAY. No capture has to be running. Wayland preserves the current
 /// compositor or host cursor policy; X11 draws the cursor into the image.
 #[pyfunction]
-#[pyo3(signature = (display = 0))]
-fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
+#[pyo3(signature = (display = 0, *, min_rgb_bits = 8, cursor = None))]
+fn screenshot_png(py: Python<'_>, display: u32, min_rgb_bits: u8, cursor: Option<bool>) -> PyResult<Py<PyAny>> {
     let png = py
-        .detach(|| crate::computer_use::resolve_backend().and_then(|b| b.screenshot_png(display)))
+        .detach(|| crate::computer_use::resolve_backend().and_then(|b| {
+            b.screenshot_png_with_options(display, computer_use::ScreenshotOptions { min_rgb_bits, cursor })
+        }))
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
     Ok(pyo3::types::PyBytes::new(py, &png).into_any().unbind())
 }
@@ -10432,6 +10540,7 @@ mod wl_frame_pool_tests {
 
     fn frame(id: usize, buf: Vec<u8>, n: u16) -> WlFrame {
         WlFrame {
+            sample: None,
             id,
             buf,
             frame_id: n,

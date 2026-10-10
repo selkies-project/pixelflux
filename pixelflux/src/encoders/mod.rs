@@ -28,6 +28,7 @@ pub mod oh264;
 /// PNG watermark overlay composited onto frames before encoding.
 pub mod overlay;
 pub mod reference;
+pub mod sample;
 /// What the full-frame software sessions share: planar input, quantizer, rate settings.
 pub mod session;
 /// CPU-based striped H.264 (libx264 or OpenH264, by build) / JPEG encoder with per-stripe
@@ -54,6 +55,166 @@ pub mod vaapi;
 pub mod vpx;
 
 pub use codec::*;
+pub use sample::SampleStamp;
+
+/// Bytes returned by an encode call; asynchronous sessions resolve samples per access unit.
+pub struct TaggedOutput {
+    pub data: Vec<u8>,
+    pub sample: Option<SampleStamp>,
+    reference: Option<reference::Reference>,
+    units: Option<Vec<UnitSample>>,
+}
+
+struct UnitSample {
+    frame_id: u16,
+    reference: reference::Reference,
+    end: usize,
+    sample: Option<SampleStamp>,
+}
+
+/// One encoded access unit and the captured sample from which it was produced, when known.
+pub struct TaggedUnit {
+    pub data: Vec<u8>,
+    pub frame_id: u16,
+    pub reference: reference::Reference,
+    pub sample: Option<SampleStamp>,
+}
+
+impl TaggedOutput {
+    pub fn new(data: Vec<u8>, sample: Option<SampleStamp>) -> Self {
+        Self {
+            data,
+            sample,
+            reference: None,
+            units: None,
+        }
+    }
+
+    fn into_units(self, encoded: u16, reference: reference::Reference) -> Vec<TaggedUnit> {
+        if self.data.is_empty() {
+            return Vec::new();
+        }
+        let reference = self.reference.unwrap_or(reference);
+        match self.units {
+            Some(units) if !units.is_empty() => {
+                if units.len() == 1 {
+                    let unit = units.into_iter().next().unwrap();
+                    return vec![TaggedUnit {
+                        data: self.data,
+                        frame_id: unit.frame_id,
+                        reference: unit.reference,
+                        sample: unit.sample,
+                    }];
+                }
+                let mut start = 0;
+                units
+                    .into_iter()
+                    .map(|unit| {
+                        let data = self.data[start..unit.end].to_vec();
+                        start = unit.end;
+                        TaggedUnit {
+                            data,
+                            frame_id: unit.frame_id,
+                            reference: unit.reference,
+                            sample: unit.sample,
+                        }
+                    })
+                    .collect()
+            }
+            units => vec![TaggedUnit {
+                data: self.data,
+                frame_id: encoded,
+                reference,
+                sample: if units.is_some() { None } else { self.sample },
+            }],
+        }
+    }
+}
+
+#[cfg(test)]
+mod sample_output_tests {
+    use super::{SampleStamp, TaggedOutput, UnitSample, reference::Reference};
+
+    fn stamp(sequence: u64) -> SampleStamp {
+        SampleStamp {
+            run_id: 7,
+            sample_seq: sequence,
+            captured_ns: sequence as i64,
+        }
+    }
+
+    #[test]
+    fn synchronous_output_preserves_sample_and_owned_payload() {
+        let bytes = vec![1, 2, 3];
+        let ptr = bytes.as_ptr();
+        let output = TaggedOutput::new(bytes, Some(stamp(1)));
+        let units = output.into_units(42, Reference::Frame(41));
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data.as_ptr(), ptr);
+        assert_eq!(units[0].frame_id, 42);
+        assert_eq!(units[0].reference, Reference::Frame(41));
+        assert_eq!(units[0].sample, Some(stamp(1)));
+    }
+
+    #[test]
+    fn delayed_batch_preserves_each_units_bytes_id_reference_and_sample() {
+        let mut output = TaggedOutput::new(vec![1, 2, 3, 4, 5], Some(stamp(99)));
+        output.units = Some(vec![
+            UnitSample {
+                frame_id: 65535,
+                reference: Reference::None,
+                end: 2,
+                sample: Some(stamp(1)),
+            },
+            UnitSample {
+                frame_id: 0,
+                reference: Reference::Frame(65535),
+                end: 5,
+                sample: Some(stamp(2)),
+            },
+        ]);
+        let units = output.into_units(5, Reference::Untracked);
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].data, [1, 2]);
+        assert_eq!(units[1].data, [3, 4, 5]);
+        assert_eq!(units[0].frame_id, 65535);
+        assert_eq!(units[1].frame_id, 0);
+        assert_eq!(units[0].reference, Reference::None);
+        assert_eq!(units[1].reference, Reference::Frame(65535));
+        assert_eq!(units[0].sample, Some(stamp(1)));
+        assert_eq!(units[1].sample, Some(stamp(2)));
+    }
+
+    #[test]
+    fn unresolved_delayed_units_never_borrow_the_current_sample() {
+        let mut output = TaggedOutput::new(vec![1], Some(stamp(99)));
+        output.units = Some(vec![UnitSample {
+            frame_id: 3,
+            reference: Reference::None,
+            end: 1,
+            sample: None,
+        }]);
+        assert_eq!(output.into_units(5, Reference::Untracked)[0].sample, None);
+        let mut output = TaggedOutput::new(vec![1], Some(stamp(99)));
+        output.units = Some(Vec::new());
+        assert_eq!(output.into_units(5, Reference::Untracked)[0].sample, None);
+    }
+
+    #[test]
+    fn synchronous_reference_is_frozen_with_the_result() {
+        let mut output = TaggedOutput::new(vec![1], None);
+        output.reference = Some(Reference::Frame(41));
+        let unit = output.into_units(42, Reference::Frame(99)).remove(0);
+        assert_eq!(unit.reference, Reference::Frame(41));
+        assert_eq!(unit.sample, None);
+    }
+
+    #[test]
+    fn empty_encode_output_delivers_no_sample() {
+        let output = TaggedOutput::new(Vec::new(), Some(stamp(1)));
+        assert!(output.into_units(42, Reference::None).is_empty());
+    }
+}
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -1157,7 +1318,23 @@ impl FrameEncoder {
         qp: u32,
         force_idr: bool,
     ) -> Result<Vec<u8>, String> {
-        match self {
+        self.encode_host_tagged(pixels, stride, rgba, frame_number, qp, force_idr, None)
+            .map(|output| output.data)
+    }
+
+    /// Encode host pixels with their process-local source sample, independent of the wire ID.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_host_tagged(
+        &mut self,
+        pixels: &[u8],
+        stride: usize,
+        rgba: bool,
+        frame_number: u64,
+        qp: u32,
+        force_idr: bool,
+        sample: Option<SampleStamp>,
+    ) -> Result<TaggedOutput, String> {
+        let data = match self {
             FrameEncoder::Nvenc(enc) => {
                 enc.encode_cpu_packed(pixels, stride, rgba, frame_number, qp, force_idr)
             }
@@ -1175,12 +1352,13 @@ impl FrameEncoder {
             }
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => {
-                enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
+                enc.encode_host_tagged(pixels, stride, rgba, frame_number, qp, force_idr, sample)
             }
             FrameEncoder::V4l2m2m(enc) => {
                 enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
             }
-        }
+        }?;
+        Ok(self.tagged_output(data, sample))
     }
 
     /// Hash the next host frame's bands of `rows` rows where the encoder holds it, beside its
@@ -1337,25 +1515,41 @@ impl FrameEncoder {
         data: Vec<u8>,
         encoded: u16,
     ) -> Vec<(Vec<u8>, u16, reference::Reference)> {
+        self.delivered_units_tagged(self.tagged_output(data, None), encoded)
+            .into_iter()
+            .map(|unit| (unit.data, unit.frame_id, unit.reference))
+            .collect()
+    }
+
+    /// Split returned bytes using the sample metadata frozen with that encode result.
+    pub fn delivered_units_tagged(
+        &self,
+        output: TaggedOutput,
+        encoded: u16,
+    ) -> Vec<TaggedUnit> {
+        output.into_units(encoded, self.last_reference())
+    }
+
+    fn tagged_output(&self, data: Vec<u8>, sample: Option<SampleStamp>) -> TaggedOutput {
+        let mut output = TaggedOutput::new(data, sample);
+        output.reference = Some(self.last_reference());
         #[cfg(target_arch = "aarch64")]
         if let FrameEncoder::Tegra(enc) = self {
-            match enc.delivered_units() {
-                [] => {}
-                &[(id, reference, _)] => return vec![(data, id, reference)],
-                units => {
-                    let mut start = 0;
-                    return units
-                        .iter()
-                        .map(|&(id, reference, end)| {
-                            let unit = data[start..end].to_vec();
-                            start = end;
-                            (unit, id, reference)
-                        })
-                        .collect();
-                }
-            }
+            output.sample = None;
+            output.units = Some(
+                enc.delivered_units()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &(frame_id, reference, end))| UnitSample {
+                        frame_id,
+                        reference,
+                        end,
+                        sample: enc.delivered_sample(index),
+                    })
+                    .collect(),
+            );
         }
-        vec![(data, encoded, self.last_reference())]
+        output
     }
 
     /// The frame the last delivered frame predicted from.
@@ -1363,11 +1557,18 @@ impl FrameEncoder {
     /// next is queued: empty from every other backend, whose units come with their frame.
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
     pub fn push_held(&mut self, frame_number: u64) -> Result<Vec<u8>, String> {
-        match self {
+        self.push_held_tagged(frame_number).map(|output| output.data)
+    }
+
+    /// Repeat retained staging pixels; their sample is resolved from the encoder's submission.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+    pub fn push_held_tagged(&mut self, frame_number: u64) -> Result<TaggedOutput, String> {
+        let data = match self {
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.push_held(frame_number),
             _ => Ok(Vec::new()),
-        }
+        }?;
+        Ok(self.tagged_output(data, None))
     }
 
     pub fn holds_frame(&self) -> bool {

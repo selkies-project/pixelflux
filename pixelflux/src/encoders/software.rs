@@ -1229,6 +1229,7 @@ impl StripeState {
 /// * `frame_id` - Frame sequence number this stripe belongs to.
 /// * `reference` - The frame this stripe predicts from.
 pub struct EncodedStripe {
+    pub sample: Option<crate::encoders::sample::SampleStamp>,
     pub data: Arc<Vec<u8>>,
     pub codec: Codec,
     pub stripe_y_start: i32,
@@ -1260,6 +1261,9 @@ impl FrameTiming {
         };
         for stripe in stripes {
             stripe.timing = timing;
+            if let Some(sample) = stripe.sample {
+                stripe.timing.capture_ns = sample.captured_ns;
+            }
         }
     }
 }
@@ -1726,6 +1730,7 @@ pub fn encode_cpu(
                         std::mem::take(&mut stripe_state.packet_buf)
                     };
                     Some(EncodedStripe {
+                        sample: None,
                         data: Arc::new(data),
                         codec: Codec::Jpeg,
                         stripe_y_start: y_start as i32,
@@ -1870,6 +1875,7 @@ pub fn encode_cpu(
                             stripe_state.rc_bytes = stripe_state.packet_buf.len();
                         }
                         Some(EncodedStripe {
+                            sample: None,
                             data: Arc::new(std::mem::take(&mut stripe_state.packet_buf)),
                             codec: Codec::H264,
                             stripe_y_start: y_start as i32,
@@ -1936,6 +1942,7 @@ pub fn encode_cpu(
                     use_gpu,
                 ) {
                     Ok(data) if !data.is_empty() => Some(EncodedStripe {
+                        sample: None,
                         data: Arc::new(data),
                         codec: Codec::H264,
                         stripe_y_start: y_start as i32,

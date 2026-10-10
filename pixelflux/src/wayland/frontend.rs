@@ -190,6 +190,7 @@ use crate::pace::FramePace;
 /// output; all fields mirror the pipeline strategy documented on [`AppState`], instantiated
 /// per display.
 pub struct WlCapture {
+    pub sample_guard: crate::capture_sample::CaptureRunGuard,
     pub settings: RustCaptureSettings,
     /// The Python frame callback, shared with the delivery thread. Kept here so a
     /// reconfigure the calloop performs on its own (a host that kept a different mode)

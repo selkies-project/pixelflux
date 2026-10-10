@@ -474,6 +474,7 @@ mod cost_tests {
         let mut data = vec![0u8; len];
         data[0] = WIRE_VIDEO;
         EncodedStripe {
+            sample: None,
             data: Arc::new(data),
             codec: Codec::H264,
             stripe_y_start: 0,

@@ -69,6 +69,70 @@ pub fn encode_png_rgba(data: &[u8], width: u32, height: u32) -> Result<Vec<u8>, 
     Ok(png)
 }
 
+/// Encode big-endian RGB16 samples without reducing their significant precision.
+pub(crate) fn encode_png_rgb16(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    significant_bits: u8,
+) -> Result<Vec<u8>, String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(6));
+    if width == 0
+        || height == 0
+        || expected != Some(data.len())
+        || !(1..=16).contains(&significant_bits)
+    {
+        return Err("Invalid RGB16 screenshot buffer or precision".to_string());
+    }
+    let mut info = png::Info::with_size(width, height);
+    info.color_type = png::ColorType::Rgb;
+    info.bit_depth = png::BitDepth::Sixteen;
+    info.sbit = Some(vec![significant_bits; 3].into());
+    let mut bytes = Vec::new();
+    {
+        let encoder = png::Encoder::with_info(&mut bytes, info)
+            .map_err(|error| format!("PNG encode error: {error}"))?;
+        let mut writer = encoder
+            .write_header()
+            .map_err(|error| format!("PNG encode error: {error}"))?;
+        writer
+            .write_image_data(data)
+            .map_err(|error| format!("PNG encode error: {error}"))?;
+        writer
+            .finish()
+            .map_err(|error| format!("PNG encode error: {error}"))?;
+    }
+    Ok(bytes)
+}
+
+/// Requirements for an independent screenshot, separate from stream encoder precision.
+#[derive(Clone, Copy, Debug)]
+pub struct ScreenshotOptions {
+    pub min_rgb_bits: u8,
+    /// None preserves the backend's existing cursor policy.
+    pub cursor: Option<bool>,
+}
+
+impl Default for ScreenshotOptions {
+    fn default() -> Self {
+        Self {
+            min_rgb_bits: 8,
+            cursor: None,
+        }
+    }
+}
+
+impl ScreenshotOptions {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !(1..=16).contains(&self.min_rgb_bits) {
+            return Err("Minimum RGB precision must be between 1 and 16 bits".to_string());
+        }
+        Ok(())
+    }
+}
+
 pub(crate) const MAX_SCREENSHOT_REQUESTS: usize = 4;
 const MAX_SCREENSHOT_REQUESTS_PER_DISPLAY: usize = 2;
 
@@ -90,7 +154,7 @@ pub struct ScreenshotFrame {
 }
 
 impl ScreenshotFrame {
-    fn encode_png(mut self) -> Result<Vec<u8>, String> {
+    pub(crate) fn encode_png(mut self) -> Result<Vec<u8>, String> {
         let expected = (self.width as usize)
             .checked_mul(self.height as usize)
             .and_then(|n| n.checked_mul(4));
@@ -290,6 +354,21 @@ pub trait CuBackend {
     fn scroll(&self, dx: f64, dy: f64);
     /// PNG of one display's framebuffer; 0 = the primary. Unknown ids are an error.
     fn screenshot_png(&self, display: u32) -> Result<Vec<u8>, String>;
+    /// Reject requirements a backend cannot preserve instead of widening an eight-bit source.
+    fn screenshot_png_with_options(
+        &self,
+        display: u32,
+        options: ScreenshotOptions,
+    ) -> Result<Vec<u8>, String> {
+        options.validate()?;
+        if options.min_rgb_bits > 8 {
+            return Err("Screenshot source preserves only 8 RGB bits".to_string());
+        }
+        if options.cursor.is_some() {
+            return Err("Screenshot cursor override is not supported by this backend".to_string());
+        }
+        self.screenshot_png(display)
+    }
     fn cursor_pos(&self) -> Result<(f64, f64), String>;
     /// Run `seq` with every keysym in `keysyms` (which `resolve_keysyms` could not place)
     /// made temporarily typeable, when the backend can arrange that; `seq` receives
@@ -1493,12 +1572,57 @@ mod record_path_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScreenshotAdmission, ScreenshotFrame, ScreenshotPixelFormat, cu_listeners, encode_png_rgba,
+        CuBackend, CuWaylandBackend, ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions,
+        ScreenshotPixelFormat, cu_listeners, encode_png_rgb16, encode_png_rgba,
     };
     use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn screenshot_rgb16_preserves_all_ten_bit_codes_and_significant_bit_metadata() {
+        let values: Vec<u16> = (0..1024u32)
+            .flat_map(|code| [code, 1023 - code, (73 * code) % 1024])
+            .map(|code| {
+                let code = code as u16;
+                (code << 6) | (code >> 4)
+            })
+            .collect();
+        let data: Vec<u8> = values.iter().flat_map(|value| value.to_be_bytes()).collect();
+        let encoded = encode_png_rgb16(&data, 1024, 1, 10).unwrap();
+        let decoder = png::Decoder::new(Cursor::new(&encoded));
+        let reader = decoder.read_info().unwrap();
+        assert_eq!(reader.info().bit_depth, png::BitDepth::Sixteen);
+        assert_eq!(reader.info().color_type, png::ColorType::Rgb);
+        assert_eq!(reader.info().sbit.as_deref(), Some([10, 10, 10].as_slice()));
+        let decoded = image::load_from_memory(&encoded).unwrap().into_rgb16();
+        assert_eq!(decoded.dimensions(), (1024, 1));
+        assert_eq!(decoded.into_raw(), values);
+        for (width, height, len, bits) in [
+            (0, 1, 0, 10), (1, 0, 0, 10), (1, 1, 5, 10),
+            (1, 1, 7, 10), (1, 1, 6, 0), (1, 1, 6, 17),
+        ] {
+            assert!(encode_png_rgb16(&vec![0; len], width, height, bits).is_err());
+        }
+    }
+
+    #[test]
+    fn screenshot_requirements_reject_eight_bit_wayland_and_cursor_overrides() {
+        let (tx, _rx) = smithay::reexports::calloop::channel::channel();
+        let (wake_tx, _wake_rx) = smithay::reexports::calloop::channel::channel();
+        let backend = CuWaylandBackend { tx, wake_tx };
+        for min_rgb_bits in [0, 9, 10, 16, 17] {
+            assert!(backend.screenshot_png_with_options(0, ScreenshotOptions {
+                min_rgb_bits, cursor: None,
+            }).is_err());
+        }
+        for cursor in [false, true] {
+            assert!(backend.screenshot_png_with_options(0, ScreenshotOptions {
+                min_rgb_bits: 8, cursor: Some(cursor),
+            }).is_err());
+        }
+    }
 
     #[test]
     fn screenshot_png_preserves_channels_alpha_and_encoding() {

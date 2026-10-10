@@ -73,6 +73,7 @@ pub struct StreamPeaks {
 
 /// One capture's description and counters.
 pub struct StreamReport {
+    pub samples: Arc<crate::capture_sample::CaptureSamples>,
     info: Mutex<StreamInfo>,
     frames: AtomicU64,
     bytes: AtomicU64,
@@ -87,6 +88,7 @@ pub struct StreamReport {
 impl Default for StreamReport {
     fn default() -> Self {
         Self {
+            samples: Arc::new(crate::capture_sample::CaptureSamples::default()),
             info: Mutex::default(),
             frames: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
@@ -371,6 +373,7 @@ mod tests {
         use crate::encoders::reference::Reference;
         use crate::encoders::software::FrameTiming;
         let stripe = |bytes: usize, capture: i64, end: i64| EncodedStripe {
+            sample: None,
             data: Arc::new(vec![0; bytes]),
             codec: Codec::H264,
             stripe_y_start: 0,

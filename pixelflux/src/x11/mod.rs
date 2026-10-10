@@ -59,6 +59,7 @@ pub mod computer_use;
 pub mod cursor;
 pub mod dri3;
 pub mod nvfbc;
+mod pixel_format;
 
 /// Cross-thread controls for a running capture: a bag of atomics (plus two mutex-guarded
 /// payloads) the owning `ScreenCapture` pyclass flips from the Python thread and the capture thread
@@ -627,6 +628,8 @@ pub(crate) fn overlay_cursor(
 /// the pool's surface `generation`, so a rebuild is still triggered when the surfaces were recreated
 /// at the SAME size (a resize flap) and the new segments happen to reuse the old virtual addresses.
 struct RawFrame {
+    layout: Option<crate::capture_sample::SampleLayout>,
+    sample: Option<crate::encoders::sample::SampleStamp>,
     idx: usize,
     ptr: *mut u8,
     len: usize,
@@ -953,10 +956,13 @@ fn encode_loop<F>(
 
         let buf = unsafe { std::slice::from_raw_parts(frame.ptr, frame.len) };
         let encode_start_ns = crate::wayland::host::now_ns();
-        let mut stripes = pl.process(buf, frame.stride);
+        let mut stripes = pl.process_tagged(buf, frame.stride, frame.sample);
         FrameTiming::stamp(&mut stripes, frame.captured_ns, encode_start_ns);
         controls.codec.store(pl.codec().id(), Ordering::Relaxed);
-        pool.recycle(frame.idx);
+        let snapshot_pending = controls.report.samples.has_pending();
+        if !snapshot_pending {
+            pool.recycle(frame.idx);
+        }
         if !stripes.is_empty() {
             frame_count += 1;
             stripe_count += stripes.len() as u64;
@@ -965,6 +971,15 @@ fn encode_loop<F>(
                 socket.write_frame(&stripes, psettings.width, psettings.height);
             }
             on_frame(stripes);
+        }
+        if snapshot_pending {
+            if let (Some(sample), Some(layout)) = (frame.sample, frame.layout) {
+                controls.report.samples.copy_requested(
+                    sample, buf, frame.stride, (frame.width.into(), frame.height.into()),
+                    crate::computer_use::ScreenshotPixelFormat::Bgrx, layout,
+                );
+            }
+            pool.recycle(frame.idx);
         }
 
         let now = Instant::now();
@@ -1117,6 +1132,8 @@ where
     F: FnMut(Vec<EncodedStripe>) + Send + 'static,
 {
     let _report = crate::report::enter(&controls.report);
+    let _samples = controls.report.samples.guard();
+    controls.report.samples.supported(false);
     let _vblank = VblankClaim::new(&controls);
     if let Some(result) = nvfbc::run_capture(
         settings.clone(),
@@ -1136,6 +1153,17 @@ where
     }
     crate::report::capture("XShm", false);
     run_shm_capture(settings, controls, encode_tid_tx, on_frame)
+}
+
+fn snapshot_bgrx8(conn: &RustConnection, root: u32) -> bool {
+    conn.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST
+        && conn.setup().roots.iter().find(|s| s.root == root).is_some_and(|screen| {
+            screen.root_depth == 24
+                && screen.allowed_depths.iter().flat_map(|d| &d.visuals).any(|v| {
+                    v.visual_id == screen.root_visual && v.red_mask == 0x00ff0000
+                        && v.green_mask == 0x0000ff00 && v.blue_mask == 0x000000ff
+                })
+        })
 }
 
 /// Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
@@ -1194,6 +1222,7 @@ where
         x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
     let mut root = conn.setup().roots[screen_num].root;
     require_32bpp(&conn, screen_num)?;
+    controls.report.samples.supported(snapshot_bgrx8(&conn, root));
 
     conn.shm_query_version()
         .map_err(|e| format!("shm_query_version: {e}"))?
@@ -1413,6 +1442,7 @@ where
                             Ok(()) => {
                                 // The reported region belonged to the server that went away.
                                 damage = RootDamage::create(&conn, root);
+                                controls.report.samples.supported(snapshot_bgrx8(&conn, root));
                                 recovered = true;
                                 break;
                             }
@@ -1445,7 +1475,8 @@ where
             let stride = surface.stride;
             let buf = surface.as_mut_slice();
 
-            if controls.capture_cursor.load(Ordering::Relaxed)
+            let capture_cursor = controls.capture_cursor.load(Ordering::Relaxed);
+            if capture_cursor
                 && let Some(c) = conn
                     .xfixes_get_cursor_image()
                     .ok()
@@ -1477,8 +1508,17 @@ where
                 watermark.blend_bgra(buf, stride, frame_w, frame_h);
             }
 
+            let captured_ns = crate::wayland::host::now_ns();
+            let sample = controls.report.samples.next(captured_ns);
+            let layout = crate::capture_sample::SampleLayout {
+                x: cap_x.into(), y: cap_y.into(), scale: 1.0,
+                cursor_composited: capture_cursor,
+                coordinate_space: "x11-root-pixels",
+            };
             let published = pool.publish(
                 RawFrame {
+                    sample,
+                    layout: Some(layout),
                     idx,
                     ptr: surface.addr,
                     len: surface.size,
@@ -1486,7 +1526,7 @@ where
                     height: cap_h,
                     stride,
                     generation: pool.generation(),
-                    captured_ns: crate::wayland::host::now_ns(),
+                    captured_ns,
                 },
                 &controls.stop,
             );
@@ -1594,6 +1634,8 @@ mod pool_tests {
 
     fn dummy(idx: usize) -> RawFrame {
         RawFrame {
+            sample: None,
+                layout: None,
             idx,
             ptr: std::ptr::null_mut(),
             len: 0,
@@ -1695,6 +1737,8 @@ mod pool_tests {
         let a = p.acquire(&stop).unwrap();
         assert!(p.publish(
             RawFrame {
+                sample: None,
+                layout: None,
                 generation: p.generation(),
                 width: 1920,
                 height: 1080,
@@ -1710,6 +1754,8 @@ mod pool_tests {
         let b = p.acquire(&stop).unwrap();
         assert!(p.publish(
             RawFrame {
+                sample: None,
+                layout: None,
                 generation: p.generation(),
                 width: 2560,
                 height: 1600,
@@ -1722,6 +1768,8 @@ mod pool_tests {
         let c = p.acquire(&stop).unwrap();
         assert!(p.publish(
             RawFrame {
+                sample: None,
+                layout: None,
                 generation: p.generation(),
                 width: 1920,
                 height: 1080,
@@ -1752,6 +1800,8 @@ mod pool_tests {
         let a = p.acquire(&stop).unwrap();
         assert!(p.publish(
             RawFrame {
+                sample: None,
+                layout: None,
                 generation: p.generation(),
                 ..dummy(a)
             },
@@ -1764,6 +1814,8 @@ mod pool_tests {
         let b = p.acquire(&stop).unwrap();
         assert!(p.publish(
             RawFrame {
+                sample: None,
+                layout: None,
                 generation: p.generation(),
                 ..dummy(b)
             },
