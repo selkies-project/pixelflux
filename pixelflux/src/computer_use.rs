@@ -1589,7 +1589,10 @@ mod tests {
                 (code << 6) | (code >> 4)
             })
             .collect();
-        let data: Vec<u8> = values.iter().flat_map(|value| value.to_be_bytes()).collect();
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_be_bytes())
+            .collect();
         let encoded = encode_png_rgb16(&data, 1024, 1, 10).unwrap();
         let decoder = png::Decoder::new(Cursor::new(&encoded));
         let reader = decoder.read_info().unwrap();
@@ -1600,8 +1603,12 @@ mod tests {
         assert_eq!(decoded.dimensions(), (1024, 1));
         assert_eq!(decoded.into_raw(), values);
         for (width, height, len, bits) in [
-            (0, 1, 0, 10), (1, 0, 0, 10), (1, 1, 5, 10),
-            (1, 1, 7, 10), (1, 1, 6, 0), (1, 1, 6, 17),
+            (0, 1, 0, 10),
+            (1, 0, 0, 10),
+            (1, 1, 5, 10),
+            (1, 1, 7, 10),
+            (1, 1, 6, 0),
+            (1, 1, 6, 17),
         ] {
             assert!(encode_png_rgb16(&vec![0; len], width, height, bits).is_err());
         }
@@ -1613,14 +1620,30 @@ mod tests {
         let (wake_tx, _wake_rx) = smithay::reexports::calloop::channel::channel();
         let backend = CuWaylandBackend { tx, wake_tx };
         for min_rgb_bits in [0, 9, 10, 16, 17] {
-            assert!(backend.screenshot_png_with_options(0, ScreenshotOptions {
-                min_rgb_bits, cursor: None,
-            }).is_err());
+            assert!(
+                backend
+                    .screenshot_png_with_options(
+                        0,
+                        ScreenshotOptions {
+                            min_rgb_bits,
+                            cursor: None,
+                        }
+                    )
+                    .is_err()
+            );
         }
         for cursor in [false, true] {
-            assert!(backend.screenshot_png_with_options(0, ScreenshotOptions {
-                min_rgb_bits: 8, cursor: Some(cursor),
-            }).is_err());
+            assert!(
+                backend
+                    .screenshot_png_with_options(
+                        0,
+                        ScreenshotOptions {
+                            min_rgb_bits: 8,
+                            cursor: Some(cursor),
+                        }
+                    )
+                    .is_err()
+            );
         }
     }
 

@@ -446,7 +446,51 @@ For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat`
 
 On Wayland, PNG compression runs in the requesting thread outside the Python GIL, after the compositor hands it an owned copy of the rendered output. Requests are bounded through compression: up to four across all displays and two per display, with at most one queued readback per display. A call that exceeds either limit returns `Screenshot busy`; it does not replace another caller's pending capture. A timed-out caller cancels its pending readback, and removing an output fails its pending capture.
 
-PNGs contain 8-bit RGBA pixels. Unused alpha bytes in opaque host formats become fully opaque; alpha-bearing formats retain their alpha. Losslessness refers to the rendered screenshot, not to the precision of an application's original data.
+Eight-bit outputs produce RGBA8 PNGs. Unused alpha bytes in opaque host formats become fully opaque; alpha-bearing formats retain their alpha. Losslessness refers to the rendered screenshot, not to the precision of an application's original data.
+
+The independent X11 screenshot also accepts a validated depth-30 TrueColor root:
+
+```python
+png = pixelflux.screenshot_png(min_rgb_bits=10, cursor=False)
+```
+
+Its RGB10 codes are preserved in RGB16 PNG samples, with `sBIT=10`. Visual masks, image
+byte order, storage depth and buffer size are checked before conversion. A source below
+`min_rgb_bits` is rejected; selecting a 10-bit video encoder does not satisfy that requirement.
+High-precision cursor composition is unsupported, so a depth-30 screenshot requires
+`cursor=False`. The default `cursor=None` preserves each backend's cursor policy. Wayland
+screenshots remain eight-bit and reject both a higher minimum precision and a cursor override.
+
+### Experimental capture-bound snapshots
+
+After the first callback, `capture.capture_run_id` names the active capture run within this
+process. `capture.snapshot_png(expected_run=run_id, timeout_s=5.0)` waits for a next sample of
+that run and returns a dict containing `png`, `run_id`, `sample_seq`, `capture_ns`, `width`,
+`height`, `origin_x`, `origin_y`, `scale`, `coordinate_space`, `cursor_composited`, and
+`preserved_rgb_bits`. The origin is in X11 root pixels or Wayland layout logical coordinates,
+as named by `coordinate_space`. Cursor composition follows the active capture's policy.
+
+Matching encoded stripes carry `sample_run_id` and `sample_seq` attributes. A sample skipped
+by the encoder can still produce a snapshot; a repeated encoded image retains its original
+sample. Unavailable association is `None`. These attributes do not change the video header.
+Run and sample identifiers must be scoped to the producing process by any transport.
+
+The snapshot uses the active XShm RGB8 buffer or the local Wayland composition, including
+its overlays. NvFBC, DRI3 and external Wayland host snapshots report unsupported; their video
+paths remain selected normally. The new operation preserves eight bits, independently of
+the depth-30 standalone screenshot above. It does not force a keyframe or bypass video pacing.
+
+One request per run and four process-wide remain admitted through compression, with a separate
+128 MiB budget for copied raw pixels. These limits are independent of the Computer-Use
+screenshot limits. PNG encoding releases the Python GIL and runs off the capture thread.
+Stop/restart invalidates waiting requests and results still being compressed; busy, stale run,
+inactive, unsupported, invalid buffer and timeout failures return distinct error messages.
+Compression already running is not interrupted, but its canceled result is discarded.
+
+`scene_id` and `source_id` are `None`: a sample identifies those pixels, not continuity of an
+output/source or proof that a browser displayed them. Stripe callbacks do not announce batch
+completion. Automatic static refinement still requires transport and presentation ordering;
+these tokens alone must not be used to keep a PNG over newer video.
 
 ## Recording Sink
 

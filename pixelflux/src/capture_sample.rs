@@ -65,6 +65,7 @@ pub struct CaptureSamples {
 }
 
 impl Default for CaptureSamples {
+    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
     fn default() -> Self {
         Self {
             run_id: NEXT_RUN
@@ -80,11 +81,14 @@ impl Default for CaptureSamples {
 }
 
 impl CaptureSamples {
+    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
     pub fn supported(&self, supported: bool) {
         let state = if supported { SUPPORTED } else { UNSUPPORTED };
-        let _ = self.status.fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
-            (s != STOPPED).then_some(state)
-        });
+        let _ = self
+            .status
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                (s != STOPPED).then_some(state)
+            });
         if !supported {
             self.reject("Capture snapshot unsupported by this capture path");
         }
@@ -99,6 +103,7 @@ impl CaptureSamples {
         CaptureRunGuard(self.clone())
     }
 
+    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
     pub fn next(&self, captured_ns: i64) -> Option<SampleStamp> {
         if self.status.load(Ordering::Acquire) == STOPPED {
             return None;
@@ -107,7 +112,11 @@ impl CaptureSamples {
             .sequence
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .ok()?;
-        Some(SampleStamp { run_id: self.run_id, sample_seq, captured_ns })
+        Some(SampleStamp {
+            run_id: self.run_id,
+            sample_seq,
+            captured_ns,
+        })
     }
 
     pub fn has_pending(&self) -> bool {
@@ -126,10 +135,17 @@ impl CaptureSamples {
         }
     }
 
-    pub fn begin(self: &Arc<Self>, expected_run: u64, timeout: Duration) -> Result<SnapshotTicket, String> {
+    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    pub fn begin(
+        self: &Arc<Self>,
+        expected_run: u64,
+        timeout: Duration,
+    ) -> Result<SnapshotTicket, String> {
         self.check(expected_run)?;
         if timeout.is_zero() || timeout > Duration::from_secs(30) {
-            return Err("Capture snapshot timeout must be greater than zero and at most 30 seconds".into());
+            return Err(
+                "Capture snapshot timeout must be greater than zero and at most 30 seconds".into(),
+            );
         }
         let deadline = Instant::now() + timeout;
         let mut request = self.request.lock().unwrap();
@@ -137,16 +153,30 @@ impl CaptureSamples {
         if self.outstanding.swap(true, Ordering::AcqRel) {
             return Err("Capture snapshot busy".into());
         }
-        if REQUESTS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < MAX_REQUESTS).then_some(n + 1)).is_err() {
+        if REQUESTS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_REQUESTS).then_some(n + 1)
+            })
+            .is_err()
+        {
             self.outstanding.store(false, Ordering::Release);
             return Err("Capture snapshot busy".into());
         }
         let canceled = Arc::new(AtomicBool::new(false));
         let (reply, rx) = mpsc::sync_channel(1);
-        *request = Some(Pending { reply, canceled: canceled.clone(), deadline,
-            min_sample_seq: self.sequence.load(Ordering::Acquire) });
+        *request = Some(Pending {
+            reply,
+            canceled: canceled.clone(),
+            deadline,
+            min_sample_seq: self.sequence.load(Ordering::Acquire),
+        });
         self.pending.store(true, Ordering::Release);
-        Ok(SnapshotTicket { run: self.clone(), rx, canceled, deadline })
+        Ok(SnapshotTicket {
+            run: self.clone(),
+            rx,
+            canceled,
+            deadline,
+        })
     }
 
     pub fn reject(&self, error: &str) {
@@ -173,8 +203,11 @@ impl CaptureSamples {
         }
         let request = {
             let mut slot = self.request.lock().unwrap();
-            if slot.as_ref().is_some_and(|r| r.check().is_ok()
-                && stamp.run_id == self.run_id && stamp.sample_seq < r.min_sample_seq) {
+            if slot.as_ref().is_some_and(|r| {
+                r.check().is_ok()
+                    && stamp.run_id == self.run_id
+                    && stamp.sample_seq < r.min_sample_seq
+            }) {
                 return;
             }
             let request = slot.take();
@@ -186,10 +219,16 @@ impl CaptureSamples {
             self.check(stamp.run_id)?;
             request.check()?;
             let (width, height) = size;
-            let row_bytes = (width as usize).checked_mul(4).ok_or("Capture snapshot size overflow")?;
-            let bytes = row_bytes.checked_mul(height as usize).ok_or("Capture snapshot size overflow")?;
-            let required = stride.checked_mul(height.saturating_sub(1) as usize)
-                .and_then(|n| n.checked_add(row_bytes)).ok_or("Capture snapshot size overflow")?;
+            let row_bytes = (width as usize)
+                .checked_mul(4)
+                .ok_or("Capture snapshot size overflow")?;
+            let bytes = row_bytes
+                .checked_mul(height as usize)
+                .ok_or("Capture snapshot size overflow")?;
+            let required = stride
+                .checked_mul(height.saturating_sub(1) as usize)
+                .and_then(|n| n.checked_add(row_bytes))
+                .ok_or("Capture snapshot size overflow")?;
             if width == 0 || height == 0 || stride < row_bytes || pixels.len() < required {
                 return Err("Capture snapshot invalid buffer".into());
             }
@@ -201,7 +240,12 @@ impl CaptureSamples {
             request.check()?;
             self.check(stamp.run_id)?;
             Ok(RawSnapshot {
-                frame: ScreenshotFrame { pixels: owned, width, height, format },
+                frame: ScreenshotFrame {
+                    pixels: owned,
+                    width,
+                    height,
+                    format,
+                },
                 stamp,
                 layout,
                 _budget: budget,
@@ -222,10 +266,14 @@ impl Drop for CaptureRunGuard {
 struct RawBudget(usize);
 
 impl RawBudget {
+    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
     fn acquire(bytes: usize) -> Result<Self, String> {
-        RAW_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(bytes).filter(|&total| total <= MAX_RAW_BYTES)
-        }).map_err(|_| "Capture snapshot raw byte budget exceeded")?;
+        RAW_BYTES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|&total| total <= MAX_RAW_BYTES)
+            })
+            .map_err(|_| "Capture snapshot raw byte budget exceeded")?;
         Ok(Self(bytes))
     }
 }
@@ -261,7 +309,13 @@ pub struct SnapshotTicket {
 
 impl SnapshotTicket {
     pub fn finish(self) -> Result<PngSnapshot, String> {
-        let raw = self.rx.recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
+        self.finish_with(ScreenshotFrame::encode_png)
+    }
+
+    fn finish_with(self, encode: impl FnOnce(ScreenshotFrame) -> Result<Vec<u8>, String>) -> Result<PngSnapshot, String> {
+        let raw = self
+            .rx
+            .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
             .map_err(|e| match e {
                 mpsc::RecvTimeoutError::Timeout => "Capture snapshot timed out",
                 mpsc::RecvTimeoutError::Disconnected => "Capture snapshot canceled",
@@ -269,9 +323,15 @@ impl SnapshotTicket {
         self.check()?;
         let width = raw.frame.width;
         let height = raw.frame.height;
-        let png = raw.frame.encode_png()?;
+        let png = encode(raw.frame)?;
         self.check()?;
-        Ok(PngSnapshot { png, stamp: raw.stamp, layout: raw.layout, width, height })
+        Ok(PngSnapshot {
+            png,
+            stamp: raw.stamp,
+            layout: raw.layout,
+            width,
+            height,
+        })
     }
 
     fn check(&self) -> Result<(), String> {
@@ -304,7 +364,10 @@ mod tests {
 
     fn layout() -> SampleLayout {
         SampleLayout {
-            x: 120, y: 37, scale: 1.0, cursor_composited: false,
+            x: 120,
+            y: 37,
+            scale: 1.0,
+            cursor_composited: false,
             coordinate_space: "x11-root-pixels",
         }
     }
@@ -316,7 +379,14 @@ mod tests {
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
         let sample = run.next(123).unwrap();
         let mut pixels = [3, 2, 1, 0, 99, 99, 99, 99, 6, 5, 4, 0];
-        run.copy_requested(sample, &pixels, 8, (1, 2), ScreenshotPixelFormat::Bgrx, layout());
+        run.copy_requested(
+            sample,
+            &pixels,
+            8,
+            (1, 2),
+            ScreenshotPixelFormat::Bgrx,
+            layout(),
+        );
         pixels.fill(0);
         let result = ticket.finish().unwrap();
         assert_eq!(result.stamp, sample);
@@ -335,7 +405,14 @@ mod tests {
             let run = active();
             let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
             if copy {
-                run.copy_requested(run.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+                run.copy_requested(
+                    run.next(1).unwrap(),
+                    &[0; 4],
+                    4,
+                    (1, 1),
+                    ScreenshotPixelFormat::Rgba,
+                    layout(),
+                );
             }
             run.stop();
             assert!(ticket.finish().err().unwrap().contains("inactive"));
@@ -353,9 +430,21 @@ mod tests {
         let old = active();
         let new = active();
         assert_ne!(old.run_id, new.run_id);
-        assert!(new.begin(old.run_id, Duration::from_secs(1)).err().unwrap().contains("stale"));
+        assert!(
+            new.begin(old.run_id, Duration::from_secs(1))
+                .err()
+                .unwrap()
+                .contains("stale")
+        );
         let ticket = new.begin(new.run_id, Duration::from_secs(1)).unwrap();
-        new.copy_requested(old.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        new.copy_requested(
+            old.next(1).unwrap(),
+            &[0; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         assert!(ticket.finish().err().unwrap().contains("stale"));
     }
 
@@ -364,9 +453,21 @@ mod tests {
         let _serial = ADMISSION_TEST.lock().unwrap();
         let run = active();
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
-        run.copy_requested(run.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            run.next(1).unwrap(),
+            &[0; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         assert!(!run.has_pending());
-        assert!(run.begin(run.run_id, Duration::from_secs(1)).err().unwrap().contains("busy"));
+        assert!(
+            run.begin(run.run_id, Duration::from_secs(1))
+                .err()
+                .unwrap()
+                .contains("busy")
+        );
         ticket.finish().unwrap();
         assert!(run.begin(run.run_id, Duration::from_secs(1)).is_ok());
     }
@@ -376,12 +477,26 @@ mod tests {
         let _serial = ADMISSION_TEST.lock().unwrap();
         let run = active();
         drop(run.begin(run.run_id, Duration::from_secs(1)).unwrap());
-        run.copy_requested(run.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            run.next(1).unwrap(),
+            &[0; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         let mut ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
         ticket.deadline = Instant::now();
         assert!(ticket.finish().err().unwrap().contains("timed out"));
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
-        run.copy_requested(run.next(2).unwrap(), &[0; 3], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            run.next(2).unwrap(),
+            &[0; 3],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         assert!(ticket.finish().err().unwrap().contains("invalid buffer"));
         assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
         assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
@@ -391,8 +506,10 @@ mod tests {
     fn global_request_and_raw_byte_limits_are_independent() {
         let _serial = ADMISSION_TEST.lock().unwrap();
         let runs: Vec<_> = (0..=MAX_REQUESTS).map(|_| active()).collect();
-        let tickets: Vec<_> = runs[..MAX_REQUESTS].iter()
-            .map(|run| run.begin(run.run_id, Duration::from_secs(1)).unwrap()).collect();
+        let tickets: Vec<_> = runs[..MAX_REQUESTS]
+            .iter()
+            .map(|run| run.begin(run.run_id, Duration::from_secs(1)).unwrap())
+            .collect();
         let last = &runs[MAX_REQUESTS];
         assert!(last.begin(last.run_id, Duration::from_secs(1)).is_err());
         let budget = RawBudget::acquire(MAX_RAW_BYTES).unwrap();
@@ -417,10 +534,24 @@ mod tests {
         let run = active();
         let old = run.next(1).unwrap();
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
-        run.copy_requested(old, &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            old,
+            &[0; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         assert!(run.has_pending());
         let new = run.next(2).unwrap();
-        run.copy_requested(new, &[255; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            new,
+            &[255; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         assert_eq!(ticket.finish().unwrap().stamp, new);
     }
 
@@ -432,5 +563,22 @@ mod tests {
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
         drop(guard);
         assert!(ticket.finish().err().unwrap().contains("inactive"));
+    }
+
+    #[test]
+    fn stop_during_compression_discards_result_and_releases_admission() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        run.copy_requested(run.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        let result = ticket.finish_with(|frame| {
+            assert!(run.begin(run.run_id, Duration::from_secs(1)).err().unwrap().contains("busy"));
+            assert_eq!(RAW_BYTES.load(Ordering::Acquire), 4);
+            run.stop();
+            frame.encode_png()
+        });
+        assert!(result.err().unwrap().contains("inactive"));
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
     }
 }

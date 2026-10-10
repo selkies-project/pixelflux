@@ -140,6 +140,7 @@ pub mod encoders;
 /// The debug switch behind every backend's tagged line.
 pub mod log;
 
+pub mod capture_sample;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
 /// When a capture is due a frame, shared by the X11 and Wayland backends.
@@ -150,7 +151,6 @@ pub mod recorder;
 pub mod recording_sink;
 /// What each capture streams and how it got there, as values a caller reads.
 pub mod report;
-pub mod capture_sample;
 /// Kernel uinput devices, the first rung of host-capture input injection.
 pub mod uinput;
 /// Headless Wayland compositor and cursor rendering.
@@ -1581,7 +1581,9 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
                                     stripe_height: height,
                                     frame_id: unit.frame_id as i32,
                                     timing: FrameTiming {
-                                        capture_ns: unit.sample.map_or(f.captured_ns, |s| s.captured_ns),
+                                        capture_ns: unit
+                                            .sample
+                                            .map_or(f.captured_ns, |s| s.captured_ns),
                                         encode_start_ns,
                                         encode_end_ns,
                                     },
@@ -2794,7 +2796,7 @@ fn start_capture_on_display(
                                         s.frame_id,
                                         s.timing,
                                         s.reference,
-                                s.sample,
+                                        s.sample,
                                     ),
                                 ) {
                                     Ok(f) => {
@@ -3375,7 +3377,10 @@ fn render_node_tick(
     trigger: TickTrigger,
 ) -> bool {
     state.pending_screenshots.prune(Instant::now());
-    let take_capture_snapshot = node.capture.as_ref().is_some_and(|c| c.report.samples.has_pending());
+    let take_capture_snapshot = node
+        .capture
+        .as_ref()
+        .is_some_and(|c| c.report.samples.has_pending());
     let force_legacy_screenshot = state.pending_screenshots.contains(node.id);
     let take_screenshot = force_legacy_screenshot || take_capture_snapshot;
     let copy_frame_wanted = state.copy_frame_pending_for(&node.output);
@@ -4256,7 +4261,9 @@ fn render_node_tick(
         node.target_seeded = true;
     }
     let sample = if render_success && !hold_frame && !host_mode {
-        node.capture.as_ref().and_then(|c| c.report.samples.next(wayland::host::now_ns()))
+        node.capture
+            .as_ref()
+            .and_then(|c| c.report.samples.next(wayland::host::now_ns()))
     } else {
         None
     };
@@ -4481,7 +4488,10 @@ fn render_node_tick(
                                         stripe_height: height,
                                         frame_id: cap.frame_counter as i32,
                                         timing: FrameTiming {
-                                            capture_ns: sample.map_or(new_stamp.unwrap_or(composite_ns), |s| s.captured_ns),
+                                            capture_ns: sample
+                                                .map_or(new_stamp.unwrap_or(composite_ns), |s| {
+                                                    s.captured_ns
+                                                }),
                                             encode_start_ns,
                                             encode_end_ns: wayland::host::now_ns(),
                                         },
@@ -4587,19 +4597,29 @@ fn render_node_tick(
         if let Some(sample) = sample {
             match &screenshot_result {
                 Some(Ok(())) => cap.report.samples.copy_requested(
-                    sample, &node.frame_buffer, width as usize * 4,
-                    (width as u32, height as u32), screenshot_format,
+                    sample,
+                    &node.frame_buffer,
+                    width as usize * 4,
+                    (width as u32, height as u32),
+                    screenshot_format,
                     capture_sample::SampleLayout {
-                        x: node.pos.0, y: node.pos.1, scale: output_scale_val,
+                        x: node.pos.0,
+                        y: node.pos.1,
+                        scale: output_scale_val,
                         cursor_composited: state.render_cursor_on_framebuffer,
                         coordinate_space: "wayland-layout-logical",
                     },
                 ),
                 Some(Err(error)) => cap.report.samples.reject(error),
-                None => cap.report.samples.reject("Capture snapshot readback unavailable"),
+                None => cap
+                    .report
+                    .samples
+                    .reject("Capture snapshot readback unavailable"),
             }
         } else if !hold_frame {
-            cap.report.samples.reject("Capture snapshot render failed or source unsupported");
+            cap.report
+                .samples
+                .reject("Capture snapshot render failed or source unsupported");
         }
     }
     if take_screenshot
@@ -6941,7 +6961,7 @@ impl StripeFrame {
             frame_id,
             FrameTiming::default(),
             Reference::Untracked,
-        None,
+            None,
         )
     }
 
@@ -8391,7 +8411,10 @@ impl ScreenCapture {
         match st.backend {
             0 | 1 => st.x11_controls().map(|c| c.report.samples.clone()),
             2 if wayland_owners().lock().unwrap().get(&st.wl_display) == Some(&self.id) => {
-                report::wayland_reports().lock().unwrap().get(&st.wl_display)
+                report::wayland_reports()
+                    .lock()
+                    .unwrap()
+                    .get(&st.wl_display)
                     .map(|r| r.samples.clone())
             }
             _ => None,
@@ -8583,15 +8606,27 @@ impl ScreenCapture {
     /// The returned sample may be skipped by video encoding; it does not certify scene
     /// continuity, a complete stripe batch, or presentation by a remote consumer.
     #[pyo3(signature = (expected_run, timeout_s = 5.0))]
-    fn snapshot_png(&self, py: Python<'_>, expected_run: u64, timeout_s: f64) -> PyResult<Py<PyAny>> {
+    fn snapshot_png(
+        &self,
+        py: Python<'_>,
+        expected_run: u64,
+        timeout_s: f64,
+    ) -> PyResult<Py<PyAny>> {
         use pyo3::exceptions::{PyRuntimeError, PyValueError};
         if !timeout_s.is_finite() || timeout_s <= 0.0 || timeout_s > 30.0 {
-            return Err(PyValueError::new_err("timeout_s must be greater than zero and at most 30 seconds"));
+            return Err(PyValueError::new_err(
+                "timeout_s must be greater than zero and at most 30 seconds",
+            ));
         }
-        let run = self.sample_run().ok_or_else(|| PyRuntimeError::new_err("Capture snapshot inactive"))?;
-        let ticket = run.begin(expected_run, Duration::from_secs_f64(timeout_s))
+        let run = self
+            .sample_run()
+            .ok_or_else(|| PyRuntimeError::new_err("Capture snapshot inactive"))?;
+        let ticket = run
+            .begin(expected_run, Duration::from_secs_f64(timeout_s))
             .map_err(PyRuntimeError::new_err)?;
-        let snapshot = py.detach(|| ticket.finish()).map_err(PyRuntimeError::new_err)?;
+        let snapshot = py
+            .detach(|| ticket.finish())
+            .map_err(PyRuntimeError::new_err)?;
         let result = pyo3::types::PyDict::new(py);
         result.set_item("png", pyo3::types::PyBytes::new(py, &snapshot.png))?;
         result.set_item("run_id", snapshot.stamp.run_id)?;
@@ -10138,11 +10173,24 @@ fn start_computer_use(bind: String, token: Option<String>) -> PyResult<()> {
 /// compositor or host cursor policy; X11 draws the cursor into the image.
 #[pyfunction]
 #[pyo3(signature = (display = 0, *, min_rgb_bits = 8, cursor = None))]
-fn screenshot_png(py: Python<'_>, display: u32, min_rgb_bits: u8, cursor: Option<bool>) -> PyResult<Py<PyAny>> {
+fn screenshot_png(
+    py: Python<'_>,
+    display: u32,
+    min_rgb_bits: u8,
+    cursor: Option<bool>,
+) -> PyResult<Py<PyAny>> {
     let png = py
-        .detach(|| crate::computer_use::resolve_backend().and_then(|b| {
-            b.screenshot_png_with_options(display, computer_use::ScreenshotOptions { min_rgb_bits, cursor })
-        }))
+        .detach(|| {
+            crate::computer_use::resolve_backend().and_then(|b| {
+                b.screenshot_png_with_options(
+                    display,
+                    computer_use::ScreenshotOptions {
+                        min_rgb_bits,
+                        cursor,
+                    },
+                )
+            })
+        })
         .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
     Ok(pyo3::types::PyBytes::new(py, &png).into_any().unbind())
 }

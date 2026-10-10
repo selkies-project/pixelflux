@@ -36,8 +36,10 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::xtest::ConnectionExt as XtestExt;
 use x11rb::rust_connection::RustConnection;
 
-use crate::computer_use::{CuBackend, CuButton, ScreenshotOptions, encode_png_rgb16, encode_png_rgba};
 use super::pixel_format::ScreenshotFormat;
+use crate::computer_use::{
+    CuBackend, CuButton, ScreenshotOptions, encode_png_rgb16, encode_png_rgba,
+};
 
 /// One wheel "click" of scroll per unit of CU `scroll_amount`, capped so a hostile amount
 /// cannot flood the server with press/release pairs.
@@ -445,17 +447,25 @@ impl CuBackend for CuX11Backend {
             .reply()
             .map_err(|e| format!("get_image reply: {e}"))?;
         let setup = self.conn.setup();
-        let screen = setup.roots.iter().find(|screen| screen.root == self.root)
+        let screen = setup
+            .roots
+            .iter()
+            .find(|screen| screen.root == self.root)
             .ok_or("Screenshot root is not present in the connection setup")?;
         if img.depth != screen.root_depth || img.visual != screen.root_visual {
             return Err("Screenshot reply does not match the root visual".to_string());
         }
-        let visual = screen.allowed_depths.iter()
+        let visual = screen
+            .allowed_depths
+            .iter()
             .filter(|depth| depth.depth == img.depth)
             .flat_map(|depth| &depth.visuals)
             .find(|visual| visual.visual_id == img.visual)
             .ok_or("Screenshot root visual was not advertised")?;
-        let storage = setup.pixmap_formats.iter().find(|format| format.depth == img.depth)
+        let storage = setup
+            .pixmap_formats
+            .iter()
+            .find(|format| format.depth == img.depth)
             .ok_or("Screenshot root pixmap format was not advertised")?;
         let format = ScreenshotFormat::new(
             img.depth,

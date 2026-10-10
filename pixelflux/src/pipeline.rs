@@ -1491,7 +1491,15 @@ impl X11Pipeline {
                 let on_device = beside && d.send && enc.hash_next_upload(DAMAGE_BAND_ROWS as u32);
                 let mut encode = || {
                     if d.send {
-                        enc.encode_host_tagged(argb, stride, false, fc, d.target_qp, force_idr, sample)
+                        enc.encode_host_tagged(
+                            argb,
+                            stride,
+                            false,
+                            fc,
+                            d.target_qp,
+                            force_idr,
+                            sample,
+                        )
                     } else {
                         enc.push_held_tagged(fc)
                     }

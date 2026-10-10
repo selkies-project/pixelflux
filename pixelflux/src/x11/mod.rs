@@ -975,8 +975,12 @@ fn encode_loop<F>(
         if snapshot_pending {
             if let (Some(sample), Some(layout)) = (frame.sample, frame.layout) {
                 controls.report.samples.copy_requested(
-                    sample, buf, frame.stride, (frame.width.into(), frame.height.into()),
-                    crate::computer_use::ScreenshotPixelFormat::Bgrx, layout,
+                    sample,
+                    buf,
+                    frame.stride,
+                    (frame.width.into(), frame.height.into()),
+                    crate::computer_use::ScreenshotPixelFormat::Bgrx,
+                    layout,
                 );
             }
             pool.recycle(frame.idx);
@@ -1157,13 +1161,24 @@ where
 
 fn snapshot_bgrx8(conn: &RustConnection, root: u32) -> bool {
     conn.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST
-        && conn.setup().roots.iter().find(|s| s.root == root).is_some_and(|screen| {
-            screen.root_depth == 24
-                && screen.allowed_depths.iter().flat_map(|d| &d.visuals).any(|v| {
-                    v.visual_id == screen.root_visual && v.red_mask == 0x00ff0000
-                        && v.green_mask == 0x0000ff00 && v.blue_mask == 0x000000ff
-                })
-        })
+        && conn
+            .setup()
+            .roots
+            .iter()
+            .find(|s| s.root == root)
+            .is_some_and(|screen| {
+                screen.root_depth == 24
+                    && screen
+                        .allowed_depths
+                        .iter()
+                        .flat_map(|d| &d.visuals)
+                        .any(|v| {
+                            v.visual_id == screen.root_visual
+                                && v.red_mask == 0x00ff0000
+                                && v.green_mask == 0x0000ff00
+                                && v.blue_mask == 0x000000ff
+                        })
+            })
 }
 
 /// Run the X11 capture pipeline until `stop` is set, splitting capture and encode across two
@@ -1222,7 +1237,10 @@ where
         x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
     let mut root = conn.setup().roots[screen_num].root;
     require_32bpp(&conn, screen_num)?;
-    controls.report.samples.supported(snapshot_bgrx8(&conn, root));
+    controls
+        .report
+        .samples
+        .supported(snapshot_bgrx8(&conn, root));
 
     conn.shm_query_version()
         .map_err(|e| format!("shm_query_version: {e}"))?
@@ -1442,7 +1460,10 @@ where
                             Ok(()) => {
                                 // The reported region belonged to the server that went away.
                                 damage = RootDamage::create(&conn, root);
-                                controls.report.samples.supported(snapshot_bgrx8(&conn, root));
+                                controls
+                                    .report
+                                    .samples
+                                    .supported(snapshot_bgrx8(&conn, root));
                                 recovered = true;
                                 break;
                             }
@@ -1511,7 +1532,9 @@ where
             let captured_ns = crate::wayland::host::now_ns();
             let sample = controls.report.samples.next(captured_ns);
             let layout = crate::capture_sample::SampleLayout {
-                x: cap_x.into(), y: cap_y.into(), scale: 1.0,
+                x: cap_x.into(),
+                y: cap_y.into(),
+                scale: 1.0,
                 cursor_composited: capture_cursor,
                 coordinate_space: "x11-root-pixels",
             };
@@ -1635,7 +1658,7 @@ mod pool_tests {
     fn dummy(idx: usize) -> RawFrame {
         RawFrame {
             sample: None,
-                layout: None,
+            layout: None,
             idx,
             ptr: std::ptr::null_mut(),
             len: 0,

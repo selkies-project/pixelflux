@@ -27,7 +27,7 @@ impl ScreenshotFormat {
         masks: [u32; 3],
     ) -> Result<Self, String> {
         let rgb_bits = match depth {
-            24 => 8,
+            24 | 32 => 8,
             30 => 10,
             _ => return Err(format!("Unsupported screenshot root depth {depth}")),
         };
@@ -198,6 +198,34 @@ mod tests {
                 assert!(layout.rgb16(&bytes, 1, 1).is_err());
             }
         }
+    }
+
+    #[test]
+    fn depth32_with_validated_rgb8_masks_preserves_channels_without_claiming_rgb10() {
+        for order in [ImageOrder::LSB_FIRST, ImageOrder::MSB_FIRST] {
+            for shifts in [[16, 8, 0], [0, 8, 16]] {
+                let layout = format(32, order, shifts.map(|shift| 255 << shift));
+                assert_eq!(layout.rgb_bits, 8);
+                for padding in [0u32, 0x55, 0xff] {
+                    let word = padding << 24
+                        | 17u32 << shifts[0]
+                        | 91u32 << shifts[1]
+                        | 203u32 << shifts[2];
+                    let mut bytes = if order == ImageOrder::LSB_FIRST {
+                        word.to_le_bytes()
+                    } else {
+                        word.to_be_bytes()
+                    };
+                    layout.normalize_bgra8(&mut bytes, 1, 1).unwrap();
+                    assert_eq!(&bytes[..3], &[203, 91, 17]);
+                    assert!(layout.rgb16(&bytes, 1, 1).is_err());
+                }
+            }
+        }
+        assert!(ScreenshotFormat::new(
+            32, 32, 32, ImageOrder::LSB_FIRST, VisualClass::TRUE_COLOR,
+            [0x3ff00000, 0xffc00, 0x3ff],
+        ).is_err());
     }
 
     #[test]

@@ -1531,6 +1531,12 @@ impl FrameEncoder {
     }
 
     fn tagged_output(&self, data: Vec<u8>, sample: Option<SampleStamp>) -> TaggedOutput {
+        // Sessions that resolve output PTS need per-unit metadata before carrying samples.
+        let sample = if matches!(self, FrameEncoder::Nvenc(_) | FrameEncoder::Vaapi(_)) {
+            sample
+        } else {
+            None
+        };
         let mut output = TaggedOutput::new(data, sample);
         output.reference = Some(self.last_reference());
         #[cfg(target_arch = "aarch64")]
@@ -1566,7 +1572,7 @@ impl FrameEncoder {
         let data = match self {
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.push_held(frame_number),
-            _ => Ok(Vec::new()),
+            _ => Ok::<_, String>(Vec::new()),
         }?;
         Ok(self.tagged_output(data, None))
     }
