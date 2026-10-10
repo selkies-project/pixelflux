@@ -465,15 +465,23 @@ screenshots remain eight-bit and reject both a higher minimum precision and a cu
 
 After the first callback, `capture.capture_run_id` names the active capture run within this
 process. `capture.snapshot_png(expected_run=run_id, timeout_s=5.0)` waits for a next sample of
-that run and returns a dict containing `png`, `run_id`, `sample_seq`, `capture_ns`, `width`,
+that run to be stamped and returns a dict containing `png`, `run_id`, `sample_seq`, `capture_ns`, `width`,
 `height`, `origin_x`, `origin_y`, `scale`, `coordinate_space`, `cursor_composited`, and
 `preserved_rgb_bits`. The origin is in X11 root pixels or Wayland layout logical coordinates,
-as named by `coordinate_space`. Cursor composition follows the active capture's policy.
+as named by `coordinate_space`. `cursor_composited` describes PixelFlux's cursor layer:
+`False` for verified exclusion, `True` after verified composition, and `None` when unknown.
+It does not describe cursors drawn as application content. The operation inherits the active
+capture policy and does not change it to serve a request.
 
 Matching encoded stripes carry `sample_run_id` and `sample_seq` attributes. A sample skipped
 by the encoder can still produce a snapshot; a repeated encoded image retains its original
-sample. Unavailable association is `None`. These attributes do not change the video header.
+sample. Unavailable association is `None`; full-frame software HEVC, VP8, VP9, SVT-AV1 and
+V4L2M2M do not yet export a verified association. These attributes do not change the video header.
 Run and sample identifiers must be scoped to the producing process by any transport.
+An old run's delayed unit can arrive through a replacement capture's callback with its old
+identifier. A grab already in progress when the request arrives can complete afterward and
+satisfy it. `capture_ns` is a CPU-side monotonic stamp, not a presentation timestamp or proof
+that a GPU fence had completed at that instant.
 
 The snapshot uses the active XShm RGB8 buffer or the local Wayland composition, including
 its overlays. NvFBC, DRI3 and external Wayland host snapshots report unsupported; their video

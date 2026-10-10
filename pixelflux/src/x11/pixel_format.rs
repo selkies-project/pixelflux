@@ -44,8 +44,9 @@ impl ScreenshotFormat {
         };
         let shifts = masks.map(u32::trailing_zeros);
         let max = (1u32 << rgb_bits) - 1;
+        let planes = u32::MAX >> (32 - depth);
         if masks.iter().zip(shifts).any(|(&mask, shift)| {
-            mask == 0 || shift >= 32 || (mask >> shift) != max
+            mask == 0 || shift >= 32 || (mask >> shift) != max || mask & !planes != 0
         }) || masks[0] & masks[1] != 0
             || masks[0] & masks[2] != 0
             || masks[1] & masks[2] != 0
@@ -235,6 +236,8 @@ mod tests {
             (30, 32, 32, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
             (30, 32, 32, VisualClass::TRUE_COLOR, [0x3ff, 0x3ff, 0x3ff]),
             (30, 32, 32, VisualClass::TRUE_COLOR, [0, 0xffc00, 0x3ff]),
+            (30, 32, 32, VisualClass::TRUE_COLOR, [0xffc00000, 0xffc00, 0x3ff]),
+            (24, 32, 32, VisualClass::TRUE_COLOR, [0xff000000, 0xff00, 0xff]),
             (24, 24, 32, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
             (24, 32, 7, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
             (24, 32, 32, VisualClass::DIRECT_COLOR, [0xff0000, 0xff00, 0xff]),

@@ -1806,10 +1806,7 @@ impl TegraEncoder {
                 .ok_or("invalid encoder output timestamp")?;
             let sample = self.samples.take(number);
             self.outstanding = self.outstanding.saturating_sub(1);
-            if self
-                .held
-                .is_some_and(|(queued, _)| queued == number)
-            {
+            if self.held.is_some_and(|(queued, _)| queued == number) {
                 self.held = None;
             }
             if length > 0 {

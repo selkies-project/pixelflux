@@ -1497,6 +1497,7 @@ where
             let buf = surface.as_mut_slice();
 
             let capture_cursor = controls.capture_cursor.load(Ordering::Relaxed);
+            let mut cursor_composited = if capture_cursor { None } else { Some(false) };
             if capture_cursor
                 && let Some(c) = conn
                     .xfixes_get_cursor_image()
@@ -1522,6 +1523,7 @@ where
                     img_x,
                     img_y,
                 );
+                cursor_composited = Some(true);
             }
 
             if watermark.is_active() {
@@ -1535,7 +1537,7 @@ where
                 x: cap_x.into(),
                 y: cap_y.into(),
                 scale: 1.0,
-                cursor_composited: capture_cursor,
+                cursor_composited,
                 coordinate_space: "x11-root-pixels",
             };
             let published = pool.publish(

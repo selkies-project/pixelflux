@@ -1522,11 +1522,7 @@ impl FrameEncoder {
     }
 
     /// Split returned bytes using the sample metadata frozen with that encode result.
-    pub fn delivered_units_tagged(
-        &self,
-        output: TaggedOutput,
-        encoded: u16,
-    ) -> Vec<TaggedUnit> {
+    pub fn delivered_units_tagged(&self, output: TaggedOutput, encoded: u16) -> Vec<TaggedUnit> {
         output.into_units(encoded, self.last_reference())
     }
 
@@ -1563,7 +1559,8 @@ impl FrameEncoder {
     /// next is queued: empty from every other backend, whose units come with their frame.
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
     pub fn push_held(&mut self, frame_number: u64) -> Result<Vec<u8>, String> {
-        self.push_held_tagged(frame_number).map(|output| output.data)
+        self.push_held_tagged(frame_number)
+            .map(|output| output.data)
     }
 
     /// Repeat retained staging pixels; their sample is resolved from the encoder's submission.

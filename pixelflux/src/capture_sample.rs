@@ -31,7 +31,7 @@ pub struct SampleLayout {
     pub x: i32,
     pub y: i32,
     pub scale: f64,
-    pub cursor_composited: bool,
+    pub cursor_composited: Option<bool>,
     pub coordinate_space: &'static str,
 }
 
@@ -65,7 +65,10 @@ pub struct CaptureSamples {
 }
 
 impl Default for CaptureSamples {
-    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires a newer compiler than Rust 1.89."
+    )]
     fn default() -> Self {
         Self {
             run_id: NEXT_RUN
@@ -81,7 +84,10 @@ impl Default for CaptureSamples {
 }
 
 impl CaptureSamples {
-    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires a newer compiler than Rust 1.89."
+    )]
     pub fn supported(&self, supported: bool) {
         let state = if supported { SUPPORTED } else { UNSUPPORTED };
         let _ = self
@@ -103,7 +109,10 @@ impl CaptureSamples {
         CaptureRunGuard(self.clone())
     }
 
-    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires a newer compiler than Rust 1.89."
+    )]
     pub fn next(&self, captured_ns: i64) -> Option<SampleStamp> {
         if self.status.load(Ordering::Acquire) == STOPPED {
             return None;
@@ -135,7 +144,10 @@ impl CaptureSamples {
         }
     }
 
-    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires a newer compiler than Rust 1.89."
+    )]
     pub fn begin(
         self: &Arc<Self>,
         expected_run: u64,
@@ -266,7 +278,10 @@ impl Drop for CaptureRunGuard {
 struct RawBudget(usize);
 
 impl RawBudget {
-    #[allow(deprecated, reason = "Atomic::try_update requires a newer compiler than Rust 1.89.")]
+    #[allow(
+        deprecated,
+        reason = "Atomic::try_update requires a newer compiler than Rust 1.89."
+    )]
     fn acquire(bytes: usize) -> Result<Self, String> {
         RAW_BYTES
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -312,7 +327,10 @@ impl SnapshotTicket {
         self.finish_with(ScreenshotFrame::encode_png)
     }
 
-    fn finish_with(self, encode: impl FnOnce(ScreenshotFrame) -> Result<Vec<u8>, String>) -> Result<PngSnapshot, String> {
+    fn finish_with(
+        self,
+        encode: impl FnOnce(ScreenshotFrame) -> Result<Vec<u8>, String>,
+    ) -> Result<PngSnapshot, String> {
         let raw = self
             .rx
             .recv_timeout(self.deadline.saturating_duration_since(Instant::now()))
@@ -367,7 +385,7 @@ mod tests {
             x: 120,
             y: 37,
             scale: 1.0,
-            cursor_composited: false,
+            cursor_composited: Some(false),
             coordinate_space: "x11-root-pixels",
         }
     }
@@ -570,9 +588,21 @@ mod tests {
         let _serial = ADMISSION_TEST.lock().unwrap();
         let run = active();
         let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
-        run.copy_requested(run.next(1).unwrap(), &[0; 4], 4, (1, 1), ScreenshotPixelFormat::Rgba, layout());
+        run.copy_requested(
+            run.next(1).unwrap(),
+            &[0; 4],
+            4,
+            (1, 1),
+            ScreenshotPixelFormat::Rgba,
+            layout(),
+        );
         let result = ticket.finish_with(|frame| {
-            assert!(run.begin(run.run_id, Duration::from_secs(1)).err().unwrap().contains("busy"));
+            assert!(
+                run.begin(run.run_id, Duration::from_secs(1))
+                    .err()
+                    .unwrap()
+                    .contains("busy")
+            );
             assert_eq!(RAW_BYTES.load(Ordering::Acquire), 4);
             run.stop();
             frame.encode_png()

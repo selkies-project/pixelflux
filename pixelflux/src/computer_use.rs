@@ -131,6 +131,17 @@ impl ScreenshotOptions {
         }
         Ok(())
     }
+
+    fn validate_rgb8_backend(&self) -> Result<(), String> {
+        self.validate()?;
+        if self.min_rgb_bits > 8 {
+            return Err("Screenshot source preserves only 8 RGB bits".to_string());
+        }
+        if self.cursor.is_some() {
+            return Err("Screenshot cursor override is not supported by this backend".to_string());
+        }
+        Ok(())
+    }
 }
 
 pub(crate) const MAX_SCREENSHOT_REQUESTS: usize = 4;
@@ -360,13 +371,7 @@ pub trait CuBackend {
         display: u32,
         options: ScreenshotOptions,
     ) -> Result<Vec<u8>, String> {
-        options.validate()?;
-        if options.min_rgb_bits > 8 {
-            return Err("Screenshot source preserves only 8 RGB bits".to_string());
-        }
-        if options.cursor.is_some() {
-            return Err("Screenshot cursor override is not supported by this backend".to_string());
-        }
+        options.validate_rgb8_backend()?;
         self.screenshot_png(display)
     }
     fn cursor_pos(&self) -> Result<(f64, f64), String>;
@@ -1572,7 +1577,7 @@ mod record_path_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CuBackend, CuWaylandBackend, ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions,
+        ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions,
         ScreenshotPixelFormat, cu_listeners, encode_png_rgb16, encode_png_rgba,
     };
     use std::io::Cursor;
@@ -1616,32 +1621,24 @@ mod tests {
 
     #[test]
     fn screenshot_requirements_reject_eight_bit_wayland_and_cursor_overrides() {
-        let (tx, _rx) = smithay::reexports::calloop::channel::channel();
-        let (wake_tx, _wake_rx) = smithay::reexports::calloop::channel::channel();
-        let backend = CuWaylandBackend { tx, wake_tx };
+        assert!(ScreenshotOptions::default().validate_rgb8_backend().is_ok());
         for min_rgb_bits in [0, 9, 10, 16, 17] {
             assert!(
-                backend
-                    .screenshot_png_with_options(
-                        0,
-                        ScreenshotOptions {
-                            min_rgb_bits,
-                            cursor: None,
-                        }
-                    )
+                ScreenshotOptions {
+                    min_rgb_bits,
+                    cursor: None,
+                }
+                    .validate_rgb8_backend()
                     .is_err()
             );
         }
         for cursor in [false, true] {
             assert!(
-                backend
-                    .screenshot_png_with_options(
-                        0,
-                        ScreenshotOptions {
-                            min_rgb_bits: 8,
-                            cursor: Some(cursor),
-                        }
-                    )
+                ScreenshotOptions {
+                    min_rgb_bits: 8,
+                    cursor: Some(cursor),
+                }
+                    .validate_rgb8_backend()
                     .is_err()
             );
         }
