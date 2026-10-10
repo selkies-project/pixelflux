@@ -40,7 +40,10 @@ impl Drop for DeliveryThreadGuard {
 
 pub(crate) fn check_snapshot_caller() -> Result<(), String> {
     if DELIVERY_THREAD.get() {
-        Err("Capture snapshot cannot wait on a delivery thread; request it from another thread".into())
+        Err(
+            "Capture snapshot cannot wait on a delivery thread; request it from another thread"
+                .into(),
+        )
     } else {
         Ok(())
     }
@@ -411,13 +414,22 @@ mod tests {
         assert!(check_snapshot_caller().is_ok());
         {
             let _delivery = DeliveryThreadGuard::enter();
-            assert!(check_snapshot_caller().unwrap_err().contains("delivery thread"));
+            assert!(
+                check_snapshot_caller()
+                    .unwrap_err()
+                    .contains("delivery thread")
+            );
             {
                 let _nested = DeliveryThreadGuard::enter();
                 assert!(check_snapshot_caller().is_err());
             }
             assert!(check_snapshot_caller().is_err());
-            assert!(std::thread::spawn(check_snapshot_caller).join().unwrap().is_ok());
+            assert!(
+                std::thread::spawn(check_snapshot_caller)
+                    .join()
+                    .unwrap()
+                    .is_ok()
+            );
         }
         assert!(check_snapshot_caller().is_ok());
     }

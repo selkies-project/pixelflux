@@ -1515,10 +1515,25 @@ impl FrameEncoder {
         data: Vec<u8>,
         encoded: u16,
     ) -> Vec<(Vec<u8>, u16, reference::Reference)> {
-        self.delivered_units_tagged(self.tagged_output(data, None), encoded)
-            .into_iter()
-            .map(|unit| (unit.data, unit.frame_id, unit.reference))
-            .collect()
+        #[cfg(target_arch = "aarch64")]
+        if let FrameEncoder::Tegra(enc) = self {
+            match enc.delivered_units() {
+                [] => {}
+                &[(id, reference, _)] => return vec![(data, id, reference)],
+                units => {
+                    let mut start = 0;
+                    return units
+                        .iter()
+                        .map(|&(id, reference, end)| {
+                            let unit = data[start..end].to_vec();
+                            start = end;
+                            (unit, id, reference)
+                        })
+                        .collect();
+                }
+            }
+        }
+        vec![(data, encoded, self.last_reference())]
     }
 
     /// Split returned bytes using the sample metadata frozen with that encode result.
@@ -1561,7 +1576,7 @@ impl FrameEncoder {
             .map(|output| output.data)
     }
 
-    /// Repeat retained staging pixels; their sample is resolved from the encoder's submission.
+    /// Repeat retained staging pixels without guessing their sample identity.
     #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
     pub fn push_held_tagged(&mut self, frame_number: u64) -> Result<TaggedOutput, String> {
         let data = match self {
