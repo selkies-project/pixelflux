@@ -442,7 +442,11 @@ For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat`
 
 ## Screenshots
 
-`screenshot_png(display=0)` returns a PNG of one display with the cursor drawn in, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture.
+`screenshot_png(display=0)` returns a PNG of one display, the same image the Computer-Use server serves: the in-process Wayland compositor's output when one runs, else the root of the X server named by `DISPLAY`. It needs no running capture. Wayland preserves the current compositor or host capture cursor policy; the X11 screenshot draws the cursor into the image.
+
+On Wayland, PNG compression runs in the requesting thread outside the Python GIL, after the compositor hands it an owned copy of the rendered output. Requests are bounded through compression: up to four across all displays and two per display, with at most one queued readback per display. A call that exceeds either limit returns `Screenshot busy`; it does not replace another caller's pending capture. A timed-out caller cancels its pending readback, and removing an output fails its pending capture.
+
+PNGs contain 8-bit RGBA pixels. Unused alpha bytes in opaque host formats become fully opaque; alpha-bearing formats retain their alpha. Losslessness refers to the rendered screenshot, not to the precision of an application's original data.
 
 ## Recording Sink
 
