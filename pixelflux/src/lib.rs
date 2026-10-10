@@ -4606,7 +4606,11 @@ fn render_node_tick(
                         x: node.pos.0,
                         y: node.pos.1,
                         scale: output_scale_val,
-                        cursor_composited: if state.render_cursor_on_framebuffer { None } else { Some(false) },
+                        cursor_composited: if state.render_cursor_on_framebuffer {
+                            None
+                        } else {
+                            Some(false)
+                        },
                         coordinate_space: "wayland-layout-logical",
                     },
                 ),

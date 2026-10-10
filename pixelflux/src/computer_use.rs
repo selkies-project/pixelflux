@@ -1577,8 +1577,8 @@ mod record_path_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions,
-        ScreenshotPixelFormat, cu_listeners, encode_png_rgb16, encode_png_rgba,
+        ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions, ScreenshotPixelFormat,
+        cu_listeners, encode_png_rgb16, encode_png_rgba,
     };
     use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -1628,8 +1628,8 @@ mod tests {
                     min_rgb_bits,
                     cursor: None,
                 }
-                    .validate_rgb8_backend()
-                    .is_err()
+                .validate_rgb8_backend()
+                .is_err()
             );
         }
         for cursor in [false, true] {
@@ -1638,8 +1638,8 @@ mod tests {
                     min_rgb_bits: 8,
                     cursor: Some(cursor),
                 }
-                    .validate_rgb8_backend()
-                    .is_err()
+                .validate_rgb8_backend()
+                .is_err()
             );
         }
     }

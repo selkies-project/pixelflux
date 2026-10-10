@@ -77,23 +77,24 @@ impl ScreenshotFormat {
         height: u32,
     ) -> Result<impl Iterator<Item = [u16; 3]> + 'a, String> {
         let stride = self.stride(width)?;
-        if width == 0
-            || height == 0
-            || stride.checked_mul(height as usize) != Some(data.len())
-        {
+        if width == 0 || height == 0 || stride.checked_mul(height as usize) != Some(data.len()) {
             return Err("Screenshot buffer does not match its visual and geometry".to_string());
         }
         Ok(data.chunks_exact(stride).flat_map(move |row| {
-            row[..width as usize * 4].as_chunks::<4>().0.iter().map(move |bytes| {
-                let word = if self.little_endian {
-                    u32::from_le_bytes(*bytes)
-                } else {
-                    u32::from_be_bytes(*bytes)
-                };
-                std::array::from_fn(|channel| {
-                    ((word & self.masks[channel]) >> self.shifts[channel]) as u16
+            row[..width as usize * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(move |bytes| {
+                    let word = if self.little_endian {
+                        u32::from_le_bytes(*bytes)
+                    } else {
+                        u32::from_be_bytes(*bytes)
+                    };
+                    std::array::from_fn(|channel| {
+                        ((word & self.masks[channel]) >> self.shifts[channel]) as u16
+                    })
                 })
-            })
         }))
     }
 
@@ -159,10 +160,8 @@ mod tests {
                 let mut expected = Vec::new();
                 for code in 0..1024u32 {
                     let rgb = [code, 1023 - code, (73 * code) % 1024];
-                    let word = 3 << 30
-                        | rgb[0] << shifts[0]
-                        | rgb[1] << shifts[1]
-                        | rgb[2] << shifts[2];
+                    let word =
+                        3 << 30 | rgb[0] << shifts[0] | rgb[1] << shifts[1] | rgb[2] << shifts[2];
                     source.extend_from_slice(&if order == ImageOrder::LSB_FIRST {
                         word.to_le_bytes()
                     } else {
@@ -188,7 +187,8 @@ mod tests {
         for order in [ImageOrder::LSB_FIRST, ImageOrder::MSB_FIRST] {
             for shifts in [[16, 8, 0], [0, 8, 16]] {
                 let layout = format(24, order, shifts.map(|shift| 255 << shift));
-                let word = 0xa5000000 | 17u32 << shifts[0] | 91u32 << shifts[1] | 203u32 << shifts[2];
+                let word =
+                    0xa5000000 | 17u32 << shifts[0] | 91u32 << shifts[1] | 203u32 << shifts[2];
                 let mut bytes = if order == ImageOrder::LSB_FIRST {
                     word.to_le_bytes()
                 } else {
@@ -223,26 +223,72 @@ mod tests {
                 }
             }
         }
-        assert!(ScreenshotFormat::new(
-            32, 32, 32, ImageOrder::LSB_FIRST, VisualClass::TRUE_COLOR,
-            [0x3ff00000, 0xffc00, 0x3ff],
-        ).is_err());
+        assert!(
+            ScreenshotFormat::new(
+                32,
+                32,
+                32,
+                ImageOrder::LSB_FIRST,
+                VisualClass::TRUE_COLOR,
+                [0x3ff00000, 0xffc00, 0x3ff],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn unsupported_or_malformed_layouts_fail_before_conversion() {
         for (depth, bpp, pad, class, masks) in [
-            (16, 16, 16, VisualClass::TRUE_COLOR, [0xf800, 0x07e0, 0x001f]),
-            (30, 32, 32, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
+            (
+                16,
+                16,
+                16,
+                VisualClass::TRUE_COLOR,
+                [0xf800, 0x07e0, 0x001f],
+            ),
+            (
+                30,
+                32,
+                32,
+                VisualClass::TRUE_COLOR,
+                [0xff0000, 0xff00, 0xff],
+            ),
             (30, 32, 32, VisualClass::TRUE_COLOR, [0x3ff, 0x3ff, 0x3ff]),
             (30, 32, 32, VisualClass::TRUE_COLOR, [0, 0xffc00, 0x3ff]),
-            (30, 32, 32, VisualClass::TRUE_COLOR, [0xffc00000, 0xffc00, 0x3ff]),
-            (24, 32, 32, VisualClass::TRUE_COLOR, [0xff000000, 0xff00, 0xff]),
-            (24, 24, 32, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
+            (
+                30,
+                32,
+                32,
+                VisualClass::TRUE_COLOR,
+                [0xffc00000, 0xffc00, 0x3ff],
+            ),
+            (
+                24,
+                32,
+                32,
+                VisualClass::TRUE_COLOR,
+                [0xff000000, 0xff00, 0xff],
+            ),
+            (
+                24,
+                24,
+                32,
+                VisualClass::TRUE_COLOR,
+                [0xff0000, 0xff00, 0xff],
+            ),
             (24, 32, 7, VisualClass::TRUE_COLOR, [0xff0000, 0xff00, 0xff]),
-            (24, 32, 32, VisualClass::DIRECT_COLOR, [0xff0000, 0xff00, 0xff]),
+            (
+                24,
+                32,
+                32,
+                VisualClass::DIRECT_COLOR,
+                [0xff0000, 0xff00, 0xff],
+            ),
         ] {
-            assert!(ScreenshotFormat::new(depth, bpp, pad, ImageOrder::LSB_FIRST, class, masks).is_err());
+            assert!(
+                ScreenshotFormat::new(depth, bpp, pad, ImageOrder::LSB_FIRST, class, masks)
+                    .is_err()
+            );
         }
         let layout = format(30, ImageOrder::LSB_FIRST, [0x3ff00000, 0xffc00, 0x3ff]);
         for (width, height, len) in [(0, 1, 0), (1, 0, 0), (1, 1, 3), (1, 1, 5), (2, 1, 4)] {
