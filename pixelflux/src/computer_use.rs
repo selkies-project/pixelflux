@@ -157,23 +157,52 @@ pub enum ScreenshotPixelFormat {
     Bgrx,
 }
 
-/// An owned copy of one rendered output, independent of the streaming buffer pool.
+pub enum ScreenshotPixels {
+    Owned(Vec<u8>),
+    SharedRgba(Arc<Vec<u8>>),
+}
+
+impl From<Vec<u8>> for ScreenshotPixels {
+    fn from(pixels: Vec<u8>) -> Self {
+        Self::Owned(pixels)
+    }
+}
+
+impl AsRef<[u8]> for ScreenshotPixels {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(pixels) => pixels,
+            Self::SharedRgba(pixels) => pixels,
+        }
+    }
+}
+
+/// Owned pixels of one rendered output, independent of the streaming buffer pool.
 /// Channel conversion and PNG compression run in the requesting thread.
 pub struct ScreenshotFrame {
-    pub pixels: Vec<u8>,
+    pub pixels: ScreenshotPixels,
     pub width: u32,
     pub height: u32,
     pub format: ScreenshotPixelFormat,
 }
 
 impl ScreenshotFrame {
-    pub(crate) fn encode_png(mut self) -> Result<Vec<u8>, String> {
+    pub(crate) fn encode_png(self) -> Result<Vec<u8>, String> {
         let expected = (self.width as usize)
             .checked_mul(self.height as usize)
             .and_then(|n| n.checked_mul(4));
-        if self.width == 0 || self.height == 0 || expected != Some(self.pixels.len()) {
+        if self.width == 0 || self.height == 0 || expected != Some(self.pixels.as_ref().len()) {
             return Err("Screenshot render produced an invalid framebuffer".to_string());
         }
+        let mut pixels = match self.pixels {
+            ScreenshotPixels::Owned(pixels) => pixels,
+            ScreenshotPixels::SharedRgba(pixels) => {
+                if self.format != ScreenshotPixelFormat::Rgba {
+                    return Err("Shared screenshot pixels must be RGBA".to_string());
+                }
+                return encode_png_rgba(&pixels, self.width, self.height);
+            }
+        };
         let swap = matches!(
             self.format,
             ScreenshotPixelFormat::Bgra | ScreenshotPixelFormat::Bgrx
@@ -183,7 +212,7 @@ impl ScreenshotFrame {
             ScreenshotPixelFormat::Rgbx | ScreenshotPixelFormat::Bgrx
         );
         if swap || opaque {
-            for px in self.pixels.as_chunks_mut::<4>().0 {
+            for px in pixels.as_chunks_mut::<4>().0 {
                 if swap {
                     px.swap(0, 2);
                 }
@@ -192,7 +221,7 @@ impl ScreenshotFrame {
                 }
             }
         }
-        encode_png_rgba(&self.pixels, self.width, self.height)
+        encode_png_rgba(&pixels, self.width, self.height)
     }
 }
 
@@ -1580,7 +1609,7 @@ mod record_path_tests {
 mod tests {
     use super::{
         ScreenshotAdmission, ScreenshotFrame, ScreenshotOptions, ScreenshotPixelFormat,
-        cu_listeners, encode_png_rgb16, encode_png_rgba,
+        ScreenshotPixels, cu_listeners, encode_png_rgb16, encode_png_rgba,
     };
     use std::io::Cursor;
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -1666,7 +1695,7 @@ mod tests {
                 }
             }
             let png = ScreenshotFrame {
-                pixels,
+                pixels: pixels.into(),
                 width: 17,
                 height: 11,
                 format,
@@ -1691,7 +1720,7 @@ mod tests {
         ] {
             assert!(
                 ScreenshotFrame {
-                    pixels: vec![0; len],
+                    pixels: vec![0; len].into(),
                     width,
                     height,
                     format: ScreenshotPixelFormat::Rgba,
@@ -1712,7 +1741,7 @@ mod tests {
                 }
             }
             let png = ScreenshotFrame {
-                pixels,
+                pixels: pixels.into(),
                 width: 3,
                 height: 1,
                 format,
@@ -1725,6 +1754,46 @@ mod tests {
                 [11, 22, 33, 255, 44, 55, 66, 255, 77, 88, 99, 255]
             );
         }
+    }
+
+    #[test]
+    fn shared_rgba_encodes_without_conversion_or_mutation() {
+        let pixels = Arc::new(vec![11, 22, 33, 0, 44, 55, 66, 128]);
+        let original_pointer = pixels.as_ptr();
+        let expected = encode_png_rgba(&pixels, 2, 1).unwrap();
+        for _ in 0..2 {
+            let frame = ScreenshotFrame {
+                pixels: ScreenshotPixels::SharedRgba(Arc::clone(&pixels)),
+                width: 2,
+                height: 1,
+                format: ScreenshotPixelFormat::Rgba,
+            };
+            assert_eq!(frame.pixels.as_ref().as_ptr(), original_pointer);
+            assert_eq!(frame.encode_png().unwrap(), expected);
+            assert_eq!(pixels.as_slice(), &[11, 22, 33, 0, 44, 55, 66, 128]);
+        }
+        assert_eq!(Arc::strong_count(&pixels), 1);
+        for format in [
+            ScreenshotPixelFormat::Bgra,
+            ScreenshotPixelFormat::Rgbx,
+            ScreenshotPixelFormat::Bgrx,
+        ] {
+            let frame = ScreenshotFrame {
+                pixels: ScreenshotPixels::SharedRgba(Arc::clone(&pixels)),
+                width: 2,
+                height: 1,
+                format,
+            };
+            assert!(frame.encode_png().unwrap_err().contains("must be RGBA"));
+            assert_eq!(pixels.as_slice(), &[11, 22, 33, 0, 44, 55, 66, 128]);
+        }
+        let invalid = ScreenshotFrame {
+            pixels: ScreenshotPixels::SharedRgba(pixels),
+            width: 3,
+            height: 1,
+            format: ScreenshotPixelFormat::Rgba,
+        };
+        assert!(invalid.encode_png().is_err());
     }
 
     #[test]

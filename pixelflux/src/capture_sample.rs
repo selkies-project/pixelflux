@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::computer_use::{ScreenshotFrame, ScreenshotPixelFormat};
+use crate::computer_use::{ScreenshotFrame, ScreenshotPixelFormat, ScreenshotPixels};
 use crate::encoders::sample::SampleStamp;
 
 thread_local! {
@@ -259,8 +259,34 @@ impl CaptureSamples {
             for row in pixels.chunks(stride).take(height as usize) {
                 owned.extend_from_slice(&row[..row_bytes]);
             }
-            Ok(owned)
+            Ok(owned.into())
         });
+    }
+
+    /// Share one admitted RGBA copy with a legacy response from the same render.
+    /// The raw budget still covers the active response; legacy admission is independent.
+    pub fn share_rgba_requested(
+        &self,
+        stamp: SampleStamp,
+        pixels: &[u8],
+        size: (u32, u32),
+        layout: SampleLayout,
+    ) -> Option<ScreenshotFrame> {
+        let mut legacy = None;
+        self.fulfill_requested(stamp, size, ScreenshotPixelFormat::Rgba, layout, |bytes| {
+            let pixels = pixels
+                .get(..bytes)
+                .ok_or("Capture snapshot invalid buffer")?;
+            let pixels = Arc::new(pixels.to_vec());
+            legacy = Some(ScreenshotFrame {
+                pixels: ScreenshotPixels::SharedRgba(Arc::clone(&pixels)),
+                width: size.0,
+                height: size.1,
+                format: ScreenshotPixelFormat::Rgba,
+            });
+            Ok(ScreenshotPixels::SharedRgba(pixels))
+        });
+        legacy
     }
 
     /// Fill an admitted snapshot directly without retaining a streaming buffer.
@@ -275,7 +301,7 @@ impl CaptureSamples {
         self.fulfill_requested(stamp, size, format, layout, |bytes| {
             let mut pixels = vec![0; bytes];
             fill(&mut pixels)?;
-            Ok(pixels)
+            Ok(pixels.into())
         });
     }
 
@@ -285,7 +311,7 @@ impl CaptureSamples {
         size: (u32, u32),
         format: ScreenshotPixelFormat,
         layout: SampleLayout,
-        pixels: impl FnOnce(usize) -> Result<Vec<u8>, String>,
+        pixels: impl FnOnce(usize) -> Result<ScreenshotPixels, String>,
     ) {
         if !self.has_pending() {
             return;
@@ -509,6 +535,166 @@ mod tests {
         assert_eq!(decoded.as_raw(), &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
         assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shared_rgba_has_one_copy_and_independent_response_lifetimes() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        let sample = run.next(123).unwrap();
+        let mut source = [1, 2, 3, 255, 4, 5, 6, 127];
+        let legacy = run
+            .share_rgba_requested(sample, &source, (2, 1), layout())
+            .unwrap();
+        let ScreenshotPixels::SharedRgba(legacy_pixels) = &legacy.pixels else {
+            panic!("expected shared pixels")
+        };
+        let weak = Arc::downgrade(legacy_pixels);
+        assert_eq!(weak.strong_count(), 2);
+        assert_ne!(legacy_pixels.as_ptr(), source.as_ptr());
+        source.fill(0);
+        let result = ticket
+            .finish_with(|frame| {
+                let ScreenshotPixels::SharedRgba(active_pixels) = &frame.pixels else {
+                    panic!("expected shared pixels")
+                };
+                assert!(Arc::ptr_eq(active_pixels, legacy_pixels));
+                assert_eq!(RAW_BYTES.load(Ordering::Acquire), 8);
+                assert!(run.begin(run.run_id, Duration::from_secs(1)).is_err());
+                frame.encode_png()
+            })
+            .unwrap();
+        assert_eq!(result.stamp, sample);
+        assert_eq!(result.layout.x, 120);
+        assert_eq!(weak.strong_count(), 1);
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        let next = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        drop(next);
+        assert_eq!(legacy.encode_png().unwrap(), result.png);
+        assert!(weak.upgrade().is_none());
+        let decoded = image::load_from_memory(&result.png).unwrap().to_rgba8();
+        assert_eq!(decoded.as_raw(), &[1, 2, 3, 255, 4, 5, 6, 127]);
+    }
+
+    #[test]
+    fn shared_legacy_survives_active_cancel_stop_timeout_and_encode_error() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        for failure in ["cancel", "inactive", "timed out", "encode failed"] {
+            let run = active();
+            let mut ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+            let legacy = run
+                .share_rgba_requested(run.next(1).unwrap(), &[1, 2, 3, 4], (1, 1), layout())
+                .unwrap();
+            match failure {
+                "cancel" => drop(ticket),
+                "encode failed" => {
+                    assert_eq!(
+                        ticket.finish_with(|_| Err(failure.into())).err().unwrap(),
+                        failure
+                    );
+                }
+                _ => {
+                    if failure == "inactive" {
+                        run.stop();
+                    } else {
+                        ticket.deadline = Instant::now();
+                    }
+                    assert!(ticket.finish().err().unwrap().contains(failure));
+                }
+            }
+            assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+            assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+            let png = legacy.encode_png().unwrap();
+            let decoded = image::load_from_memory(&png).unwrap().to_rgba8();
+            assert_eq!(decoded.as_raw(), &[1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn shared_active_survives_legacy_drop_and_keeps_outputs_separate() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let first = active();
+        let second = active();
+        let a = first.begin(first.run_id, Duration::from_secs(1)).unwrap();
+        let b = second.begin(second.run_id, Duration::from_secs(1)).unwrap();
+        let stamp_a = first.next(1).unwrap();
+        let stamp_b = second.next(2).unwrap();
+        let legacy_a = first
+            .share_rgba_requested(stamp_a, &[1, 2, 3, 4], (1, 1), layout())
+            .unwrap();
+        let legacy_b = second
+            .share_rgba_requested(stamp_b, &[5, 6, 7, 8], (1, 1), layout())
+            .unwrap();
+        assert_ne!(
+            legacy_a.pixels.as_ref().as_ptr(),
+            legacy_b.pixels.as_ref().as_ptr()
+        );
+        drop((legacy_a, legacy_b));
+        for (ticket, stamp, expected) in [(a, stamp_a, [1, 2, 3, 4]), (b, stamp_b, [5, 6, 7, 8])] {
+            let result = ticket.finish().unwrap();
+            assert_eq!(result.stamp, stamp);
+            let decoded = image::load_from_memory(&result.png).unwrap().to_rgba8();
+            assert_eq!(decoded.as_raw(), &expected);
+        }
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shared_rgba_does_not_copy_unadmitted_invalid_or_old_samples() {
+        let _serial = ADMISSION_TEST.lock().unwrap();
+        let run = active();
+        let old = run.next(1).unwrap();
+        assert!(
+            run.share_rgba_requested(old, &[], (1, 1), layout())
+                .is_none()
+        );
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        assert!(
+            run.share_rgba_requested(old, &[], (1, 1), layout())
+                .is_none()
+        );
+        assert!(run.has_pending());
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+        let sample = run.next(2).unwrap();
+        let legacy = run
+            .share_rgba_requested(sample, &[1; 4], (1, 1), layout())
+            .unwrap();
+        assert_eq!(ticket.finish().unwrap().stamp, sample);
+        drop(legacy);
+        for error in ["canceled", "timed out", "stale", "invalid buffer"] {
+            let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+            let mut sample = run.next(3).unwrap();
+            match error {
+                "canceled" => ticket.canceled.store(true, Ordering::Release),
+                "timed out" => {
+                    run.request.lock().unwrap().as_mut().unwrap().deadline = Instant::now();
+                }
+                "stale" => sample.run_id = active().run_id,
+                _ => {}
+            }
+            assert!(
+                run.share_rgba_requested(sample, &[], (1, 1), layout())
+                    .is_none()
+            );
+            assert!(ticket.finish().err().unwrap().contains(error));
+            assert!(!run.has_pending());
+            assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
+            assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        }
+        let ticket = run.begin(run.run_id, Duration::from_secs(1)).unwrap();
+        let budget = RawBudget::acquire(MAX_RAW_BYTES).unwrap();
+        assert!(
+            run.share_rgba_requested(run.next(4).unwrap(), &[], (1, 1), layout())
+                .is_none()
+        );
+        assert!(ticket.finish().err().unwrap().contains("raw byte budget"));
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), MAX_RAW_BYTES);
+        assert_eq!(REQUESTS.load(Ordering::Acquire), 0);
+        drop(budget);
+        assert_eq!(RAW_BYTES.load(Ordering::Acquire), 0);
     }
 
     #[test]

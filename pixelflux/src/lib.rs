@@ -3186,7 +3186,7 @@ fn screenshot_frame(
         .ok_or_else(|| "Screenshot readback produced incomplete pixels".to_string())?
         .to_vec();
     Ok(computer_use::ScreenshotFrame {
-        pixels,
+        pixels: pixels.into(),
         width: width as u32,
         height: height as u32,
         format,
@@ -3247,7 +3247,7 @@ mod screenshot_frame_tests {
         let mut source = vec![1, 2, 3, 4, 5, 6, 7, 8, 99, 99, 99, 99];
         let frame = screenshot_frame(&source, 2, 1, ScreenshotPixelFormat::Bgra).unwrap();
         source.fill(0);
-        assert_eq!(frame.pixels, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(frame.pixels.as_ref(), [1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!((frame.width, frame.height), (2, 1));
         assert!(matches!(frame.format, ScreenshotPixelFormat::Bgra));
     }
@@ -4601,6 +4601,7 @@ fn render_node_tick(
     {
         pool.cancel(id, buf);
     }
+    let mut shared_legacy_frame = None;
     if let Some(mut target) = deferred_screenshot {
         state.pending_screenshots.prune(Instant::now());
         let legacy_pending = force_legacy_screenshot && state.pending_screenshots.contains(node.id);
@@ -4637,6 +4638,20 @@ fn render_node_tick(
                         true,
                     )
                 })());
+                if take_capture_snapshot
+                    && screenshot_format == computer_use::ScreenshotPixelFormat::Rgba
+                    && screenshot_result.as_ref().is_some_and(Result::is_ok)
+                    && let Some(sample) = sample
+                    && let Some(cap) = node.capture.as_ref()
+                {
+                    shared_legacy_frame = cap.report.samples.share_rgba_requested(
+                        sample,
+                        &node.frame_buffer,
+                        (width as u32, height as u32),
+                        snapshot_layout,
+                    );
+                    capture_snapshot_serviced = true;
+                }
             }
         } else {
             screenshot_result = Some(Err("Screenshot renderer unavailable".to_string()));
@@ -4677,7 +4692,11 @@ fn render_node_tick(
                 if !render_success {
                     return Err("Screenshot render failed".to_string());
                 }
-                screenshot_frame(&node.frame_buffer, width, height, screenshot_format)
+                if let Some(frame) = shared_legacy_frame {
+                    Ok(frame)
+                } else {
+                    screenshot_frame(&node.frame_buffer, width, height, screenshot_format)
+                }
             });
         let result = if request.canceled.load(Ordering::Acquire) {
             Err("Screenshot canceled".to_string())
