@@ -702,7 +702,8 @@ fn refresh_quality(settings: &RustCaptureSettings, encoder: EncoderQuality, spen
 ///    band a frame at the paint-over quantizer where the encoder holds one (`FIRST_BAND`,
 ///    `BAND_BUDGETS`) until the sweep has covered it or motion ends it, else one held frame at
 ///    `held_refresh_quality`. The bands are sized to the rate the path carries (`cleanup_rate`) and kept to
-///    it, one past its budget waited out before the next, and each cleanup frame, the rate
+///    it, as the rate control's frames are outside Turbo, one past its budget waited out before the
+///    next, and each cleanup frame, the rate
 ///    control's and the sweep's, is held to its cap: the encoder takes one back that comes out
 ///    past it and codes it again, a band in a shorter one and the rate control's frame refining
 ///    nothing (`FrameEncoder::cap`). At 8 fps and 500 kbps NVENC's rate control refines a 1080p
@@ -880,6 +881,7 @@ pub fn decide_hw_fullframe(
         }
         if converges && cleanup != Cleanup::None && !d.force_idr {
             d.cap = Some(cleanup_cap(settings));
+            st.cleanup_paced = true;
         }
         if converges && (cleanup != Cleanup::None || (burst > 0 && recovery_idr)) {
             if (st.h264_burst_frames_remaining <= 0 && !st.settled) || recovery_idr {
@@ -910,17 +912,44 @@ pub fn decide_hw_fullframe(
         }
         return d;
     }
-    if let Some((mut from, mut size)) = st.sweep {
-        // A band the encoder took back for coming out past its cap covered only so far.
-        if let Some(end) = encoder.refit.filter(|&end| end > 0.0 && end < from) {
-            size -= from - end;
-            from = end;
+    // A band the encoder took back for coming out past its cap covered only so far.
+    if let Some((from, size)) = st.sweep.as_mut()
+        && let Some(end) = encoder.refit.filter(|&end| end > 0.0 && end < *from)
+    {
+        *size -= *from - end;
+        *from = end;
+    }
+    // A cleanup's frames, a sweep's bands and outside Turbo the rate control's, are kept to the
+    // cleanup's rate: a budget they ran past is waited out before the next, the wait counting
+    // toward the sweep's and the burst's time. At 0.1 Mbit/s NVENC's rate control codes a still
+    // 720p texture in 5 kB frames, 14 budgets, and a band sent right behind one ran past what
+    // WebRTC's sender lets through, which dropped it.
+    let pace = frame_budget(cleanup_rate(settings), settings.target_fps);
+    let last = if st.sweep.is_some() {
+        encoder.band
+    } else {
+        encoder.bytes
+    };
+    let spent = if std::mem::take(&mut st.cleanup_paced) {
+        last.unwrap_or(0)
+    } else {
+        0
+    };
+    st.cleanup_debt = (st.cleanup_debt + spent as f64 - pace).max(0.0);
+    let bursting =
+        converges && st.h264_burst_frames_remaining > 0 && !settings.video_streaming_mode;
+    if (st.sweep.is_some() || bursting) && st.cleanup_debt >= pace {
+        if st.sweep.is_some() {
+            st.sweep_frames = st.sweep_frames.saturating_add(1);
+        } else {
+            // The burst's last frame is left to end it.
+            st.h264_burst_frames_remaining = (st.h264_burst_frames_remaining - 1).max(1);
         }
-        // Bands are sized to the cleanup's rate and kept to it: a budget they ran past is waited
-        // out before the next.
-        let budget = frame_budget(cleanup_rate(settings), settings.target_fps);
+        d.send = settings.video_streaming_mode || is_animated;
+        return d;
+    }
+    if let Some((from, size)) = st.sweep {
         let held = std::mem::take(&mut st.sweep_held).then(|| encoder.band.unwrap_or(0));
-        st.sweep_debt = (st.sweep_debt + held.unwrap_or(0) as f64 - budget).max(0.0);
         // What the whole picture comes to at the refresh's quantizer by the bands so far, each at
         // what it came out, six steps coarser a halving.
         if let Some(bytes) = held.filter(|&b| b > 0 && size > 0.0) {
@@ -931,19 +960,13 @@ pub fn decide_hw_fullframe(
                 cost
             };
         }
-        if st.sweep_debt >= budget {
-            st.sweep = Some((from, size));
-            st.sweep_frames = st.sweep_frames.saturating_add(1);
-            d.send = settings.video_streaming_mode || is_animated;
-            return d;
-        }
-        let size = band_share(size, encoder.band, budget);
+        let size = band_share(size, encoder.band, pace);
         let to = (from + size).min(1.0);
         st.sweep_frames = st.sweep_frames.saturating_add(1);
         let left = (REFINE_S * settings.target_fps.max(1.0)).round() - st.sweep_frames as f64;
         let paced = encoder
             .band
-            .is_some_and(|b| b as f64 <= 2.0 * BAND_BUDGETS * budget);
+            .is_some_and(|b| b as f64 <= 2.0 * BAND_BUDGETS * pace);
         // The rest of the picture at that cost against the frames left: a step coarser where it
         // would run past them, a step finer where a step finer still ends well within them. At
         // 0.2 Mbit/s at 1080p a first band far past its budget had the bands after it, sized down
@@ -951,7 +974,7 @@ pub fn decide_hw_fullframe(
         // them to quantizer 43 and ended the sweep at 32.5 dB in 9 s of a 30 s window.
         if paced && st.sweep_cost > 0.0 {
             let frames = |coarser: u32| {
-                (1.0 - to) * st.sweep_cost * 0.5f64.powf(coarser as f64 / 6.0) / budget
+                (1.0 - to) * st.sweep_cost * 0.5f64.powf(coarser as f64 / 6.0) / pace
             };
             if frames(st.sweep_coarser) > left.max(1.0) {
                 st.sweep_coarser += 1;
@@ -968,6 +991,7 @@ pub fn decide_hw_fullframe(
         }
         st.sweep = (to < 1.0).then_some((to, size));
         st.sweep_held = true;
+        st.cleanup_paced = true;
         d.send = true;
         d.hold_qp = Some(q);
         d.hold_band = Some((from, to));
@@ -1099,6 +1123,7 @@ pub fn decide_hw_fullframe(
         }
         if converges {
             d.cap = Some(cleanup_cap(settings));
+            st.cleanup_paced = true;
         }
         return d;
     }
@@ -1114,9 +1139,10 @@ fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision, qp: u32) {
     st.sweep = Some((FIRST_BAND, FIRST_BAND));
     st.sweep_frames = 0;
     st.sweep_coarser = 0;
-    st.sweep_debt = 0.0;
+    st.cleanup_debt = 0.0;
     st.sweep_cost = 0.0;
     st.sweep_held = true;
+    st.cleanup_paced = true;
 }
 
 /// A refresh due on a session that sweeps it (`decide_hw_fullframe`'s `sweeps`): a sweep from the
@@ -2841,11 +2867,12 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         let trigger = s.paint_over_trigger_frames as usize;
-        let refresh = trigger;
+        let paid = |k: usize| (k as f64 * pinned.bytes.unwrap() as f64 / budget) as usize;
+        let refresh = paid(trigger);
         assert_eq!(
             sent,
-            (0..=refresh).collect::<Vec<_>>(),
-            "a trigger period through the rate control, then the refresh"
+            (0..=trigger).map(paid).collect::<Vec<_>>(),
+            "a trigger period through the rate control, each frame waited out, then the refresh"
         );
         assert_eq!(
             (still[refresh].hold_qp, still[refresh].hold_band),
@@ -2891,7 +2918,8 @@ mod tests {
             })
         };
         let trigger = s.paint_over_trigger_frames as usize;
-        assert_eq!(refresh(ReferenceReport::Withheld), Some(trigger));
+        let paid = (trigger as f64 * pinned.bytes.unwrap() as f64 / budget) as usize;
+        assert_eq!(refresh(ReferenceReport::Withheld), Some(paid));
         assert_eq!(refresh(ReferenceReport::Lost), None);
     }
 
@@ -3093,15 +3121,23 @@ mod tests {
             after.send && after.hold_qp.is_none(),
             "the burst through the rate control"
         );
-        let refit = decide_hw_fullframe(
-            &mut st,
-            &s,
-            2,
-            Damage::None,
-            false,
-            false,
-            rc(43, 7.5, Some(0.0)),
-        );
+        // The frame of 7.5 budgets is waited out first.
+        let (n, refit) = (2..)
+            .map(|i| {
+                let d = decide_hw_fullframe(
+                    &mut st,
+                    &s,
+                    i,
+                    Damage::None,
+                    false,
+                    false,
+                    rc(43, 7.5, Some(0.0)),
+                );
+                (i, d)
+            })
+            .find(|(_, d)| d.send)
+            .unwrap();
+        assert_eq!(n, 8);
         assert_eq!(
             (refit.hold_qp, refit.hold_band),
             (Some(18), Some((0.0, FIRST_BAND))),
@@ -3110,7 +3146,7 @@ mod tests {
         let band = decide_hw_fullframe(
             &mut st,
             &s,
-            3,
+            n + 1,
             Damage::None,
             false,
             false,
