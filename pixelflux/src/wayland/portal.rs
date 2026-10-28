@@ -13,8 +13,11 @@
 //! Every portal call that ends in a `Response` signal is made through [`PortalSession::request`],
 //! which subscribes to the request object the portal will answer on before calling, as the
 //! handle-token convention requires; a consent dialog the backend shows blocks that call until
-//! the user answers. Input notifications are fire-and-forget method calls, so an event never
-//! waits on the bus round trip. Each public call runs its async zbus calls to completion with
+//! the user answers. Input notifications go to an input thread of the session's own, so no
+//! caller waits on the bus round trip, and it makes each once the one before it is answered: the
+//! frontend handles every method call on a thread pool, so two in flight together reach the
+//! backend in either order (a click's release before its press, which leaves the button held).
+//! Each public call runs its async zbus calls to completion with
 //! [`zbus::block_on`] on the calling thread; between calls zbus drives the connection from a
 //! helper thread of its own, so a `Response` that lands meanwhile is queued for the stream that
 //! subscribed to it. A restore token the backend hands back is kept under the
@@ -26,6 +29,7 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{OnceLock, mpsc};
 
 use zbus::export::futures_core::Stream;
 use zbus::{Connection, OwnedObjectPath, OwnedVariant, Proxy, Variant};
@@ -46,6 +50,11 @@ const SOURCE_MONITOR: u32 = 1;
 const PERSIST_UNTIL_REVOKED: u32 = 2;
 
 type Options<'a> = HashMap<&'a str, Variant<'a>>;
+
+/// A `Notify*` method for the input thread, and the call that makes it.
+type NotifyCall<P = Proxy<'static>> = (&'static str, Box<dyn FnOnce(&P) + Send>);
+
+const MOTION_ABSOLUTE: &str = "NotifyPointerMotionAbsolute";
 
 /// One monitor stream the portal started: its PipeWire node and, where the backend says,
 /// its logical position and size in the compositor's coordinate space.
@@ -79,6 +88,8 @@ pub struct PortalSession {
     /// Whether dropping the session closes it on the portal: not while `open` still runs it
     /// inside its `zbus::block_on`, which a second one inside would panic on.
     armed: bool,
+    /// The input thread's queue, from the first `Notify*` call on.
+    notify_tx: OnceLock<mpsc::Sender<NotifyCall>>,
 }
 
 fn opt_u32(o: &mut Options<'_>, key: &'static str, v: u32) {
@@ -238,6 +249,7 @@ impl PortalSession {
             kde: false,
             mutter: false,
             armed: false,
+            notify_tx: OnceLock::new(),
         })
     }
 
@@ -466,28 +478,41 @@ impl PortalSession {
         Ok(fd.into())
     }
 
-    fn notify<B>(&self, method: &str, args: &B)
+    /// Queue a `Notify*` call for the input thread, started by the first.
+    fn notify<B>(&self, method: &'static str, args: B)
     where
-        B: serde::Serialize + zbus::DynamicType,
+        B: serde::Serialize + zbus::DynamicType + Send + 'static,
     {
-        if let Some(rd) = &self.remote {
-            let _ = zbus::block_on(rd.call_noreply(method, args));
-        }
+        let Some(rd) = &self.remote else { return };
+        let tx = self.notify_tx.get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            let rd = rd.clone();
+            let _ = std::thread::Builder::new()
+                .name("pf-portal-input".into())
+                .spawn(move || notify_loop(rd, rx));
+            tx
+        });
+        let _ = tx.send((
+            method,
+            Box::new(move |rd: &Proxy<'static>| {
+                let _ = zbus::block_on(rd.call_method(method, &args));
+            }),
+        ));
     }
 
     /// Absolute pointer motion in the logical coordinate space of the stream `node`, the `size`
     /// it announced: the portal frontend refuses a point outside that size.
     pub fn pointer_motion_abs(&self, node: u32, x: f64, y: f64) {
         self.notify(
-            "NotifyPointerMotionAbsolute",
-            &(self.session.clone(), Options::new(), node, x, y),
+            MOTION_ABSOLUTE,
+            (self.session.clone(), Options::new(), node, x, y),
         );
     }
 
     pub fn pointer_motion(&self, dx: f64, dy: f64) {
         self.notify(
             "NotifyPointerMotion",
-            &(self.session.clone(), Options::new(), dx, dy),
+            (self.session.clone(), Options::new(), dx, dy),
         );
     }
 
@@ -495,7 +520,7 @@ impl PortalSession {
     pub fn pointer_button(&self, button: i32, pressed: bool) {
         self.notify(
             "NotifyPointerButton",
-            &(self.session.clone(), Options::new(), button, pressed as u32),
+            (self.session.clone(), Options::new(), button, pressed as u32),
         );
     }
 
@@ -507,24 +532,21 @@ impl PortalSession {
         let mut options = Options::new();
         options.insert("finish", Variant::Bool(finish));
         let dy = if self.kde { -dy } else { dy };
-        self.notify(
-            "NotifyPointerAxis",
-            &(self.session.clone(), options, dx, dy),
-        );
+        self.notify("NotifyPointerAxis", (self.session.clone(), options, dx, dy));
     }
 
     /// Wheel steps: `axis` 0 vertical, 1 horizontal.
     pub fn pointer_axis_discrete(&self, axis: u32, steps: i32) {
         self.notify(
             "NotifyPointerAxisDiscrete",
-            &(self.session.clone(), Options::new(), axis, steps),
+            (self.session.clone(), Options::new(), axis, steps),
         );
     }
 
     pub fn keysym(&self, keysym: i32, pressed: bool) {
         self.notify(
             "NotifyKeyboardKeysym",
-            &(self.session.clone(), Options::new(), keysym, pressed as u32),
+            (self.session.clone(), Options::new(), keysym, pressed as u32),
         );
     }
 
@@ -532,7 +554,7 @@ impl PortalSession {
     pub fn keycode(&self, keycode: i32, pressed: bool) {
         self.notify(
             "NotifyKeyboardKeycode",
-            &(
+            (
                 self.session.clone(),
                 Options::new(),
                 keycode,
@@ -557,6 +579,22 @@ impl Drop for PortalSession {
     fn drop(&mut self) {
         if self.armed {
             zbus::block_on(self.close());
+        }
+    }
+}
+
+/// The input thread: each `Notify*` call once the one before it is answered, an absolute motion
+/// with another queued behind it left out; it ends with the session's queue.
+fn notify_loop<P>(rd: P, rx: mpsc::Receiver<NotifyCall<P>>) {
+    let mut next = rx.recv().ok();
+    while let Some((method, call)) = next.take() {
+        next = rx.try_recv().ok();
+        if method == MOTION_ABSOLUTE && next.as_ref().is_some_and(|(m, _)| *m == MOTION_ABSOLUTE) {
+            continue;
+        }
+        call(&rd);
+        if next.is_none() {
+            next = rx.recv().ok();
         }
     }
 }
@@ -636,6 +674,42 @@ mod tests {
         assert_eq!(
             request_path(":1.42", "pixelflux7_3"),
             "/org/freedesktop/portal/desktop/request/1_42/pixelflux7_3"
+        );
+    }
+
+    /// The input thread makes its calls in the order queued, an absolute motion with another
+    /// behind it left out, and ends once the session's queue is gone.
+    #[test]
+    fn notify_calls_keep_their_order_and_runs_of_motion_end_at_their_last() {
+        type Seen = std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>;
+        let (tx, rx) = mpsc::channel::<NotifyCall<Seen>>();
+        for (method, tag) in [
+            (MOTION_ABSOLUTE, "motion 1"),
+            (MOTION_ABSOLUTE, "motion 2"),
+            ("NotifyPointerButton", "press"),
+            ("NotifyPointerButton", "release"),
+            (MOTION_ABSOLUTE, "motion 3"),
+            ("NotifyPointerMotion", "relative 1"),
+            ("NotifyPointerMotion", "relative 2"),
+            (MOTION_ABSOLUTE, "motion 4"),
+        ] {
+            let call = move |seen: &Seen| seen.borrow_mut().push(tag);
+            tx.send((method, Box::new(call))).unwrap();
+        }
+        drop(tx);
+        let seen = Seen::default();
+        notify_loop(seen.clone(), rx);
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "motion 2",
+                "press",
+                "release",
+                "motion 3",
+                "relative 1",
+                "relative 2",
+                "motion 4"
+            ]
         );
     }
 }
