@@ -116,6 +116,10 @@ const LEVEL_S: f64 = 4.0;
 /// 12 Mbit/s link.
 const FIRST_BAND: f64 = 1.0 / 64.0;
 
+/// The least share of the picture a band covers. A band that small costs next to nothing, so a
+/// held frame of one that comes out past its budget is the rest of the frame's cost.
+const LEAST_BAND: f64 = 1.0 / 4096.0;
+
 /// The share of a sweep's frames left that the rest of the picture may take at a quantizer step
 /// finer before the sweep steps finer: room for the bands' cost to vary down the picture.
 const SWEEP_FINER_SHARE: f64 = 0.8;
@@ -513,7 +517,7 @@ fn band_share(size: f64, bytes: Option<usize>, budget: f64) -> f64 {
         Some(b) if b > 0 => (size * BAND_BUDGETS * budget / b as f64).clamp(size / 2.0, size * 2.0),
         _ => size,
     };
-    next.clamp(1.0 / 4096.0, 1.0)
+    next.clamp(LEAST_BAND, 1.0)
 }
 
 /// One frame of a cleanup that measures the picture it is refining, where the encoder can
@@ -954,11 +958,33 @@ pub fn decide_hw_fullframe(
         // what it came out, six steps coarser a halving.
         if let Some(bytes) = held.filter(|&b| b > 0 && size > 0.0) {
             let cost = bytes as f64 / size * 2f64.powf(st.sweep_coarser as f64 / 6.0);
+            if st.sweep_cost == 0.0 {
+                st.sweep_first = cost;
+            }
             st.sweep_cost = if st.sweep_cost > 0.0 {
                 (st.sweep_cost + cost) / 2.0
             } else {
                 cost
             };
+        }
+        // A least band whose frame still comes out past its budget, at more than twice what the
+        // band comes to at the first band's cost, pays for the rest of the frame: NVENC's HEVC
+        // codes a still 1080p texture in 2.8 kB frames whatever the band, five budgets at 0.25
+        // Mbit/s, and its sweep crawled on without end; at 720p and 0.5 Mbit/s it stepped coarser
+        // to the rate control's quantizer and ended at 8.9 levels. The rest of the picture is
+        // refreshed in one held frame instead, as a pinned rate control's is.
+        let band = st.sweep_first * size * 0.5f64.powf(st.sweep_coarser as f64 / 6.0);
+        if let Some(bytes) = held.filter(|&b| {
+            size <= LEAST_BAND && b as f64 > BAND_BUDGETS * pace && b as f64 > 2.0 * band
+        }) {
+            let target = frame_budget(settings.video_bitrate_kbps, settings.target_fps);
+            st.sweep = None;
+            d.send = true;
+            d.hold_qp = Some(refresh_quality(settings, encoder, bytes as f64 / target));
+            if converges {
+                d.cap = Some(cleanup_cap(settings));
+            }
+            return d;
         }
         let size = band_share(size, encoder.band, pace);
         let to = (from + size).min(1.0);
@@ -1141,6 +1167,7 @@ fn start_sweep(st: &mut StripeState, d: &mut HwFrameDecision, qp: u32) {
     st.sweep_coarser = 0;
     st.cleanup_debt = 0.0;
     st.sweep_cost = 0.0;
+    st.sweep_first = 0.0;
     st.sweep_held = true;
     st.cleanup_paced = true;
 }
@@ -3672,6 +3699,60 @@ mod tests {
             bands.iter().all(|b| b.2 <= pace + 1),
             "none past the pace: {counts:?}"
         );
+    }
+
+    /// A sweep whose frames stay past the budget at the least band, the rest of each frame costing
+    /// what the band does not, refreshes the rest of the picture in one held frame and ends.
+    #[test]
+    fn a_sweep_past_its_budget_at_the_least_band_is_refreshed_whole() {
+        let s = hw_settings();
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let idle = |held: usize| EncoderQuality {
+            last: Some(38),
+            bytes: Some(budget as usize / 10),
+            holds: true,
+            reopens: false,
+            keys: true,
+            band: Some(held),
+            measures: false,
+            psnr: None,
+            refit: None,
+            follows_cap: false,
+            finer: 0,
+            ends_on_key: false,
+        };
+        let floor = (3.0 * budget) as usize;
+        let mut st = StripeState::default();
+        decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, idle(0));
+        let mut bands = Vec::new();
+        let mut whole = None;
+        for i in 1..=600u16 {
+            let held = if bands.is_empty() { 0 } else { floor };
+            let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, idle(held));
+            match (d.hold_band, d.hold_qp) {
+                (Some((a, b)), Some(_)) => bands.push(b - a),
+                (None, Some(q)) if !bands.is_empty() => {
+                    whole = Some((i, q));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (at, q) = whole.expect("a whole held refresh");
+        assert!(
+            bands.len() <= 8 && bands.last().is_some_and(|&b| b <= 2.0 * LEAST_BAND),
+            "bands halved down to the least: {bands:?}"
+        );
+        assert!(
+            st.sweep.is_none() && q < 38,
+            "the sweep ends in a refresh at {q}"
+        );
+        let after = (at + 1..=at + 600)
+            .filter(|&i| {
+                decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, idle(floor)).send
+            })
+            .count();
+        assert_eq!(after, 0, "and nothing goes out after it");
     }
 
     /// A session that holds no quantizer and measures nothing, whose frames of a still screen keep

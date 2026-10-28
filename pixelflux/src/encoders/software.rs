@@ -1088,7 +1088,8 @@ impl H264EncoderWrapper {
 ///   full-frame refresh falls back to (`pipeline::decide_hw_fullframe`), `sweep_frames` its
 ///   bands so far, `sweep_coarser` the steps they are coded coarser than the refresh,
 ///   `sweep_held` whether the last frame was one of them, and `sweep_cost` the bytes the whole
-///   picture would come to at the refresh's quantizer, by its bands so far; `cleanup_debt` is the
+///   picture would come to at the refresh's quantizer, by its bands so far (`sweep_first`, by its
+///   first); `cleanup_debt` is the
 ///   bytes a cleanup's frames, the rate control's and the bands, came to past the cleanup's
 ///   budget a frame, which it waits out (`cleanup_paced`: the last frame was one of them).
 /// - **Content-hash damage** (only for sources without external damage, i.e. X11): `last_hash` is
@@ -1126,6 +1127,7 @@ pub struct StripeState {
     pub sweep_frames: u32,
     pub sweep_coarser: u32,
     pub sweep_cost: f64,
+    pub sweep_first: f64,
     pub sweep_held: bool,
     pub cleanup_debt: f64,
     pub cleanup_paced: bool,
