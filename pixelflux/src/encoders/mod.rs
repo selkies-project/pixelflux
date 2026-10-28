@@ -1489,7 +1489,11 @@ impl FrameEncoder {
                 enc.acknowledge_reference(id, false);
                 true
             }
-            (enc, reference::ReferenceReport::Lost(frame_id)) => enc.invalidate_reference(frame_id),
+            (
+                enc,
+                reference::ReferenceReport::Lost(frame_id)
+                | reference::ReferenceReport::Withheld(frame_id),
+            ) => enc.invalidate_reference(frame_id),
             _ => true,
         }
     }

@@ -898,11 +898,13 @@ pub enum ThreadCommand {
     RequestIdr {
         display_id: u32,
     },
-    /// A client lost frame `frame_id` of one display's capture: the frames after it stop
-    /// predicting from it, so the next one decodes without a keyframe.
+    /// A client lost frame `frame_id` of one display's capture, or its sender withheld it
+    /// (`withheld`): the frames after it stop predicting from it, so the next one decodes without a
+    /// keyframe.
     InvalidateReference {
         display_id: u32,
         frame_id: u16,
+        withheld: bool,
     },
     /// Every client holds frame `frame_id` of one display's capture, or where not `held` was
     /// sent it.
@@ -1564,15 +1566,15 @@ fn wayland_encode_loop(pool: &WlFramePool, cfg: WlEncodeConfig) -> Option<FrameE
         // torn down is already gone, and its last frames are not recorded.
         let recording_sink = cfg.recording_sink.as_ref().and_then(|w| w.upgrade());
         for report in std::mem::take(&mut *cfg.controls.reference_reports.lock().unwrap()) {
-            if let encoders::reference::ReferenceReport::Lost(_) = report {
-                hw_state.lost_frame();
-                stripes.iter_mut().for_each(StripeState::lost_frame);
-            }
+            hw_state.take_report(report);
+            stripes.iter_mut().for_each(|st| st.take_report(report));
             let taken = match (video_encoder.as_mut(), report) {
                 (Some(encoder), report) => encoder.take_report(report),
-                (None, encoders::reference::ReferenceReport::Lost(frame_id)) => {
-                    encoders::software::invalidate_reference(&mut stripes, frame_id)
-                }
+                (
+                    None,
+                    encoders::reference::ReferenceReport::Lost(frame_id)
+                    | encoders::reference::ReferenceReport::Withheld(frame_id),
+                ) => encoders::software::invalidate_reference(&mut stripes, frame_id),
                 (None, encoders::reference::ReferenceReport::Held(frame_id)) => {
                     encoders::software::acknowledge_reference(&mut stripes, frame_id, true);
                     true
@@ -6778,11 +6780,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             ThreadCommand::InvalidateReference {
                 display_id,
                 frame_id,
+                withheld,
             } => {
                 if let Some(idx) = state.node_idx_for_id(display_id)
                     && let Some(cap) = state.output_nodes[idx].capture.as_mut()
                 {
-                    cap.invalidate_reference(frame_id);
+                    cap.invalidate_reference(frame_id, withheld);
                 }
             }
             ThreadCommand::AcknowledgeReference {
@@ -7896,14 +7899,16 @@ impl WaylandBackend {
         Ok(())
     }
 
-    /// A client lost frame `frame_id` of the given display's capture: the frames after it stop
-    /// predicting from it, so the next one decodes there without a keyframe. An encoder that
-    /// cannot leave a frame out codes a keyframe instead.
-    #[pyo3(signature = (frame_id, display_id = 0))]
-    fn invalidate_reference(&self, frame_id: u16, display_id: u32) -> PyResult<()> {
+    /// A client lost frame `frame_id` of the given display's capture, or its sender withheld it to
+    /// hold the stream to a rate (`withheld`): the frames after it stop predicting from it, so the
+    /// next one decodes there without a keyframe. An encoder that cannot leave a frame out codes a
+    /// keyframe instead.
+    #[pyo3(signature = (frame_id, display_id = 0, withheld = false))]
+    fn invalidate_reference(&self, frame_id: u16, display_id: u32, withheld: bool) -> PyResult<()> {
         self.send(ThreadCommand::InvalidateReference {
             display_id,
             frame_id,
+            withheld,
         })
         .map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
@@ -8743,7 +8748,12 @@ impl ScreenCapture {
                 {
                     let be = be.bind(py).borrow();
                     let _ = match report {
-                        ReferenceReport::Lost(frame_id) => be.invalidate_reference(frame_id, did),
+                        ReferenceReport::Lost(frame_id) => {
+                            be.invalidate_reference(frame_id, did, false)
+                        }
+                        ReferenceReport::Withheld(frame_id) => {
+                            be.invalidate_reference(frame_id, did, true)
+                        }
                         ReferenceReport::Held(frame_id) => {
                             be.acknowledge_reference(frame_id, did, true)
                         }
@@ -9284,11 +9294,19 @@ impl ScreenCapture {
         Ok(())
     }
 
-    /// A client lost frame `frame_id`: the frames after it stop predicting from it, so the next
-    /// one decodes there without a keyframe. An encoder that cannot leave a frame out of its
-    /// predictions codes a keyframe instead. Non-blocking, like `request_idr_frame`.
-    fn invalidate_reference(&self, py: Python<'_>, frame_id: u16) -> PyResult<()> {
-        self.hand_report(py, encoders::reference::ReferenceReport::Lost(frame_id));
+    /// A client lost frame `frame_id`, or its sender withheld it to hold the stream to a rate
+    /// (`withheld`): the frames after it stop predicting from it, so the next one decodes there
+    /// without a keyframe. An encoder that cannot leave a frame out of its predictions codes a
+    /// keyframe instead. Non-blocking, like `request_idr_frame`.
+    #[pyo3(signature = (frame_id, withheld = false))]
+    fn invalidate_reference(&self, py: Python<'_>, frame_id: u16, withheld: bool) -> PyResult<()> {
+        use encoders::reference::ReferenceReport;
+        let report = if withheld {
+            ReferenceReport::Withheld(frame_id)
+        } else {
+            ReferenceReport::Lost(frame_id)
+        };
+        self.hand_report(py, report);
         Ok(())
     }
 

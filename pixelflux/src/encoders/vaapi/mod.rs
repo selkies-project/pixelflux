@@ -1674,7 +1674,9 @@ impl VaapiEncoder {
     /// one of them holds or was sent (`ReferenceWindow::acknowledge`, `ReferenceSlots::acknowledge`).
     pub fn take_report(&mut self, report: ReferenceReport) -> bool {
         let (frame_id, held) = match report {
-            ReferenceReport::Lost(frame_id) => return self.invalidate_reference(frame_id),
+            ReferenceReport::Lost(frame_id) | ReferenceReport::Withheld(frame_id) => {
+                return self.invalidate_reference(frame_id);
+            }
             ReferenceReport::Held(frame_id) => (frame_id, true),
             ReferenceReport::Sent(frame_id) => (frame_id, false),
         };

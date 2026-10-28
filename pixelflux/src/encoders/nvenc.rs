@@ -3128,7 +3128,7 @@ impl NvencEncoder {
     /// frame is coded instead.
     pub fn take_report(&mut self, report: ReferenceReport) -> bool {
         match report {
-            ReferenceReport::Lost(frame_id) => {
+            ReferenceReport::Lost(frame_id) | ReferenceReport::Withheld(frame_id) => {
                 // The cleanup starts again for a loss (`StripeState::lost_frame`).
                 self.band_log.clear();
                 self.invalidate_reference(frame_id)

@@ -59,6 +59,9 @@ pub enum ReferenceReport {
     Held(u16),
     /// Every consumer was sent the frame, which one may yet lose (`ReferenceWindow::acknowledge`).
     Sent(u16),
+    /// The consumers' sender let the frame go unsent to hold the stream to a rate, as it was handed
+    /// over (`invalidate_reference(withheld=True)`): lost to every consumer.
+    Withheld(u16),
 }
 
 /// The frame a delivered frame predicts from.

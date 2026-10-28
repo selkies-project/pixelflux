@@ -249,10 +249,16 @@ impl WlCapture {
     }
 
     /// Leave frame `frame_id` and every frame after it out of the predictions, for a client that
-    /// lost it: handed to the encode thread where one runs, applied to the calloop's own session
-    /// otherwise. An encoder that cannot codes a keyframe instead.
-    pub fn invalidate_reference(&mut self, frame_id: u16) {
-        self.take_report(crate::encoders::reference::ReferenceReport::Lost(frame_id));
+    /// lost it or a sender that withheld it (`withheld`): handed to the encode thread where one
+    /// runs, applied to the calloop's own session otherwise. An encoder that cannot codes a
+    /// keyframe instead.
+    pub fn invalidate_reference(&mut self, frame_id: u16, withheld: bool) {
+        use crate::encoders::reference::ReferenceReport;
+        self.take_report(if withheld {
+            ReferenceReport::Withheld(frame_id)
+        } else {
+            ReferenceReport::Lost(frame_id)
+        });
     }
 
     /// Note that every consumer holds frame `frame_id`, or where not `held` was sent it
@@ -267,9 +273,7 @@ impl WlCapture {
     }
 
     fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
-        if let crate::encoders::reference::ReferenceReport::Lost(_) = report {
-            self.vaapi_state.lost_frame();
-        }
+        self.vaapi_state.take_report(report);
         if self.encode_pool.is_some() {
             self.encode_controls
                 .reference_reports

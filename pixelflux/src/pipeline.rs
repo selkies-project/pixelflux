@@ -272,6 +272,28 @@ impl StripeState {
             }
         }
     }
+
+    /// A frame of this region's stream was withheld (`ReferenceReport::Withheld`). A cleanup
+    /// running through the rate control codes past it, its next frames predicting from what the
+    /// consumers hold; one that ended or sweeps is due again as after a loss. Started over at each
+    /// drop of a rate budget, NVENC's cleanup of a texture at 0.1 Mbit/s never reached the one
+    /// held frame that ends it.
+    pub fn withheld_frame(&mut self) {
+        if self.h264_burst_frames_remaining <= 0 || self.sweep.is_some() {
+            self.lost_frame();
+        }
+    }
+
+    /// What a report of the consumers does to this region's cleanup (`lost_frame`,
+    /// `withheld_frame`).
+    pub fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
+        use crate::encoders::reference::ReferenceReport;
+        match report {
+            ReferenceReport::Lost(_) => self.lost_frame(),
+            ReferenceReport::Withheld(_) => self.withheld_frame(),
+            ReferenceReport::Held(_) | ReferenceReport::Sent(_) => {}
+        }
+    }
 }
 
 /// The share of a region's recent frames that carried more than a small change, `motion` taking
@@ -1585,13 +1607,13 @@ impl X11Pipeline {
     /// every frame after it out of the predictions, a key frame where the encoder cannot.
     pub fn take_report(&mut self, report: crate::encoders::reference::ReferenceReport) {
         use crate::encoders::reference::ReferenceReport;
-        if let ReferenceReport::Lost(_) = report {
-            self.hw_state.lost_frame();
-            self.stripes.iter_mut().for_each(StripeState::lost_frame);
-        }
+        self.hw_state.take_report(report);
+        self.stripes
+            .iter_mut()
+            .for_each(|st| st.take_report(report));
         let taken = match (self.hw.as_mut(), report) {
             (Some(enc), report) => enc.take_report(report),
-            (None, ReferenceReport::Lost(frame_id)) => {
+            (None, ReferenceReport::Lost(frame_id) | ReferenceReport::Withheld(frame_id)) => {
                 invalidate_reference(&mut self.stripes, frame_id)
             }
             (None, ReferenceReport::Held(frame_id)) => {
@@ -2830,6 +2852,47 @@ mod tests {
             (Some(40), None),
             "frames of 16 budgets leave 11 steps of the 35 a second buys"
         );
+    }
+
+    /// That rate control's frames withheld by a sender as they go out are coded past: the refresh
+    /// comes after the same trigger period. Taken as losses, each started the cleanup over and the
+    /// refresh never came.
+    #[test]
+    fn a_pinned_rate_control_withheld_is_refreshed_all_the_same() {
+        use crate::encoders::reference::ReferenceReport;
+        let s = RustCaptureSettings {
+            video_bitrate_kbps: 100,
+            ..hw_settings()
+        };
+        let budget = frame_budget(s.video_bitrate_kbps, s.target_fps);
+        let pinned = EncoderQuality {
+            last: Some(51),
+            bytes: Some((budget * 16.0) as usize),
+            holds: true,
+            reopens: false,
+            keys: true,
+            band: Some(0),
+            measures: false,
+            psnr: None,
+            refit: None,
+            follows_cap: false,
+            finer: 0,
+            ends_on_key: false,
+        };
+        let refresh = |report: fn(u16) -> ReferenceReport| {
+            let mut st = StripeState::default();
+            decide_hw_fullframe(&mut st, &s, 0, Damage::Area(1.0), false, false, pinned);
+            (1..=200).position(|i| {
+                let d = decide_hw_fullframe(&mut st, &s, i, Damage::None, false, false, pinned);
+                if d.send && d.hold_qp.is_none() {
+                    st.take_report(report(i));
+                }
+                d.hold_qp.is_some()
+            })
+        };
+        let trigger = s.paint_over_trigger_frames as usize;
+        assert_eq!(refresh(ReferenceReport::Withheld), Some(trigger));
+        assert_eq!(refresh(ReferenceReport::Lost), None);
     }
 
     /// A key frame asked for on a still screen with nothing for a cleanup to improve (the session
