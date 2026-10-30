@@ -339,6 +339,11 @@ impl Arm {
         };
         let t = self.tiles;
 
+        let render_size = |w: &mut BitWriter| {
+            w.flag(true);
+            w.u(16, (n.width - 1) as u64);
+            w.u(16, (n.height - 1) as u64);
+        };
         let mut w = BitWriter::new();
         w.flag(false);
         w.u(2, if frame.key { 0 } else { 1 });
@@ -356,13 +361,13 @@ impl Arm {
             for _ in 0..7 {
                 w.u(3, reference_slot.unwrap() as u64);
             }
-            w.flag(false);
+            render_size(&mut w);
             w.flag(false);
             w.flag(false);
             w.u(2, 0);
             w.flag(false);
         } else {
-            w.flag(false);
+            render_size(&mut w);
         }
         w.flag(false);
         w.flag(true);

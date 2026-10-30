@@ -1086,10 +1086,13 @@ fn av1_names_its_reference_slot_in_the_frame_header() {
         for i in 0..7 {
             assert_eq!(r.u(3), 4, "ref_frame_idx[{i}]");
         }
+        assert_eq!(r.u(1), 1, "render_and_frame_size_different");
+        assert_eq!(r.u(16), (W - 1) as u32, "render_width_minus_1");
+        assert_eq!(r.u(16), (H - 1) as u32, "render_height_minus_1");
         assert_eq!(
             pic.bit_offset_qindex as usize,
-            r.pos + 1 + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1,
-            "the quantizer follows render_and_frame_size_different, allow_high_precision_mv, is_filter_switchable, interpolation_filter, \
+            r.pos + 1 + 1 + 2 + 1 + 1 + 1 + 1 + 1,
+            "the quantizer follows allow_high_precision_mv, is_filter_switchable, interpolation_filter, \
              is_motion_mode_switchable, disable_frame_end_update_cdf, uniform_tile_spacing_flag, and one tile increment bit each for \
              columns and rows, with no use_ref_frame_mvs in a sequence without reference motion vectors"
         );
