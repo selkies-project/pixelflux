@@ -969,6 +969,9 @@ where
     let mut next_frame = Instant::now();
     let mut geometry_check = GEOMETRY_POLL_FRAMES;
     let mut grab_errors = 0u32;
+    // No capture session runs: a rebuild the driver refused, or one a lost session or handle
+    // asks for, which the geometry step below creates against the root as it is now.
+    let mut session_down = false;
     let mut encode_errors = 0u32;
     let mut last_log = Instant::now();
     let mut sent_frames: u64 = 0;
@@ -1037,21 +1040,38 @@ where
                 gpu.screen = status.screenSize;
             }
         }
-        if recheck_geometry || want_cursor != gpu.nvfbc.with_cursor {
+        if session_down || recheck_geometry || want_cursor != gpu.nvfbc.with_cursor {
+            // A resize can shrink the root before the poll above sees it, and a box resolved
+            // against the size it had is one the driver refuses.
+            if (session_down || recheck_geometry)
+                && let Ok(status) = gpu.nvfbc.status()
+            {
+                gpu.screen = status.screenSize;
+            }
             let (region, size) = resolve_region(gpu.screen, &gpu.request);
-            if region != gpu.nvfbc.region
+            if session_down
+                || region != gpu.nvfbc.region
                 || size != gpu.nvfbc.size
                 || want_cursor != gpu.nvfbc.with_cursor
             {
                 match restart_session(&mut gpu, region, size, want_cursor) {
                     Ok(()) => {
+                        session_down = false;
                         state = StripeState::default();
                         hashes.clear();
                         lagged = Damage::None;
                         pending_force_idr = true;
                     }
                     Err(e) => {
-                        return Some(Err(format!("NvFBC could not follow the new geometry: {e}")));
+                        // A refusal counts as a failed grab: the root or the region may yet
+                        // settle, and the next pass resolves the box again.
+                        grab_errors += 1;
+                        if grab_errors > 5 {
+                            return Some(Err(format!("NvFBC capture could not be rebuilt: {e}")));
+                        }
+                        eprintln!("[X11] NvFBC refused the capture session ({e}); trying again.");
+                        session_down = true;
+                        continue;
                     }
                 }
             }
@@ -1068,21 +1088,15 @@ where
                 if recovery == Recovery::None || grab_errors > 5 {
                     return Some(Err(format!("NvFBC capture ended: {e}")));
                 }
-                let (region, size) = resolve_region(gpu.screen, &gpu.request);
-                let rebuilt = if recovery == Recovery::Handle {
+                if recovery == Recovery::Handle {
                     eprintln!("[X11] NvFBC lost the X server ({e}); rebuilding the client handle.");
-                    rebuild_handle(&mut gpu, region, size, want_cursor)
+                    if let Err(e) = reopen_handle(&mut gpu) {
+                        return Some(Err(format!("NvFBC capture could not be rebuilt: {e}")));
+                    }
                 } else {
                     eprintln!("[X11] NvFBC grab failed ({e}); rebuilding the capture session.");
-                    restart_session(&mut gpu, region, size, want_cursor).map_err(|e| e.to_string())
-                };
-                if let Err(e) = rebuilt {
-                    return Some(Err(format!("NvFBC capture could not be rebuilt: {e}")));
                 }
-                state = StripeState::default();
-                hashes.clear();
-                lagged = Damage::None;
-                pending_force_idr = true;
+                session_down = true;
                 continue;
             }
         };
@@ -1291,28 +1305,19 @@ fn restart_session(
     Ok(())
 }
 
-/// Replace the client handle and the capture session on it, for the one failure the API offers no
-/// other way back from: the X server the handle was opened on is gone.
+/// Replace the client handle, for the one failure the API offers no other way back from: the X
+/// server the handle was opened on is gone. The capture session on it is created again by the
+/// loop's geometry step, against the root the new handle reports.
 ///
 /// The encoder, its CUDA context, and the frames already delivered all survive; only the driver
 /// objects are rebuilt, in the order that keeps the encoder from holding a registration of memory
 /// the outgoing session owns.
-fn rebuild_handle(
-    gpu: &mut GpuCapture,
-    region: NVFBC_BOX,
-    size: NVFBC_SIZE,
-    with_cursor: bool,
-) -> Result<(), String> {
+fn reopen_handle(gpu: &mut GpuCapture) -> Result<(), String> {
     gpu.encoder.release_external_input();
     gpu.nvfbc.stop();
     gpu.nvfbc = NvfbcSession::open()?;
     gpu.screen = gpu.nvfbc.status().map_err(|e| e.to_string())?.screenSize;
-    let (region, size) = if region == NVFBC_BOX::default() {
-        resolve_region(gpu.screen, &gpu.request)
-    } else {
-        (region, size)
-    };
-    restart_session(gpu, region, size, with_cursor).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// The row stride of a captured frame: the driver's own, derived from the buffer size it
@@ -1822,6 +1827,82 @@ mod gpu_tests {
             pointers[0],
             pointers.len()
         );
+    }
+
+    /// On an NVIDIA X server RandR can resize (a virtual screen larger than 1920x1080): the root
+    /// shrinks under a running capture of a region narrower than it, which the driver cannot carry
+    /// across the resize the way it does a whole-screen capture, and the region follows only
+    /// after, as Selkies resizes (the root first, then the region it realized a little narrower).
+    /// The capture rebuilds inside the root as it is and keeps delivering, where a rebuild against
+    /// the size the root had was refused and ended it. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_nvfbc_rebuilds_inside_a_root_that_shrank() {
+        use std::sync::atomic::AtomicU64;
+        let fb = |w: i32, h: i32| {
+            std::process::Command::new("xrandr")
+                .args(["--fb", &format!("{w}x{h}")])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !fb(1920, 1080) || !paint_root((0x20, 0x40, 0xc0)) {
+            println!("no X root RandR can resize here (xrandr --fb, $DISPLAY); nothing to capture");
+            return;
+        }
+        let mut s = settings(crate::encoders::codec::Codec::H264);
+        s.width = 1918;
+        s.height = 1080;
+        let controls = Arc::new(Controls::new(&s));
+        let frames = Arc::new(AtomicU64::new(0));
+        let capture = {
+            let (controls, frames) = (controls.clone(), frames.clone());
+            std::thread::spawn(move || {
+                let (tx, _rx) = std::sync::mpsc::channel();
+                run_capture(s, controls, tx, &mut |_: Vec<EncodedStripe>| {
+                    frames.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        // Frames come on damage, so the root is repainted while they are counted.
+        let delivered_over = |ms: u64| {
+            let before = frames.load(Ordering::Relaxed);
+            let end = Instant::now() + Duration::from_millis(ms);
+            let mut v = 0u8;
+            while Instant::now() < end {
+                paint_root((v, 0x40, 0x80));
+                v = v.wrapping_add(17);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            frames.load(Ordering::Relaxed) - before
+        };
+        if capture.is_finished() {
+            println!("the NvFBC path declined this host; nothing to capture");
+            return;
+        }
+        assert!(delivered_over(1000) > 0, "frames before the resize");
+        for (w, h) in [(1920, 1000), (1920, 1080), (1920, 1000)] {
+            assert!(fb(w, h), "xrandr --fb {w}x{h}");
+            // Frames grabbed before the region follows meet the old box in the new root.
+            delivered_over(300);
+            assert!(
+                !capture.is_finished(),
+                "the capture ended when the root went to {w}x{h}"
+            );
+            *controls.region.lock().unwrap() = (0, 0, w - 2, h);
+            controls.region_dirty.store(true, Ordering::Release);
+            let n = delivered_over(1500);
+            assert!(
+                !capture.is_finished(),
+                "the capture ended after the root went to {w}x{h}"
+            );
+            assert!(n > 0, "frames after the root went to {w}x{h}");
+            println!("{w}x{h}: {n} frames delivered in 1.5 s");
+        }
+        controls.stop.store(true, Ordering::Relaxed);
+        let ended = capture.join().expect("capture thread");
+        let _ = fb(1920, 1080);
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
     }
 
     /// What the zero-copy path costs on a real GPU, per codec the device serves.
