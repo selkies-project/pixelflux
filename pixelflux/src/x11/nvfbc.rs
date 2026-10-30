@@ -1077,7 +1077,12 @@ where
             }
         }
 
-        let frame = match gpu.nvfbc.grab(frame_dur) {
+        // A still screen leaves the grab waiting for damage until its timeout: to this frame's
+        // deadline, or a whole frame's wait would come on top of the pacing and the encode.
+        let wait = next_frame
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let frame = match gpu.nvfbc.grab(wait) {
             Ok(f) => {
                 grab_errors = 0;
                 f
@@ -1903,6 +1908,45 @@ mod gpu_tests {
         let ended = capture.join().expect("capture thread");
         let _ = fb(1920, 1080);
         assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+    }
+
+    /// On a real NVIDIA X server: a still screen in Turbo runs at the frame rate asked for. Each
+    /// pass's grab waits for damage only to that frame's deadline, where a whole frame's wait on
+    /// top of the pacing and the encode held it near 50 at 60. Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_nvfbc_keeps_its_frame_rate_on_a_still_screen() {
+        use std::sync::atomic::AtomicU64;
+        if !paint_root((0x30, 0x60, 0x90)) {
+            println!("no X root this host can paint (xsetroot, $DISPLAY); nothing to capture");
+            return;
+        }
+        let s = settings(crate::encoders::codec::Codec::H264);
+        let fps = s.target_fps;
+        let controls = Arc::new(Controls::new(&s));
+        let frames = Arc::new(AtomicU64::new(0));
+        let capture = {
+            let (controls, frames) = (controls.clone(), frames.clone());
+            std::thread::spawn(move || {
+                let (tx, _rx) = std::sync::mpsc::channel();
+                run_capture(s, controls, tx, &mut |_: Vec<EncodedStripe>| {
+                    frames.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_secs(1));
+        if capture.is_finished() {
+            println!("the NvFBC path declined this host; nothing to capture");
+            return;
+        }
+        let before = frames.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(3));
+        let rate = (frames.load(Ordering::Relaxed) - before) as f64 / 3.0;
+        controls.stop.store(true, Ordering::Relaxed);
+        let ended = capture.join().expect("capture thread");
+        println!("{rate:.1} frames a second on a still screen at {fps}");
+        assert!(matches!(ended, Some(Ok(()))), "{ended:?}");
+        assert!(rate >= fps * 0.95, "{rate:.1} frames a second at {fps}");
     }
 
     /// What the zero-copy path costs on a real GPU, per codec the device serves.
