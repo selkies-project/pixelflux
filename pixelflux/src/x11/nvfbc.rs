@@ -57,7 +57,7 @@ use libloading::Library;
 use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
 
 use super::Controls;
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use crate::encoders::nvenc::NvencEncoder;
 use crate::encoders::software::{EncodedStripe, FrameTiming, StripeState};
 use crate::pipeline::{
@@ -619,7 +619,7 @@ fn recovery_for(err: &NvfbcError) -> Recovery {
 ///
 /// A zero-sized box means the whole tracked region, so a capture that covers the screen asks for
 /// it that way and keeps following a resize.
-fn resolve_region(screen: NVFBC_SIZE, s: &RustCaptureSettings) -> (NVFBC_BOX, NVFBC_SIZE) {
+fn resolve_region(screen: NVFBC_SIZE, s: &CaptureSettings) -> (NVFBC_BOX, NVFBC_SIZE) {
     let (w, h) = super::resolve_dims(
         screen.w.min(u16::MAX as u32) as u16,
         screen.h.min(u16::MAX as u32) as u16,
@@ -656,11 +656,11 @@ struct GpuCapture {
     encoder: NvencEncoder,
     /// The live session: its geometry is what is actually being captured and encoded, and its
     /// rate and quality fields follow the cross-thread controls.
-    settings: RustCaptureSettings,
+    settings: CaptureSettings,
     /// The geometry that was asked for, which a region change updates and every region is
     /// resolved from. Kept apart from `settings` because a capture that follows the framebuffer
     /// would otherwise take its own current size for the request and stop following.
-    request: RustCaptureSettings,
+    request: CaptureSettings,
     screen: NVFBC_SIZE,
 }
 
@@ -790,7 +790,7 @@ fn declined(reason: &str) -> Option<GpuCapture> {
 /// composited into host pixels and would mean reading the frame back), a libX11 bound to another
 /// libxcb than the driver's, an X server the NVIDIA driver does not drive, or a driver that offers
 /// no NvFBC on this X server.
-fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
+fn open(settings: &CaptureSettings) -> Option<GpuCapture> {
     if !settings.codec.is_video() {
         return declined("the codec is JPEG");
     }
@@ -944,7 +944,7 @@ const GEOMETRY_POLL_FRAMES: i32 = 30;
 ///    which the X server may not report, reads as the motion it is; and hands the bitstream to
 ///    the recording sink and the delivery callback.
 pub fn run_capture<F>(
-    settings: RustCaptureSettings,
+    settings: CaptureSettings,
     controls: Arc<Controls>,
     encode_tid_tx: std::sync::mpsc::Sender<std::thread::ThreadId>,
     on_frame: &mut F,
@@ -1456,8 +1456,8 @@ mod region_tests {
     use super::*;
     use crate::encoders::codec::Codec;
 
-    fn settings(w: i32, h: i32) -> RustCaptureSettings {
-        RustCaptureSettings {
+    fn settings(w: i32, h: i32) -> CaptureSettings {
+        CaptureSettings {
             width: w,
             height: h,
             codec: Codec::H264,
