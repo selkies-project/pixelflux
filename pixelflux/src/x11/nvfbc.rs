@@ -16,9 +16,9 @@
 //!
 //! Three properties follow from that, and the module is built around keeping all three:
 //!
-//! 1. **Zero copy.** The device pointer is stable for as long as the geometry is, so it is
-//!    registered and mapped once (`NvencEncoder::encode_cuda_pitch`) and every later frame reuses
-//!    that registration.
+//! 1. **Zero copy.** The device pointers are stable for as long as the geometry is (recent drivers
+//!    alternate between two), so each is registered and mapped once
+//!    (`NvencEncoder::encode_cuda_pitch`) and every later frame from it reuses that registration.
 //! 2. **Lowest latency.** The session runs in push model — the driver generates a frame when an
 //!    application damages the screen rather than on a sampling timer — and each grab is issued
 //!    with `NOWAIT_IF_NEW_FRAME_READY`, so a frame that already exists is taken immediately and
@@ -54,7 +54,10 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use libloading::Library;
-use x11rb::protocol::xproto::ConnectionExt as XprotoExt;
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as XprotoExt, EventMask};
+use x11rb::rust_connection::RustConnection;
 
 use super::Controls;
 use crate::CaptureSettings;
@@ -561,7 +564,12 @@ impl NvfbcSession {
             dwFlags: flags,
             pCUDADeviceBuffer: &mut device_ptr as *mut CUdeviceptr as *mut c_void,
             pFrameGrabInfo: &mut info,
-            dwTimeoutMs: timeout.as_millis().clamp(1, u32::MAX as u128) as u32,
+            // Rounded up: a grab that gave up ahead of its deadline would send the frame before
+            // again and leave a change landing in the time left to the next one.
+            dwTimeoutMs: timeout
+                .as_micros()
+                .div_ceil(1000)
+                .clamp(1, u32::MAX as u128) as u32,
         };
         let st = unsafe { (self.funcs.nvFBCToCudaGrabFrame.unwrap())(self.handle, &mut params) };
         if st != NVFBC_SUCCESS {
@@ -662,6 +670,42 @@ struct GpuCapture {
     /// would otherwise take its own current size for the request and stop following.
     request: CaptureSettings,
     screen: NVFBC_SIZE,
+}
+
+/// The X server's word that its root window changed size (a RandR resize), on a connection of
+/// our own: the capture polls it every frame without a round trip, where asking the driver
+/// (`NvFBCGetStatus`) took 15 ms a call on an NVIDIA Xorg, a frame and more at 240 fps.
+struct RootWatch {
+    conn: RustConnection,
+}
+
+impl RootWatch {
+    fn open() -> Option<Self> {
+        let (conn, screen) = x11rb::connect(None).ok()?;
+        let root = conn.setup().roots.get(screen)?.root;
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )
+        .ok()?
+        .check()
+        .ok()?;
+        Some(Self { conn })
+    }
+
+    /// Whether the root was reconfigured since the last call, by the events queued meanwhile;
+    /// a lost connection counts as one, so the driver is asked again.
+    fn changed(&self) -> bool {
+        let mut changed = false;
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(Event::ConfigureNotify(_))) => changed = true,
+                Ok(Some(_)) => {}
+                Ok(None) => return changed,
+                Err(_) => return true,
+            }
+        }
+    }
 }
 
 /// How long the driver may take to answer whether it can capture this X server at all.
@@ -968,6 +1012,7 @@ where
     let mut pending_force_idr = false;
     let mut next_frame = Instant::now();
     let mut geometry_check = GEOMETRY_POLL_FRAMES;
+    let root_watch = RootWatch::open();
     let mut grab_errors = 0u32;
     // No capture session runs: a rebuild the driver refused, or one a lost session or handle
     // asks for, which the geometry step below creates against the root as it is now.
@@ -1032,8 +1077,16 @@ where
             // An explicit live size pins the region; `<= 0` keeps following the framebuffer.
             gpu.request.auto_adjust_screen_capture_size = nw <= 0 || nh <= 0;
         }
-        geometry_check -= 1;
-        if geometry_check <= 0 {
+        // The root watch says when the root changes size; without one the driver is asked
+        // every GEOMETRY_POLL_FRAMES frames.
+        let ask_driver = match root_watch.as_ref() {
+            Some(watch) => watch.changed(),
+            None => {
+                geometry_check -= 1;
+                geometry_check <= 0
+            }
+        };
+        if ask_driver {
             geometry_check = GEOMETRY_POLL_FRAMES;
             if let Ok(status) = gpu.nvfbc.status() {
                 recheck_geometry |= status.screenSize != gpu.screen;
@@ -1157,6 +1210,9 @@ where
         } else {
             hash(&mut gpu.encoder, &mut hashes)
         };
+        if gpu.encoder.take_lost_cleanup() {
+            state.lost_frame();
+        }
         let mut decision = decide_hw_fullframe(
             &mut state,
             &gpu.settings,
@@ -1737,10 +1793,10 @@ mod gpu_tests {
     /// color that was painted.
     ///
     /// The zero-copy property is asserted rather than assumed, three ways: the driver reports it
-    /// needed no post-processing pass (the native BGRA request means no conversion copy), every
-    /// grab hands back the *same* device pointer (so the encoder's registration is made once and
-    /// reused instead of per frame), and repainting the root changes the decoded color, which it
-    /// could not if the encoder were reading a stale copy. Ignored by default.
+    /// needed no post-processing pass (the native BGRA request means no conversion copy), the
+    /// grabs hand back no more buffers than the encoder keeps registered (so each registration is
+    /// made once and reused instead of per frame), and repainting the root changes the decoded
+    /// color, which it could not if the encoder were reading a stale copy. Ignored by default.
     #[test]
     #[ignore]
     fn gpu_nvfbc_zero_copy_encodes_the_painted_root() {
@@ -1754,6 +1810,12 @@ mod gpu_tests {
             println!("the NvFBC path declined this session on this host; nothing to capture");
             return;
         };
+        // The session's first frame may predate the paint: the paint is made again once it runs.
+        let _ = gpu.nvfbc.grab(Duration::from_millis(200));
+        assert!(
+            paint_root(FIRST),
+            "the root was painted once, so a repaint must work"
+        );
         let mut dec = VideoDecoder::new(DecCodec::H264).expect("H.264 decoder");
         let mut pointers = Vec::new();
 
@@ -1821,15 +1883,18 @@ mod gpu_tests {
             );
         }
 
+        let mut buffers = pointers.clone();
+        buffers.sort_unstable();
+        buffers.dedup();
         assert!(
-            pointers.windows(2).all(|w| w[0] == w[1]),
-            "the capture buffer moved between frames, so the registration cannot be reused: {pointers:?}"
+            buffers.len() <= crate::encoders::nvenc::EXTERNAL_INPUTS,
+            "the capture used more buffers than the encoder keeps registered: {pointers:x?}"
         );
         println!(
-            "captured {}x{} into one device pointer {:#x} across {} frames, no post-processing pass",
+            "captured {}x{} into {} device buffers {buffers:x?} across {} frames, no post-processing pass",
             gpu.encoder.width(),
             gpu.encoder.height(),
-            pointers[0],
+            buffers.len(),
             pointers.len()
         );
     }
@@ -1881,6 +1946,12 @@ mod gpu_tests {
             }
             frames.load(Ordering::Relaxed) - before
         };
+        // A session can take over a second to open; the NvFBC path declining ends the thread.
+        let end = Instant::now() + Duration::from_secs(15);
+        while frames.load(Ordering::Relaxed) == 0 && !capture.is_finished() && Instant::now() < end
+        {
+            delivered_over(100);
+        }
         if capture.is_finished() {
             println!("the NvFBC path declined this host; nothing to capture");
             return;
@@ -1934,11 +2005,17 @@ mod gpu_tests {
                 })
             })
         };
-        std::thread::sleep(Duration::from_secs(1));
+        // A session can take over a second to open; the NvFBC path declining ends the thread.
+        let end = Instant::now() + Duration::from_secs(15);
+        while frames.load(Ordering::Relaxed) == 0 && !capture.is_finished() && Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         if capture.is_finished() {
             println!("the NvFBC path declined this host; nothing to capture");
             return;
         }
+        std::thread::sleep(Duration::from_millis(500));
         let before = frames.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_secs(3));
         let rate = (frames.load(Ordering::Relaxed) - before) as f64 / 3.0;

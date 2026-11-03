@@ -106,6 +106,10 @@ const KEYMAP_FORMAT_XKB_V1: u32 = 1;
 /// one being blitted by the compositor while the previous one is encoded.
 const SLOTS: usize = 2;
 
+/// The generation of a retained frame the session copied out of its buffer
+/// (`HostSession::detach_retained`): no capture's, so releasing it reaches no slot.
+const DETACHED: u64 = u64::MAX;
+
 /// A frame the compositor finished blitting, ready for the encoder.
 pub struct HostFrame {
     pub(crate) generation: u64,
@@ -121,6 +125,28 @@ pub struct HostFrame {
     pub damage: Vec<Rectangle<i32, Physical>>,
     /// The compositor's CLOCK_MONOTONIC stamp for the frame, or its arrival when the host gives none.
     pub stamp_ns: i64,
+}
+
+impl HostFrame {
+    /// This frame as copied into `dmabuf`, a buffer of the capture's own: retained in its place,
+    /// it holds none of the stream's buffers (`HostSession::detach_retained`).
+    pub fn detached_into(&self, dmabuf: Dmabuf) -> HostFrame {
+        HostFrame {
+            generation: DETACHED,
+            slot: 0,
+            dmabuf: Some(dmabuf),
+            cpu: None,
+            width: self.width,
+            height: self.height,
+            damage: self.damage.clone(),
+            stamp_ns: self.stamp_ns,
+        }
+    }
+
+    /// Whether this is a copy that holds none of the stream's buffers.
+    pub fn is_detached(&self) -> bool {
+        self.generation == DETACHED
+    }
 }
 
 /// CLOCK_MONOTONIC in nanoseconds, the clock PipeWire stamps frames with.
@@ -275,6 +301,8 @@ enum ToHost {
     Start {
         width: i32,
         height: i32,
+        /// The display's origin in the union layout, where its cursor metas are placed.
+        origin: (i32, i32),
         zero_copy: bool,
         paint_cursor: bool,
         fps_milli: u32,
@@ -1532,6 +1560,12 @@ impl HostSession {
     /// False once the host connection is gone (the primary connection or the first
     /// output's capture ended): the owner drops the session and reports its captures as
     /// stopped, so they are rebuilt against a new connection instead of feeding a dead one.
+    /// Whether the frames come from a portal's stream, whose compositor drives it on buffers of
+    /// its own.
+    pub fn is_portal(&self) -> bool {
+        self.portal.is_some()
+    }
+
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Relaxed) && !self.portal.as_ref().is_some_and(|c| c.dead())
     }
@@ -1566,19 +1600,64 @@ impl HostSession {
     /// Keep `frame` as `display_id`'s current content (releasing the one it
     /// replaces).
     pub fn retain_frame(&self, display_id: u32, frame: HostFrame) {
+        if let Some(old) = self.swap_retained(display_id, frame) {
+            self.release_frame(display_id, old);
+        }
+    }
+
+    /// Under portal capture, swap the software frame retained for `display_id` for a copy of its
+    /// pixels and give the stream its buffer back: a compositor driving its stream (KWin) sends
+    /// no cursor update while short of buffers, and a still screen would hold one for as long
+    /// as it stands. A GPU frame is copied on the GPU (`detach_retained_gpu`).
+    pub fn detach_retained(&self, display_id: u32) {
+        if self.portal.is_none() {
+            return;
+        }
         let Some(handle) = self
             .output_index_for(display_id)
             .and_then(|i| self.outputs.get(i))
         else {
             return;
         };
-        let old = handle.retained.lock().unwrap().replace(frame);
-        if let Some(old) = old {
+        let mut retained = handle.retained.lock().unwrap();
+        let Some(f) = retained.as_ref() else {
+            return;
+        };
+        let Some(cpu) = f.cpu.as_ref().filter(|_| f.generation != DETACHED) else {
+            return;
+        };
+        let mut bgra = vec![0u8; f.width.max(0) as usize * f.height.max(0) as usize * 4];
+        cpu.write_bgra(f.width, f.height, &mut bgra);
+        let copy = HostFrame {
+            generation: DETACHED,
+            slot: 0,
+            dmabuf: None,
+            cpu: Some(HostCpuFrame {
+                map: Arc::new(bgra),
+                offset: 0,
+                stride: f.width.max(0) as usize * 4,
+                format: wl_shm::Format::Argb8888 as u32,
+            }),
+            width: f.width,
+            height: f.height,
+            damage: f.damage.clone(),
+            stamp_ns: f.stamp_ns,
+        };
+        if let Some(old) = retained.replace(copy) {
             handle.send(ToHost::Release {
                 generation: old.generation,
                 slot: old.slot,
             });
         }
+    }
+
+    /// `retain_frame`, handing the frame it replaces to the caller instead of the host:
+    /// an encode in flight may still read it.
+    pub fn swap_retained(&self, display_id: u32, frame: HostFrame) -> Option<HostFrame> {
+        let handle = self
+            .output_index_for(display_id)
+            .and_then(|i| self.outputs.get(i))?;
+        handle.retained.lock().unwrap().replace(frame)
     }
 
     /// Run `f` with `display_id`'s retained (current-content) frame, if any.
@@ -2043,6 +2122,7 @@ impl LayoutSlot {
         ToHost::Start {
             width: self.want.0,
             height: self.want.1,
+            origin: self.pos,
             zero_copy: self.zero_copy,
             paint_cursor: self.paint_cursor,
             fps_milli: self.fps_milli,
@@ -2395,6 +2475,7 @@ fn portal_capture_loop(
     geoms: Vec<OutputGeom>,
 ) -> Result<(), String> {
     let mut want: Option<Want> = None;
+    let mut origin = (0, 0);
     let mut stream: Option<(PwStream, u64)> = None;
     let mut warned_unshared = false;
     loop {
@@ -2428,10 +2509,12 @@ fn portal_capture_loop(
                 ToHost::Start {
                     width,
                     height,
+                    origin: at,
                     zero_copy,
                     paint_cursor,
                     fps_milli,
                 } => {
+                    origin = at;
                     want = Some(Want {
                         size: (width, height),
                         zero_copy,
@@ -2457,6 +2540,19 @@ fn portal_capture_loop(
             dma_formats: dma_formats.clone(),
             fps_milli: w.fps_milli,
             expect: w.size,
+            place: crate::wayland::pwcapture::CursorPlace {
+                origin,
+                size: w.size,
+                // The logical size the portal announces for the stream, as injection reads it
+                // (`HostSession::scale_at`), else the output's.
+                logical: assign_streams(&live.session.streams, &geoms)
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .and_then(|si| live.session.streams[si].size)
+                    .or_else(|| geoms.get(index).map(|g| g.logical))
+                    .unwrap_or((0, 0)),
+            },
         };
         match &stream {
             Some((s, _)) => {
@@ -2983,6 +3079,7 @@ fn capture_loop(
                     zero_copy,
                     paint_cursor,
                     fps_milli,
+                    ..
                 } => {
                     let next = Want {
                         size: (width, height),
@@ -3335,6 +3432,7 @@ fn capture_loop_ext(
                     zero_copy,
                     paint_cursor,
                     fps_milli,
+                    ..
                 } => {
                     let next = Want {
                         size: (width, height),
@@ -3710,6 +3808,7 @@ fn drain_ctl(
                 zero_copy,
                 paint_cursor,
                 fps_milli,
+                ..
             }) => {
                 let next = Want {
                     size: (width, height),
@@ -3975,5 +4074,34 @@ mod tests {
             stream_point(&slot, (2040, 1152), 1920.0 + 9000.0, -5.0),
             (2039.0, 0.0)
         );
+    }
+
+    /// A cursor meta comes back as the union point the pointer was injected at: placing it
+    /// (`pwcapture::host_pointer_at`) inverts `stream_point` for a display at scale 2 beside
+    /// another, whether the stream runs at the output's mode or at its logical size.
+    #[test]
+    fn a_cursor_meta_maps_back_to_the_injected_point() {
+        let slot = LayoutSlot {
+            want: (4080, 2304),
+            pos: (1920, 0),
+            active: true,
+            zero_copy: false,
+            paint_cursor: false,
+            fps_milli: 60_000,
+        };
+        let logical = (2040, 1152);
+        let (lx, ly) = stream_point(&slot, logical, 1920.0 + 3000.0, 2000.0);
+        let place = crate::wayland::pwcapture::CursorPlace {
+            origin: slot.pos,
+            size: slot.want,
+            logical,
+        };
+        for stream in [(4080, 2304), (2040, 1152)] {
+            let sx = lx * f64::from(stream.0) / f64::from(logical.0);
+            let sy = ly * f64::from(stream.1) / f64::from(logical.1);
+            let at =
+                crate::wayland::pwcapture::host_pointer_at(place, stream, sx as i32, sy as i32, 0);
+            assert_eq!((at.x, at.y), (1920.0 + 3000.0, 2000.0));
+        }
     }
 }
