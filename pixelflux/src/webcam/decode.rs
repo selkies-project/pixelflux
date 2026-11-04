@@ -590,7 +590,9 @@ impl Dav1dBackend {
 
     fn decode(&mut self, data: &[u8]) -> Result<Option<Picture>, DecodeError> {
         use codec_sys::dav1d::*;
-        const AGAIN: c_int = -(libc::EAGAIN);
+        // dav1d reports "send more later" as -EAGAIN, and EAGAIN is 11 wherever libc
+        // serves it and where it does not.
+        const AGAIN: c_int = -11;
         let mut input: Dav1dData = unsafe { std::mem::zeroed() };
         let buffer = unsafe { dav1d_data_create(&mut input, data.len()) };
         if buffer.is_null() {

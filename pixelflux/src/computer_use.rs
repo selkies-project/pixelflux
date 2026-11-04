@@ -34,6 +34,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The keymap library the Wayland compositor's keymap shares, where named keysym
+/// resolution has to match what the clients type.
+#[cfg(target_os = "linux")]
 use smithay::input::keyboard::xkb;
 
 use base64::Engine;
@@ -41,7 +44,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use image::{ImageBuffer, ImageFormat, Rgba};
 use serde::Deserialize;
 
+/// The command type the compositor channel carries, where a compositor exists.
+#[cfg(target_os = "linux")]
 use crate::ThreadCommand;
+/// The keysym of a literal character: the compositor's own mapping on Linux, and the
+/// Unicode-plane encoding — the same wire value — wherever that keymap does not exist.
+#[cfg(target_os = "linux")]
 use crate::wayland::keymap::keysym_for_char;
 
 fn clamp<T: PartialOrd>(v: T, lo: T, hi: T) -> T {
@@ -212,13 +220,16 @@ impl ReadbackSlot {
     }
 }
 
-/// A screenshot the GPU is still reading back into a [`ReadbackSlot`].
+/// A screenshot the GPU is still reading back into a [`ReadbackSlot`]. Linux alone: the
+/// fence it waits on is the compositor renderer's.
+#[cfg(target_os = "linux")]
 pub struct GpuReadback {
     pub(crate) slot: Arc<ReadbackSlot>,
     pub(crate) sync: smithay::backend::renderer::sync::SyncPoint,
     pub(crate) len: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl GpuReadback {
     /// Wait for the readback until `deadline`, then copy the pixels out of the slot.
     fn resolve(self, deadline: Instant) -> Result<ScreenshotBuffer, String> {
@@ -235,6 +246,8 @@ impl GpuReadback {
 /// A screenshot's pixels: in the caller's buffer, or still on their way from the GPU.
 pub enum ScreenshotPixels {
     Ready(ScreenshotBuffer),
+    /// The compositor's GPU readback, where the fence is the renderer's own.
+    #[cfg(target_os = "linux")]
     Gpu(GpuReadback),
 }
 
@@ -255,10 +268,12 @@ pub struct ScreenshotFrame {
 
 impl ScreenshotFrame {
     /// The frame with its pixels in the caller's buffer, a GPU readback waited for until
-    /// `deadline` and copied out.
+    /// `deadline` and copied out. The deadline serves the GPU arm, which is Linux's.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     fn resolve(self, deadline: Instant) -> Result<Self, String> {
         let pixels = match self.pixels {
             ScreenshotPixels::Ready(pixels) => pixels,
+            #[cfg(target_os = "linux")]
             ScreenshotPixels::Gpu(readback) => readback.resolve(deadline)?,
         };
         Ok(Self {
@@ -268,6 +283,10 @@ impl ScreenshotFrame {
     }
 
     fn encode_png(self) -> Result<Vec<u8>, String> {
+        // The GPU arm is Linux's; off it the Ready pixels are all there are.
+        #[cfg(not(target_os = "linux"))]
+        let ScreenshotPixels::Ready(mut pixels) = self.pixels;
+        #[cfg(target_os = "linux")]
         let ScreenshotPixels::Ready(mut pixels) = self.pixels else {
             return Err("Screenshot pixels are still being read back".to_string());
         };
@@ -429,11 +448,34 @@ fn keysym_for_key_spec(name: &str) -> u32 {
     if let (Some(c), None) = (chars.next(), chars.next()) {
         return keysym_for_char(c);
     }
-    let sym = xkb::keysym_from_name(name, xkb::KEYSYM_NO_FLAGS).raw();
-    if sym != 0 {
-        return sym;
+    // A name needs the keymap library, which exists where the Wayland keymap does; an
+    // unresolvable keysym is what the caller's unsupported-key path reports.
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
     }
-    xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE).raw()
+    #[cfg(target_os = "linux")]
+    {
+        let sym = xkb::keysym_from_name(name, xkb::KEYSYM_NO_FLAGS).raw();
+        if sym != 0 {
+            return sym;
+        }
+        xkb::keysym_from_name(name, xkb::KEYSYM_CASE_INSENSITIVE).raw()
+    }
+}
+
+/// The Unicode-plane keysym of a literal character, the encoding the wire carries for text:
+/// the Latin-1 range as itself, everything else as its code point set high. Legacy-plane
+/// resolution needs the keymap the Wayland backend owns; a backend that maps keys itself
+/// reads the Unicode plane off this same value.
+#[cfg(not(target_os = "linux"))]
+fn keysym_for_char(c: char) -> u32 {
+    let cp = c as u32;
+    if (0x20..=0xFF).contains(&cp) {
+        cp
+    } else {
+        0x0100_0000 | cp
+    }
 }
 
 fn is_modifier(scancode: u32) -> bool {
@@ -508,12 +550,14 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wayland implementation: every primitive is a `ThreadCommand` on the compositor's calloop
 /// channel, so injection and readback serialize naturally with rendering and encoding.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub struct CuWaylandBackend {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     wake_tx: smithay::reexports::calloop::channel::Sender<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl CuBackend for CuWaylandBackend {
     fn name(&self) -> &'static str {
         "wayland"
@@ -877,6 +921,7 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
             // a virtual-keyboard client, since keys on pixelflux's own seat carry an
             // overlay keymap the inner compositor never sees. Falls through to the
             // local seat if the app socket is unreachable.
+            #[cfg(target_os = "linux")]
             if b.name() == "wayland"
                 && let Some(sock) = app_wayland_socket_path()
             {
@@ -1129,6 +1174,7 @@ fn handle_action_inner(req: CuActionRequest, b: &dyn CuBackend) -> Result<String
     }
 }
 
+#[cfg(target_os = "linux")]
 static WAYLAND_BACKEND: Mutex<Option<CuWaylandBackend>> = Mutex::new(None);
 
 /// Body of `POST /record_start`. All fields are optional; unset ones fall back to the
@@ -1248,6 +1294,7 @@ static CU_APP_WAYLAND_DISPLAY: Mutex<Option<String>> = Mutex::new(None);
 /// and for relative pointer motion into a nested KWin session.
 pub fn set_app_wayland_display(display: Option<String>) {
     *CU_APP_WAYLAND_DISPLAY.lock().unwrap() = display.filter(|s| !s.is_empty());
+    #[cfg(target_os = "linux")]
     crate::wayland::ficlient::arm(app_wayland_socket_path());
 }
 
@@ -1255,6 +1302,7 @@ pub fn set_app_wayland_display(display: Option<String>) {
 /// local seat. The ABI value selkies set wins; a standalone CU (no selkies) falls
 /// back to PIXELFLUX_APP_WAYLAND_DISPLAY. A value naming pixelflux's own
 /// compositor means nothing is nested.
+#[cfg(target_os = "linux")]
 pub(crate) fn app_wayland_socket_path() -> Option<String> {
     let name = CU_APP_WAYLAND_DISPLAY
         .lock()
@@ -1270,6 +1318,7 @@ pub(crate) fn app_wayland_socket_path() -> Option<String> {
 
 /// Make the Wayland compositor the preferred CU backend: once a live calloop sender is
 /// registered, every subsequent request routes to it instead of an X11 connection.
+#[cfg(target_os = "linux")]
 pub fn register_wayland_backend(
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     wake_tx: smithay::reexports::calloop::channel::Sender<()>,
@@ -1279,6 +1328,7 @@ pub fn register_wayland_backend(
 
 /// The registered compositor's command channel, if a Wayland compositor is running in this
 /// process. The recorder uses it to attach to (or start) a capture without any Python client.
+#[cfg(target_os = "linux")]
 pub(crate) fn wayland_command_sender()
 -> Option<smithay::reexports::calloop::channel::Sender<ThreadCommand>> {
     WAYLAND_BACKEND
@@ -1390,12 +1440,17 @@ fn cu_listeners(bind: &str) -> Result<Vec<TcpListener>, String> {
     for addr in addrs {
         match bind_listener(addr) {
             Ok(listener) => listeners.push(listener),
+            #[cfg(target_os = "linux")]
             Err(e)
                 if matches!(
                     e.raw_os_error(),
                     Some(libc::EADDRNOTAVAIL | libc::EAFNOSUPPORT)
                 ) =>
             {
+                skipped.push(format!("{addr} ({e})"));
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
                 skipped.push(format!("{addr} ({e})"));
             }
             Err(e) => return Err(format!("cannot bind {addr}: {e}")),
@@ -1416,6 +1471,7 @@ fn cu_listeners(bind: &str) -> Result<Vec<TcpListener>, String> {
 /// A listening socket on `addr`, IPv6-only for an IPv6 address so `[::]` and
 /// `0.0.0.0` can share a port: the standard library binds `[::]` dual-stack and
 /// offers no way to change that before the bind.
+#[cfg(target_os = "linux")]
 fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 
@@ -1493,14 +1549,29 @@ fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     Ok(unsafe { TcpListener::from_raw_fd(sock.into_raw_fd()) })
 }
 
+/// A listening socket on `addr` where the raw-socket bind is not needed: the standard
+/// library binds each address, and Windows already lets `[::]` and `0.0.0.0` share a port.
+#[cfg(not(target_os = "linux"))]
+fn bind_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr)
+}
+
 /// Pick the backend for one request: the registered Wayland compositor when present,
 /// otherwise a fresh private connection to `DISPLAY`. The X11 connection is per-request so a
 /// restarted X server never leaves the CU thread holding a dead connection.
+#[cfg(target_os = "linux")]
 pub(crate) fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
     if let Some(backend) = WAYLAND_BACKEND.lock().unwrap().clone() {
         return Ok(Box::new(backend));
     }
     crate::x11::computer_use::CuX11Backend::connect().map(|be| Box::new(be) as Box<dyn CuBackend>)
+}
+
+/// The CU backend where no Wayland compositor or X server exists: the actions report
+/// the absence rather than acting on nothing.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn resolve_backend() -> Result<Box<dyn CuBackend>, String> {
+    Err("the Computer Use backend is not wired for this OS yet".to_string())
 }
 
 /// Expose the captured desktop to an AI agent over HTTP, so a Computer Use client can drive
@@ -1935,6 +2006,8 @@ mod tests {
         assert!(!slot.in_use());
     }
 
+    /// Linux alone: the readback it drives waits on the compositor renderer's fence.
+    #[cfg(target_os = "linux")]
     #[test]
     fn screenshot_gpu_readback_waits_for_its_fence_until_the_deadline() {
         let mapping = [9u8; 12];

@@ -16,6 +16,11 @@ use crate::encoders::software::{
     stripes_held_still,
 };
 use crate::encoders::{self, Codec, FrameEncoder, FrameSource};
+// The geometry types the pipeline speaks: smithay's on Linux, where its x11/wayland callers
+// hand the pipeline smithay rectangles, and the crate's own shape-identical ones elsewhere.
+#[cfg(not(target_os = "linux"))]
+use crate::geometry::{Physical, Rectangle};
+#[cfg(target_os = "linux")]
 use smithay::utils::{Physical, Rectangle};
 use std::sync::Arc;
 
@@ -129,7 +134,7 @@ impl Damage {
     /// The damage a set of rectangles on a `width` x `height` frame reports: their summed area,
     /// clipped to the frame, overlaps counted twice.
     pub fn of_rects<'a>(
-        rects: impl IntoIterator<Item = &'a smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
+        rects: impl IntoIterator<Item = &'a Rectangle<i32, Physical>>,
         width: i32,
         height: i32,
     ) -> Self {
@@ -1411,7 +1416,8 @@ fn band_rects(dirty: &[bool], width: i32, height: i32) -> Vec<Rectangle<i32, Phy
 /// and return what `encode` returned with the bands that changed: a Turbo frame's hash kept off
 /// its encode's path. A scoped thread per frame rather than the rayon pool, whose idle workers
 /// spin after every wake; where no thread starts, the hash runs here after the encode. The
-/// thread keeps to the CPUs sharing this one's last-level cache (`share_cache_with`).
+/// thread keeps to the CPUs sharing this one's last-level cache (`share_cache_with`) — a
+/// Linux scheduling affinity, absent here.
 #[allow(clippy::too_many_arguments)]
 fn hash_beside<R>(
     bands: &mut Vec<StripeState>,
@@ -1422,11 +1428,13 @@ fn hash_beside<R>(
     duration: i32,
     encode: impl FnOnce() -> R,
 ) -> (R, Vec<bool>) {
+    #[cfg(target_os = "linux")]
     let cpu = unsafe { libc::sched_getcpu() };
     let (out, hashed) = std::thread::scope(|s| {
         let hashing = std::thread::Builder::new()
             .name("pxf-x11-hash".into())
             .spawn_scoped(s, || {
+                #[cfg(target_os = "linux")]
                 share_cache_with(cpu);
                 hash_bands(bands, pixels, stride, height, threshold, duration)
             });
@@ -1447,6 +1455,7 @@ fn hash_beside<R>(
 /// evicts whatever else runs there. Beside the encode, which has just read the same frame, it
 /// costs neither. A CPU whose caches the kernel does not list, or a cache of no CPU this thread
 /// may use, leaves it where it is.
+#[cfg(target_os = "linux")]
 fn share_cache_with(cpu: i32) {
     static CACHES: std::sync::Mutex<std::collections::BTreeMap<i32, Option<libc::cpu_set_t>>> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
@@ -1480,6 +1489,7 @@ fn share_cache_with(cpu: i32) {
 }
 
 /// The CPUs sharing `cpu`'s last-level cache, the highest level its sysfs cache entries list.
+#[cfg(target_os = "linux")]
 fn last_cache_cpus(cpu: i32) -> Option<libc::cpu_set_t> {
     let (_, list) = std::fs::read_dir(format!("/sys/devices/system/cpu/cpu{cpu}/cache"))
         .ok()?
@@ -1501,6 +1511,7 @@ fn last_cache_cpus(cpu: i32) -> Option<libc::cpu_set_t> {
 }
 
 /// A kernel CPU list ("0-3,32-35") as a set.
+#[cfg(target_os = "linux")]
 fn cpu_list(list: &str) -> Option<libc::cpu_set_t> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for part in list.trim().split(',').filter(|p| !p.is_empty()) {
@@ -2181,6 +2192,7 @@ mod tests {
     /// frame or not: a refresh held at the paint-over quantizer after the trigger, a key frame
     /// held there once it has held still four trigger periods, each followed by the recovery
     /// burst, then silence (or Turbo's frames at the session quality).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_kernel_cpu_list_reads_as_its_cpus() {
         let set = cpu_list("0-3,32-35\n").unwrap();
@@ -2192,6 +2204,7 @@ mod tests {
         assert!(cpu_list("x").is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_hash_thread_keeps_to_cpus_it_was_allowed() {
         let size = std::mem::size_of::<libc::cpu_set_t>();
@@ -4809,7 +4822,7 @@ mod tests {
         let pixels = vec![0x80u8; 64 * 64 * 4];
         let mut stripes = p.process(&pixels, 64 * 4);
         assert!(!stripes.is_empty(), "the first frame of a pipeline is sent");
-        let start = crate::wayland::host::now_ns();
+        let start = crate::clock::now_ns();
         crate::encoders::software::FrameTiming::stamp(
             &mut stripes,
             start - 2_000_000,
@@ -4881,6 +4894,8 @@ mod tests {
 
     /// A capture larger than the engine's maximum H.264 picture comes up in software, and a
     /// resize into the engine's range rebuilds it there. Ignored by default; run with the GPU set.
+    /// Linux alone: it reads its settings through the X11 test support.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn gpu_x11_h264_past_the_engine_maximum_takes_the_engine_once_resized() {
@@ -4923,6 +4938,8 @@ mod tests {
     }
 
     /// On a host with a hardware encoder the report names it, the GPU it runs on, and the node.
+    /// Linux alone: it reads its settings through the X11 test support.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn gpu_x11_pipeline_reports_the_hardware_session() {
@@ -4951,6 +4968,7 @@ mod tests {
     /// up. Mixed into the device's band state, the CPU hashes read every band as changed two
     /// frames in three, and the cleanup never came due. Ignored by default.
     #[test]
+    #[cfg(target_os = "linux")]
     #[ignore]
     fn gpu_a_turbo_still_screen_reads_still_through_its_cleanup() {
         let (w, h) = (1280usize, 720usize);
@@ -5134,7 +5152,6 @@ mod tests {
     /// Damage rectangles report the share of the frame they cover, clipped to it.
     #[test]
     fn damage_rectangles_report_their_share_of_the_frame() {
-        use smithay::utils::Rectangle;
         assert_eq!(Damage::of_rects(&[], 100, 100), Damage::None);
         let quarter = [Rectangle::new((0, 0).into(), (50, 50).into())];
         assert_eq!(Damage::of_rects(&quarter, 100, 100), Damage::Area(0.25));

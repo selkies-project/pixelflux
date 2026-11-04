@@ -30,6 +30,10 @@ impl DmaBufIdentity {
     /// Read the identity of the buffer behind `fd`: `fstat` supplies the inode and allocation
     /// size, and the caller supplies the modifier and geometry from the dmabuf descriptor. A failed
     /// `fstat` leaves the inode/size zero, which still combines with the modifier and geometry.
+    ///
+    /// Linux alone: an `fstat` of a dma-buf is a Linux kernel stat, taken by the dmabuf import
+    /// paths this OS does not have.
+    #[cfg(target_os = "linux")]
     pub(crate) fn probe(fd: i32, modifier: u64, width: u32, height: u32) -> Self {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let (dev, ino, size) = if unsafe { libc::fstat(fd, &mut st) } == 0 {
@@ -83,6 +87,7 @@ mod tests {
     /// `probe` reads a real fd deterministically and folds the modifier and geometry into the
     /// identity: the same fd and parameters yield equal identities, and changing the modifier or the
     /// geometry changes the identity even on the same fd.
+    #[cfg(target_os = "linux")]
     #[test]
     fn dmabuf_identity_probe_is_stable_and_parameterized() {
         use std::os::fd::AsRawFd;

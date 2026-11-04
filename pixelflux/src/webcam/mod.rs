@@ -17,9 +17,16 @@
 
 pub mod convert;
 pub mod decode;
+/// The PipeWire `Video/Source` node sink, where a PipeWire daemon is reachable.
+#[cfg(target_os = "linux")]
 pub mod pipewire;
 pub mod ring;
+/// The control socket serving the ring to the Selkies V4L2 interposer.
+#[cfg(target_os = "linux")]
 pub mod server;
+mod sinks;
+/// The v4l2loopback kernel device sink.
+#[cfg(target_os = "linux")]
 pub mod v4l2out;
 
 use std::collections::VecDeque;
@@ -32,10 +39,8 @@ use crate::Error;
 
 use convert::{DeviceFormat, Normalizer, Orientation, orient_i420};
 use decode::{Codec, DecodeError, Decoder, new_decoder, sniff_keyframe};
-use pipewire::PipeWireSink;
 use ring::{Ring, RingFormat};
-use server::Server;
-use v4l2out::V4l2Output;
+use sinks::{Shared, Sinks};
 
 /// Configuration for [`VirtualCamera::start`].
 #[derive(Clone, Debug, PartialEq)]
@@ -85,13 +90,20 @@ impl Default for VirtualCameraSettings {
 }
 
 /// Where the camera socket lives unless a caller names one: the session's private runtime
-/// directory, where no other account can take the name first, else `/tmp`. The v4l2
-/// interposer looks in the same place.
+/// directory, where no other account can take the name first, else the OS's temporary
+/// directory. The v4l2 interposer looks in the same place.
 pub fn socket_dir() -> String {
-    std::env::var("XDG_RUNTIME_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "/tmp".into())
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var("XDG_RUNTIME_DIR")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| "/tmp".into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir().to_string_lossy().into_owned()
+    }
 }
 
 fn parse_pixel_format(name: &str) -> Option<u32> {
@@ -216,7 +228,7 @@ impl Pool {
 struct Running {
     queue: Arc<Queue>,
     thread: Option<JoinHandle<()>>,
-    server: Arc<Server>,
+    shared: Shared,
     keyframe_wanted: Arc<AtomicBool>,
     pool: Arc<Pool>,
     device_path: Arc<Mutex<String>>,
@@ -230,25 +242,34 @@ pub struct VirtualCamera {
     stats: Arc<Stats>,
 }
 
+/// Nanoseconds on the OS's monotonic clock: the kernel's own clock where libc serves it,
+/// and the standard library's monotonic instant elsewhere.
 fn monotonic_ns() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64
+    }
 }
 
 struct WorkerConfig {
     queue: Arc<Queue>,
     ring: Ring,
-    server: Arc<Server>,
     stats: Arc<Stats>,
     keyframe_wanted: Arc<AtomicBool>,
     pool: Arc<Pool>,
-    v4l2out: Option<V4l2Output>,
-    device_path: Arc<Mutex<String>>,
-    pipewire: Option<PipeWireSink>,
+    sinks: Sinks,
 }
 
 /// Re-encode quality for frames that must be fitted into an MJPEG device (a camera of another
@@ -299,42 +320,8 @@ impl MjpegEncoder {
     }
 }
 
-/// After a publish: wake the socket clients and mirror the frame into the kernel device and the
-/// PipeWire node where those sinks are up, retiring a sink that failed.
-fn fan_out(
-    ring: &Ring,
-    server: &Server,
-    v4l2out: &mut Option<V4l2Output>,
-    device_path: &Mutex<String>,
-    pipewire: &mut Option<PipeWireSink>,
-    ts: u64,
-    stats: &Stats,
-) {
-    server.ring_doorbell();
-    if let Some(frame) = ring.latest_frame() {
-        if let Some(out) = v4l2out.as_mut() {
-            out.write_frame(frame);
-            if out.is_failed() {
-                device_path
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-                *v4l2out = None;
-            }
-        }
-        if let Some(pw) = pipewire.as_mut() {
-            pw.publish(frame, ts);
-            stats
-                .pipewire_streaming
-                .store(pw.is_streaming(), Ordering::Relaxed);
-            if pw.is_failed() {
-                eprintln!("[webcam] PipeWire node stopped; PipeWire sink disabled");
-                *pipewire = None;
-                stats.pipewire_streaming.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-}
+/// After a publish the sinks the decoder thread owns take the frame: see [`Sinks::fan_out`],
+/// the per-OS interface this worker drives identically everywhere.
 
 /// Decoder thread body: decode, fit, publish, wake clients. A dropped or undecodable inter-coded
 /// frame parks the stream until the next keyframe and asks the client for one, so a consumer never
@@ -343,13 +330,10 @@ fn worker(cfg: WorkerConfig) {
     let WorkerConfig {
         queue,
         mut ring,
-        server,
         stats,
         keyframe_wanted,
         pool,
-        mut v4l2out,
-        device_path,
-        mut pipewire,
+        mut sinks,
     } = cfg;
     let fmt = *ring.format();
     let dev = DeviceFormat {
@@ -403,15 +387,7 @@ fn worker(cfg: WorkerConfig) {
                     }) {
                         stats.passthrough.fetch_add(1, Ordering::Relaxed);
                         stats.published.fetch_add(1, Ordering::Relaxed);
-                        fan_out(
-                            &ring,
-                            &server,
-                            &mut v4l2out,
-                            &device_path,
-                            &mut pipewire,
-                            ts,
-                            &stats,
-                        );
+                        sinks.fan_out(&ring, ts, &stats);
                     }
                     pool.put(job.data);
                     continue;
@@ -466,15 +442,7 @@ fn worker(cfg: WorkerConfig) {
                     });
                     if published {
                         stats.published.fetch_add(1, Ordering::Relaxed);
-                        fan_out(
-                            &ring,
-                            &server,
-                            &mut v4l2out,
-                            &device_path,
-                            &mut pipewire,
-                            ts,
-                            &stats,
-                        );
+                        sinks.fan_out(&ring, ts, &stats);
                     }
                 }
             }
@@ -569,62 +537,25 @@ impl VirtualCamera {
         let started = (move || -> Result<Running, String> {
             let ring =
                 Ring::new(fmt, slots).map_err(|e| format!("ring allocation failed: {}", e))?;
-            let server = Arc::new(
-                Server::bind(&socket_path, ring.config_bytes(), ring.fd())
-                    .map_err(|e| format!("bind({}) failed: {}", socket_path, e))?,
-            );
-            let v4l2out = match device_setting.as_str() {
-                "" | "false" | "no" | "off" | "none" => None,
-                "auto" | "true" | "yes" | "on" => {
-                    V4l2Output::find_loopback_device().and_then(|p| {
-                        match V4l2Output::open(&p, &fmt) {
-                            Ok(o) => Some(o),
-                            Err(e) => {
-                                eprintln!("[webcam] {}; kernel device sink disabled", e);
-                                None
-                            }
-                        }
-                    })
-                }
-                path => match V4l2Output::open(path, &fmt) {
-                    Ok(o) => Some(o),
-                    Err(e) => {
-                        eprintln!("[webcam] {}; kernel device sink disabled", e);
-                        None
-                    }
-                },
-            };
-            let device_path = Arc::new(Mutex::new(
-                v4l2out
-                    .as_ref()
-                    .map(|o| o.path().to_string())
-                    .unwrap_or_default(),
-            ));
-            let pipewire = if want_pipewire {
-                match PipeWireSink::connect(&pipewire_node_name, "Selkies Virtual Camera", &fmt) {
-                    Ok(sink) => Some(sink),
-                    Err(e) => {
-                        eprintln!("[webcam] PipeWire sink unavailable: {}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let pipewire_on = pipewire.is_some();
+            let (shared, sinks) = Sinks::start(
+                &socket_path,
+                &ring,
+                &device_setting,
+                want_pipewire,
+                &pipewire_node_name,
+            )?;
+            let pipewire_on = sinks.pipewire_active();
+            let device_path = sinks.device_path();
             let queue = Arc::new(Queue::new(queue_depth));
             let keyframe_wanted = Arc::new(AtomicBool::new(true));
             let pool = Arc::new(Pool(Mutex::new(Vec::new())));
             let cfg = WorkerConfig {
                 queue: queue.clone(),
                 ring,
-                server: server.clone(),
                 stats,
                 keyframe_wanted: keyframe_wanted.clone(),
                 pool: pool.clone(),
-                v4l2out,
-                device_path: device_path.clone(),
-                pipewire,
+                sinks,
             };
             let thread = thread::Builder::new()
                 .name("pixelflux-webcam".into())
@@ -633,7 +564,7 @@ impl VirtualCamera {
             Ok(Running {
                 queue,
                 thread: Some(thread),
-                server,
+                shared,
                 keyframe_wanted,
                 pool,
                 device_path,
@@ -705,7 +636,7 @@ impl VirtualCamera {
         Ok(running.keyframe_wanted.swap(false, Ordering::Relaxed) as u32)
     }
 
-    /// Stop the decoder thread, close every interposer client, and remove the socket.
+    /// Stop the decoder thread, close every sink the worker owns, and remove the socket.
     pub fn stop(&self) {
         let running = self
             .running
@@ -717,7 +648,7 @@ impl VirtualCamera {
             if let Some(t) = r.thread.take() {
                 let _ = t.join();
             }
-            drop(r.server);
+            drop(r.shared);
         }
     }
 
@@ -734,7 +665,7 @@ impl VirtualCamera {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|r| r.server.client_count())
+            .map(|r| r.shared.clients())
             .unwrap_or(0)
     }
 
@@ -743,7 +674,7 @@ impl VirtualCamera {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|r| r.server.path().to_string())
+            .and_then(|r| r.shared.socket_path())
     }
 
     /// Kernel device currently mirrored, or "" when none is in use.
@@ -780,13 +711,13 @@ impl VirtualCamera {
                 .map(|c| c.name())
                 .unwrap_or(""),
             running: guard.as_ref().map(|r| CameraRunning {
-                clients: r.server.client_count(),
+                clients: r.shared.clients(),
                 width: r.format.width,
                 height: r.format.height,
                 fps_num: r.format.fps_num,
                 fps_den: r.format.fps_den,
-                pixel_format: v4l2out::fourcc_str(r.format.fourcc),
-                socket_path: r.server.path().to_string(),
+                pixel_format: ring::fourcc_str(r.format.fourcc),
+                socket_path: r.shared.socket_path().unwrap_or_default(),
                 device_path: r
                     .device_path
                     .lock()

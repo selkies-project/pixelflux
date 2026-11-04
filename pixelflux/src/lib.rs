@@ -56,24 +56,43 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
 use std::fs::File;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// The GBM allocator the render targets and zero-copy dmabufs come from, a Linux DRM device.
+#[cfg(target_os = "linux")]
 use gbm::{BufferObject, BufferObjectFlags, Device as RawGbmDevice, Format as GbmFormat};
+/// The headless Smithay compositor: every renderer, input, and Wayland protocol state
+/// `run_wayland_thread` is built from. Linux alone — the compositor is the capture backend
+/// this port has not wired for any other OS.
+#[cfg(target_os = "linux")]
 use smithay::backend::egl::fence::EGLFence;
+#[cfg(target_os = "linux")]
 use smithay::desktop::utils::{OutputPresentationFeedback, send_frames_surface_tree};
+#[cfg(target_os = "linux")]
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+#[cfg(target_os = "linux")]
 use smithay::reexports::wayland_server::protocol::wl_shm;
+#[cfg(target_os = "linux")]
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+#[cfg(target_os = "linux")]
 use smithay::wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState};
+#[cfg(target_os = "linux")]
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, ImageCopyCaptureState};
+#[cfg(target_os = "linux")]
 use smithay::wayland::presentation::{PresentationState, Refresh};
+#[cfg(target_os = "linux")]
 use smithay::wayland::selection::ext_data_control::DataControlState as ExtDataControlState;
+#[cfg(target_os = "linux")]
 use smithay::wayland::selection::wlr_data_control::DataControlState;
+#[cfg(target_os = "linux")]
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+#[cfg(target_os = "linux")]
 use smithay::wayland::viewporter::ViewporterState;
+#[cfg(target_os = "linux")]
 use smithay::{
     backend::{
         allocator::{
@@ -148,8 +167,12 @@ pub mod log;
 #[cfg(feature = "python")]
 mod python;
 
+/// The one monotonic clock capture and encode stamp with.
+pub mod clock;
 /// HTTP server implementing the Anthropic Computer Use spec for AI agent desktop control.
 pub mod computer_use;
+/// The geometry the frame pipeline speaks.
+pub mod geometry;
 /// When a capture is due a frame, shared by the X11 and Wayland backends.
 pub mod pace;
 /// Built-in MP4 recorder: independent capture-to-file with API/env/REST control.
@@ -161,20 +184,30 @@ pub mod report;
 /// What a capture hands its consumer, and the traits a consumer implements to receive it.
 pub mod sink;
 /// Kernel uinput devices, the first rung of host-capture input injection.
+#[cfg(target_os = "linux")]
 pub mod uinput;
 /// Headless Wayland compositor and cursor rendering.
+#[cfg(target_os = "linux")]
 pub mod wayland;
 
 #[cfg(test)]
 mod cleanup_bench;
 /// Multi-GPU NVENC device filtering via kernel ioctl.
+#[cfg(target_os = "linux")]
 pub mod nvgpufilter;
 /// Frame-processing policy shared by the X11 and Wayland backends.
 pub mod pipeline;
 /// Run-time libpipewire binding and SPA pod encoding shared by the webcam sink and host capture.
+#[cfg(target_os = "linux")]
 pub mod pipewire;
 /// X11/XShm capture loop, stripe dispatch, and per-stripe change detection.
+#[cfg(target_os = "linux")]
 pub mod x11;
+
+/// Windows desktop capture: Windows.Graphics.Capture frames encoded in place by NVENC on
+/// the same D3D11 device.
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 pub mod webcam;
 
@@ -193,6 +226,10 @@ fn get_process_rss_bytes() -> usize {
 
 /// Blocks actually allocated, not apparent size, so a sparse file is not reported as
 /// memory the process took. Feeds the debug log line only.
+///
+/// Linux alone: the block count is `st_blocks`, a POSIX `stat` field, and `/dev/shm` is a
+/// Linux tmpfs the session's Wayland clients allocate in.
+#[cfg(target_os = "linux")]
 fn shm_usage_in(dir: &str) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let mut total_size = 0;
@@ -206,20 +243,38 @@ fn shm_usage_in(dir: &str) -> u64 {
     total_size
 }
 
+/// The session's `/dev/shm` usage (`shm_usage_in`), for the compositor's debug log line.
+#[cfg(target_os = "linux")]
 fn get_shm_usage_bytes() -> u64 {
     shm_usage_in("/dev/shm")
 }
 
+#[cfg(target_os = "linux")]
+use encoders::FrameSource;
+/// The watermark overlay the compositor renders into each frame, Linux alone with the
+/// renderer that draws it.
+#[cfg(target_os = "linux")]
 use encoders::overlay::OverlayState;
+#[cfg(target_os = "linux")]
 use encoders::software::MAX_STRIPE_CAPACITY;
-use encoders::{Codec, FrameEncoder, FrameSource};
+use encoders::{Codec, FrameEncoder};
 
+/// The compositor's virtual-keyboard manager global, for the compositor thread's own
+/// keymap protocol wiring.
+#[cfg(target_os = "linux")]
 use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
 
+#[cfg(target_os = "linux")]
 use pace::{FramePace, TickTrigger};
+/// The compositor's cursor worker and calloop state, with the compositor itself Linux alone.
+#[cfg(target_os = "linux")]
 use wayland::cursor::{Cursor, CursorJob};
+#[cfg(target_os = "linux")]
 use wayland::frontend::{AppState, ClientState, FocusTarget, next_serial, wayland_time};
 
+/// The element set one render composites a frame from — windows, layer surfaces, and the
+/// cursor — produced by `render_elements!` over the Smithay renderers, Linux alone.
+#[cfg(target_os = "linux")]
 smithay::backend::renderer::element::render_elements! {
     pub CompositionElements<R, E> where R: ImportAll + ImportMem;
     Space=SpaceRenderElements<R, E>,
@@ -232,6 +287,7 @@ smithay::backend::renderer::element::render_elements! {
 /// order `layer_map.layers()` reversed gives, each with its popups and subsurfaces. Shared by
 /// both renderers and by both of a frame's layer passes, which differ only in the layers they
 /// name.
+#[cfg(target_os = "linux")]
 fn push_layer_elements<R>(
     renderer: &mut R,
     elements: &mut Vec<CompositionElements<R, WaylandSurfaceRenderElement<R>>>,
@@ -268,6 +324,7 @@ fn push_layer_elements<R>(
 /// reaches the encoder sheared. A buffer the display engine may scan out carries that engine's aligned pitch, so a
 /// linear allocation whose pitch is not a multiple of 64 is made again for scanout as well, and
 /// that one is kept only where it came out aligned.
+#[cfg(target_os = "linux")]
 pub(crate) fn alloc_render_target<T: std::os::fd::AsFd>(
     gbm: &RawGbmDevice<T>,
     width: u32,
@@ -299,6 +356,7 @@ pub(crate) fn alloc_render_target<T: std::os::fd::AsFd>(
 /// the buffer is described precisely enough (fd, stride, DRM modifier) for the importer to interpret
 /// it. The render targets and host capture slots have one plane; retain the BO's format so an
 /// opaque host slot is not imported as a buffer with alpha.
+#[cfg(target_os = "linux")]
 pub(crate) fn create_dmabuf_from_bo(bo: &BufferObject<()>) -> Dmabuf {
     let fd = bo.fd().expect("Failed to get FD from GBM BO");
     let modifier = bo.modifier();
@@ -1089,6 +1147,7 @@ fn auto_select_render_node(token: Option<&str>) -> Option<String> {
 /// thread: the slot's buffer (a readback's packed rows, or the zero-copy session's GPU target)
 /// plus the per-frame inputs of the encode dispatch (damage, overlay animation); the IDR
 /// request travels separately via the controls atomic.
+#[cfg(target_os = "linux")]
 pub struct WlFrame<B = Vec<u8>> {
     /// Pool slot id; travels with the buffer so recycle returns it to the right slot.
     id: usize,
@@ -1104,6 +1163,7 @@ pub struct WlFrame<B = Vec<u8>> {
 }
 
 /// Interior state of `WlFramePool`: the free-buffer list plus the single publish slot.
+#[cfg(target_os = "linux")]
 struct WlPoolInner<B> {
     free: Vec<(usize, B)>,
     slot: Option<WlFrame<B>>,
@@ -1120,12 +1180,14 @@ struct WlPoolInner<B> {
 /// The zero-copy session runs the same split on GPU buffers: the calloop composites into one
 /// of the pool's render targets and publishes it, and the encode thread encodes it in place,
 /// so the compositor thread is free again as soon as the composite is.
+#[cfg(target_os = "linux")]
 pub struct WlFramePool<B = Vec<u8>> {
     inner: Mutex<WlPoolInner<B>>,
     cv: Condvar,
     stop: AtomicBool,
 }
 
+#[cfg(target_os = "linux")]
 impl WlFramePool<Vec<u8>> {
     /// Pre-allocate all `n` capture buffers up front (each `buf_len` bytes, all initially
     /// free) so the steady-state render/encode loop hands buffers around without ever allocating on
@@ -1135,6 +1197,7 @@ impl WlFramePool<Vec<u8>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<B> WlFramePool<B> {
     /// A pool of the buffers given, all initially free, numbered in order.
     fn of(buffers: Vec<B>) -> Self {
@@ -1213,6 +1276,7 @@ impl<B> WlFramePool<B> {
 /// frame ALREADY in flight instead of waiting one pipeline stage for the next publish.
 /// `reference_reports` are what clients said of frames (lost, or held by every one of them),
 /// drained ahead of the same encode.
+#[cfg(target_os = "linux")]
 pub struct WlEncodeControls {
     rate_dirty: AtomicBool,
     bitrate_kbps: AtomicI32,
@@ -1228,6 +1292,7 @@ pub struct WlEncodeControls {
     tunables: Mutex<Option<LiveTunables>>,
 }
 
+#[cfg(target_os = "linux")]
 impl WlEncodeControls {
     fn new() -> Self {
         Self {
@@ -1281,6 +1346,7 @@ fn frame_period(fps: f64) -> Duration {
 }
 
 /// The frame period a capture renders at.
+#[cfg(target_os = "linux")]
 fn capture_period(cap: &wayland::frontend::WlCapture) -> Duration {
     frame_period(cap.settings.target_fps)
 }
@@ -1293,6 +1359,7 @@ pub(crate) const SCROLL_V120_PER_UNIT: f64 = 12.0;
 /// Shared capture stats: whichever thread owns the encoders counts frames/stripes and
 /// composes `desc` + `n_stripes` (the encoder half of the 1 s debug log line); the calloop
 /// log loads, prints, and resets the counters.
+#[cfg(target_os = "linux")]
 pub struct WlEncodeStats {
     frames: AtomicU32,
     stripes: AtomicU32,
@@ -1303,6 +1370,7 @@ pub struct WlEncodeStats {
     recycled: AtomicU64,
 }
 
+#[cfg(target_os = "linux")]
 impl WlEncodeStats {
     fn new() -> Self {
         Self {
@@ -1318,6 +1386,7 @@ impl WlEncodeStats {
 /// Everything the Wayland encode thread needs, fixed for the life of one capture (a
 /// StartCapture reconfigure tears the thread down and spawns a fresh one). Rate changes
 /// flow through `controls`; damage and the IDR request arrive per-frame in `WlFrame`.
+#[cfg(target_os = "linux")]
 struct WlEncodeConfig {
     settings: CaptureSettings,
     /// Output/display id this encode loop serves; keys the recorder's delivery-layer tap.
@@ -1350,6 +1419,7 @@ struct WlEncodeConfig {
 /// A zero-copy hardware session (GLES render + same-GPU dmabuf encode), driven by the
 /// capture's encode thread. The calloop opens it and takes it back at a restart to reuse in
 /// place; the thread holds the lock for one encode at a time, never across a delivery.
+#[cfg(target_os = "linux")]
 struct ZeroCopySession {
     encoder: Arc<Mutex<Option<FrameEncoder>>>,
     /// The renderer's EGL display (`FrameSource::Dmabuf`), as an address, for a rebuild after
@@ -1359,6 +1429,7 @@ struct ZeroCopySession {
 
 /// What a Wayland encode thread encodes a frame from: the packed rows a readback filled, or
 /// the GPU buffer a zero-copy session encodes in place.
+#[cfg(target_os = "linux")]
 trait WlPayload: Send + 'static {
     /// Encode the frame on a full-frame session. `source` stands in for the slot's own buffer
     /// (`WlFrame::source`).
@@ -1379,6 +1450,7 @@ trait WlPayload: Send + 'static {
     fn rows(&self) -> Option<&[u8]>;
 }
 
+#[cfg(target_os = "linux")]
 impl WlPayload for Vec<u8> {
     fn encode(
         &self,
@@ -1408,6 +1480,7 @@ impl WlPayload for Vec<u8> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl WlPayload for Dmabuf {
     fn encode(
         &self,
@@ -1433,6 +1506,7 @@ impl WlPayload for Dmabuf {
 /// software path, where `encode_cpu` builds its own per-stripe state. A compatible NVENC
 /// session handed over from the previous encode thread is reconfigured in place rather than
 /// rebuilt, which would stall the stream.
+#[cfg(target_os = "linux")]
 fn build_readback_encoders(
     settings: &mut CaptureSettings,
     try_gpu: bool,
@@ -1482,6 +1556,7 @@ fn build_readback_encoders(
 /// a readback hardware session is handed back to the calloop so a restart can reuse it in
 /// place when the new settings stay compatible (a plain `StopCapture` just drops it); a
 /// zero-copy one stays in its `ZeroCopySession`.
+#[cfg(target_os = "linux")]
 fn wayland_encode_loop<B: WlPayload>(
     pool: &WlFramePool<B>,
     cfg: WlEncodeConfig,
@@ -2057,6 +2132,7 @@ mod stream_settings_line_tests {
 /// the restart — and a plain stop hands both to the reaper. The zero-copy session (if any)
 /// is left on the capture for the caller to reuse or drop, and so are the host frames its
 /// thread may still be reading (`release_host_inflight`).
+#[cfg(target_os = "linux")]
 fn teardown_capture(
     cap: &mut wayland::frontend::WlCapture,
 ) -> (
@@ -2086,6 +2162,7 @@ fn teardown_capture(
 
 /// Stop a capture's zero-copy session: its encode thread ends after the frame in flight, and
 /// its render targets go. False where none ran.
+#[cfg(target_os = "linux")]
 fn end_zero_copy(cap: &mut wayland::frontend::WlCapture) -> bool {
     let Some(pool) = cap.gpu_pool.take() else {
         return false;
@@ -2099,6 +2176,7 @@ fn end_zero_copy(cap: &mut wayland::frontend::WlCapture) -> bool {
 
 /// Keep `frame` as the display's host content. Under a zero-copy session the frame it replaces
 /// goes back to the host only once no frame in flight to the encode thread reads it.
+#[cfg(target_os = "linux")]
 fn retain_host_frame(
     host: &wayland::host::HostSession,
     cap: Option<&mut wayland::frontend::WlCapture>,
@@ -2120,6 +2198,7 @@ fn retain_host_frame(
 /// `HostSession::detach_retained` for a GPU frame, which only a zero-copy session takes: the
 /// renderer copies it into a buffer of the capture's own, which re-encodes then read, and the
 /// stream's buffer goes back once no frame in flight reads it.
+#[cfg(target_os = "linux")]
 fn detach_retained_gpu(
     renderer: Option<&mut GlesRenderer>,
     gbm: Option<&RawGbmDevice<std::fs::File>>,
@@ -2180,6 +2259,7 @@ fn detach_retained_gpu(
 }
 
 /// Hand back the pool reservations a render tick made and did not publish.
+#[cfg(target_os = "linux")]
 fn cancel_slots(
     node: &wayland::frontend::OutputNode,
     pool_slot: &mut Option<(usize, Vec<u8>)>,
@@ -2203,6 +2283,7 @@ fn cancel_slots(
 /// Hand back to the host the frames its compositor blitted that a zero-copy encode no longer
 /// reads: each once the encode thread is done with every frame published from it, or all of
 /// them (`all`) where the capture is going away.
+#[cfg(target_os = "linux")]
 fn release_host_inflight(
     host: Option<&wayland::host::HostSession>,
     cap: &mut wayland::frontend::WlCapture,
@@ -2228,6 +2309,7 @@ fn release_host_inflight(
 /// capture it fed: their displays leave the alive set, so `is_capturing` turns false and the
 /// consumer rebuilds them (the next start reconnects), and no input is written to a dead
 /// connection. The same signal X11 gives when its capture thread ends.
+#[cfg(target_os = "linux")]
 fn reap_dead_host(state: &mut AppState) {
     if !state.host.as_ref().is_some_and(|h| !h.alive()) {
         return;
@@ -2265,6 +2347,7 @@ fn reap_dead_host(state: &mut AppState) {
 
 /// Stop the capture bound to `display_id`, leaving the output (and every other display's
 /// capture) running.
+#[cfg(target_os = "linux")]
 fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
     let Some(idx) = state.node_idx_for_id(display_id) else {
         return;
@@ -2290,6 +2373,7 @@ fn stop_capture_on_display(state: &mut AppState, display_id: u32) {
 
 /// The geometry `get_realized_geometry` reports for `display_id`: the live capture's size
 /// and scale, else the output's current mode, else zeros for an unknown display.
+#[cfg(target_os = "linux")]
 fn realized_geometry(state: &AppState, display_id: u32) -> (i32, i32, f64) {
     state
         .node_idx_for_id(display_id)
@@ -2315,6 +2399,7 @@ fn realized_geometry(state: &AppState, display_id: u32) -> (i32, i32, f64) {
 
 /// Answer geometry readers parked behind a host layout request with what `display_id`
 /// captures now.
+#[cfg(target_os = "linux")]
 fn answer_geometry_waiters(
     state: &AppState,
     display_id: u32,
@@ -2359,6 +2444,7 @@ const HOST_MODE_REFUSALS_BEFORE_HINT: u32 = 3;
 /// in-place reconfigure a resize takes, so it never gates on a size the host will not
 /// produce, and the mismatch becomes the capture's caveat. Geometry readers parked behind a
 /// request answer once it is settled, with the size actually captured.
+#[cfg(target_os = "linux")]
 fn reconcile_host_layouts(state: &mut AppState) {
     if state.host_layout_pending.is_empty() {
         return;
@@ -2448,6 +2534,7 @@ fn reconcile_host_layouts(state: &mut AppState) {
 /// capture whose zero-copy session is absent or just died. Mirrors the start-capture
 /// bootstrap: u64::MAX content generations mark every pool slot stale so each one is
 /// read back before its first publish, whatever the damage says.
+#[cfg(target_os = "linux")]
 fn bootstrap_readback_pool(
     cap: &mut wayland::frontend::WlCapture,
     display_id: u32,
@@ -2506,6 +2593,7 @@ fn bootstrap_readback_pool(
 
 /// `WL_POOL_SURFACES` zero-copy render targets the size of the capture, or `None` where the
 /// GPU refuses one.
+#[cfg(target_os = "linux")]
 fn alloc_zero_copy_ring(
     gbm: &RawGbmDevice<std::fs::File>,
     settings: &CaptureSettings,
@@ -2537,6 +2625,7 @@ fn alloc_zero_copy_ring(
 
 /// Start a zero-copy capture's encode thread on `encoder`, a session the calloop opened on the
 /// renderer's EGL display, on `ring`'s render targets.
+#[cfg(target_os = "linux")]
 fn bootstrap_zero_copy_pool(
     cap: &mut wayland::frontend::WlCapture,
     ring: Vec<(BufferObject<()>, Dmabuf)>,
@@ -2601,6 +2690,10 @@ fn bootstrap_zero_copy_pool(
 /// encode path (Wayland zero-copy, Wayland readback, X11) so recovery timing matches.
 pub(crate) const HW_ERROR_RECOVERY_THRESHOLD: u32 = 30;
 
+/// The compositor's dispatch of a capture start: everything above the encoder — the output
+/// reprogram, render targets, the host session, and the encode/delivery threads — runs on
+/// the calloop, Linux alone with the compositor itself.
+#[cfg(target_os = "linux")]
 fn start_capture_on_display(
     state: &mut AppState,
     display_id: u32,
@@ -3216,6 +3309,7 @@ fn start_capture_on_display(
 /// Stamp the watermark element onto `target` in place — no clear, so the
 /// captured content underneath stays — returning the draw's sync point for the
 /// encoder to wait on.
+#[cfg(target_os = "linux")]
 fn draw_host_watermark(
     renderer: &mut GlesRenderer,
     overlay: &crate::encoders::overlay::OverlayState,
@@ -3239,6 +3333,7 @@ fn draw_host_watermark(
 /// Re-compose `src` (the retained host frame) into `target`, with the watermark where `overlay`
 /// is given: the path a moving watermark needs, since re-drawing over the same retained buffer
 /// would leave trails.
+#[cfg(target_os = "linux")]
 fn compose_host_frame(
     renderer: &mut GlesRenderer,
     overlay: Option<&crate::encoders::overlay::OverlayState>,
@@ -3296,6 +3391,7 @@ fn warn_once_host_watermark(e: &str) {
 
 /// Copy full rows from `src` (tight `width*4` stride) into an Argb8888/Xrgb8888 shm
 /// buffer, honoring the destination's own offset and stride.
+#[cfg(target_os = "linux")]
 fn copy_rows_into_shm(
     buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
     src: &[u8],
@@ -3332,6 +3428,7 @@ fn copy_rows_into_shm(
 
 /// The GPU target the last render composited into: `source`, a zero-copy capture's target
 /// still on the calloop, or else the output's own.
+#[cfg(target_os = "linux")]
 fn composited_target(
     node: &wayland::frontend::OutputNode,
     source: Option<&Dmabuf>,
@@ -3347,6 +3444,7 @@ fn composited_target(
 /// composited buffer (`composited_target`); an shm target by one readback (GLES) or one
 /// row copy (pixman). With no damage, a session that has already received content keeps
 /// its frame parked, so a static screen costs capture clients nothing.
+#[cfg(target_os = "linux")]
 fn service_copy_frames(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
@@ -3452,6 +3550,7 @@ fn service_copy_frames(
 /// Answer the frame callbacks of a surface-backed cursor. Xwayland and libwayland-cursor
 /// clients wait for the cursor surface's frame callback before attaching their next
 /// sprite, so a cursor surface that never gets one stops updating after its first sprite.
+#[cfg(target_os = "linux")]
 fn send_cursor_frame(state: &AppState, output: &Output, time: impl Into<Duration>) {
     if let Some(CursorImageStatus::Surface(surface)) = &state.current_cursor_icon {
         send_frames_surface_tree(surface, output, time, Some(Duration::ZERO), |_, _| {
@@ -3462,6 +3561,7 @@ fn send_cursor_frame(state: &AppState, output: &Output, time: impl Into<Duration
 
 /// Hotspot of a surface-backed cursor, in the surface's logical coordinates (zero when the
 /// client set none). The sprite is placed at pointer - hotspot, like named and X11 cursors.
+#[cfg(target_os = "linux")]
 fn cursor_surface_hotspot(
     surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
 ) -> Point<i32, smithay::utils::Logical> {
@@ -3486,6 +3586,7 @@ const UNDRAWN_TICKS_PER_FRAME: u32 = 60;
 /// Reads `target` back as RGBA into `dst`. The read runs in a frame of the target: a dmabuf
 /// bound as a texture gets a framebuffer of its own on each bind, which only a frame makes
 /// current, so a bare read on a tick that drew nothing would read another framebuffer.
+#[cfg(target_os = "linux")]
 fn read_back_rgba(
     renderer: &mut GlesRenderer,
     target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
@@ -3516,6 +3617,7 @@ const READBACK_SLOT_IDLE: Duration = Duration::from_secs(10);
 /// compositor reads back synchronously into the caller's buffer instead. Declared ahead of the
 /// renderer in [`AppState`](wayland::frontend::AppState), so its drop forgets every mapping, waiting
 /// out a copy under way, before the GL context goes away.
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 pub(crate) struct ScreenshotReadbacks {
     slots: Vec<(Arc<computer_use::ReadbackSlot>, Instant)>,
@@ -3523,6 +3625,7 @@ pub(crate) struct ScreenshotReadbacks {
     storage: Option<Option<BufferStorageFn>>,
 }
 
+#[cfg(target_os = "linux")]
 impl ScreenshotReadbacks {
     fn lookup(gl: &smithay::backend::renderer::gles::ffi::Gles2) -> Option<BufferStorageFn> {
         if std::env::var_os("PIXELFLUX_SCREENSHOT_SYNC").is_some_and(|v| !v.is_empty() && v != "0")
@@ -3641,6 +3744,7 @@ impl ScreenshotReadbacks {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for ScreenshotReadbacks {
     fn drop(&mut self) {
         for (slot, _) in &self.slots {
@@ -3651,6 +3755,7 @@ impl Drop for ScreenshotReadbacks {
 
 /// Start reading the bound target back into a pixel-pack buffer and return the readback the
 /// caller waits for, or `None` where the buffers are unavailable.
+#[cfg(target_os = "linux")]
 fn read_back_rgba_async(
     renderer: &mut GlesRenderer,
     readbacks: &mut ScreenshotReadbacks,
@@ -3696,6 +3801,7 @@ fn read_back_rgba_async(
 }
 
 /// Screenshot reads also check GL errors before any pixels can be handed to the caller.
+#[cfg(target_os = "linux")]
 fn read_back_rgba_result(
     renderer: &mut GlesRenderer,
     target: &mut smithay::backend::renderer::gles::GlesTarget<'_>,
@@ -3733,6 +3839,7 @@ fn read_back_rgba_result(
 }
 
 /// Where a screenshot's pixels are once its output has rendered.
+#[cfg(target_os = "linux")]
 enum ShotPixels {
     /// The render's own CPU pixels: the pool slot while one is held, else the frame buffer.
     Rendered,
@@ -3768,6 +3875,7 @@ fn screenshot_pixels(
 }
 
 /// Reject truncated host mappings instead of retaining pixels from an earlier frame.
+#[cfg(target_os = "linux")]
 fn validate_host_screenshot(
     frame: &wayland::host::HostCpuFrame,
     width: i32,
@@ -3808,6 +3916,7 @@ fn validate_host_screenshot(
     )
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(test)]
 mod screenshot_frame_tests {
     use super::{screenshot_pixels, validate_host_screenshot};
@@ -3932,6 +4041,7 @@ mod screenshot_frame_tests {
 /// rather than a compositor thread parked forever. The wait is one `eglClientWaitSync` to the
 /// deadline, flushing whatever commands still queue ahead of the fence; a fence-less sync
 /// point is reached at once.
+#[cfg(target_os = "linux")]
 fn wait_render_fence(sync: &SyncPoint, display_id: u32) -> bool {
     let reached = match sync.get::<EGLFence>() {
         Some(fence) => fence
@@ -3951,6 +4061,7 @@ fn wait_render_fence(sync: &SyncPoint, display_id: u32) -> bool {
 /// Render every output that is due for `trigger`, and say whether a readback pool was still
 /// busy. The nodes are taken out of the state so each per-output render can borrow the shared
 /// renderer/space alongside its own damage tracker and buffers.
+#[cfg(target_os = "linux")]
 fn render_pass(state: &mut AppState, trigger: TickTrigger) -> bool {
     let drivers: Vec<bool> = state
         .output_nodes
@@ -3972,6 +4083,7 @@ fn render_pass(state: &mut AppState, trigger: TickTrigger) -> bool {
 /// input, a host frame) once its period is open: a change takes its period's frame as it
 /// lands, the X11 captures' schedule, rather than waiting for the frame timer. A capture whose
 /// period a frame already took keeps waiting, and the timer wakes as the next one opens.
+#[cfg(target_os = "linux")]
 fn serve_changes(state: &mut AppState) {
     let now = Instant::now();
     let open: Vec<u32> = state
@@ -3996,6 +4108,7 @@ fn serve_changes(state: &mut AppState) {
 /// the vblank a display gives them. A change renders as it lands (`serve_changes`), and a
 /// client drawing on frame callbacks takes its clock from them, which the boundaries keep even.
 /// The frame timer wakes at every boundary while a display captures, and calls this each time.
+#[cfg(target_os = "linux")]
 fn answer_frame_callbacks(state: &mut AppState) {
     let now = Instant::now();
     let time = state.clock.now();
@@ -4041,6 +4154,7 @@ fn answer_frame_callbacks(state: &mut AppState) {
 }
 
 /// One display's render tick, for a trigger that concerns that display alone.
+#[cfg(target_os = "linux")]
 fn render_display(state: &mut AppState, display_id: u32, trigger: TickTrigger) {
     let drives = state
         .output_nodes
@@ -4059,6 +4173,7 @@ fn render_display(state: &mut AppState, display_id: u32, trigger: TickTrigger) {
 /// view would render as many times a frame as there are displays over it, one asked by nobody
 /// (the screen itself is often captured by views alone) would freeze on the frame it first
 /// painted, and one driven by a slower sibling would stream stale frames on the faster display.
+#[cfg(target_os = "linux")]
 fn drives_screen(
     nodes: &[wayland::frontend::OutputNode],
     node: &wayland::frontend::OutputNode,
@@ -4078,6 +4193,10 @@ fn drives_screen(
     })
 }
 
+/// One output node's render tick: the damage, composite, and publish of a display's
+/// frame on either renderer (GLES on a render node, pixman without one). Runs on the
+/// calloop of the compositor thread, Linux alone with it.
+#[cfg(target_os = "linux")]
 fn render_node_tick(
     state: &mut AppState,
     node: &mut wayland::frontend::OutputNode,
@@ -5269,6 +5388,7 @@ type OutputOverlap = (u32, &'static str, (i32, i32, i32, i32));
 /// (Space layout, scale-divided) and physical (mode pixels at the same origin) — because
 /// input injection and cursor compositing key off the physical rects while window layout
 /// keys off the logical ones, and neither may overlap.
+#[cfg(target_os = "linux")]
 fn find_output_overlap(
     nodes: &[wayland::frontend::OutputNode],
     skip_id: Option<u32>,
@@ -5304,6 +5424,7 @@ fn find_output_overlap(
 /// a capture reconfigure (StartCapture on an existing output) resizes UNVALIDATED, so
 /// keeping a multi-step relayout overlap-free at every step is the caller's ordering
 /// responsibility.
+#[cfg(target_os = "linux")]
 fn create_output_on(
     state: &mut AppState,
     id: u32,
@@ -5478,6 +5599,7 @@ fn create_output_on(
 /// validated: a capture reconfigure (StartCapture on an existing output) resizes
 /// UNVALIDATED, so keeping a multi-step relayout overlap-free at every step is the
 /// caller's ordering responsibility.
+#[cfg(target_os = "linux")]
 fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
     let Some(idx) = state.node_idx_for_id(id) else {
         return false;
@@ -5590,6 +5712,7 @@ fn reposition_output_on(state: &mut AppState, id: u32, x: i32, y: i32) -> bool {
 
 /// Destroy a secondary output: end its capture, relocate its windows onto the primary
 /// output, unmap it from the space, and retract its global. The primary (id 0) is refused.
+#[cfg(target_os = "linux")]
 fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
     if id == 0 {
         return false;
@@ -5663,6 +5786,7 @@ fn destroy_output_on(state: &mut AppState, id: u32) -> bool {
 /// Send every non-parked window on `display_id`'s output a fullscreen configure
 /// for the new mode, with the scale each surface should render at. Without this
 /// a live session keeps drawing at the old size under the resized screen.
+#[cfg(target_os = "linux")]
 fn configure_windows_for_mode(
     state: &AppState,
     display_id: u32,
@@ -5713,6 +5837,8 @@ fn configure_windows_for_mode(
     }
 }
 
+/// Resize a screen's output in place on the compositor's space, keeping its position.
+#[cfg(target_os = "linux")]
 fn resize_output_on(state: &mut AppState, id: u32, width: i32, height: i32, scale: f64) -> bool {
     if width <= 0 || height <= 0 || scale <= 0.0 {
         return false;
@@ -5832,6 +5958,7 @@ const DEFAULT_VIEW_ID: u32 = 1;
 /// displays the client is shown. That is what a window drag needs: the pointer grab it
 /// runs under stays inside one surface across the whole desk, where separate screens
 /// stop it at the edge of the one it began on.
+#[cfg(target_os = "linux")]
 fn create_view_on(
     state: &mut AppState,
     id: u32,
@@ -5912,6 +6039,7 @@ fn create_view_on(
 
 /// Startup inputs for the compositor thread: its two calloop channels, the sender it hands
 /// to computer-use, the initial geometry, and the GPU / cursor policy.
+#[cfg(target_os = "linux")]
 struct WaylandThreadConfig {
     command_rx: smithay::reexports::calloop::channel::Channel<ThreadCommand>,
     wake_rx: smithay::reexports::calloop::channel::Channel<()>,
@@ -5930,6 +6058,7 @@ struct WaylandThreadConfig {
 ///
 /// The compositor and [`probe_wayland_gpu`] share this so the probe's answer is the
 /// compositor's own. Errors name the step that failed, which is all a caller can act on.
+#[cfg(target_os = "linux")]
 fn gpu_render_init(
     device_path: &std::path::Path,
 ) -> Result<(RawGbmDevice<File>, GlesRenderer), String> {
@@ -5953,6 +6082,7 @@ fn gpu_render_init(
 
 /// What the compositor renders with on a GPU, all of it brought up before any client hears of
 /// the GPU (`gpu_bring_up`).
+#[cfg(target_os = "linux")]
 struct GpuBringUp {
     gbm: RawGbmDevice<File>,
     renderer: GlesRenderer,
@@ -5967,6 +6097,7 @@ struct GpuBringUp {
 /// whose EGL comes up but whose allocator refuses the target, as on a virtual GPU) offered the
 /// GL renderer's formats to a compositor rendering in Pixman, which refused every buffer, and a
 /// nested kwin_wayland died of the protocol error.
+#[cfg(target_os = "linux")]
 fn gpu_bring_up(
     device_path: &std::path::Path,
     width: u32,
@@ -5993,6 +6124,7 @@ fn gpu_bring_up(
 /// `GL_RENDERER` of a live renderer — the driver that actually answered, which is the only
 /// thing that separates a GPU from Mesa's software fallback on the same node. Empty when the
 /// context cannot be made current or the string is unavailable.
+#[cfg(target_os = "linux")]
 fn gl_renderer_name(renderer: &mut GlesRenderer) -> String {
     renderer
         .with_context(|gl| unsafe {
@@ -6011,6 +6143,7 @@ fn gl_renderer_name(renderer: &mut GlesRenderer) -> String {
 /// The name the GL driver gives the GPU behind render node `node_index`, asked once per node
 /// and remembered: what a VA-API session, which names no device, is reported to run on.
 /// Empty where no GL context comes up on the node.
+#[cfg(target_os = "linux")]
 fn node_gpu_name(node_index: i32) -> String {
     static NAMES: OnceLock<Mutex<std::collections::HashMap<i32, String>>> = OnceLock::new();
     let mut names = NAMES.get_or_init(Default::default).lock().unwrap();
@@ -6025,11 +6158,19 @@ fn node_gpu_name(node_index: i32) -> String {
         .clone()
 }
 
+/// No render node exists to name a GPU from off Linux, so a hardware session there has no
+/// driver name to report.
+#[cfg(not(target_os = "linux"))]
+fn node_gpu_name(_node_index: i32) -> String {
+    String::new()
+}
+
 /// A GPU is exposed to this container or machine.
 ///
 /// Only device nodes count. `/sys/class/drm` is the host's and lists cards a container may
 /// have no access to, while `/dev` is the container's own; the NVIDIA character devices
 /// answer for a driver stack that was given no DRM node at all.
+#[cfg(target_os = "linux")]
 fn gpu_exposed() -> bool {
     std::path::Path::new("/dev/nvidiactl").exists()
         || std::fs::read_dir("/dev/dri")
@@ -6085,6 +6226,7 @@ fn gpu_exposed() -> bool {
 ///    delivery thread — it feeds the delivery sender and must be gone first — and the retained
 ///    callbacks are dropped and gated by a process-shutdown flag so nothing fires into a finalizing
 ///    interpreter.
+#[cfg(target_os = "linux")]
 fn run_wayland_thread(cfg: WaylandThreadConfig) {
     let WaylandThreadConfig {
         command_rx,
@@ -7542,6 +7684,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
 /// demand: constructing it spawns that thread and it stays up for the process lifetime. The
 /// struct itself is nothing but the command-channel sender used to drive that thread across
 /// the boundary; `ensure_wayland_display` hands out the process-wide one.
+#[cfg(target_os = "linux")]
 pub struct Compositor {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     /// The compositor's pointer, as its thread last published it (`pointer_location`).
@@ -7554,6 +7697,7 @@ pub struct Compositor {
     wake_tx: smithay::reexports::calloop::channel::Sender<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl Compositor {
     fn send(&self, cmd: ThreadCommand) -> Result<(), String> {
         self.tx.send(cmd).map_err(|e| e.to_string())?;
@@ -7580,6 +7724,7 @@ impl Compositor {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Compositor {
     /// Construct the backend and spawn the long-lived compositor thread, handing it the
     /// strongest scheduling edge (nice -15) because it drives the calloop, input dispatch, the render
@@ -8130,6 +8275,7 @@ fn wayland_capture_state(display_id: u32) -> (String, Option<String>) {
     (state.to_string(), last_error)
 }
 
+#[cfg(target_os = "linux")]
 impl Compositor {
     /// Retune the live per-frame knobs of `display_id`'s capture without restarting it.
     pub fn update_tunables(&self, display_id: u32, t: LiveTunables) -> Result<(), Error> {
@@ -8141,12 +8287,16 @@ impl Compositor {
     }
 }
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicI32, AtomicU32};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+#[cfg(target_os = "linux")]
 use crate::encoders::software::{EncodedStripe, FrameTiming};
 
 /// Process-wide Wayland backend: input and capture share ONE compositor (constructed lazily).
+#[cfg(target_os = "linux")]
 static WAYLAND_BACKEND: OnceLock<Mutex<Option<Arc<Compositor>>>> = OnceLock::new();
 /// The compositor's auto-picked socket name (e.g. "wayland-1"), published by the compositor
 /// thread once its listening socket exists. `ListeningSocketSource::new_auto` binds the first
@@ -8258,8 +8408,11 @@ static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 /// Registry of every live X11 capture's `Controls`, so the atexit sweep can flag them all to
 /// stop before the interpreter finalizes even after the owning `ScreenCapture` Python handles have
 /// been dropped — without a central registry those captures would have no reachable stop switch.
+/// Linux alone, with the X11 capture backend that produces them.
+#[cfg(target_os = "linux")]
 static LIVE_X11: OnceLock<Mutex<Vec<Arc<crate::x11::Controls>>>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn live_x11() -> &'static Mutex<Vec<Arc<crate::x11::Controls>>> {
     LIVE_X11.get_or_init(|| Mutex::new(Vec::new()))
 }
@@ -8308,6 +8461,7 @@ pub(crate) fn join_within(handle: thread::JoinHandle<()>, what: &str) {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod gpu_bring_up_tests {
     use super::*;
 
@@ -8358,6 +8512,7 @@ mod join_tests {
 /// level within the daemon's own bounds to any process of the seat. A host without rtkit,
 /// or without a system bus at all as a container is, leaves the thread at the default, said
 /// once in the log.
+#[cfg(target_os = "linux")]
 pub(crate) fn boost_thread_priority(nice: libc::c_int) {
     static RTKIT: OnceLock<zbus::Result<zbus::Connection>> = OnceLock::new();
     static REFUSED: std::sync::Once = std::sync::Once::new();
@@ -8392,7 +8547,13 @@ pub(crate) fn boost_thread_priority(nice: libc::c_int) {
     }
 }
 
+/// Windows threads carry the priority their scheduler class gives them, so the capture and
+/// compositor threads run at their default priority there.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn boost_thread_priority(_nice: i32) {}
+
 /// Forward a live rate change to the shared Wayland backend (no-op if none is running).
+#[cfg(target_os = "linux")]
 fn wayland_update_rate(
     display_id: u32,
     bitrate_kbps: Option<i32>,
@@ -8406,8 +8567,19 @@ fn wayland_update_rate(
     }
 }
 
+/// No Wayland backend runs off Linux, so a rate change there has nobody to forward to.
+#[cfg(not(target_os = "linux"))]
+fn wayland_update_rate(
+    _display_id: u32,
+    _bitrate_kbps: Option<i32>,
+    _vbv_multiplier: Option<f64>,
+    _fps: Option<f64>,
+) {
+}
+
 /// Forward the rate a display's path carries to the shared Wayland backend (no-op if none is
 /// running).
+#[cfg(target_os = "linux")]
 fn wayland_update_link_rate(display_id: u32, link_kbps: i32) {
     if let Some(slot) = WAYLAND_BACKEND.get()
         && let Some(be) = slot.lock().unwrap().as_ref()
@@ -8419,7 +8591,12 @@ fn wayland_update_link_rate(display_id: u32, link_kbps: i32) {
     }
 }
 
+/// No Wayland backend runs off Linux, so a link-rate change there has nobody to forward to.
+#[cfg(not(target_os = "linux"))]
+fn wayland_update_link_rate(_display_id: u32, _link_kbps: i32) {}
+
 /// Forward live per-frame tunables to the shared Wayland backend (no-op if none is running).
+#[cfg(target_os = "linux")]
 fn wayland_update_tunables(display_id: u32, t: LiveTunables) {
     if let Some(slot) = WAYLAND_BACKEND.get()
         && let Some(be) = slot.lock().unwrap().as_ref()
@@ -8427,6 +8604,10 @@ fn wayland_update_tunables(display_id: u32, t: LiveTunables) {
         let _ = be.update_tunables(display_id, t);
     }
 }
+
+/// No Wayland backend runs off Linux, so a tunables change there has nobody to forward to.
+#[cfg(not(target_os = "linux"))]
+fn wayland_update_tunables(_display_id: u32, _t: LiveTunables) {}
 
 /// Get-or-create the singleton Wayland backend (idempotent: the first dimensions and render
 /// node win, and a later capture just resizes).
@@ -8436,6 +8617,7 @@ fn wayland_update_tunables(display_id: u32, t: LiveTunables) {
 /// at creation, by precedence: an explicit `render_node_path`, then an `auto_gpu` pick, then the
 /// encoder node (so a caller that sets only one node still renders on that GPU); empty selects the
 /// software renderer.
+#[cfg(target_os = "linux")]
 pub fn ensure_compositor(
     width: i32,
     height: i32,
@@ -8483,7 +8665,9 @@ pub fn ensure_compositor(
 
 /// The live Wayland backend, if any — never creates one. The pre-capture entry points
 /// (input injection, cursor/config setters) use this so they can't lock in a backend
-/// with a placeholder render node.
+/// with a placeholder render node. Linux alone: the compositor it finds exists nowhere
+/// else, and the entry points below answer "nothing running" themselves.
+#[cfg(target_os = "linux")]
 pub fn running_compositor() -> Option<Arc<Compositor>> {
     let slot = WAYLAND_BACKEND.get()?;
     let g = slot.lock().unwrap();
@@ -8494,7 +8678,7 @@ pub fn running_compositor() -> Option<Arc<Compositor>> {
 /// X11 controls and thread handle, and the capture / encode thread ids used to detect a re-entrant
 /// stop.
 struct ScState {
-    /// 0 = idle, 1 = X11, 2 = Wayland.
+    /// 0 = idle, 1 = X11, 2 = Wayland, 3 = Windows.
     backend: u8,
     /// This capture holds one reference on the shared X11 cursor monitor. Set in
     /// the same locked section as `backend = 1` and TAKEN in the same locked
@@ -8504,12 +8688,15 @@ struct ScState {
     /// the monitor once the acquire lands). The GIL happens to serialize that
     /// window today; the pairing must not depend on it.
     cursor_ref: bool,
+    /// Linux alone, with the X11 capture backend that produces the controls.
+    #[cfg(target_os = "linux")]
     controls: Option<Arc<crate::x11::Controls>>,
     /// The controls of an X11 capture whose threads already run while `start_capture` has not
     /// published it: its first frames can reach a consumer before the start returns, and what
     /// that consumer asks for in reply (a lost frame, a key frame, a rate) has to reach the
     /// capture. A stop or a newer start in that window ends that capture, which is then never
     /// published.
+    #[cfg(target_os = "linux")]
     starting: Option<Arc<crate::x11::Controls>>,
     handle: Option<thread::JoinHandle<()>>,
     cap_thread_id: Option<thread::ThreadId>,
@@ -8524,6 +8711,12 @@ struct ScState {
     /// caller), a deadlock cycle. The id send strictly precedes any callback running on
     /// that thread, so a `try_recv` at stop time cannot miss it.
     encode_tid_rx: Option<std::sync::mpsc::Receiver<thread::ThreadId>>,
+    /// The controls of the Windows capture this instance runs (backend == 3). Set when its
+    /// thread is spawned, before the start has proven the pipeline live, so a stop arriving
+    /// while the capture still comes up reaches the same flags the capture loop reads; the
+    /// X11 backend keeps this window covered by its `starting` slot.
+    #[cfg(target_os = "windows")]
+    win_controls: Option<Arc<crate::windows::Controls>>,
     /// Delivery thread: owns the GIL-bound Python callback so encode(N+1) never
     /// serializes behind deliver(N). Joined on stop; a re-entrant stop from
     /// inside the callback (which runs on this thread) must detach instead of
@@ -8540,7 +8733,8 @@ struct ScState {
 
 impl ScState {
     /// The X11 controls a request reaches: the published capture's, else those of one still
-    /// starting.
+    /// starting. Linux alone, with the controls themselves.
+    #[cfg(target_os = "linux")]
     fn x11_controls(&self) -> Option<Arc<crate::x11::Controls>> {
         match self.backend {
             1 => self.controls.clone(),
@@ -8589,6 +8783,7 @@ impl ScreenCapture {
     /// Both slots outlive the capture that set them, so they carry the latest live
     /// registration (`CURSOR_REGISTRATIONS`): `None` withdraws this capture's own, releasing
     /// what it holds and restoring the one registered before it.
+    #[cfg(target_os = "linux")]
     pub fn set_cursor_sink(
         &self,
         sink: Option<Arc<dyn crate::sink::CursorSink>>,
@@ -8613,8 +8808,19 @@ impl ScreenCapture {
         }
     }
 
+    /// No capture backend runs off Linux to register with — the X11 cursor monitor and the
+    /// compositor are what a registration reaches — so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_cursor_sink(
+        &self,
+        _sink: Option<Arc<dyn crate::sink::CursorSink>>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Hand what a client said of a frame to the capture: the X11 controls, drained ahead of the
     /// next encode, or the shared Wayland backend.
+    #[cfg(target_os = "linux")]
     fn hand_report(&self, report: encoders::reference::ReferenceReport) {
         use encoders::reference::ReferenceReport;
         let (backend, controls, did) = {
@@ -8651,6 +8857,10 @@ impl ScreenCapture {
         }
     }
 
+    /// No capture runs off Linux to hand a report to, so the call is a no-op.
+    #[cfg(not(target_os = "linux"))]
+    fn hand_report(&self, _report: encoders::reference::ReferenceReport) {}
+
     /// Stop this capture: signal the capture thread, drop the live controls, and join.
     ///
     /// The path forks on the backend. A **Wayland** capture only tells the shared compositor to
@@ -8661,6 +8871,7 @@ impl ScreenCapture {
     /// GIL across the joins would deadlock. A re-entrant stop arriving on the capture, encode, or
     /// deliver thread cannot join itself, so it detaches and lets the threads exit on the stop flag.
     /// An X11 capture still starting is only signaled: its start joins it and publishes nothing.
+    #[cfg(target_os = "linux")]
     fn stop_internal(&self) -> Result<(), Error> {
         let (handle, deliver_handle, same_thread, backend, controls, wl_display, cursor_ref) = {
             let mut st = self.inner.lock().unwrap();
@@ -8746,6 +8957,56 @@ impl ScreenCapture {
         }
         Ok(())
     }
+
+    /// Stop the Windows capture: flag the capture thread — which owns the NVENC session and
+    /// the frame pool, and tears both down as it exits — then join it and the delivery
+    /// thread behind it. A re-entrant stop arriving on either thread cannot join a chain
+    /// that includes itself, so it detaches and lets the threads exit on the stop flag. A
+    /// capture still starting is only flagged: its start joins it and publishes nothing.
+    #[cfg(target_os = "windows")]
+    fn stop_internal(&self) -> Result<(), Error> {
+        let (handle, deliver_handle, same_thread, backend, controls) = {
+            let mut st = self.inner.lock().unwrap();
+            if let Some(c) = &st.win_controls {
+                c.stop.store(true, Ordering::Relaxed);
+            }
+            let cur = Some(thread::current().id());
+            let same = st.cap_thread_id == cur || st.deliver_thread_id == cur;
+            let controls = st.win_controls.take();
+            let handle = st.handle.take();
+            let deliver_handle = st.deliver_handle.take();
+            let backend = st.backend;
+            st.backend = 0;
+            st.cap_thread_id = None;
+            st.deliver_thread_id = None;
+            st.err = None;
+            (handle, deliver_handle, same, backend, controls)
+        };
+        drop(controls);
+        if backend == 3 && !same_thread {
+            if let Some(h) = handle {
+                join_within(h, "capture");
+            }
+            // The capture thread's end drops the delivery sender, so the deliver thread
+            // drains its one queued frame and exits behind it.
+            if let Some(h) = deliver_handle {
+                join_within(h, "delivery");
+            }
+        } else {
+            // Detach: the threads exit on the stop flag once the callback returns, or were
+            // never published (a start still in flight joins them itself).
+            drop(handle);
+            drop(deliver_handle);
+        }
+        Ok(())
+    }
+
+    /// No capture runs off Linux or Windows, so there is nothing to stop and the call
+    /// reports nothing to do.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn stop_internal(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 impl ScreenCapture {
@@ -8753,6 +9014,7 @@ impl ScreenCapture {
     fn report(&self) -> Option<Arc<report::StreamReport>> {
         let st = self.inner.lock().unwrap();
         match st.backend {
+            #[cfg(target_os = "linux")]
             1 => st.controls.as_ref().map(|c| c.report.clone()),
             2 => report::wayland_reports()
                 .lock()
@@ -8771,12 +9033,16 @@ impl ScreenCapture {
             inner: Mutex::new(ScState {
                 backend: 0,
                 cursor_ref: false,
+                #[cfg(target_os = "linux")]
                 controls: None,
+                #[cfg(target_os = "linux")]
                 starting: None,
                 handle: None,
                 cap_thread_id: None,
                 encode_thread_id: None,
                 encode_tid_rx: None,
+                #[cfg(target_os = "windows")]
+                win_controls: None,
                 deliver_handle: None,
                 deliver_thread_id: None,
                 wl_display: 0,
@@ -8788,6 +9054,7 @@ impl ScreenCapture {
     /// The codec this capture streams, by name, once its pipeline has been built: the
     /// requested one, or the one the selection ladder demoted it to when no encoder could
     /// serve the request. None before the first frame or after a stop.
+    #[cfg(target_os = "linux")]
     pub fn active_codec(&self) -> Result<Option<String>, Error> {
         let (backend, controls, wl_display) = {
             let st = self.inner.lock().unwrap();
@@ -8806,6 +9073,12 @@ impl ScreenCapture {
             _ => u32::MAX,
         };
         Ok(Codec::from_id(id).map(|c| c.name().to_string()))
+    }
+
+    /// No capture runs off Linux to name the codec of, so the read reports none.
+    #[cfg(not(target_os = "linux"))]
+    pub fn active_codec(&self) -> Result<Option<String>, Error> {
+        Ok(None)
     }
 
     /// What this capture streams and how it got there, or None before a start and after a
@@ -8853,6 +9126,7 @@ impl ScreenCapture {
         self.stop_internal()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn request_idr_frame(&self) -> Result<(), Error> {
         let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
@@ -8872,6 +9146,25 @@ impl ScreenCapture {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// No capture runs off Linux to ask a keyframe of, so the call reports nothing to do.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    pub fn request_idr_frame(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Ask the running Windows capture for a keyframe on its next encoded frame.
+    #[cfg(target_os = "windows")]
+    pub fn request_idr_frame(&self) -> Result<(), Error> {
+        let controls = {
+            let st = self.inner.lock().unwrap();
+            st.win_controls.clone()
+        };
+        if let Some(c) = &controls {
+            c.force_idr.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -8910,6 +9203,7 @@ impl ScreenCapture {
     ///
     /// On the X11 path the dirty flag is Release-published after the payload store, so the encode
     /// thread's Acquire read can never observe the flag set against a stale bitrate.
+    #[cfg(target_os = "linux")]
     pub fn update_video_bitrate(&self, kbps: i32) -> Result<(), Error> {
         let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
@@ -8928,9 +9222,16 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux to retarget, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_video_bitrate(&self, _kbps: i32) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Apply the rate (kbps) the path the stream crosses carries, as the transport measures it, which
     /// a still screen's constant-rate cleanup may run at; 0 where the transport has no measure,
     /// which keeps the cleanup to the stream's rate.
+    #[cfg(target_os = "linux")]
     pub fn update_link_rate(&self, kbps: i32) -> Result<(), Error> {
         let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
@@ -8948,6 +9249,13 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux to tell the rate to, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_link_rate(&self, _kbps: i32) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn update_framerate(&self, fps: f64) -> Result<(), Error> {
         let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
@@ -8967,7 +9275,14 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux to retarget, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_framerate(&self, _fps: f64) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Live CBR VBV change, as a multiple of one frame's bit budget (<= 0 = policy default).
+    #[cfg(target_os = "linux")]
     pub fn update_vbv_multiplier(&self, multiplier: f64) -> Result<(), Error> {
         let (backend, controls, did) = {
             let st = self.inner.lock().unwrap();
@@ -8987,11 +9302,18 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux to retarget, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_vbv_multiplier(&self, _multiplier: f64) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Move/resize the live X11 capture region (root-relative). The capture loop drains
     /// in-flight frames, re-targets its surfaces, and the encoder follows in place where
     /// it can (NVENC reconfigure / stripe re-derive) -- no capture restart. `width`/
     /// `height` <= 0 mean "to the root edge". On Wayland the output IS the capture
     /// region: restart the capture with new dimensions instead (in-place there too).
+    #[cfg(target_os = "linux")]
     pub fn update_capture_region(
         &self,
         x: i32,
@@ -9013,9 +9335,22 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux to move the region of, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_capture_region(
+        &self,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     pub fn is_capturing(&self) -> bool {
         let st = self.inner.lock().unwrap();
         match st.backend {
+            #[cfg(target_os = "linux")]
             1 => st
                 .controls
                 .as_ref()
@@ -9025,28 +9360,65 @@ impl ScreenCapture {
                 wayland_owners().lock().unwrap().get(&st.wl_display) == Some(&self.id)
                     && wayland_alive().lock().unwrap().contains(&st.wl_display)
             }
+            #[cfg(target_os = "windows")]
+            3 => st
+                .win_controls
+                .as_ref()
+                .map(|c| !c.stop.load(Ordering::Relaxed))
+                .unwrap_or(false),
             _ => false,
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub fn inject_key(&self, scancode: u32, state: u32) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_key(scancode, state))
     }
 
+    /// No compositor runs off Linux, so a key has nowhere to be injected and the
+    /// call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_key(&self, _scancode: u32, _state: u32) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Inject an ordered run of `(keycode, state)` events in one message.
+    #[cfg(target_os = "linux")]
     pub fn inject_keys(&self, events: Vec<(u32, u32)>) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_keys(events))
     }
 
+    /// No compositor runs off Linux, so a key run has nowhere to be injected and the
+    /// call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_keys(&self, _events: Vec<(u32, u32)>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn set_keymap_string(&self, text: String) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.set_keymap_string(text))
+    }
+
+    /// No compositor runs off Linux to carry a keymap, so the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_keymap_string(&self, _text: String) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Bind explicit `(keycode, keysym)` pairs onto the current base keymap in one swap;
     /// false when no backend runs or no base keymap is installed. See the backend method
     /// for the split of responsibility.
+    #[cfg(target_os = "linux")]
     pub fn set_keymap_overlay(&self, binds: Vec<(u32, u32)>) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.set_keymap_overlay(binds))
+    }
+
+    /// No compositor runs off Linux to carry a keymap, so an overlay has nothing to bind
+    /// onto and the call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_keymap_overlay(&self, _binds: Vec<(u32, u32)>) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Compositor apps run under (a nested labwc/kwin session pixelflux captures),
@@ -9066,6 +9438,7 @@ impl ScreenCapture {
     /// live under (the nested session's, or pixelflux's own in a direct session).
     /// Blocking; releases the GIL for the duration. Raises
     /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
+    #[cfg(target_os = "linux")]
     pub fn type_text_wayland(&self, display: String, text: String) -> Result<(), Error> {
         {
             let path = crate::wayland::wlclient::socket_path(&display)
@@ -9084,6 +9457,7 @@ impl ScreenCapture {
     /// Tap `keysyms` in order through `display`'s virtual keyboard, verbatim: the
     /// caller owns which keysym spells which character (selkies' policy layer);
     /// this owns delivery. Same one-shot client and errors as `type_text_wayland`.
+    #[cfg(target_os = "linux")]
     pub fn type_keysyms_wayland(&self, display: String, keysyms: Vec<u32>) -> Result<(), Error> {
         {
             let path = crate::wayland::wlclient::socket_path(&display)
@@ -9103,6 +9477,7 @@ impl ScreenCapture {
     /// larger while the capture keeps its full resolution. False when that
     /// compositor manages no outputs for clients (KWin), whose scale follows
     /// the capture output's instead.
+    #[cfg(target_os = "linux")]
     pub fn set_app_output_scale(
         &self,
         display: String,
@@ -9126,6 +9501,7 @@ impl ScreenCapture {
     /// accepts a scale over its own output management and then ignores it, its
     /// screens taking their scale from the host window's preferred fractional
     /// scale, which is the capture output's.
+    #[cfg(target_os = "linux")]
     pub fn set_app_screen_geometry(
         &self,
         display: String,
@@ -9150,6 +9526,7 @@ impl ScreenCapture {
     /// `kde_output_management_v2` (positions only there — a nested KWin
     /// screen's size follows its host window). Returns how many were
     /// positioned; 0 = that compositor manages no outputs for clients.
+    #[cfg(target_os = "linux")]
     pub fn set_app_screen_layout(
         &self,
         display: String,
@@ -9174,6 +9551,7 @@ impl ScreenCapture {
     /// other way to be checked against. The same ladder as
     /// `set_app_screen_layout` (zwlr, then KWin's output devices). Empty =
     /// that compositor manages no outputs for clients.
+    #[cfg(target_os = "linux")]
     pub fn list_app_screens(
         &self,
         display: String,
@@ -9196,6 +9574,7 @@ impl ScreenCapture {
     /// session serves no control socket. A registry read that touches no
     /// screen: whether the compositor registers the screen it grows is proven
     /// when a display asks for one (`add_app_screen` refuses one that does not).
+    #[cfg(target_os = "linux")]
     pub fn app_screen_control_offered(&self, display: String) -> Result<bool, Error> {
         {
             let path = crate::wayland::wlclient::socket_path(&display)
@@ -9209,6 +9588,7 @@ impl ScreenCapture {
     /// `remove_app_screen`. The name is what `list_app_screens` reports and
     /// removal addresses; `width`/`height`/`scale` only seed the screen, whose
     /// size follows the capture output that adopts its host window.
+    #[cfg(target_os = "linux")]
     pub fn add_app_screen(
         &self,
         display: String,
@@ -9228,6 +9608,7 @@ impl ScreenCapture {
     /// Remove a screen `add_app_screen` grew; the compositor's own
     /// output-destroy path returns its windows to the primary. False when no
     /// such screen is held.
+    #[cfg(target_os = "linux")]
     pub fn remove_app_screen(&self, name: String) -> Result<bool, Error> {
         Ok(crate::wayland::kdeclient::remove_screen(&name))
     }
@@ -9236,6 +9617,7 @@ impl ScreenCapture {
     /// so a session that opened more screens than there are capture outputs does
     /// not lay its desktop out across one nobody sees. Returns how many were
     /// resized (0 = that compositor manages no outputs for clients).
+    #[cfg(target_os = "linux")]
     pub fn hold_spare_app_screens(
         &self,
         display: String,
@@ -9252,12 +9634,14 @@ impl ScreenCapture {
     }
 
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
+    #[cfg(target_os = "linux")]
     pub fn clipboard_types_app(&self, display: String) -> Result<Vec<String>, Error> {
         (crate::wayland::dcclient::list_types(&app_socket_path(&display)?)).map_err(Error::Capture)
     }
 
     /// The app compositor selection's payload for `mime`, or None when nothing is
     /// copied or the selection does not offer that mime.
+    #[cfg(target_os = "linux")]
     pub fn clipboard_read_app(
         &self,
         display: String,
@@ -9270,6 +9654,7 @@ impl ScreenCapture {
 
     /// Take the app compositor's selection, serving `entries` (mime, bytes) to
     /// every paster from a background thread until another client copies.
+    #[cfg(target_os = "linux")]
     pub fn clipboard_write_app(
         &self,
         display: String,
@@ -9282,6 +9667,7 @@ impl ScreenCapture {
     /// The mimes the selection `clipboard_write_app` last took has served to pasters,
     /// in order, once it has served more than `after` of them or `timeout_s` has
     /// passed (at most a minute).
+    #[cfg(target_os = "linux")]
     pub fn clipboard_served_app(&self, after: usize, timeout_s: f64) -> Vec<String> {
         let timeout = Duration::from_secs_f64(if timeout_s.is_finite() {
             timeout_s.clamp(0.0, 60.0)
@@ -9292,11 +9678,13 @@ impl ScreenCapture {
     }
 
     /// Drop the app compositor's selection.
+    #[cfg(target_os = "linux")]
     pub fn clipboard_clear_app(&self, display: String) -> Result<(), Error> {
         (crate::wayland::dcclient::clear(&app_socket_path(&display)?)).map_err(Error::Capture)
     }
 
     /// Stop the selection watch for `display` (no-op without one).
+    #[cfg(target_os = "linux")]
     pub fn clipboard_unwatch_app(&self, display: String) {
         if let Ok(path) = app_socket_path(&display) {
             crate::wayland::dcclient::unwatch(&path);
@@ -9304,46 +9692,101 @@ impl ScreenCapture {
     }
 
     /// The move's number (`pointer_location`), or None without a running compositor.
+    #[cfg(target_os = "linux")]
     pub fn inject_mouse_move(&self, x: f64, y: f64) -> Result<Option<u64>, Error> {
         running_compositor().map_or(Ok(None), |be| be.inject_mouse_move(x, y).map(Some))
     }
 
+    /// No compositor runs off Linux, so a move has nowhere to go and no number to report.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_mouse_move(&self, _x: f64, _y: f64) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
     /// The move's number (`pointer_location`), or None without a running compositor.
+    #[cfg(target_os = "linux")]
     pub fn inject_relative_mouse_move(&self, dx: f64, dy: f64) -> Result<Option<u64>, Error> {
         running_compositor().map_or(Ok(None), |be| {
             be.inject_relative_mouse_move(dx, dy).map(Some)
         })
     }
 
+    /// No compositor runs off Linux, so a relative move has nowhere to go and no number
+    /// to report.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_relative_mouse_move(&self, _dx: f64, _dy: f64) -> Result<Option<u64>, Error> {
+        Ok(None)
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn inject_mouse_button(&self, btn: u32, state: u32) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_mouse_button(btn, state))
     }
 
+    /// No compositor runs off Linux, so a button has nowhere to be injected and the call
+    /// reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_mouse_button(&self, _btn: u32, _state: u32) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn inject_mouse_scroll(&self, x: f64, y: f64) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_mouse_scroll(x, y))
     }
 
+    /// No compositor runs off Linux, so a scroll has nowhere to be injected and the call
+    /// reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_mouse_scroll(&self, _x: f64, _y: f64) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// `WaylandBackend.inject_finger_scroll`; nothing without a running compositor.
+    #[cfg(target_os = "linux")]
     pub fn inject_finger_scroll(&self, dx: f64, dy: f64) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_finger_scroll(dx, dy))
     }
 
+    /// No compositor runs off Linux, so a finger scroll has nowhere to be injected and the
+    /// call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_finger_scroll(&self, _dx: f64, _dy: f64) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// `WaylandBackend.inject_finger_scroll_end`; nothing without a running compositor.
+    #[cfg(target_os = "linux")]
     pub fn inject_finger_scroll_end(&self) -> Result<(), Error> {
         running_compositor().map_or(Ok(()), |be| be.inject_finger_scroll_end())
+    }
+
+    /// No compositor runs off Linux, so a finger scroll has no end to signal and the call
+    /// reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn inject_finger_scroll_end(&self) -> Result<(), Error> {
+        Ok(())
     }
 
     /// Where the Wayland compositor's pointer is, as `(x, y, scale, motion)`
     /// (`WaylandBackend.pointer_location`), or None without a running compositor, before its
     /// first pass, or under host capture before its first cursor meta or where the host paints
     /// its cursor into the frames. An X11 session reads its pointer from the X server.
+    #[cfg(target_os = "linux")]
     pub fn pointer_location(&self) -> Option<(f64, f64, f64, u64)> {
         running_compositor().and_then(|be| be.pointer_location())
+    }
+
+    /// No compositor runs off Linux, so there is no pointer to locate.
+    #[cfg(not(target_os = "linux"))]
+    pub fn pointer_location(&self) -> Option<(f64, f64, f64, u64)> {
+        None
     }
 
     /// Toggle compositing the cursor into captured frames (the alternative to the
     /// out-of-band cursor callback): the X11 grab re-reads the flag per frame, Wayland
     /// forwards to the compositor.
+    #[cfg(target_os = "linux")]
     pub fn set_cursor_rendering(&self, enabled: bool) -> Result<(), Error> {
         let controls = self.inner.lock().unwrap().x11_controls();
         if let Some(c) = &controls {
@@ -9353,11 +9796,26 @@ impl ScreenCapture {
         running_compositor().map_or(Ok(()), |be| be.set_cursor_rendering(enabled))
     }
 
+    /// No capture runs whose frames a cursor could be composited into off Linux, so the
+    /// call reports nothing to do.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_cursor_rendering(&self, _enabled: bool) -> Result<(), Error> {
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn get_xkb_keymap_string(&self) -> Result<String, Error> {
         running_compositor().map_or(Ok(String::new()), |be| be.get_xkb_keymap_string())
     }
 
+    /// No compositor runs off Linux to carry a keymap, so there is none to read.
+    #[cfg(not(target_os = "linux"))]
+    pub fn get_xkb_keymap_string(&self) -> Result<String, Error> {
+        Ok(String::new())
+    }
+
     /// Compositor-side clipboard offer: serve one payload per `(mime, data)` entry.
+    #[cfg(target_os = "linux")]
     pub fn set_clipboard(&self, entries: Vec<(String, Vec<u8>)>) -> Result<(), Error> {
         match running_compositor() {
             Some(be) => be.set_clipboard(entries),
@@ -9365,8 +9823,16 @@ impl ScreenCapture {
         }
     }
 
+    /// No compositor runs off Linux to serve a selection from, so the offer is refused the
+    /// way a Linux session without one is.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_clipboard(&self, _entries: Vec<(String, Vec<u8>)>) -> Result<(), Error> {
+        Err(Error::Capture("wayland backend not running".into()))
+    }
+
     /// Set the seat's BASE xkb layout from RMLVO names; false when no backend runs or the
     /// layout fails to compile.
+    #[cfg(target_os = "linux")]
     pub fn set_xkb_layout(
         &self,
         layout: String,
@@ -9380,17 +9846,47 @@ impl ScreenCapture {
         })
     }
 
+    /// No compositor runs off Linux to carry a keymap, so there is no layout to set.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_xkb_layout(
+        &self,
+        _layout: String,
+        _variant: String,
+        _options: String,
+        _model: String,
+        _rules: String,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Seat keyboard readback: `(pressed_keycodes, modifier_mask)`; empty when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn get_keyboard_state(&self) -> Result<(Vec<u32>, u32), Error> {
         running_compositor().map_or(Ok((Vec::new(), 0)), |be| be.get_keyboard_state())
+    }
+
+    /// No compositor runs off Linux, so there is no seat keyboard to read back.
+    #[cfg(not(target_os = "linux"))]
+    pub fn get_keyboard_state(&self) -> Result<(Vec<u32>, u32), Error> {
+        Ok((Vec::new(), 0))
     }
 
     /// The capture geometry actually live on the given display `(width, height, scale)`;
     /// `None` when no Wayland backend runs or the compositor did not answer in time (a
     /// timeout is distinct from a real answer so the caller treats it as unknown rather than
     /// "nothing to reconcile"). X11 has no compositor to read back and returns `None`.
+    #[cfg(target_os = "linux")]
     pub fn get_realized_geometry(&self, display_id: u32) -> Result<Option<(i32, i32, f64)>, Error> {
         running_compositor().map_or(Ok(None), |be| be.get_realized_geometry(display_id))
+    }
+
+    /// No capture runs off Linux, so there is no live geometry to read back.
+    #[cfg(not(target_os = "linux"))]
+    pub fn get_realized_geometry(
+        &self,
+        _display_id: u32,
+    ) -> Result<Option<(i32, i32, f64)>, Error> {
+        Ok(None)
     }
 
     /// Lifecycle of this capture as `(state, last_error)`: `state` is `"running"`, `"failed"`,
@@ -9398,6 +9894,7 @@ impl ScreenCapture {
     /// came up with (encoder fell back to CPU, host connect refused, a refused resize). The
     /// Wayland outcome is recorded by the compositor thread; the X11 outcome is the capture
     /// thread's own exit error. `display_id` selects a Wayland output; X11 ignores it.
+    #[cfg(target_os = "linux")]
     pub fn capture_state(&self, display_id: u32) -> (String, Option<String>) {
         let (backend, running, err) = {
             let st = self.inner.lock().unwrap();
@@ -9428,8 +9925,49 @@ impl ScreenCapture {
         }
     }
 
+    /// No capture runs off Linux, so the lifecycle reads idle with no error.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    pub fn capture_state(&self, _display_id: u32) -> (String, Option<String>) {
+        ("idle".to_string(), None)
+    }
+
+    /// Lifecycle of this capture as `(state, last_error)`, the Windows capture thread's own
+    /// exit error standing in for the X11 one: the capture runs until its thread is flagged
+    /// down, so the flags it leaves behind say whether it is running and the error slot why
+    /// it died. `display_id` selects a Wayland output; Windows captures the one primary
+    /// monitor and ignores it.
+    #[cfg(target_os = "windows")]
+    pub fn capture_state(&self, _display_id: u32) -> (String, Option<String>) {
+        let (backend, running, err) = {
+            let st = self.inner.lock().unwrap();
+            let running = st
+                .win_controls
+                .as_ref()
+                .map(|c| !c.stop.load(Ordering::Relaxed))
+                .unwrap_or(false);
+            let err = st
+                .err
+                .as_ref()
+                .and_then(|e| e.lock().ok().and_then(|g| g.clone()));
+            (st.backend, running, err)
+        };
+        if backend == 3 {
+            let state = if running {
+                "running"
+            } else if err.is_some() {
+                "failed"
+            } else {
+                "idle"
+            };
+            (state.to_string(), err)
+        } else {
+            ("idle".to_string(), None)
+        }
+    }
+
     /// Create an additional Wayland output (see `WaylandBackend.create_output`); false when
     /// no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn create_output(
         &self,
         id: u32,
@@ -9444,8 +9982,23 @@ impl ScreenCapture {
         })
     }
 
+    /// No compositor runs off Linux, so there is no output to create.
+    #[cfg(not(target_os = "linux"))]
+    pub fn create_output(
+        &self,
+        _id: u32,
+        _width: i32,
+        _height: i32,
+        _x: i32,
+        _y: i32,
+        _scale: f64,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Add a display over a rectangle of an existing Wayland output (see
     /// `WaylandBackend.create_view`); false when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn create_view(
         &self,
         id: u32,
@@ -9460,8 +10013,23 @@ impl ScreenCapture {
         })
     }
 
+    /// No compositor runs off Linux, so there is no display to add.
+    #[cfg(not(target_os = "linux"))]
+    pub fn create_view(
+        &self,
+        _id: u32,
+        _owner: u32,
+        _x: i32,
+        _y: i32,
+        _width: i32,
+        _height: i32,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Resize a Wayland screen's output in place (see `WaylandBackend.resize_output`);
     /// false when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn resize_output(
         &self,
         id: u32,
@@ -9472,51 +10040,113 @@ impl ScreenCapture {
         running_compositor().map_or(Ok(false), |be| be.resize_output(id, width, height, scale))
     }
 
+    /// No compositor runs off Linux, so there is no output to resize.
+    #[cfg(not(target_os = "linux"))]
+    pub fn resize_output(
+        &self,
+        _id: u32,
+        _width: i32,
+        _height: i32,
+        _scale: f64,
+    ) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Destroy a secondary Wayland output; false when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn destroy_output(&self, id: u32) -> Result<bool, Error> {
         running_compositor().map_or(Ok(false), |be| be.destroy_output(id))
     }
 
+    /// No compositor runs off Linux, so there is no output to destroy.
+    #[cfg(not(target_os = "linux"))]
+    pub fn destroy_output(&self, _id: u32) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Move a Wayland output (the primary included) to layout offset `(x, y)`; false when
     /// no backend runs or the id is unknown.
+    #[cfg(target_os = "linux")]
     pub fn reposition_output(&self, id: u32, x: i32, y: i32) -> Result<bool, Error> {
         running_compositor().map_or(Ok(false), |be| be.reposition_output(id, x, y))
     }
 
+    /// No compositor runs off Linux, so there is no output to move.
+    #[cfg(not(target_os = "linux"))]
+    pub fn reposition_output(&self, _id: u32, _x: i32, _y: i32) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Recreate the Wayland cursor theme at `size` pixels (named-cursor callbacks and the
     /// burned-in overlay); false when no backend runs or the size is non-positive.
+    #[cfg(target_os = "linux")]
     pub fn set_cursor_size(&self, size: i32) -> Result<bool, Error> {
         running_compositor().map_or(Ok(false), |be| be.set_cursor_size(size))
     }
 
+    /// No compositor runs off Linux, so there is no cursor theme to recreate.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_cursor_size(&self, _size: i32) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Every live Wayland output as `(id, x, y, width, height, scale, capturing)`; empty
     /// when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn list_outputs(&self) -> Result<Vec<OutputDesc>, Error> {
         running_compositor().map_or(Ok(Vec::new()), |be| be.list_outputs())
     }
 
+    /// No compositor runs off Linux, so there are no outputs to list.
+    #[cfg(not(target_os = "linux"))]
+    pub fn list_outputs(&self) -> Result<Vec<OutputDesc>, Error> {
+        Ok(Vec::new())
+    }
+
     /// Display capacity (see `WaylandBackend.output_capacity`); -1 when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn output_capacity(&self) -> Result<i64, Error> {
         running_compositor().map_or(Ok(-1), |be| be.output_capacity())
     }
 
+    /// No compositor runs off Linux, so there is no display capacity to report.
+    #[cfg(not(target_os = "linux"))]
+    pub fn output_capacity(&self) -> Result<i64, Error> {
+        Ok(-1)
+    }
+
     /// Move a window onto an output (fullscreened there); false when no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn move_window_to_output(&self, window_id: u32, output_id: u32) -> Result<bool, Error> {
         running_compositor().map_or(Ok(false), |be| {
             be.move_window_to_output(window_id, output_id)
         })
     }
 
+    /// No compositor runs off Linux, so there is no window to move.
+    #[cfg(not(target_os = "linux"))]
+    pub fn move_window_to_output(&self, _window_id: u32, _output_id: u32) -> Result<bool, Error> {
+        Ok(false)
+    }
+
     /// Every mapped window as `(window_id, title, app_id, output_id, waiting)`; empty when
     /// no backend runs.
+    #[cfg(target_os = "linux")]
     pub fn list_windows(&self) -> Result<Vec<WindowDesc>, Error> {
         running_compositor().map_or(Ok(Vec::new()), |be| be.list_windows())
+    }
+
+    /// No compositor runs off Linux, so there are no windows to list.
+    #[cfg(not(target_os = "linux"))]
+    pub fn list_windows(&self) -> Result<Vec<WindowDesc>, Error> {
+        Ok(Vec::new())
     }
 
     /// Begin a capture delivering every frame to `sink`, on the backend `settings` select
     /// (`CaptureSettings::wants_wayland`): the shared compositor's display `display_id`, or
     /// an X11 capture of this instance's own. A start on a Wayland display this instance
     /// already captures reconfigures it in place; any other start stops what ran before.
+    #[cfg(target_os = "linux")]
     pub fn start_capture(
         &self,
         sink: Arc<dyn crate::sink::FrameSink>,
@@ -9710,8 +10340,173 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// Begin a Windows capture delivering every frame to `sink`: Windows.Graphics.Capture
+    /// takes the primary monitor's frames and NVENC encodes them on the same D3D11 device.
+    /// Any start stops what ran before it.
+    ///
+    /// The consumer runs on its own thread, bounded at one in-flight frame exactly as the
+    /// X11 arm arranges, so a slow consumer backpressures the encoder by one frame and
+    /// loses none. The capture thread's start is proven by a handshake — it signals once the
+    /// pipeline is live, or the reason it came up short — before the capture is published,
+    /// and the controls are seated at spawn so a stop arriving inside that window still
+    /// reaches the capture's flags.
+    #[cfg(target_os = "windows")]
+    pub fn start_capture(
+        &self,
+        sink: Arc<dyn crate::sink::FrameSink>,
+        settings: CaptureSettings,
+    ) -> Result<(), Error> {
+        use crate::encoders::software::EncodedStripe;
+
+        self.stop_internal()?;
+        // A fresh start proves the interpreter is alive: clear the teardown flag the atexit
+        // sweep may have set, or the delivery thread below would drop every frame.
+        SHUTDOWN.store(false, Ordering::Relaxed);
+        let mut rs = settings;
+        // H.264 alone is served on Windows for now; the encoder ladder that would walk a
+        // refused codec to what the host encodes is parity work.
+        if rs.codec != Codec::H264 {
+            eprintln!(
+                "[Windows] {} is not served on Windows yet; streaming H264 instead",
+                rs.codec.display()
+            );
+            rs.codec = Codec::H264;
+        }
+        if !rs.video_cbr_mode {
+            eprintln!(
+                "[Windows] CRF mode is not served on Windows yet; streaming CBR at {} kbps instead",
+                rs.video_bitrate_kbps
+            );
+        }
+        println!(
+            "[Windows] Configuring Output: {}x{} @ {:.2} FPS",
+            rs.width, rs.height, rs.target_fps
+        );
+
+        let controls = Arc::new(crate::windows::Controls::new());
+        let cb = sink;
+        let err_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let err_slot2 = err_slot.clone();
+
+        // The consumer runs on its own thread (as the X11 arm and the Wayland backend do)
+        // so encode(N+1) never serializes behind deliver(N). Bounded at one in-flight
+        // frame: a slower consumer backpressures the encoder by exactly one frame instead
+        // of growing a queue, and no frame is ever dropped.
+        let (deliver_tx, deliver_rx) = std::sync::mpsc::sync_channel::<Vec<EncodedStripe>>(1);
+        let deliver_handle = thread::spawn(move || {
+            crate::boost_thread_priority(-10);
+            while let Ok(frame) = deliver_rx.recv() {
+                if SHUTDOWN.load(Ordering::Relaxed) {
+                    continue;
+                }
+                cb.frames(frame);
+            }
+        });
+        let deliver_thread_id = deliver_handle.thread().id();
+
+        let on_frame = move |frame: Vec<EncodedStripe>| {
+            // Blocks only when the single slot is still occupied (consumer more than one
+            // frame behind); a dropped receiver (stop) discards.
+            let _ = deliver_tx.send(frame);
+        };
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let started_err = started_tx.clone();
+        {
+            let mut st = self.inner.lock().unwrap();
+            if let Some(other) = st.win_controls.replace(controls.clone()) {
+                other.stop.store(true, Ordering::Relaxed);
+            }
+        }
+        let c2 = controls.clone();
+        let c3 = controls.clone();
+        let handle = thread::spawn(move || {
+            crate::boost_thread_priority(-15);
+            let _ = tid_tx.send(thread::current().id());
+            let res = crate::windows::run_capture(rs, c2, started_tx, on_frame);
+            c3.stop.store(true, Ordering::Release);
+            if let Err(e) = res {
+                // Where the failure raced the start's handshake, hand it the reason rather
+                // than a bare disconnect; past the handshake this lands in a channel
+                // nobody reads any more and is dropped.
+                let _ = started_err.send(Err(e.clone()));
+                eprintln!("[Windows] capture error: {e}");
+                if let Ok(mut g) = err_slot2.lock() {
+                    *g = Some(e);
+                }
+            }
+        });
+        let tid = tid_rx.recv().ok();
+        let failure = match started_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(())) => None,
+            Ok(Err(msg)) => Some(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(
+                err_slot
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| "Windows capture thread exited during start".to_string()),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                controls.stop.store(true, Ordering::Relaxed);
+                Some("the Windows capture did not come up within 10 s".to_string())
+            }
+        };
+        if let Some(msg) = failure {
+            let superseded = {
+                let st = self.inner.lock().unwrap();
+                !st.win_controls
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, &controls))
+            };
+            join_within(handle, "capture");
+            join_within(deliver_handle, "delivery");
+            // A stop or a newer start already claimed this capture: it joined the threads
+            // it owned and the newer one owns the outcome, so this start reports nothing.
+            if superseded {
+                return Ok(());
+            }
+            return Err(Error::Capture(msg));
+        }
+        let mut st = self.inner.lock().unwrap();
+        if !st
+            .win_controls
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(c, &controls))
+        {
+            drop(st);
+            join_within(handle, "capture");
+            join_within(deliver_handle, "delivery");
+            return Ok(());
+        }
+        st.backend = 3;
+        st.handle = Some(handle);
+        st.cap_thread_id = tid;
+        st.deliver_handle = Some(deliver_handle);
+        st.deliver_thread_id = Some(deliver_thread_id);
+        st.err = Some(err_slot);
+        drop(st);
+        Ok(())
+    }
+
+    /// Begin a capture where no backend is wired yet: the start reports the absence the
+    /// way a refused Linux start reports its own, so the caller learns the OS this build
+    /// serves rather than a silent no-op.
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    pub fn start_capture(
+        &self,
+        _sink: Arc<dyn crate::sink::FrameSink>,
+        _settings: CaptureSettings,
+    ) -> Result<(), Error> {
+        Err(Error::Capture(
+            "no capture backend is wired for this OS yet".into(),
+        ))
+    }
+
     /// Retune the live per-frame knobs (`LiveTunables::from_settings`) of a running capture
     /// without restarting it.
+    #[cfg(target_os = "linux")]
     pub fn update_tunables(&self, settings: &CaptureSettings) -> Result<(), Error> {
         let rs = settings;
         let t = LiveTunables::from_settings(rs);
@@ -9734,7 +10529,14 @@ impl ScreenCapture {
         Ok(())
     }
 
+    /// No capture runs off Linux, so there is nothing to retune.
+    #[cfg(not(target_os = "linux"))]
+    pub fn update_tunables(&self, _settings: &CaptureSettings) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Register the consumer of what client applications copy to the compositor's clipboard.
+    #[cfg(target_os = "linux")]
     pub fn set_clipboard_sink(
         &self,
         sink: Arc<dyn crate::sink::ClipboardSink>,
@@ -9745,8 +10547,20 @@ impl ScreenCapture {
         }
     }
 
+    /// No compositor runs off Linux to watch a selection on, so the registration is
+    /// refused the way a Linux session without one is.
+    #[cfg(not(target_os = "linux"))]
+    pub fn set_clipboard_sink(
+        &self,
+        _sink: Arc<dyn crate::sink::ClipboardSink>,
+    ) -> Result<(), Error> {
+        Err(Error::Compositor("wayland backend not running".into()))
+    }
+
     /// Report every selection change of the application compositor `display` to `watch`,
     /// from a thread of its own; a second watch on the same display replaces the first.
+    /// Linux alone: it reads the application compositor's socket.
+    #[cfg(target_os = "linux")]
     pub fn clipboard_watch_app(
         &self,
         display: String,
@@ -9763,6 +10577,7 @@ impl ScreenCapture {
 /// atexit sweep.
 impl Drop for ScreenCapture {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         if let Ok(mut st) = self.inner.lock() {
             if let Some(c) = &st.controls {
                 c.stop.store(true, Ordering::Relaxed);
@@ -9794,12 +10609,23 @@ impl Drop for ScreenCapture {
                 crate::x11::cursor::release();
             }
         }
+        // A dropped handle that never saw stop_capture flags its Windows capture down; the
+        // join is left to a stop that never came or the process's exit, either of which is
+        // safe because the thread owns every COM and NVENC object it touched.
+        #[cfg(target_os = "windows")]
+        if let Ok(st) = self.inner.lock() {
+            if let Some(c) = &st.win_controls {
+                c.stop.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
 /// The `pixelflux` Python module: registers the exported classes and functions, and hooks
 /// `_stop_all_captures` into `atexit` so every live capture is stopped before interpreter shutdown.
 /// Socket path for a Wayland display name, with the ABI methods' error shape.
+/// Linux alone: the runtime directory it resolves from is the compositor's.
+#[cfg(target_os = "linux")]
 fn app_socket_path(display: &str) -> Result<String, String> {
     crate::wayland::wlclient::socket_path(display)
         .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())
@@ -9820,36 +10646,43 @@ pub fn shutdown() {
     SHUTDOWN.store(true, Ordering::Relaxed);
     crate::recorder::finalize_on_exit();
     *PENDING_CURSOR_CALLBACK.lock().unwrap() = None;
-    crate::x11::cursor::shutdown();
-    crate::wayland::dcclient::unwatch_all();
-    let x11: Vec<Arc<crate::x11::Controls>> = live_x11().lock().unwrap().iter().cloned().collect();
-    for c in &x11 {
-        c.stop.store(true, Ordering::Relaxed);
-    }
-    if !x11.is_empty() {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    // The sweep is the Linux capture paths' own: the X11 cursor monitor and capture
+    // threads, the selection watches, and the compositor's command channel, none of
+    // which exist off Linux.
+    #[cfg(target_os = "linux")]
+    {
+        crate::x11::cursor::shutdown();
+        crate::wayland::dcclient::unwatch_all();
+        let x11: Vec<Arc<crate::x11::Controls>> =
+            live_x11().lock().unwrap().iter().cloned().collect();
         for c in &x11 {
-            while !c.finished.load(Ordering::Acquire) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(5));
+            c.stop.store(true, Ordering::Relaxed);
+        }
+        if !x11.is_empty() {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for c in &x11 {
+                while !c.finished.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
             }
         }
-    }
-    // The handle is cloned out of the slot so its mutex is released before the barrier wait:
-    // a capture dropped meanwhile takes the same mutex.
-    let be = WAYLAND_BACKEND
-        .get()
-        .and_then(|slot| slot.lock().unwrap().as_ref().cloned());
-    if let Some(be) = be {
-        let mut displays: Vec<u32> = wayland_alive().lock().unwrap().iter().copied().collect();
-        if !displays.contains(&0) {
-            displays.push(0);
-        }
-        for did in displays {
-            let _ = be.stop_capture(did);
-        }
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
-        if be.send(ThreadCommand::Barrier { reply: ack_tx }).is_ok() {
-            let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+        // The handle is cloned out of the slot so its mutex is released before the barrier wait:
+        // a capture dropped meanwhile takes the same mutex.
+        let be = WAYLAND_BACKEND
+            .get()
+            .and_then(|slot| slot.lock().unwrap().as_ref().cloned());
+        if let Some(be) = be {
+            let mut displays: Vec<u32> = wayland_alive().lock().unwrap().iter().copied().collect();
+            if !displays.contains(&0) {
+                displays.push(0);
+            }
+            for did in displays {
+                let _ = be.stop_capture(did);
+            }
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+            if be.send(ThreadCommand::Barrier { reply: ack_tx }).is_ok() {
+                let _ = ack_rx.recv_timeout(Duration::from_secs(2));
+            }
         }
     }
     wayland_owners().lock().unwrap().clear();
@@ -9905,6 +10738,8 @@ pub fn recording_status() -> Option<crate::recorder::RecordingStatus> {
 /// Bring up the process-wide compositor (`ensure_compositor`) and return its socket name, so a
 /// consumer can place `WAYLAND_DISPLAY` for the clients it starts; empty where the compositor
 /// published no socket within five seconds.
+/// Linux alone: the compositor it waits for is the in-process Wayland one.
+#[cfg(target_os = "linux")]
 pub fn ensure_wayland_display(
     width: i32,
     height: i32,
@@ -9925,7 +10760,9 @@ pub fn ensure_wayland_display(
 
 /// What `probe_wayland_gpu` found: the render node tried, whether it renders in hardware, the
 /// GL renderer's name, and why it was refused where it was.
+/// Linux alone: the probe it reports is of the compositor's GBM/GL bring-up.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(target_os = "linux")]
 pub struct WaylandGpuProbe {
     /// The render node probed, empty where none was found.
     pub node: String,
@@ -9943,6 +10780,8 @@ pub struct WaylandGpuProbe {
 /// Probe the render node the compositor would run on: `render_node` explicitly, else the
 /// `auto_gpu` pick. Allocates one GBM buffer, exports it, and opens a GL context on it, so a
 /// deployment learns before starting whether the compositor renders in hardware.
+/// Linux alone: the GBM buffer it exports is the compositor's own.
+#[cfg(target_os = "linux")]
 pub fn probe_wayland_gpu(render_node: String, auto_gpu: String) -> WaylandGpuProbe {
     let node = if render_node.is_empty() {
         auto_render_node(&auto_gpu)
@@ -10002,9 +10841,16 @@ pub fn hardware_encoders(encode_node_index: i32, auto_gpu: &str) -> encoders::Ha
 
 /// The socket name of the running compositor, `None` without one or where it published none
 /// within two seconds.
+#[cfg(target_os = "linux")]
 pub fn wayland_display_name() -> Option<String> {
     running_compositor()?;
     wait_socket_name(Duration::from_secs(2))
+}
+
+/// No compositor runs off Linux, so there is no socket name to wait for.
+#[cfg(not(target_os = "linux"))]
+pub fn wayland_display_name() -> Option<String> {
+    None
 }
 
 /// Start the Computer-Use HTTP server on `bind`, every request carrying `token` where one is
@@ -10166,6 +11012,7 @@ mod encode_node_tests {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod shm_usage_tests {
     //! What the session reports as its /dev/shm usage: allocated blocks, so a sparse
     //! file is not counted as memory anyone holds.
@@ -10328,6 +11175,7 @@ mod output_overlap_tests {
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod wl_frame_pool_tests {
     //! Invariants under test: try_begin is non-blocking and hands out a buffer ONLY while the
     //! publish slot is empty (so publish can never block the calloop); take blocks until a

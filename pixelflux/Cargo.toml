@@ -15,22 +15,9 @@ crate-type = ["rlib", "cdylib"]
 # The Python bridge (src/python.rs) and nothing else; `python` turns it on, and the wheel
 # build adds `extension-module` so the module links no libpython of its own.
 pyo3 = { version = "0.30.1", optional = true }
-wayland-server = { version = "0.31.10", features = ["dlopen"] }
-wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
-wayland-client = "0.31"
-# The generated KDE output bindings (src/wayland/kdeproto.rs) build from the
-# XMLs vendored under protocols/, so the scanner, the backend it references, and
-# the bitflags its enums expand to are direct deps.
-wayland-scanner = "0.31"
-wayland-backend = "0.3"
-bitflags = "2"
-wayland-protocols-misc = { version = "0.3", features = ["client"] }
-wayland-protocols-plasma = { version = "0.3", features = ["client"] }
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 memmap2 = "0.9"
 crossbeam-channel = "0.5"
-calloop = "0.14"
-turbojpeg = "1.3" 
+turbojpeg = "1.3"
 rayon = "1.10"
 # Software H.264 is one of two encoders, chosen at build time by the features below:
 # GPL-2.0+ libx264 (the default `gpl` feature) or BSD-licensed Cisco OpenH264 (the
@@ -46,32 +33,81 @@ openh264-sys2 = "0.9"
 # linked: libvpx (VP8/VP9), SVT-AV1, and the virtual camera's dav1d and libde265 decoders;
 # x265 and kvazaar are the features below.
 codec-sys = { path = "codec-sys", features = ["vpx", "svtav1", "dav1d", "de265"] }
-# VA-API types from the bundled libva headers; the library itself is loaded at run time.
-va-sys = { path = "va-sys" }
-libc = "0.2"
 # fast_mode enables YuvConversionMode::Fast: empirically 1.23x faster than libyuv ARGBToI420
 # on x86-64-v3 (AVX2) at <=1 LSB error vs a float BT.709 reference (accuracy preserved).
 yuv = { version = "0.8.9", features = ["fast_mode"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-gbm = "0.18" 
 libloading = "0.9"
+image = "=0.25.10"
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+cfg-if = "1"
+
+# The Linux capture backends and their compositor: the headless Smithay Wayland compositor
+# with the portals and virtual devices it serves, and the X11 capture paths (XShm, XFixes,
+# DRI3, NvFBC) over Pure-Rust XCB.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-server = { version = "0.31.10", features = ["dlopen"] }
+wayland-protocols = { version = "0.32", features = ["server", "client", "staging"] }
+wayland-client = "0.31"
+# The generated KDE output bindings (src/wayland/kdeproto.rs) build from the
+# XMLs vendored under protocols/, so the scanner, the backend it references, and
+# the bitflags its enums expand to are direct deps.
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+bitflags = "2"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+calloop = "0.14"
+gbm = "0.18"
 xcursor = "0.3.1"
 # X11 host capture (replaces the C++ XShm/XFixes path): shm = XShm zero-copy grab,
 # xfixes = hardware cursor image, dri3 + render = the zero-copy DRI3 capture (GPU
 # buffers as pixmaps, the cursor composited by the server), damage = the server's
 # report that the screen changed. Pure-Rust XCB; links the system libxcb.
 x11rb = { version = "0.14", features = ["shm", "xfixes", "xtest", "randr", "damage", "dri3", "render"] }
-image = "=0.25.10"
-base64 = "0.23"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-cfg-if = "1"
 zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
 reis = "0.7"
+# VA-API types from the bundled libva headers; the library itself is loaded at run time.
+va-sys = { path = "va-sys" }
+libc = "0.2"
 
-[dependencies.nvcodec-sys]
+# NVENC's committed bindings build wherever the NVIDIA driver does; Linux pairs them with
+# the CUDA driver subset its capture path hands the encoder.
+[target.'cfg(not(target_os = "macos"))'.dependencies.nvcodec-sys]
 path = "nvcodec-sys"
 features = ["cuda"]
+
+# recording_sink's Unix-socket fan-out over Windows' AF_UNIX.
+[target.'cfg(target_os = "windows")'.dependencies]
+uds_windows = "1"
+# The Windows capture backend: Windows.Graphics.Capture frames as D3D11 textures, handed to
+# the NVENC session that encodes them in place on the same device. The feature list is the
+# one the wgc-probe reference binary was proven with on this stack.
+windows = { version = '0.62', features = [
+    'Foundation',
+    'Foundation_Numerics',
+    'Graphics',
+    'Graphics_Capture',
+    'Graphics_DirectX',
+    'Graphics_DirectX_Direct3D11',
+    'Graphics_Imaging',
+    'Storage_Streams',
+    'Win32_Foundation',
+    'Win32_Graphics_Direct3D',
+    'Win32_Graphics_Direct3D11',
+    'Win32_Graphics_Dxgi',
+    'Win32_Graphics_Dxgi_Common',
+    'Win32_Graphics_Gdi',
+    'Win32_System_Com',
+    'Win32_System_Threading',
+    'Win32_Security',
+    'Win32_System_WinRT',
+    'Win32_System_WinRT_Direct3D11',
+    'Win32_System_WinRT_Graphics_Capture',
+] }
 
 [features]
 default = ["gpl"]
@@ -88,7 +124,7 @@ gpl = ["dep:x264-sys", "codec-sys/x265"]
 ## HEVC encoder of a build without `gpl`; the crate fails to compile with neither feature.
 openh264 = ["codec-sys/kvazaar"]
 
-[dependencies.smithay]
+[target.'cfg(target_os = "linux")'.dependencies.smithay]
 git = "https://github.com/Smithay/smithay"
 rev = "928d4a9b222b2adcd739a2c60caf3e8f304a45a5"
 default-features = false
@@ -98,7 +134,7 @@ features = [
     "backend_gbm",
     "backend_libinput",
     "backend_udev",
-    "renderer_gl", 
+    "renderer_gl",
     "renderer_pixman",
     "use_system_lib",
     "desktop",

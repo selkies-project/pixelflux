@@ -27,8 +27,14 @@ use super::reference::{Invalidation, ReferenceWindow};
 #[cfg(feature = "gpl")]
 use super::sps::{WideFrameNum, h264_frame_num_range};
 use crate::CaptureSettings;
+#[cfg(not(target_os = "linux"))]
+use crate::geometry::{Physical, Rectangle};
 use crate::pipeline::{Cleanup, Damage};
 use rayon::prelude::*;
+/// The geometry the stripes are cut from: smithay's Rectangle on Linux, where the capture
+/// backends hand the pipeline smithay rectangles and this must be the same type, and the
+/// crate's own geometry anywhere else, where smithay does not build.
+#[cfg(target_os = "linux")]
 use smithay::utils::{Physical, Rectangle};
 #[cfg(feature = "gpl")]
 use std::ffi::CString;
@@ -1304,7 +1310,7 @@ impl FrameTiming {
         let timing = FrameTiming {
             capture_ns,
             encode_start_ns,
-            encode_end_ns: crate::wayland::host::now_ns(),
+            encode_end_ns: crate::clock::now_ns(),
         };
         for stripe in stripes {
             stripe.timing = timing;
@@ -2437,7 +2443,7 @@ mod tests {
             use_paint_over_quality: false,
             ..Default::default()
         };
-        let full = [smithay::utils::Rectangle::new((0, 0).into(), (w, h).into())];
+        let full = [Rectangle::new((0, 0).into(), (w, h).into())];
         let stripes_n = super::stripe_count(h, settings.codec, settings.video_fullframe);
         if stripes_n < 2 {
             return;
@@ -2470,10 +2476,7 @@ mod tests {
         // Motion that narrows to one corner narrows the divisor with it, so the budget
         // follows the stripes that are actually spending it. A frame with no motion at all
         // encodes nothing and carries nothing, so it leaves the divisor where it was.
-        let band = [smithay::utils::Rectangle::new(
-            (0, 0).into(),
-            (w, 64).into(),
-        )];
+        let band = [Rectangle::new((0, 0).into(), (w, 64).into())];
         for frame in 40..120u16 {
             let shade = 40u8.wrapping_add(frame.wrapping_mul(11) as u8);
             let mut px = vec![200u8; (w * h * 4) as usize];
@@ -2803,7 +2806,7 @@ mod tests {
         };
         let mut stripes = Vec::new();
         let mut carrying = 1.0f32;
-        let full = [smithay::utils::Rectangle::new((0, 0).into(), (w, h).into())];
+        let full = [Rectangle::new((0, 0).into(), (w, h).into())];
         let dirty = super::encode_cpu(
             &mut stripes,
             &mut carrying,

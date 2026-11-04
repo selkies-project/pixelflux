@@ -28,12 +28,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use libloading::{Library, Symbol};
+// The dmabuf a Wayland capture or an X server hands a zero-copy session is a Linux buffer
+// object, so the type and the helpers that read it stay with the paths that produce one.
+#[cfg(target_os = "linux")]
 use smithay::backend::allocator::{Buffer, Fourcc, dmabuf::Dmabuf};
 
 use super::codec::{
@@ -563,6 +567,7 @@ enum DmaBufInput {
 /// The fourcc a dmabuf is described with for CUDA's EGL import: the alpha-carrying twin of an
 /// X-format, since the NVIDIA driver refuses XRGB/XBGR images there while the bytes lie identically
 /// and NVENC ignores the alpha channel of ARGB/ABGR input.
+#[cfg(target_os = "linux")]
 fn egl_import_fourcc(code: Fourcc) -> Fourcc {
     match code {
         Fourcc::Xrgb8888 => Fourcc::Argb8888,
@@ -571,6 +576,7 @@ fn egl_import_fourcc(code: Fourcc) -> Fourcc {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fourcc_nvenc_format(code: Fourcc) -> Option<NV_ENC_BUFFER_FORMAT> {
     match code {
         Fourcc::Argb8888 | Fourcc::Xrgb8888 => {
@@ -993,6 +999,8 @@ pub(crate) fn probe_codecs(encode_node_index: i32) -> Result<Vec<(Codec, super::
     let cuda = std::mem::ManuallyDrop::new(NvencEncoder::load_cuda()?);
     let nvenc_lib = std::mem::ManuallyDrop::new(NvencEncoder::load_nvenc()?);
     nvenc_negotiate(&nvenc_lib);
+    // The ioctl filter names the render node a container was handed, a Linux kernel service.
+    #[cfg(target_os = "linux")]
     crate::nvgpufilter::install();
     unsafe {
         let res = (cuda.cuInit)(0);
@@ -2217,6 +2225,8 @@ impl NvencEncoder {
         let nvenc_lib = Arc::new(Self::load_nvenc()?);
         nvenc_negotiate(&nvenc_lib);
 
+        // The ioctl filter names the render node a container was handed, a Linux kernel service.
+        #[cfg(target_os = "linux")]
         crate::nvgpufilter::install();
 
         static LEAK_ONCE: std::sync::Once = std::sync::Once::new();
@@ -4174,6 +4184,10 @@ impl NvencEncoder {
     /// Encode a dmabuf frame zero-copy, by importing it through EGL into CUDA and, where the
     /// driver allows, handing the mapped plane to NVENC as its input.
     ///
+    /// Linux alone: the dmabuf, its EGL import, and the X server's blit semaphore are this OS's,
+    /// and the Windows session takes host pixels (the D3D11 input of its own capture backend is
+    /// the next milestone's).
+    ///
     /// Applies any pending ConstQP change, then works under the pushed CUDA context:
     ///
     /// 1. **Import once, cache by fd with an identity check**: the cache is keyed by the dmabuf fd
@@ -4196,6 +4210,7 @@ impl NvencEncoder {
     ///
     /// The dmabuf fd is read out before the context is pushed so an early `?` return cannot leave the
     /// CUDA context stack imbalanced.
+    #[cfg(target_os = "linux")]
     pub fn encode(
         &mut self,
         dmabuf: &Dmabuf,
@@ -4211,6 +4226,7 @@ impl NvencEncoder {
     /// (`blit_semaphore_fd`), so it runs on the GPU right behind the blit instead of after the
     /// CPU has learnt of it. NVENC reads its input on the default stream, as the copy and the
     /// convert do, so one wait there orders all of it.
+    #[cfg(target_os = "linux")]
     pub fn encode_after_blit(
         &mut self,
         dmabuf: &Dmabuf,
@@ -4223,7 +4239,9 @@ impl NvencEncoder {
 
     /// A new semaphore for the X server to signal after a blit and `encode_after_blit` to wait
     /// on: made on this session's GPU, imported into its context in place of any earlier one,
-    /// and returned as the fd the server imports.
+    /// and returned as the fd the server imports. Linux alone with the X server it serves: the
+    /// semaphore is an OPAQUE_FD pair, a Linux kernel handle.
+    #[cfg(target_os = "linux")]
     pub fn blit_semaphore_fd(&mut self) -> Result<std::os::fd::OwnedFd, String> {
         use std::os::fd::IntoRawFd;
         unsafe {
@@ -4266,6 +4284,7 @@ impl NvencEncoder {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn encode_frame(
         &mut self,
         dmabuf: &Dmabuf,
@@ -8053,6 +8072,7 @@ mod gpu_tests {
     /// back with neutral chroma, whichever way the driver mapped the import — pitch-linear, read
     /// in place, or a CUDA array, read through a texture. Neither case copies the RGB.
     /// Ignored by default.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore]
     fn gpu_dmabuf_chroma_is_sited_at_the_block_center() {
@@ -10206,6 +10226,7 @@ mod decision_tests {
     /// The dmabuf fourcc picks the NVENC packed format with the same byte order: XR24 / AR24 are
     /// B,G,R,A in memory and so NVENC `ARGB`; XB24 / AB24 are R,G,B,A and so `ABGR`; anything else
     /// has no packed 8-bit NVENC equivalent.
+    #[cfg(target_os = "linux")]
     #[test]
     fn fourcc_selects_nvenc_byte_order() {
         for code in [Fourcc::Argb8888, Fourcc::Xrgb8888] {
@@ -10232,6 +10253,7 @@ mod decision_tests {
     }
 
     /// The EGL import names X-formats by their alpha twin and leaves everything else alone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn egl_import_names_alpha_twins() {
         assert_eq!(egl_import_fourcc(Fourcc::Xrgb8888), Fourcc::Argb8888);

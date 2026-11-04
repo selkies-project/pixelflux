@@ -10,7 +10,10 @@
 
 /// The bit writer the packed headers of the VA-API session are written with.
 pub mod bits;
-/// The GPU semaphore an X server's blit signals for the encoder, made through Vulkan.
+/// The GPU semaphore an X server's blit signals for the encoder, made through Vulkan and
+/// exported as an OPAQUE_FD pair. The fd is a Linux kernel handle, so the module stays with the
+/// X server that signals it.
+#[cfg(target_os = "linux")]
 pub(crate) mod blit_semaphore;
 /// Codec identities, wire framing, quantizer domains, level ladders, bitstream reads.
 pub mod codec;
@@ -30,7 +33,10 @@ pub mod oh264;
 /// The long-term references of an OpenH264 session, read off its own slice headers.
 #[cfg(any(feature = "openh264", test))]
 pub mod oh264_refs;
-/// PNG watermark overlay composited onto frames before encoding.
+/// PNG watermark overlay composited onto frames before encoding, drawn by the renderers of
+/// the capture paths that blend it — the Wayland compositor's GLES and pixman passes and the
+/// X11 grab's CPU blend, all of which are Linux backends.
+#[cfg(target_os = "linux")]
 pub mod overlay;
 pub mod reference;
 /// What the full-frame software sessions share: planar input, quantizer, rate settings.
@@ -51,20 +57,31 @@ pub mod svtav1;
 pub mod tegra;
 /// Hardware H.264 through a generic stateful V4L2 M2M encoder: boards whose encoder sits
 /// behind the kernel's own interface rather than a vendor library or a render node, such as
-/// a Raspberry Pi 4, RK356x, or i.MX8M. Built everywhere, since the interface is the kernel's.
+/// a Raspberry Pi 4, RK356x, or i.MX8M. Built on every Linux architecture, since the
+/// interface is the kernel's.
+#[cfg(target_os = "linux")]
 pub mod v4l2m2m;
-/// VA-API hardware sessions on a DRM render node, driven through libva directly.
+/// VA-API hardware sessions on a DRM render node, driven through libva directly. The DRM
+/// render node and the library it loads are Linux's.
+#[cfg(target_os = "linux")]
 pub mod vaapi;
 /// Software VP8 and VP9 through libvpx.
 pub mod vpx;
 
 pub use codec::*;
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use nvenc::NvencEncoder;
+/// The dmabuf a Wayland capture or an X server hands a zero-copy session, a Linux buffer
+/// object whose planes the encoder imports by fd.
+#[cfg(target_os = "linux")]
 use smithay::backend::allocator::dmabuf::Dmabuf;
 
 use crate::CaptureSettings;
@@ -134,6 +151,10 @@ type ProbeAnswer = Result<HardwareEncoders, (&'static str, String)>;
 /// `hardware_encoders` with the refusal of a node whose backend could not be brought up. A
 /// device with no NVENC session to spare (`nvenc::SESSIONS_TAKEN`) says nothing lasting, so
 /// that answer is asked again.
+///
+/// The probe on a render node: the Linux DRM driver read decides NVENC or VA-API, and the
+/// stateful M2M encoder serves where neither came up.
+#[cfg(target_os = "linux")]
 fn probe_node(encode_node_index: i32) -> ProbeAnswer {
     static PROBED: OnceLock<Mutex<HashMap<i32, ProbeAnswer>>> = OnceLock::new();
     let node = encode_node_index.max(0);
@@ -204,6 +225,18 @@ fn probe_node(encode_node_index: i32) -> ProbeAnswer {
         probed.insert(node, answer.clone());
     }
     answer
+}
+
+/// The probe where render nodes do not exist: no hardware backend is wired for this OS yet,
+/// and the ladder reads that as the refusal it falls through on. The Windows backend names
+/// what its own adapter probe serves once it lands.
+#[cfg(not(target_os = "linux"))]
+fn probe_node(_encode_node_index: i32) -> ProbeAnswer {
+    Err((
+        "none",
+        "hardware encode is not wired for this OS yet; sessions run on the software encoders"
+            .to_string(),
+    ))
 }
 
 /// Whether the software encoder of a codec carries a 4:4:4 (`video_fullcolor`) request: x264
@@ -340,6 +373,7 @@ fn encodes_in_child(codec: Codec) -> bool {
 /// no SVT-AV1 handle is alive (`svtav1::LIFECYCLE`), as at the import-time probe: one being
 /// created, released, or run holds process-wide state the child would inherit half-built or
 /// locked. One a sandbox refuses to fork counts as alive.
+#[cfg(target_os = "linux")]
 fn survives_in_child(f: impl FnOnce()) -> bool {
     let mut live = svtav1::LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
     while *live > 0 {
@@ -374,6 +408,22 @@ fn survives_in_child(f: impl FnOnce()) -> bool {
         }
         _ => true,
     }
+}
+
+/// The same probe where `fork` does not exist: the library opens and codes in this process
+/// behind a panic guard, which catches a Rust panic but not a fault in the library's own
+/// machine code. The codec libraries ship from this build, so the fault case is a broken
+/// install rather than a machine the probe has to survive.
+#[cfg(not(target_os = "linux"))]
+fn survives_in_child(f: impl FnOnce()) -> bool {
+    let mut live = svtav1::LIFECYCLE.lock().unwrap_or_else(|e| e.into_inner());
+    while *live > 0 {
+        live = svtav1::RELEASED
+            .wait(live)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+    drop(live);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_ok()
 }
 
 /// Seconds of a constant-rate target a held frame (the cleanup of a still screen) may spend: a
@@ -892,6 +942,9 @@ mod tests {
     }
 
     /// A child's fate is the finding: a fatal signal, and only that, reads as not surviving.
+    /// Linux alone: the fork the finding depends on is, and a signal raised in-process takes
+    /// the process the probe was meant to keep.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_child_survives_unless_a_signal_takes_it() {
         assert!(survives_in_child(|| {}));
@@ -1042,6 +1095,7 @@ mod tests {
 pub enum FrameEncoder {
     Nvenc(NvencEncoder),
     /// A VA-API session on a render node, hardware.
+    #[cfg(target_os = "linux")]
     Vaapi(vaapi::VaapiEncoder),
     /// libvpx VP8 or VP9, software.
     Vpx(vpx::VpxEncoder),
@@ -1053,6 +1107,7 @@ pub enum FrameEncoder {
     #[cfg(target_arch = "aarch64")]
     Tegra(tegra::TegraEncoder),
     /// A stateful V4L2 M2M encoder, driven through the kernel interface directly.
+    #[cfg(target_os = "linux")]
     V4l2m2m(v4l2m2m::V4l2M2mEncoder),
 }
 
@@ -1061,12 +1116,14 @@ macro_rules! each {
     ($self:expr, $enc:ident => $e:expr) => {
         match $self {
             FrameEncoder::Nvenc($enc) => $e,
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi($enc) => $e,
             FrameEncoder::Vpx($enc) => $e,
             FrameEncoder::Hevc($enc) => $e,
             FrameEncoder::Av1($enc) => $e,
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra($enc) => $e,
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m($enc) => $e,
         }
     };
@@ -1093,6 +1150,7 @@ impl FrameEncoder {
         match self {
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => Some("CBR"),
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(_) => Some("VBR"),
             _ => None,
         }
@@ -1102,12 +1160,14 @@ impl FrameEncoder {
     pub fn backend_name(&self) -> &'static str {
         match self {
             FrameEncoder::Nvenc(_) => "NVENC",
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(_) => "VAAPI",
             FrameEncoder::Vpx(enc) => enc.library(),
             FrameEncoder::Hevc(enc) => enc.library(),
             FrameEncoder::Av1(enc) => enc.library(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => "TEGRA",
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(_) => "V4L2M2M",
         }
     }
@@ -1122,10 +1182,12 @@ impl FrameEncoder {
     pub fn bit_depth(&self) -> u32 {
         match self {
             FrameEncoder::Nvenc(enc) => enc.bit_depth(),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.bit_depth(),
             FrameEncoder::Vpx(enc) => enc.bit_depth(),
             FrameEncoder::Hevc(enc) => enc.bit_depth(),
             FrameEncoder::Av1(enc) => enc.bit_depth(),
+            #[cfg(target_os = "linux")]
             _ => 8,
         }
     }
@@ -1144,12 +1206,14 @@ impl FrameEncoder {
                 enc.reconfigure_rate(settings);
                 Ok(())
             }
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.reconfigure_rate(settings),
             FrameEncoder::Vpx(enc) => enc.reconfigure_rate(settings),
             FrameEncoder::Hevc(enc) => enc.reconfigure_rate(settings),
             FrameEncoder::Av1(enc) => enc.reconfigure_rate(settings),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(enc) => enc.reconfigure_rate(settings),
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(enc) => enc.reconfigure_rate(settings),
         }
     }
@@ -1169,6 +1233,7 @@ impl FrameEncoder {
             FrameEncoder::Nvenc(enc) => {
                 enc.encode_cpu_packed(pixels, stride, rgba, frame_number, qp, force_idr)
             }
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => {
                 enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
             }
@@ -1185,6 +1250,7 @@ impl FrameEncoder {
             FrameEncoder::Tegra(enc) => {
                 enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
             }
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(enc) => {
                 enc.encode_host(pixels, stride, rgba, frame_number, qp, force_idr)
             }
@@ -1215,10 +1281,12 @@ impl FrameEncoder {
     pub fn last_quality(&self) -> Option<u32> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_quality(),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.last_quality(),
             FrameEncoder::Vpx(enc) => enc.last_quality(),
             FrameEncoder::Hevc(enc) => enc.last_quality(),
             FrameEncoder::Av1(enc) => enc.last_quality(),
+            #[cfg(target_os = "linux")]
             _ => None,
         }
     }
@@ -1231,6 +1299,7 @@ impl FrameEncoder {
     pub fn last_size(&self) -> Option<usize> {
         match self {
             FrameEncoder::Nvenc(enc) => enc.last_size(),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.last_size(),
             FrameEncoder::Vpx(enc) => enc.last_size(),
             FrameEncoder::Hevc(enc) => enc.last_size(),
@@ -1241,6 +1310,7 @@ impl FrameEncoder {
     /// Have the next frame's reconstruction measured against its source, where the session
     /// can (`last_psnr`).
     pub fn measure(&mut self) {
+        #[cfg(target_os = "linux")]
         if let FrameEncoder::Vaapi(enc) = self {
             enc.measure();
         }
@@ -1250,6 +1320,7 @@ impl FrameEncoder {
     /// reconstruction back, where the driver's surfaces let it.
     pub fn measures(&self) -> bool {
         match self {
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.measures(),
             _ => false,
         }
@@ -1261,6 +1332,7 @@ impl FrameEncoder {
     /// whatever quantizer the driver reports.
     pub fn last_psnr(&self) -> Option<f32> {
         match self {
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.last_psnr(),
             _ => None,
         }
@@ -1275,6 +1347,7 @@ impl FrameEncoder {
     pub fn cap(&mut self, bytes: usize) {
         match self {
             FrameEncoder::Nvenc(enc) => enc.cap(bytes),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.cap(bytes),
             FrameEncoder::Vpx(enc) => enc.cap(bytes),
             _ => {}
@@ -1287,6 +1360,7 @@ impl FrameEncoder {
     /// back instead.
     pub fn follows_cap(&self) -> bool {
         match self {
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.follows_cap(),
             FrameEncoder::Vpx(enc) => enc.follows_cap(),
             _ => false,
@@ -1313,6 +1387,7 @@ impl FrameEncoder {
     /// came out at 231 kB and 30.9 dB at its coarsest).
     pub fn ends_cleanup_on_key(&self) -> bool {
         match self {
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.ends_cleanup_on_key(),
             _ => false,
         }
@@ -1360,11 +1435,13 @@ impl FrameEncoder {
         match self {
             FrameEncoder::Nvenc(_) => true,
             FrameEncoder::Vpx(enc) => enc.holds_quantizer(),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => !enc.is_cbr(),
             FrameEncoder::Hevc(enc) => enc.holds_quantizer(),
             FrameEncoder::Av1(enc) => enc.holds_quantizer(),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => false,
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(_) => false,
         }
     }
@@ -1397,12 +1474,14 @@ impl FrameEncoder {
     pub fn hold_quantizer(&mut self, crf: u32, band: Option<(f64, f64)>) {
         match self {
             FrameEncoder::Nvenc(enc) => enc.hold_quantizer(crf, band),
+            #[cfg(target_os = "linux")]
             FrameEncoder::Vaapi(enc) => enc.hold_quantizer(crf),
             FrameEncoder::Vpx(enc) => enc.hold_quantizer(crf, band),
             FrameEncoder::Hevc(enc) => enc.hold_quantizer(crf),
             FrameEncoder::Av1(enc) => enc.hold_quantizer(crf),
             #[cfg(target_arch = "aarch64")]
             FrameEncoder::Tegra(_) => {}
+            #[cfg(target_os = "linux")]
             FrameEncoder::V4l2m2m(_) => {}
         }
     }
@@ -1474,6 +1553,7 @@ impl FrameEncoder {
     pub fn take_report(&mut self, report: reference::ReferenceReport) -> bool {
         match (self, report) {
             (FrameEncoder::Nvenc(enc), report) => enc.take_report(report),
+            #[cfg(target_os = "linux")]
             (FrameEncoder::Vaapi(enc), report) => enc.take_report(report),
             (FrameEncoder::Vpx(enc), reference::ReferenceReport::Held(id)) => {
                 enc.acknowledge_reference(id, true);
@@ -1501,6 +1581,10 @@ impl FrameEncoder {
     }
 
     /// Encode one Wayland dmabuf in place (a zero-copy session).
+    ///
+    /// Linux alone: a dmabuf is handed over by the Wayland capture and the X server's zero-copy
+    /// paths, neither of which exists on this OS, so a session here takes host frames.
+    #[cfg(target_os = "linux")]
     pub fn encode_dmabuf(
         &mut self,
         dmabuf: &Dmabuf,
@@ -1520,6 +1604,7 @@ impl FrameEncoder {
 
     /// `encode_dmabuf`, for a buffer the X server signals the session's blit semaphore after
     /// blitting into (`blit_semaphore_fd`): the frame's GPU work waits on it on the GPU.
+    #[cfg(target_os = "linux")]
     pub fn encode_dmabuf_after_blit(
         &mut self,
         dmabuf: &Dmabuf,
@@ -1539,6 +1624,10 @@ impl FrameEncoder {
     /// A semaphore for the X server to signal after each blit, as the fd it imports, for
     /// `encode_dmabuf_after_blit` to wait on; None for a session that cannot wait on one (NVENC
     /// alone can, through CUDA).
+    ///
+    /// Linux alone with the blit it waits on: the semaphore is a Vulkan-made fd the X server
+    /// imports, and no capture path here produces one.
+    #[cfg(target_os = "linux")]
     pub fn blit_semaphore_fd(&mut self) -> Option<Result<std::os::fd::OwnedFd, String>> {
         match self {
             FrameEncoder::Nvenc(enc) => Some(enc.blit_semaphore_fd()),
@@ -1577,11 +1666,18 @@ pub fn driver_name(driver: &str) -> &str {
 }
 
 /// How a session's frames arrive: Wayland dmabufs (with the EGL display NVENC imports them
-/// through), or packed host pixels in R,G,B,A (`rgba`) or B,G,R,A byte order.
+/// through), or packed host pixels in R,G,B,A (`rgba`) or B,G,R,A byte order. A dmabuf source
+/// is Linux's alone — the Wayland capture and the X server's zero-copy paths are the ones that
+/// hand a session one — so this OS offers host frames and the ladder stays on them.
 #[derive(Clone, Copy)]
 pub enum FrameSource {
-    Dmabuf { egl_display: *const c_void },
-    Host { rgba: bool },
+    #[cfg(target_os = "linux")]
+    Dmabuf {
+        egl_display: *const c_void,
+    },
+    Host {
+        rgba: bool,
+    },
 }
 
 /// The threads a striped H.264 session encodes on: its stripes at once, one a rayon worker, or
@@ -1635,9 +1731,12 @@ pub fn select_frame_encoder(
     }
     // A dmabuf source stops here, its readback path running the ladder again on host frames,
     // and H.264 has come up on the striped path the caller encodes itself.
+    #[cfg(target_os = "linux")]
     let FrameSource::Host { rgba } = source else {
         return None;
     };
+    #[cfg(not(target_os = "linux"))]
+    let FrameSource::Host { rgba } = source;
     if requested == Codec::H264 {
         return None;
     }
@@ -1849,6 +1948,7 @@ fn select_for_codec(
                 }
             }
             let egl_display = match source {
+                #[cfg(target_os = "linux")]
                 FrameSource::Dmabuf { egl_display } => egl_display,
                 FrameSource::Host { .. } => std::ptr::null(),
             };
@@ -1877,38 +1977,45 @@ fn select_for_codec(
         } else {
             // Nothing below reconfigures a session in place, so the previous one is released
             // here: a single-context M2M node refuses to open while its own last session is
-            // alive, and a window resize would then demote a working hardware path.
-            drop(prior);
-            let input = match source {
-                FrameSource::Dmabuf { .. } => vaapi::Input::Dmabuf,
-                FrameSource::Host { rgba } => vaapi::Input::Host { rgba },
-            };
-            match vaapi::VaapiEncoder::new(settings, codec, input) {
-                Ok(enc) => {
-                    println!(
-                        "[{tag}] Encoder: VAAPI {} {} {}-bit on {} surfaces (render node {node}, {} driver).",
-                        codec.display(),
-                        chroma_name(enc.is_fullcolor()),
-                        enc.bit_depth(),
-                        enc.surface_format_name(),
-                        driver_name(&driver)
-                    );
-                    crate::report::hardware_encoder("", driver_name(&driver), node);
-                    return Some(FrameEncoder::Vaapi(enc));
-                }
-                Err(e) => {
-                    eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display());
-                    crate::report::encoder_reason(&format!(
-                        "VAAPI {} did not open: {e}",
-                        codec.display()
-                    ));
+            // alive, and a window resize would then demote a working hardware path. VA-API is
+            // Linux's alone — its render node and library are — so this OS takes the NVENC
+            // branch its empty driver read routes to or none at all.
+            #[cfg(target_os = "linux")]
+            {
+                drop(prior);
+                let input = match source {
+                    FrameSource::Dmabuf { .. } => vaapi::Input::Dmabuf,
+                    FrameSource::Host { rgba } => vaapi::Input::Host { rgba },
+                };
+                match vaapi::VaapiEncoder::new(settings, codec, input) {
+                    Ok(enc) => {
+                        println!(
+                            "[{tag}] Encoder: VAAPI {} {} {}-bit on {} surfaces (render node {node}, {} driver).",
+                            codec.display(),
+                            chroma_name(enc.is_fullcolor()),
+                            enc.bit_depth(),
+                            enc.surface_format_name(),
+                            driver_name(&driver)
+                        );
+                        crate::report::hardware_encoder("", driver_name(&driver), node);
+                        return Some(FrameEncoder::Vaapi(enc));
+                    }
+                    Err(e) => {
+                        eprintln!("[{tag}] Failed to init VAAPI {}: {e}", codec.display());
+                        crate::report::encoder_reason(&format!(
+                            "VAAPI {} did not open: {e}",
+                            codec.display()
+                        ));
+                    }
                 }
             }
         }
         // A stateful M2M encoder publishes no render node driver to select on, so it is
         // reached only once the two backends that do have refused. The size is checked before
         // the node is opened: a refusal here falls through to software, a refusal later would
-        // leave a session that came up and produces nothing.
+        // leave a session that came up and produces nothing. The kernel interface it drives is
+        // Linux's, so the rung does not exist here.
+        #[cfg(target_os = "linux")]
         if let (Some(_), FrameSource::Host { rgba }) = (v4l2m2m::coded_fourcc(codec), source)
             && v4l2m2m::encodes(codec, settings.width, settings.height)
         {
@@ -1928,9 +2035,12 @@ fn select_for_codec(
         crate::log::debug!("[{tag}] Software encoding selected (use_cpu or encode_node_index -1).");
         crate::report::encoder_reason("software encoding selected");
     }
+    #[cfg(target_os = "linux")]
     let FrameSource::Host { rgba } = source else {
         return None;
     };
+    #[cfg(not(target_os = "linux"))]
+    let FrameSource::Host { rgba } = source;
     software_fallback(settings, rgba, tag)
 }
 

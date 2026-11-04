@@ -22,7 +22,7 @@
 //! constant-rate control otherwise refreshes GOLDEN on a schedule of its own, whatever a frame's
 //! flags say.
 
-use std::ffi::{CStr, c_int, c_long, c_void};
+use std::ffi::{CStr, c_int, c_long, c_ulong, c_void};
 use std::ptr;
 
 use codec_sys::vpx::*;
@@ -756,7 +756,7 @@ impl VpxEncoder {
                 pts as i64,
                 1,
                 flags,
-                VPX_DL_REALTIME as u64,
+                VPX_DL_REALTIME as c_ulong,
             )
         };
         if res != VPX_CODEC_OK {

@@ -39,17 +39,34 @@
 pub mod mp4;
 pub mod ogg;
 
+/// The recorder's queue and its thread machinery are the Linux capture's; the imports they
+/// need stay with them.
+#[cfg(target_os = "linux")]
 use std::collections::VecDeque;
+/// The recorder's file hardening and its pcmflux audio socket are POSIX's; both users of
+/// these imports are Linux-gated below.
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+#[cfg(target_os = "linux")]
+use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Sender, TrySendError};
 
 use crate::CaptureSettings;
+#[cfg(target_os = "linux")]
 use crate::ThreadCommand;
 use crate::encoders::software::EncodedStripe;
 
@@ -198,6 +215,7 @@ pub struct RecordingStatus {
 
 /// The wayland-side tap handle consulted by [`wayland_tap`]; cloneable so the delivery
 /// thread can drop the registry lock before doing any work.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct WlTap {
     display_id: u32,
@@ -210,12 +228,14 @@ struct WlTap {
 }
 
 /// Sends `ThreadCommand::RequestIdr` for one display over the compositor's command channel.
+#[cfg(target_os = "linux")]
 #[derive(Clone)]
 struct IdrRequester {
     tx: smithay::reexports::calloop::channel::Sender<ThreadCommand>,
     display_id: u32,
 }
 
+#[cfg(target_os = "linux")]
 impl IdrRequester {
     fn request(&self) {
         let _ = self.tx.send(ThreadCommand::RequestIdr {
@@ -225,6 +245,7 @@ impl IdrRequester {
 }
 
 /// How the active recording is fed and what must be torn down on stop.
+#[cfg(target_os = "linux")]
 enum RecordingMode {
     /// Recorder-owned X11 capture: its controls and capture thread.
     X11Own {
@@ -238,6 +259,7 @@ enum RecordingMode {
     WaylandAttached,
 }
 
+#[cfg(target_os = "linux")]
 struct ActiveRecording {
     path: String,
     backend: &'static str,
@@ -250,16 +272,21 @@ struct ActiveRecording {
     audio: Option<thread::JoinHandle<()>>,
 }
 
+#[cfg(target_os = "linux")]
 static ACTIVE: Mutex<Option<ActiveRecording>> = Mutex::new(None);
+#[cfg(target_os = "linux")]
 static LAST_FINISHED: Mutex<Option<RecordingStatus>> = Mutex::new(None);
 /// Fast idle guard for [`wayland_tap`]: the delivery threads pay one relaxed atomic load
 /// per frame while no recording is armed.
+#[cfg(target_os = "linux")]
 static WL_TAP_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "linux")]
 static WL_TAP: Mutex<Option<WlTap>> = Mutex::new(None);
 
 /// Delivery-layer feed from the Wayland pipelines (readback encode loop and zero-copy
 /// tick). Near-zero cost when idle; while recording it clones an `Arc` into the bounded
 /// queue and never blocks.
+#[cfg(target_os = "linux")]
 pub(crate) fn wayland_tap(display_id: u32, stripes: &[EncodedStripe]) {
     if !WL_TAP_ARMED.load(Ordering::Relaxed) {
         return;
@@ -278,6 +305,7 @@ pub(crate) fn wayland_tap(display_id: u32, stripes: &[EncodedStripe]) {
 
 /// Issue a standard request-IDR when the cadence interval has elapsed. Compare-and-swap on
 /// the last-request stamp so concurrent delivery threads emit one request per interval.
+#[cfg(target_os = "linux")]
 fn pace_idr_requests(shared: &RecShared, idr: &IdrRequester, interval_us: u64) {
     if interval_us == 0 {
         return;
@@ -336,6 +364,7 @@ fn offer_frame(shared: &RecShared, tx: &Sender<Tap>, stripes: &[EncodedStripe]) 
 /// the first IDR with parameter sets; earlier frames are discarded and audio packets held.
 /// Runs until every sender is dropped (stop) or a write error occurs, then finalizes the
 /// file and publishes the final status.
+#[cfg(target_os = "linux")]
 fn writer_thread(
     rx: Receiver<Tap>,
     file: std::fs::File,
@@ -451,6 +480,7 @@ fn writer_thread(
 
 /// Connect to the audio sink within a moment and read its headers: the reader positioned
 /// at the first audio packet, and the `OpusHead` the track is declared from.
+#[cfg(target_os = "linux")]
 fn open_audio(path: &str) -> Result<(ogg::PageReader<UnixStream>, ogg::OpusHead), String> {
     let deadline = Instant::now() + Duration::from_secs(2);
     let stream = loop {
@@ -492,6 +522,7 @@ fn page_start(position: u64, granule: u64, samples: u64) -> u64 {
 /// clock from the first packet's arrival. Packets wait for their page's last, which carries
 /// the granule; an unfinished page's packets at the stream's end follow the page before. Ends
 /// with the stream, or on stop.
+#[cfg(target_os = "linux")]
 fn audio_thread(
     mut reader: ogg::PageReader<UnixStream>,
     tx: Sender<Tap>,
@@ -592,6 +623,7 @@ fn own_capture_settings(opts: &RecordOptions) -> Result<CaptureSettings, String>
 }
 
 /// Start a recording. Exactly one may be active per process; returns the initial status.
+#[cfg(target_os = "linux")]
 pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
     let mut guard = ACTIVE.lock().unwrap();
     if guard.is_some() {
@@ -830,6 +862,37 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
     Ok(status)
 }
 
+/// Start a recording where the compositor channel and the X server do not exist:
+/// the entry point reports the absence rather than pretending a recording is running.
+/// The recorder's audio half reads pcmflux's Unix socket and its file hardening is
+/// POSIX's, so a working recorder on this OS is later milestone work.
+#[cfg(not(target_os = "linux"))]
+pub fn start(_opts: RecordOptions) -> Result<RecordingStatus, String> {
+    Err("recording is not wired for this OS yet".to_string())
+}
+
+/// Stop the active recording: none can be active here.
+#[cfg(not(target_os = "linux"))]
+pub fn stop() -> Result<RecordingStatus, String> {
+    Err("no recording is active".to_string())
+}
+
+/// The current status: no recording can be active or finished here.
+#[cfg(not(target_os = "linux"))]
+pub fn status() -> Option<RecordingStatus> {
+    None
+}
+
+/// Finalize any active recording at interpreter shutdown: none can be active here.
+#[cfg(not(target_os = "linux"))]
+pub fn finalize_on_exit() {}
+
+/// `PIXELFLUX_RECORD=<path>`: recording does not exist on this OS, so the environment
+/// variable names a feature this build reports absent.
+#[cfg(not(target_os = "linux"))]
+pub fn autostart_from_env() {}
+
+#[cfg(target_os = "linux")]
 fn disarm_tap() {
     WL_TAP_ARMED.store(false, Ordering::Relaxed);
     *WL_TAP.lock().unwrap() = None;
@@ -837,6 +900,7 @@ fn disarm_tap() {
 
 /// Stop the active recording, finalize the MP4, and return the final status. Errors when no
 /// recording is active or when nothing recordable was ever received.
+#[cfg(target_os = "linux")]
 pub fn stop() -> Result<RecordingStatus, String> {
     let active = ACTIVE
         .lock()
@@ -894,6 +958,7 @@ pub fn stop() -> Result<RecordingStatus, String> {
 
 /// The current status: the live recording when one is active, otherwise the last finished
 /// one; `None` when the process has never recorded.
+#[cfg(target_os = "linux")]
 pub fn status() -> Option<RecordingStatus> {
     let guard = ACTIVE.lock().unwrap();
     if let Some(a) = guard.as_ref() {
@@ -920,6 +985,7 @@ pub fn status() -> Option<RecordingStatus> {
 
 /// Finalize any active recording at interpreter shutdown so the MP4's last buffered sample
 /// is flushed. Best-effort; the fragmented layout keeps even an unflushed file playable.
+#[cfg(target_os = "linux")]
 pub fn finalize_on_exit() {
     if ACTIVE.lock().unwrap().is_some() {
         let _ = stop();
@@ -929,6 +995,7 @@ pub fn finalize_on_exit() {
 /// `PIXELFLUX_RECORD=<path>`: record from process start. X11 (via `DISPLAY`) starts
 /// immediately; otherwise a background thread waits for the in-process Wayland compositor to
 /// come up and then starts. Retries transient failures until the deadline.
+#[cfg(target_os = "linux")]
 pub fn autostart_from_env() {
     use std::sync::OnceLock;
     static STARTED: OnceLock<()> = OnceLock::new();
@@ -1002,6 +1069,7 @@ pub fn status_to_json(s: &RecordingStatus) -> serde_json::Value {
 /// Open the recording's file. The recording is the desktop: readable by its owner alone,
 /// never written through a link someone else may have planted at a predictable name in a
 /// shared directory, nor into a file there that is another's, or has another name too.
+#[cfg(target_os = "linux")]
 fn open_recording(path: &str) -> Result<std::fs::File, String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
@@ -1030,6 +1098,8 @@ mod tests {
 
     /// The recording opens only into a file of this user's alone: a new one, or one of its
     /// own made private, never through a link nor into a file that has another name too.
+    /// Linux alone: the hardening it probes is POSIX's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_recording_opens_only_into_a_file_of_this_users_alone() {
         use std::os::unix::fs::PermissionsExt;
@@ -1072,6 +1142,8 @@ mod tests {
     /// Each packet keeps its place under its page's granule: contiguous pages follow each other,
     /// the page after a gap a gated producer left sits after that gap, the packets of one page
     /// follow one another, and a final page whose granule trims its end follows the one before.
+    /// Linux alone: it feeds the reader over a Unix socket pair.
+    #[cfg(target_os = "linux")]
     #[test]
     fn audio_packets_keep_their_place_across_a_gap() {
         let (mut writer, reader) = UnixStream::pair().unwrap();

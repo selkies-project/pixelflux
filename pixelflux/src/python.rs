@@ -18,6 +18,7 @@
 //! interpreter.
 
 use super::*;
+use crate::encoders::software::FrameTiming;
 use crate::sink::Reference;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyModule};
@@ -480,9 +481,12 @@ impl crate::sink::SelectionWatch for PySelectionWatch {
 
 /// The Python handle to the compositor: `WaylandBackend` in Python, one method per
 /// `Compositor` method, each called with the GIL released.
+/// Linux alone: the compositor it wraps is the in-process Wayland one.
+#[cfg(target_os = "linux")]
 #[pyclass(name = "WaylandBackend")]
 struct PyWaylandBackend(Arc<Compositor>);
 
+#[cfg(target_os = "linux")]
 #[pymethods]
 impl PyWaylandBackend {
     /// Construct the backend and spawn the long-lived compositor thread, handing it the
@@ -1399,6 +1403,7 @@ impl PyScreenCapture {
     /// live under (the nested session's, or pixelflux's own in a direct session).
     /// Blocking; releases the GIL for the duration. Raises
     /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
+    #[cfg(target_os = "linux")]
     fn type_text_wayland(&self, py: Python<'_>, display: String, text: String) -> PyResult<()> {
         let c = self.0.clone();
         py.detach(move || c.type_text_wayland(display, text))
@@ -1408,6 +1413,7 @@ impl PyScreenCapture {
     /// Tap `keysyms` in order through `display`'s virtual keyboard, verbatim: the
     /// caller owns which keysym spells which character (selkies' policy layer);
     /// this owns delivery. Same one-shot client and errors as `type_text_wayland`.
+    #[cfg(target_os = "linux")]
     fn type_keysyms_wayland(
         &self,
         py: Python<'_>,
@@ -1424,6 +1430,7 @@ impl PyScreenCapture {
     /// compositor manages no outputs for clients (KWin), whose scale follows
     /// the capture output's instead.
     #[pyo3(signature = (display, scale, index = 0))]
+    #[cfg(target_os = "linux")]
     fn set_app_output_scale(
         &self,
         py: Python<'_>,
@@ -1445,6 +1452,7 @@ impl PyScreenCapture {
     /// screens taking their scale from the host window's preferred fractional
     /// scale, which is the capture output's.
     #[pyo3(signature = (display, width, height, scale, index = 0))]
+    #[cfg(target_os = "linux")]
     fn set_app_screen_geometry(
         &self,
         py: Python<'_>,
@@ -1466,6 +1474,7 @@ impl PyScreenCapture {
     /// `kde_output_management_v2` (positions only there — a nested KWin
     /// screen's size follows its host window). Returns how many were
     /// positioned; 0 = that compositor manages no outputs for clients.
+    #[cfg(target_os = "linux")]
     fn set_app_screen_layout(
         &self,
         py: Python<'_>,
@@ -1483,6 +1492,7 @@ impl PyScreenCapture {
     /// other way to be checked against. The same ladder as
     /// `set_app_screen_layout` (zwlr, then KWin's output devices). Empty =
     /// that compositor manages no outputs for clients.
+    #[cfg(target_os = "linux")]
     fn list_app_screens(
         &self,
         py: Python<'_>,
@@ -1498,6 +1508,7 @@ impl PyScreenCapture {
     /// session serves no control socket. A registry read that touches no
     /// screen: whether the compositor registers the screen it grows is proven
     /// when a display asks for one (`add_app_screen` refuses one that does not).
+    #[cfg(target_os = "linux")]
     fn app_screen_control_offered(&self, py: Python<'_>, display: String) -> PyResult<bool> {
         let c = self.0.clone();
         py.detach(move || c.app_screen_control_offered(display))
@@ -1509,6 +1520,7 @@ impl PyScreenCapture {
     /// removal addresses; `width`/`height`/`scale` only seed the screen, whose
     /// size follows the capture output that adopts its host window.
     #[pyo3(signature = (display, name, width = 1920, height = 1080, scale = 1.0))]
+    #[cfg(target_os = "linux")]
     fn add_app_screen(
         &self,
         py: Python<'_>,
@@ -1526,6 +1538,7 @@ impl PyScreenCapture {
     /// Remove a screen `add_app_screen` grew; the compositor's own
     /// output-destroy path returns its windows to the primary. False when no
     /// such screen is held.
+    #[cfg(target_os = "linux")]
     fn remove_app_screen(&self, py: Python<'_>, name: String) -> PyResult<bool> {
         let c = self.0.clone();
         py.detach(move || c.remove_app_screen(name))
@@ -1536,6 +1549,7 @@ impl PyScreenCapture {
     /// so a session that opened more screens than there are capture outputs does
     /// not lay its desktop out across one nobody sees. Returns how many were
     /// resized (0 = that compositor manages no outputs for clients).
+    #[cfg(target_os = "linux")]
     fn hold_spare_app_screens(
         &self,
         py: Python<'_>,
@@ -1550,6 +1564,7 @@ impl PyScreenCapture {
     }
 
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
+    #[cfg(target_os = "linux")]
     fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
         let c = self.0.clone();
         py.detach(move || c.clipboard_types_app(display))
@@ -1558,6 +1573,7 @@ impl PyScreenCapture {
 
     /// The app compositor selection's payload for `mime`, or None when nothing is
     /// copied or the selection does not offer that mime.
+    #[cfg(target_os = "linux")]
     fn clipboard_read_app(
         &self,
         py: Python<'_>,
@@ -1573,6 +1589,7 @@ impl PyScreenCapture {
 
     /// Take the app compositor's selection, serving `entries` (mime, bytes) to
     /// every paster from a background thread until another client copies.
+    #[cfg(target_os = "linux")]
     fn clipboard_write_app(
         &self,
         py: Python<'_>,
@@ -1587,12 +1604,14 @@ impl PyScreenCapture {
     /// The mimes the selection `clipboard_write_app` last took has served to pasters,
     /// in order, once it has served more than `after` of them or `timeout_s` has
     /// passed (at most a minute).
+    #[cfg(target_os = "linux")]
     fn clipboard_served_app(&self, py: Python<'_>, after: usize, timeout_s: f64) -> Vec<String> {
         let c = self.0.clone();
         py.detach(move || c.clipboard_served_app(after, timeout_s))
     }
 
     /// Drop the app compositor's selection.
+    #[cfg(target_os = "linux")]
     fn clipboard_clear_app(&self, py: Python<'_>, display: String) -> PyResult<()> {
         let c = self.0.clone();
         py.detach(move || c.clipboard_clear_app(display))
@@ -1603,6 +1622,7 @@ impl PyScreenCapture {
     /// selection change in the app compositor (including the one current at call
     /// time), with no mimes for a cleared selection. A second watch for the same
     /// display replaces the first.
+    #[cfg(target_os = "linux")]
     fn clipboard_watch_app(
         &self,
         py: Python<'_>,
@@ -1616,6 +1636,7 @@ impl PyScreenCapture {
     }
 
     /// Stop the selection watch for `display` (no-op without one).
+    #[cfg(target_os = "linux")]
     fn clipboard_unwatch_app(&self, py: Python<'_>, display: String) {
         let c = self.0.clone();
         py.detach(move || c.clipboard_unwatch_app(display))
@@ -1938,6 +1959,7 @@ fn py_recording_status(py: Python<'_>) -> PyResult<Py<PyAny>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[pyfunction(name = "ensure_wayland_display")]
 #[pyo3(signature = (width = 0, height = 0, render_node = String::new(), auto_gpu = String::new(), cursor_size = -1))]
 fn py_ensure_wayland_display(
@@ -1952,6 +1974,7 @@ fn py_ensure_wayland_display(
         .map_err(PyErr::from)
 }
 
+#[cfg(target_os = "linux")]
 #[pyfunction(name = "probe_wayland_gpu")]
 #[pyo3(signature = (render_node = String::new(), auto_gpu = String::new()))]
 fn py_probe_wayland_gpu(
@@ -2323,6 +2346,7 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     if std::env::var_os("SVT_LOG").is_none() {
         unsafe { std::env::set_var("SVT_LOG", "1") };
     }
+    #[cfg(target_os = "linux")]
     m.add_class::<PyWaylandBackend>()?;
     m.add_class::<StripeFrame>()?;
     m.add_class::<PyCaptureSettings>()?;
@@ -2359,8 +2383,10 @@ fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hardware_fullcolor, m)?)?;
     m.add_function(wrap_pyfunction!(hardware_formats, m)?)?;
     m.add_function(wrap_pyfunction!(stripe_frame_from_buffer, m)?)?;
+    #[cfg(target_os = "linux")]
     m.add_function(wrap_pyfunction!(py_ensure_wayland_display, m)?)?;
     m.add_function(wrap_pyfunction!(get_wayland_display_name, m)?)?;
+    #[cfg(target_os = "linux")]
     m.add_function(wrap_pyfunction!(py_probe_wayland_gpu, m)?)?;
     m.add_function(wrap_pyfunction!(py_start_recording, m)?)?;
     m.add_function(wrap_pyfunction!(py_stop_recording, m)?)?;

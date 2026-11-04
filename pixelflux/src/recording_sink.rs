@@ -14,12 +14,18 @@
 
 use std::fs;
 use std::io::{ErrorKind, Write};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+/// The socket the fan-out listens on: the kernel's AF_UNIX on Linux, Windows' own where the
+/// recording tools run there. The session-user hardening below is Linux's SO_PEERCRED.
+#[cfg(target_os = "linux")]
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+#[cfg(not(target_os = "linux"))]
+use uds_windows::UnixListener;
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 
@@ -100,7 +106,12 @@ impl RecordingSink {
     fn bind(path: String, fps: FrameRate) -> std::io::Result<Self> {
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path)?;
+        #[cfg(target_os = "linux")]
         crate::webcam::server::restrict_to_owner(&path)?;
+        #[cfg(not(target_os = "linux"))]
+        eprintln!(
+            "[recording_sink] {path}: socket access follows the file's ACL, which this build does not restrict"
+        );
         listener.set_nonblocking(true)?;
 
         let clients: Arc<Mutex<Vec<ClientHandle>>> = Arc::new(Mutex::new(Vec::new()));
@@ -117,6 +128,7 @@ impl RecordingSink {
             while !shutdown_acc.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        #[cfg(target_os = "linux")]
                         if !crate::webcam::server::peer_is_session_user(stream.as_raw_fd()) {
                             continue;
                         }

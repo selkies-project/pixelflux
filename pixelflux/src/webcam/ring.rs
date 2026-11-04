@@ -12,6 +12,9 @@
 //! and a stalled reader never blocks the writer.
 
 use std::io;
+/// The backing store's descriptor, where the descriptor is what a peer receives over the
+/// control socket: the Linux ABI of the interposer.
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -121,7 +124,13 @@ impl RingFormat {
 
 /// Writer side of the ring. Not `Sync`: one thread publishes.
 pub struct Ring {
+    /// The descriptor a Linux peer receives over the control socket.
+    #[cfg(target_os = "linux")]
     fd: OwnedFd,
+    /// The file the section is backed by, where the backing store is a mapped file rather
+    /// than an anonymous kernel object.
+    #[cfg(not(target_os = "linux"))]
+    file: std::fs::File,
     map: MmapMut,
     format: RingFormat,
     n_slots: u32,
@@ -133,39 +142,65 @@ pub struct Ring {
 }
 
 impl Ring {
-    /// Allocate and zero-initialize the memfd and write the header.
+    /// Allocate and zero-initialize the backing store and write the header: on Linux an
+    /// anonymous memfd the peers receive by descriptor, on Windows a file-backed section
+    /// beside the session's temporary directory, the shape the camera sinks read.
     pub fn new(format: RingFormat, n_slots: u32) -> io::Result<Self> {
         let n_slots = n_slots.clamp(MIN_SLOTS, MAX_SLOTS);
         let slot_size = page_align(format.sizeimage.max(1) as usize);
         let total = DATA_OFFSET as usize + n_slots as usize * slot_size;
-        let name = c"selkies-webcam-staging";
-        let raw: RawFd = unsafe {
-            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        #[cfg(target_os = "linux")]
+        let (fd, map) = {
+            let name = c"selkies-webcam-staging";
+            let raw: RawFd = unsafe {
+                libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+            };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            if unsafe { libc::ftruncate(fd.as_raw_fd(), total as libc::off_t) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let map = unsafe { MmapMut::map_mut(&fd)? };
+            // Sealed once this writer's own mapping exists, so the read-only contract each peer
+            // receives the descriptor under is the kernel's: no peer maps it writable or resizes it
+            // (future-write sealing needs Linux 5.1; an older kernel keeps the size seals alone).
+            let size_seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
+            if unsafe {
+                libc::fcntl(
+                    fd.as_raw_fd(),
+                    libc::F_ADD_SEALS,
+                    size_seals | libc::F_SEAL_FUTURE_WRITE,
+                )
+            } != 0
+            {
+                unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, size_seals) };
+            }
+            (fd, map)
         };
-        if raw < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        if unsafe { libc::ftruncate(fd.as_raw_fd(), total as libc::off_t) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let map = unsafe { MmapMut::map_mut(&fd)? };
-        // Sealed once this writer's own mapping exists, so the read-only contract each peer
-        // receives the descriptor under is the kernel's: no peer maps it writable or resizes it
-        // (future-write sealing needs Linux 5.1; an older kernel keeps the size seals alone).
-        let size_seals = libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL;
-        if unsafe {
-            libc::fcntl(
-                fd.as_raw_fd(),
-                libc::F_ADD_SEALS,
-                size_seals | libc::F_SEAL_FUTURE_WRITE,
-            )
-        } != 0
-        {
-            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, size_seals) };
-        }
+        #[cfg(not(target_os = "linux"))]
+        let (file, map) = {
+            let path = std::env::temp_dir().join(format!(
+                "selkies-webcam-ring-{}-{:x}",
+                std::process::id(),
+                total
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .read(true)
+                .truncate(true)
+                .open(&path)?;
+            file.set_len(total as u64)?;
+            let map = unsafe { MmapMut::map_mut(&file)? };
+            (file, map)
+        };
         let mut ring = Ring {
+            #[cfg(target_os = "linux")]
             fd,
+            #[cfg(not(target_os = "linux"))]
+            file,
             map,
             format,
             n_slots,
@@ -179,6 +214,8 @@ impl Ring {
         Ok(ring)
     }
 
+    /// The descriptor the control socket hands a peer, where the descriptor is the ABI.
+    #[cfg(target_os = "linux")]
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
@@ -326,10 +363,27 @@ impl Ring {
     }
 }
 
+/// Round to the allocation page: the kernel's page size where the kernel names one,
+/// the 4 KiB every mapping this crate makes on the others is granular below.
+#[cfg(target_os = "linux")]
 pub fn page_align(n: usize) -> usize {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let page = if page > 0 { page as usize } else { 4096 };
     n.div_ceil(page) * page
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn page_align(n: usize) -> usize {
+    n.div_ceil(4096) * 4096
+}
+
+/// The fourcc as the four characters it spells, the spelling every sink and the Python
+/// surface report a format by.
+pub fn fourcc_str(f: u32) -> String {
+    let b = f.to_le_bytes();
+    std::ffi::CStr::from_bytes_until_nul(&[b[0], b[1], b[2], b[3], 0])
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -338,6 +392,8 @@ mod tests {
 
     /// A peer that receives the descriptor maps it read-only and nothing else: a writable map
     /// or a resize is the kernel's to refuse, while this writer's own mapping keeps working.
+    /// Linux alone: the seals it probes are the kernel's.
+    #[cfg(target_os = "linux")]
     #[test]
     fn peers_cannot_write_or_resize_the_ring() {
         let f = RingFormat::raw(V4L2_PIX_FMT_YUV420, 64, 48, 30, 1).unwrap();
