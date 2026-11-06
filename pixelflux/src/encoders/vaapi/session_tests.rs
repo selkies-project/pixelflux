@@ -14,8 +14,8 @@ use crate::encoders::sps::{
 const W: i32 = 320;
 const H: i32 = 240;
 
-fn settings(codec: Codec, cbr: bool) -> RustCaptureSettings {
-    RustCaptureSettings {
+fn settings(codec: Codec, cbr: bool) -> CaptureSettings {
+    CaptureSettings {
         width: W,
         height: H,
         target_fps: 30.0,
@@ -33,7 +33,7 @@ fn device() -> Arc<Device> {
     Arc::new(Device::on(mock::api(), node.into(), "stand-in").unwrap())
 }
 
-fn open(codec: Codec, settings: &RustCaptureSettings) -> Result<VaapiEncoder, String> {
+fn open(codec: Codec, settings: &CaptureSettings) -> Result<VaapiEncoder, String> {
     VaapiEncoder::on_device(device(), settings, codec, Input::Host { rgba: false })
 }
 
@@ -179,7 +179,7 @@ fn the_frame_rate_reaches_every_codec_as_its_fraction() {
             mock::reset(Driver::generous());
             let mut enc = open(
                 codec,
-                &RustCaptureSettings {
+                &CaptureSettings {
                     target_fps: fps,
                     ..settings(codec, true)
                 },
@@ -1395,8 +1395,8 @@ fn fullcolor_takes_the_surface_the_driver_renders() {
 }
 
 /// A session at `width` x `height` and `fps` on the stood-in driver.
-fn sized(codec: Codec, cbr: bool, width: i32, height: i32, fps: f64) -> RustCaptureSettings {
-    RustCaptureSettings {
+fn sized(codec: Codec, cbr: bool, width: i32, height: i32, fps: f64) -> CaptureSettings {
+    CaptureSettings {
         width,
         height,
         target_fps: fps,
@@ -1780,7 +1780,7 @@ fn a_session_without_headers_returns_the_coded_bytes_alone() {
         let mut framed = session(codec, false);
         let mut bare = open(
             codec,
-            &RustCaptureSettings {
+            &CaptureSettings {
                 omit_stripe_headers: true,
                 ..settings(codec, false)
             },
@@ -2368,4 +2368,106 @@ fn hevc_predicts_in_the_direction_the_driver_takes() {
             }
         });
     }
+}
+
+/// A driver that takes regions of interest with a quantizer delta under its rate control
+/// (`VAConfigAttribEncROI`) is handed a refinement as a region a run of blocks along a row, each
+/// at the delta to the target within `REFINE_REACH`; one that takes none under a constant rate
+/// refines nothing, and a key frame carries no regions.
+#[test]
+fn a_refinement_reaches_the_driver_as_regions_of_interest() {
+    use crate::ledger::{BlockLedger, Refinement};
+    let regions = || {
+        mock::with(|d| {
+            d.last_misc()
+                .into_iter()
+                .find(|m| m.0 == VAEncMiscParameterTypeROI)
+                .map(|m| unsafe {
+                    let p = ptr::read_unaligned(m.1.as_ptr() as *const VAEncMiscParameterBufferROI);
+                    std::slice::from_raw_parts(p.roi, p.num_roi as usize)
+                        .iter()
+                        .map(|r| {
+                            let rect = r.roi_rectangle;
+                            (rect.x, rect.y, rect.width, rect.height, r.roi_value)
+                        })
+                        .collect::<Vec<_>>()
+                })
+        })
+    };
+    let mut driver = Driver::generous();
+    driver.attributes.push((VAConfigAttribEncROI, 0x210));
+    mock::reset(driver);
+    let mut enc = session(Codec::H264, true);
+    let refiner = enc.refines().expect("the driver takes regions");
+    assert_eq!(refiner.runs, 16);
+    let mut ledger = BlockLedger::new(W, H);
+    ledger.frame([&smithay::utils::Rectangle::new(
+        (32, 0).into(),
+        (16, H).into(),
+    )]);
+    ledger.frame([&smithay::utils::Rectangle::new(
+        (32, 0).into(),
+        (16, H).into(),
+    )]);
+    let plan = ledger.plan(1, 5, refiner.runs).unwrap();
+    let refinement = Refinement {
+        plan,
+        target: 12,
+        from: 40,
+        reach: refiner.reach,
+    };
+    enc.refine_blocks(&refinement);
+    encode(&mut enc, 0, true);
+    assert_eq!(regions(), None, "a key frame carries none");
+    enc.refine_blocks(&refinement);
+    encode(&mut enc, 1, false);
+    assert_eq!(
+        regions(),
+        Some(vec![(0, 0, 32, 16, -10), (48, 0, 48, 16, -10)]),
+        "two runs, the delta held to the reach"
+    );
+    encode(&mut enc, 2, false);
+    assert_eq!(regions(), None, "a frame not refining carries none");
+
+    let mut driver = Driver::generous();
+    driver.attributes.push((VAConfigAttribEncROI, 0x010));
+    mock::reset(driver);
+    assert!(
+        session(Codec::H264, true).refines().is_none(),
+        "no quantizer delta under the rate control"
+    );
+    assert!(session(Codec::H264, false).refines().is_some());
+}
+
+/// A driver offering HEVC temporal motion-vector prediction is told it on predicted frames, with
+/// the reference it takes the co-located picture from, and never on a key frame, whose reference
+/// list holds none: iHD reads the reference the index names whatever the frame's type, past the
+/// end of its table where it is invalid.
+#[test]
+fn an_hevc_key_frame_names_no_collocated_picture() {
+    let mut driver = Driver::generous();
+    for (kind, value) in driver.attributes.iter_mut() {
+        if *kind == VAConfigAttribEncHEVCFeatures {
+            let mut features = VAConfigAttribValEncHEVCFeatures { value: *value };
+            unsafe { features.bits.set_temporal_mvp(1) };
+            *value = unsafe { features.value };
+        }
+    }
+    mock::reset(driver);
+    let mut enc = session(Codec::H265, true);
+    let coded = |enc: &mut VaapiEncoder, t: u64, key: bool| {
+        encode(enc, t, key);
+        mock::with(|d| {
+            let pic: VAEncPictureParameterBufferHEVC = d
+                .last_param(VAEncPictureParameterBufferType)
+                .expect("a picture");
+            let slice: VAEncSliceParameterBufferHEVC = d
+                .last_param(VAEncSliceParameterBufferType)
+                .expect("a slice");
+            let mvp = unsafe { slice.slice_fields.bits.slice_temporal_mvp_enabled_flag() };
+            (pic.collocated_ref_pic_index, mvp)
+        })
+    };
+    assert_eq!(coded(&mut enc, 0, true), (0xff, 0), "the key frame");
+    assert_eq!(coded(&mut enc, 1, false), (0, 1), "a predicted frame");
 }

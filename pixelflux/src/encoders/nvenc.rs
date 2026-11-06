@@ -45,7 +45,7 @@ use super::dmabuf_identity::DmaBufIdentity;
 use super::frame_rate::FrameRate;
 use super::reference::{ANCHORS, Invalidation, Reference, ReferenceReport, ReferenceWindow};
 use super::sps::{WideFrameNum, h264_frame_num_range};
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use nvcodec_sys::cuda::*;
 use nvcodec_sys::*;
 
@@ -800,14 +800,14 @@ fn split_mode(
 
 /// The CBR target of a session at `settings`, in bits per second, held to the codec's
 /// `nvenc_rate_ceiling`.
-fn cbr_bps(settings: &RustCaptureSettings) -> u32 {
+fn cbr_bps(settings: &CaptureSettings) -> u32 {
     (settings.video_bitrate_kbps.max(0) as u32)
         .saturating_mul(1000)
         .min(nvenc_rate_ceiling(settings.codec))
 }
 
 /// Say so where `cbr_bps` held the target `settings` asks for to the codec's ceiling.
-fn log_held_rate(settings: &RustCaptureSettings, bps: u32) {
+fn log_held_rate(settings: &CaptureSettings, bps: u32) {
     let asked = settings.video_bitrate_kbps.max(0) as u64 * 1000;
     if (bps as u64) < asked {
         eprintln!(
@@ -821,7 +821,7 @@ fn log_held_rate(settings: &RustCaptureSettings, bps: u32) {
 
 /// The VBV of a CBR session at `bps`, from the session's frame rate, key-frame interval, and
 /// explicit multiplier.
-fn cbr_vbv(settings: &RustCaptureSettings, bps: u32) -> u32 {
+fn cbr_vbv(settings: &CaptureSettings, bps: u32) -> u32 {
     crate::encoders::vbv_bits(
         bps,
         settings.target_fps,
@@ -840,6 +840,14 @@ fn set_cbr_rate(rc: &mut NV_ENC_RC_PARAMS, bps: u32, vbv: u32) {
     rc.vbvBufferSize = vbv;
     rc.vbvInitialDelay = vbv;
 }
+
+/// Quality index steps finer than the paint-over one a refined block is coded at
+/// (`FrameEncoder::refines`): what brings it to the quality NVENC's own cleanup of a still screen
+/// reaches. 1080p text beside a video, H.264 on an RTX 3060, against that cleanup's 45.2 dB at
+/// 8 Mbit/s, 47.6 at 16, and 47.0 at a constant quality: 44.4, 45.5, and 46.8 at the paint-over
+/// quantizer, 45.9, 47.0, and 48.1 three steps finer, 48.2, 48.7, and 50.6 six steps finer,
+/// spending on the text what the video would have had.
+pub const REFINE_FINER: u32 = 3;
 
 /// The share of its cap a held band taken back for coming out past it is coded again to, at the
 /// bytes a block of it came to (`NvencEncoder::cap`): the next rows of a page can be denser.
@@ -1726,6 +1734,12 @@ pub struct NvencEncoder {
     /// Bytes of the last held frame, and the QP delta map a held band is coded through.
     held_bytes: usize,
     qp_map: Vec<i8>,
+    /// The blocks the next frame of the rate control's refines (`refine_blocks`), whether the
+    /// session's rate control takes a QP delta map, and whether the driver refused one, said
+    /// once, which ends refinement on the session.
+    refinement: Option<crate::ledger::Refinement>,
+    delta_mapped: bool,
+    refine_refused: bool,
     /// The quality index the rate control last coded a frame at (held frames aside), from the
     /// driver's average quantizer.
     last_quality: Option<u32>,
@@ -2192,14 +2206,14 @@ impl NvencEncoder {
     /// `init_params.encodeConfig` raw pointer is nulled before the struct is returned (it points at
     /// a local `config` about to move); the reconfigure paths repoint it at `self.encode_config`
     /// when they resubmit.
-    pub fn new(settings: &RustCaptureSettings, egl_display: *const c_void) -> Result<Self, String> {
+    pub fn new(settings: &CaptureSettings, egl_display: *const c_void) -> Result<Self, String> {
         Self::new_tuned(settings, egl_display, NvencTuning::default())
     }
 
     /// `new` with the preset, rate-control passes, and adaptive quantization named, for the
     /// tuning bench; production sessions take `NvencTuning::default`.
     pub(crate) fn new_tuned(
-        settings: &RustCaptureSettings,
+        settings: &CaptureSettings,
         egl_display: *const c_void,
         tuning: NvencTuning,
     ) -> Result<Self, String> {
@@ -2814,6 +2828,9 @@ impl NvencEncoder {
                 lost_cleanup: false,
                 held_bytes: 0,
                 qp_map: Vec::new(),
+                refinement: None,
+                delta_mapped: false,
+                refine_refused: false,
                 last_quality: None,
                 last_bytes: None,
                 encode_config: config,
@@ -3194,10 +3211,7 @@ impl NvencEncoder {
     ///    the byte order the session was last fed.
     ///
     /// On a resize the next encoded frame is a reset-RC IDR and `Ok(true)` is returned.
-    pub fn reconfigure_resolution(
-        &mut self,
-        settings: &RustCaptureSettings,
-    ) -> Result<bool, String> {
+    pub fn reconfigure_resolution(&mut self, settings: &CaptureSettings) -> Result<bool, String> {
         let new_w = settings.width as u32;
         let new_h = settings.height as u32;
         let is_cbr = self.encode_config.rcParams.rateControlMode
@@ -3588,6 +3602,63 @@ impl NvencEncoder {
         self.held_band = band.filter(|_| self.band_size().is_some());
     }
 
+    /// Whether the session refines blocks through a QP delta map under its rate control
+    /// (`refine_blocks`): H.264, HEVC, and AV1, until the driver refuses the map.
+    pub fn refines(&self) -> bool {
+        matches!(self.codec, Codec::H264 | Codec::H265 | Codec::Av1) && !self.refine_refused
+    }
+
+    /// Code the blocks `refinement` names in the next frame of the rate control's at its target
+    /// quality, through the frame's QP delta map: each map unit (a 16x16 macroblock, a 32x32
+    /// coding tree block, a 64x64 superblock) holding a refined block takes the delta from the
+    /// quantizer the rate control last coded at to the target, the rest 0. The rate control
+    /// is put on the delta map mode the first time, by the reconfigure that takes the
+    /// rate-control mode without a reset, and stays there.
+    pub fn refine_blocks(&mut self, refinement: &crate::ledger::Refinement) {
+        self.refinement = self.refines().then(|| refinement.clone());
+    }
+
+    /// Fill `qp_map` for `refinement` (`refine_blocks`), returning whether the session codes
+    /// through it, which a refused reconfigure ends for good.
+    unsafe fn refine_map(&mut self, refinement: &crate::ledger::Refinement) -> bool {
+        if !self.delta_mapped {
+            let saved = self.encode_config.rcParams;
+            self.encode_config.rcParams.qpMapMode = NV_ENC_QP_MAP_MODE::NV_ENC_QP_MAP_DELTA;
+            let status = self.reconfigure(false, false);
+            if status != NVENCSTATUS::NV_ENC_SUCCESS {
+                self.encode_config.rcParams = saved;
+                self.refine_refused = true;
+                eprintln!(
+                    "[NVENC] Refining blocks through a QP delta map refused ({status:?}): {}",
+                    last_error(&self.nvenc_funcs, self.encoder_session)
+                );
+                return false;
+            }
+            self.delta_mapped = true;
+        }
+        let hw = |index: i32| self.codec.hardware_quantizer(Hardware::Nvenc, index) as i32;
+        let delta = (hw(refinement.target) - hw(refinement.from)).clamp(i8::MIN as i32, 0) as i8;
+        let unit = match self.codec {
+            Codec::H264 => 16,
+            Codec::H265 => 32,
+            _ => 64,
+        };
+        let (cols, rows) = (self.width.div_ceil(unit), self.height.div_ceil(unit));
+        let plan = &refinement.plan;
+        self.qp_map.clear();
+        self.qp_map.extend((0..rows).flat_map(|row| {
+            (0..cols).map(move |col| {
+                let (x, y, u) = ((col * unit) as i32, (row * unit) as i32, unit as i32);
+                if plan.refines_area(x, y, u, u) {
+                    delta
+                } else {
+                    0
+                }
+            })
+        }));
+        true
+    }
+
     /// Take the next frame back where it comes out past `bytes` and code it again within them: a
     /// held band in a shorter one, to `REFIT_SHARE` of them at the bytes the band came to, and a
     /// frame of the rate control's at the coarsest quantizer, which on a still screen refines
@@ -3714,7 +3785,7 @@ impl NvencEncoder {
     /// only ever has to be high enough and the driver refuses one below the decoded picture
     /// buffer the session declared — so calling it every frame is cheap. A reconfigure the driver
     /// refuses leaves the session encoding at its previous rate, logged with the driver's reason.
-    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> bool {
+    pub fn reconfigure_rate(&mut self, settings: &CaptureSettings) -> bool {
         unsafe {
             let mut changed = false;
             let mut level_raised = false;
@@ -3944,6 +4015,15 @@ impl NvencEncoder {
                 _ => self.hold_rate(q, None),
             }
         });
+        let refinement = self
+            .refinement
+            .take()
+            .filter(|_| held_qp.is_none() && !force_idr);
+        if let Some(refinement) = refinement
+            && self.refine_map(&refinement)
+        {
+            point_at_qp_map(&mut pic_params, &mut self.qp_map, nvenc_cur_ver());
+        }
         let mut result = self.encode_picture(
             &mut pic_params,
             output_bitstream,
@@ -5185,8 +5265,8 @@ pub(crate) mod gpu_tests {
     use crate::encoders::reference::REFERENCE_FRAMES;
 
     /// Test helper: H.264 full-frame capture settings at `w×h`, `fps`, CRF 25.
-    fn settings(w: i32, h: i32, fps: f64) -> RustCaptureSettings {
-        RustCaptureSettings {
+    fn settings(w: i32, h: i32, fps: f64) -> CaptureSettings {
+        CaptureSettings {
             width: w,
             height: h,
             codec: Codec::H264,
@@ -5200,7 +5280,7 @@ pub(crate) mod gpu_tests {
     /// none of: a registration outlives the buffer it page-locked, and a later buffer at an
     /// overlapping address then fails to upload, or uploads the pages of the freed one, where a
     /// capture's persistent shm is released on every reshape.
-    fn host_session(s: &RustCaptureSettings) -> Result<NvencEncoder, String> {
+    fn host_session(s: &CaptureSettings) -> Result<NvencEncoder, String> {
         NvencEncoder::new(s, ptr::null()).map(|mut enc| {
             enc.pin_uploads = false;
             enc
@@ -5209,7 +5289,7 @@ pub(crate) mod gpu_tests {
 
     /// Test helper: `host_session`, or `None` where the device has no engine for the codec (AV1
     /// before Ada, HEVC on Kepler) or for its 4:4:4 (Kepler), which the caller skips.
-    fn codec_session(s: &RustCaptureSettings) -> Option<NvencEncoder> {
+    fn codec_session(s: &CaptureSettings) -> Option<NvencEncoder> {
         match host_session(s) {
             Ok(enc) => Some(enc),
             Err(e) if e.contains("engine") => {
@@ -8181,7 +8261,7 @@ pub(crate) mod gpu_tests {
             "NVENC's own conversion weights the columns 3:1: {hardware:?} against {weighted:?}"
         );
 
-        let full = RustCaptureSettings {
+        let full = CaptureSettings {
             video_fullcolor: true,
             ..st
         };
@@ -8215,7 +8295,7 @@ pub(crate) mod gpu_tests {
             (Codec::H264, true),
             (Codec::H265, true),
         ] {
-            let st = RustCaptureSettings {
+            let st = CaptureSettings {
                 codec,
                 video_fullcolor: fullcolor,
                 ..settings(w as i32, h as i32, 60.0)
@@ -8270,7 +8350,7 @@ pub(crate) mod gpu_tests {
             // A resize rebuilds the convert's surface around the new geometry, so the chart is
             // read back again at a size the session was not opened for.
             let (w2, h2) = (w + 64, h + 32);
-            let grown = RustCaptureSettings {
+            let grown = CaptureSettings {
                 width: w2 as i32,
                 height: h2 as i32,
                 ..st
@@ -10085,7 +10165,7 @@ mod decision_tests {
             (Codec::H264, 1_000_000, 1_000_000_000),
             (Codec::H264, 5_000_000, 1_000_000_000),
         ] {
-            let s = RustCaptureSettings {
+            let s = CaptureSettings {
                 codec,
                 video_bitrate_kbps: kbps,
                 ..Default::default()

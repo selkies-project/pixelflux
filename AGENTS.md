@@ -13,9 +13,19 @@ explanation. The code commenting should reflect the current state of the codebas
 to an LLM bot or developer. Write American English -- color, behavior, center, initialize, canceled -- except
 where a name belongs to something upstream, such as a Wayland `Cancelled` event or an NVENC `colourMatrix` field.
 
+pixelflux is a Rust library first and a Python extension module second: `src/python.rs`, behind the `python`
+feature, is the one place that names PyO3, and every class there wraps a public Rust type (`CaptureSettings`,
+`ScreenCapture`, `Compositor`, `webcam::VirtualCamera`) or a public function, converting its arguments, calling
+with the GIL released, and mapping `Error` to the exception Python raised before. Frames, cursor images, and
+clipboard contents reach a consumer through the `sink` traits; the Python callbacks are sink implementations.
+A capability a Rust consumer needs is added to the Rust API and then wrapped, never the other way around, and
+nothing in Python-facing code is reachable only from Python. setup.py builds the wheel with `--features
+python,extension-module`; `cargo build` alone links no interpreter.
+
 Empirical testing is possible for everything here, including implementation, auditing, validation, and verification,
-and every change is validated before it is reported. `cargo test --lib` in both feature configurations and
-`pre-commit run --all-files` (rustfmt, clippy, ruff, and codespell) are the floor;
+and every change is validated before it is reported. `cargo test --lib` in every feature configuration (the default,
+`--features python`, and `--no-default-features --features openh264`) and
+`pre-commit run --all-files` (rustfmt, clippy in both the default and `python` configurations, ruff, and codespell) are the floor;
 the `#[ignore]`d `gpu_` tests need an NVIDIA GPU (`cargo test gpu_ -- --ignored --nocapture --test-threads=1`,
 serially, since concurrent session builds fault in the driver), the `gpu_dmabuf_` ones a render node as well, and the
 `gpu_bench_` ones print measurements to quote rather than assert. The VA-API surface probe (`vpp_sw_formats`)
@@ -107,9 +117,8 @@ level ladders, and the bitstream reads that label frames. A session advertises i
 shared ladder at the current geometry (`codec.rs`), the lowest a decoder is asked to accept, so a hardware
 decoder that gates on the level — older Apple and Intel parts refuse a level above their ceiling even for a
 picture they could hold — takes the stream; NVENC re-declares it with a forced IDR on each in-place resize, and
-holds AV1 alone at the resize headroom's level, which NVENC validates its session against at init. JPEG and
-H.264 may stripe (`encoders/software.rs`);
-every other codec streams whole frames. Every session that can name what a frame predicts from
+holds AV1 alone at the resize headroom's level, which NVENC validates its session against at init. JPEG
+stripes (`encoders/software.rs`); every video codec streams whole frames. Every session that can name what a frame predicts from
 does (`encoders/reference.rs`, `StripeFrame.reference_frame_id`), and `invalidate_reference`
 leaves a frame a consumer lost out of the predictions so recovery costs no keyframe: libx264 and libvpx
 always (VP9 in libvpx's flexible reference mode, VP8 across its three buffers on a schedule `reference.rs`
@@ -180,9 +189,9 @@ without hardware. The software HEVC (x265 with the `gpl` feature, else kvazaar; 
 build time from the headers of the copies that are linked (`codec-sys`), so which library serves a codec is the
 build's (`encoders::software_encoder`, exported as `pixelflux.SOFTWARE_ENCODERS`). Software H.264 is
 resolved at build time, never by a setting: the default `gpl` feature makes libx264 the encoder behind every
-CPU H.264 session (striped and full-frame), and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
-`--no-default-features --features openh264`) puts Cisco OpenH264 behind the same striped path
-(`encoders/oh264.rs`, one instance per stripe) with the same wire framing; selkies reads the exported names to
+CPU H.264 session, and a build without it (`PIXELFLUX_ENABLE_GPL=0` →
+`--no-default-features --features openh264`) puts Cisco OpenH264 behind the same CPU path
+(`encoders/oh264.rs`) with the same wire framing; selkies reads the exported names to
 name the encoder and to keep a WebRTC offer on OpenH264 at the 4:2:0 profile. Every session, on every backend,
 converts with the BT.709 matrix — the sRGB
 desktop's own primaries and transfer — at limited range for 4:2:0 and full range for the software
@@ -221,11 +230,12 @@ in display order; the unit tests hold each encoder to it. Every session takes th
 it names (`encoders::frame_rate`: 59.94 is 60000/1001), never a whole number, so its rate control and the timing its
 stream declares hold to the rate the capture is paced at. Encoder settings are chosen by measured latency first, frame rate second, quality third, and
 bitrate last: every software encoder runs at the fastest setting its library offers in real time (x264
-ultrafast, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, a frame
+ultrafast, with the uneven multi-hexagon motion search in place of its diamond, which costs a tenth of a
+millisecond and finds the scrolls and moved windows the diamond codes as new pixels, VP8 speed 16, VP9 speed 8 with screen tuning, SVT-AV1 preset 11 in its real-time mode, a frame
 predicting from an anchor alone at preset 10, since preset 11 leaves some blocks the picture changed since the anchor
 as they stood in it (`ANCHOR_PRESET`), x265 ultrafast with wavefront threads; each full-frame software session, and the conversion ahead of it, on the
 threads `encoders::session::encode_threads` names, one less than the cores up to eight, four for H.264's slices,
-or one alone where `cpu_encode_threading` is off, which also codes the striped encoders' stripes one after another;
+or one alone where `cpu_encode_threading` is off, which also codes JPEG's stripes one after another;
 a Turbo frame keeps its hash beside the encode either way), NVENC at preset P3 with two-pass quarter-resolution rate control
 (`gpu_bench_tuning` measures the alternatives), and VA-API at the fastest quality level the driver takes, on the low-power entry point where the driver lists one, except H.264 on Skylake and Broxton, whose low-power encoder codes a picture as one slice whatever it is handed and reports nothing of it (told by the kernel's PCI id; the full entry point first, the low-power one in a single slice where the driver build carries no other); the VP8, VP9, and AV1 quantizer tables in `codec.rs`,
 and the hardware ones, were measured at those settings and must be re-measured whenever they change
@@ -248,22 +258,65 @@ the OpenH264 crates are dependencies of every build, since their decoder is the 
 so the OpenH264 encoder's tests run under the default build too. The
 wheel recipe (`pyproject.toml`) builds libvpx, SVT-AV1, dav1d, libde265, and x264 and x265 for the GPL wheel or
 kvazaar for the non-GPL one from source.
+libx264 is built from the commit the recipe pins with the patches under `patches/x264` applied, since pixelflux reads
+the API they add: every other build (CI, the devcontainer, the scanner image, Selkies' packaging) takes it from
+`scripts/build-x264.sh`, never from a distribution. The patches make x264 the screen encoder it is used as: the
+caller's per-macroblock quantizer offsets apply without adaptive quantization's variance pass (`rc.b_qp_offsets`),
+and the macroblocks the caller's `mb_info` marks unchanged (`H264EncoderWrapper::constant_blocks`, from the block
+ledger, given only where the source reports every change) are coded as skips without analysis, copied from the
+input, filtered into the lowres picture again, or costed again by the lookahead, each where the full path would
+code, copy, filter, or cost them the same: a stream comes out bit for bit as without them; and the lowres planes are
+filtered on the idle threads of the synchronous lookahead, their border expanded again only where an edge block
+changed. At 2560x1600 a 256x256 change took x264 2.0 ms of a frame where it took 4.1, and a frame that changed whole
+the same as before. A row's run of constant macroblocks is coded at once, the reference's pixels copied for the run
+and only its last macroblock's column cached (a still 2560x1600 frame 0.27 ms where it took 0.41). The macroblocks a
+page scroll moved whole are named to x264 as copies (`X264_MBINFO_COPY` with a vector a macroblock in `mb_copy`;
+`H264EncoderWrapper::copy_hints`) by `encoders/copyhint.rs`, which hashes the luma rows of a few narrow strips of
+each picture and votes, per strip, for the shift that maps its changed rows onto the previous picture's; a hint is
+a candidate, which x264 compares with the previous input it still holds in place before it codes a copy, so a wrong
+one costs that compare alone, and a picture it copied takes none. A macroblock matched whole at an even vector is
+coded as a P_SKIP without analysis where that is the P_SKIP vector, on the same run path as a constant one; one
+matched in luma alone, at an odd vector that moved the chroma sites, is coded as a 16x16 block at the vector, or a
+P_SKIP where x264's own probe finds its residual quantizes away. The lookahead keeps its own search, so the rate
+control sees the frame it saw without hints (its lowres search reads a scroll as new picture and a constant-quality
+session codes it coarse, which holds the bandwidth of a scroll where a hinted estimate raised it by half). At one
+quantizer a 24-pixel scroll took x264 0.95 ms of a frame where it took 1.38, and a 120-pixel one, past the search's
+reach, 2.42 ms and 29 kB where it took 2.76 and 57; the stream's level bounds the vectors, so a capture whose level admits 128 rows takes no hint past that.
+An 8-bit 4:2:0 picture reaches x264 as NV12 laid out as its own frames (`Nv12Planes`, from
+`x264_param_input_layout`), which it encodes where it lies instead of copying it (`X264_CSP_IN_PLACE`) and reads through the
+next encode as the previous input, so the CPU path converts into two pictures in turn and the X11 capture keeps that
+pool surface out of its pool until an encode no longer reads it (`x264_encoder_release_input` frees it for a resize):
+a 2560x1600 scroll took 6.7 ms of a frame where it took 7.4.
 The crate's `Cargo.toml` is the one place the version lives: `setup.py` reads it, spelling a semver pre-release
 the PEP 440 way (`2.1.0-rc.1` is `2.1.0rc1` to pip), and the release workflow stamps the tag into the manifest
 and the lock, so a build ahead of a release carries the series version and a release the tag's.
 
 A still screen is cleaned up by one policy (`pipeline::cleanup_due`, run per frame by
-`decide_hw_fullframe` and per stripe by `encode_cpu`) that reads what changed from the content —
+`decide_hw_fullframe` and per region by `encode_cpu`) that reads what changed from the content —
 compositor damage, the X server's report, a content hash (NvFBC's on the GPU) — never from what was sent,
 so Turbo (`video_streaming_mode`) sees the screen go still like any other mode: a refresh at the
 paint-over quantizer once the region holds still for the trigger, a key frame at it once a large
-change has held still for four times that, and the same cleanup for a region that keeps changing
-only a little. Under a constant quality the cleanup moves the session's quality to the
-paint-over one until the region moves again (`pipeline::decide_constant_quality`, and the stripe's
+change has held still for four times that where the block ledger below has not refined most of
+the region, and the same cleanup for a region that keeps changing only a little. Within a region that keeps changing, a block ledger (`ledger.rs`) refines the blocks that
+held still for the trigger and are not clean through the encoder's per-block quantizer, as many
+steps finer than the paint-over quantizer as the encoder needs to come to what its own cleanup
+reaches (six for x264 and x265, three for NVENC and VA-API, none for VP8 and kvazaar), a turn of them a frame sized to what the rate control has
+room for, a block counting clean once its frame came out at that quantizer: a video playing in
+one window no longer holds the text around it at motion quality. x264's sessions take it as
+macroblock quantizer offsets applied as given (`rc.b_qp_offsets`, below), NVENC's H.264, HEVC, and AV1 through the QP delta map under the rate control, and libvpx's
+VP8 through its region-of-interest map, x265 through its per-block quantizer offsets, kvazaar
+through its map of a delta a tree block, and VA-API's H.264 through the driver's regions of
+interest, a region a run of blocks along a row and at most ten steps finer than the frame, on X11 (XShm, the shared framebuffer, DRI3) and Wayland; a
+constant rate whose frames already run over it refines nothing. NvFBC, whose driver says only
+that a frame is new, VP9, which skips a block whose source has not changed whatever its
+quantizer, VA-API's HEVC, whose regions Intel's iHD codes into a worse picture, SVT-AV1, whose
+mode decision skips a still block whatever its segment's quantizer, and the
+other encoders keep the region-wide cleanup alone. Under a constant quality the cleanup moves the session's quality to the
+paint-over one until the region moves again (`pipeline::decide_constant_quality`, and x264's
 rate factor in `encode_cpu`), as main's paint-over did, so every encoder codes the cleanup key
 frame the way it codes one at that quality, with its own intra offset. Under a constant rate,
 a session that holds a quantizer and whose rate control reports the quantizer and the bytes of
-its frames (NVENC, and libx264 per stripe) is cleaned up through that rate
+its frames (NVENC, and libx264) is cleaned up through that rate
 control: the frames keep flowing, each within its budget, until it codes the region at the
 paint-over quantizer or finer in a small frame (`pipeline::convergence`), and no key frame is
 sent; only where NVENC's rate control stalls short of it (a low rate for the resolution) is the
@@ -295,8 +348,7 @@ the one before for `EMPTY_S` at a quantizer as coarse as the floor's, and any of
 `REFINE_S`. That cleanup then counts as settled, and only more than a small change arms another, so
 a caret on a clean screen costs its own frames. A session that reports no bytes (Tegra, a stateful
 V4L2 device) gets a refresh and its burst at the rate control's own quality. A constant-rate x264
-stripe
-is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame and a half
+session is given a buffer of `CLEANUP_VBV_FRAMES` frames while it is cleaned up, since in a frame and a half
 its row-level control coarsens the rows it names a fine quantizer for, and its cleanup ends once its
 frames have been slice headers alone for `EMPTY_S`: x264 keeps its quantizer on a screen that does
 not change. On Intel's iHD the VA-API rate control itself is bounded per codec
@@ -332,7 +384,13 @@ on a DRM driver), where the server blits the root into dmabufs pixelflux allocat
 the server's own render node and wrapped as pixmaps, the blit is waited for with a one-pixel
 `GetImage`, the XFixes cursor is composited by the server through Render, and the hardware session
 imports each dmabuf in place through the same `encode_dmabuf` the Wayland zero-copy path uses; and
-the general XShm path otherwise. Each zero-copy backend is declined -- with one line saying why --
+the general path otherwise, which reads the screen in place where the server shares its framebuffer
+(`x11/framebuffer.rs`: the images' Xvfb holding the screen in system memory offers SELKIES-FRAMEBUFFER, a
+read-only memfd of the screen, a watch of the tiles drawn into it, and an eventfd, so a frame copies only
+the tiles its pool surface misses, or for an 8-bit 4:2:0 x264 session with no overlay drawn converts them
+straight into the surface's NV12 planes, which x264 encodes in place (`FramebufferGrab::convert`), waits on no request, and is decided on those tiles and the overlays drawn onto it
+with no content hash, `X11Pipeline::process_reported`) and through XShm and XDamage on every other
+server. Each zero-copy backend is declined -- with one line saying why --
 for a codec its engine does not serve, software encoding, a server or device that does not qualify
 (DRI3 also asks that the server draw on the encode node's GPU and that the encoder read the first frame),
 and NvFBC for a non-NVIDIA encode node, a watermark, a driver without it, a 10-bit request NVENC lacks
@@ -344,7 +402,7 @@ setting either way: the server's and the driver's own answers decide, and a host
 pays about 7 ms once per capture start to find that out.
 All three publish a change as it lands rather than on the next tick: NvFBC because the driver
 generates a frame on damage and the grab waits for it, DRI3 and XShm because the X server's
-DAMAGE reports end the wait early. How far any of them may come early is the frame pacing the
+DAMAGE reports end the wait early, and a shared framebuffer because its watch's eventfd does. How far any of them may come early is the frame pacing the
 Wayland backend also keeps (`pace.rs`), so the rate stays the configured one. NvFBC's driver says
 only that a frame is new; how much of it changed comes from a hash of its bands on the GPU
 (`band_hash`, in the convert's module, read back as one word a band), the XShm path's band damage

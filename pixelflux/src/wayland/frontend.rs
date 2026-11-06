@@ -23,8 +23,6 @@ use std::fs::File;
 use std::time::{Duration, Instant};
 
 use gbm::{BufferObject, Device as RawGbmDevice};
-use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use std::sync::Mutex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -143,7 +141,7 @@ use smithay::{
     },
 };
 
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use crate::encoders::FrameEncoder;
 use crate::encoders::overlay::OverlayState;
 
@@ -190,11 +188,11 @@ use crate::pace::FramePace;
 /// output; all fields mirror the pipeline strategy documented on [`AppState`], instantiated
 /// per display.
 pub struct WlCapture {
-    pub settings: RustCaptureSettings,
-    /// The Python frame callback, shared with the delivery thread. Kept here so a
-    /// reconfigure the calloop performs on its own (a host that kept a different mode)
-    /// can respawn delivery with the same consumer; `None` for a recorder-owned capture.
-    pub callback: Option<Arc<Py<PyAny>>>,
+    pub settings: CaptureSettings,
+    /// The frame sink, shared with the delivery thread. Kept here so a reconfigure the
+    /// calloop performs on its own (a host that kept a different mode) can respawn delivery
+    /// with the same consumer; `None` for a recorder-owned capture.
+    pub callback: Option<Arc<dyn crate::sink::FrameSink>>,
     /// Zero-copy GPU session (GLES render + same-GPU dmabuf encode), driven by the encode
     /// thread on `gpu_pool`'s targets and taken back by a restart (`crate::ZeroCopySession`);
     /// `None` whenever a readback path is active for this display.
@@ -216,8 +214,8 @@ pub struct WlCapture {
     pub deliver_tx:
         Option<std::sync::mpsc::SyncSender<Vec<crate::encoders::software::EncodedStripe>>>,
     pub deliver_join: Option<std::thread::JoinHandle<()>>,
-    /// Raised at teardown so the deliver thread stops calling into Python and
-    /// only drains: its exit is then bounded by the one in-flight callback.
+    /// Raised at teardown so the deliver thread stops calling the sink and
+    /// only drains: its exit is then bounded by the one in-flight call.
     pub deliver_discard: Option<Arc<AtomicBool>>,
     pub encode_pool: Option<Arc<crate::WlFramePool>>,
     pub encode_join: Option<std::thread::JoinHandle<Option<FrameEncoder>>>,
@@ -942,13 +940,13 @@ pub struct AppState {
 
     /// Mirror of the PRIMARY display's capture settings (geometry fallbacks, computer-use
     /// info); per-display settings live on each capture.
-    pub settings: RustCaptureSettings,
-    /// A cursor callback is registered on the `wl-cursor` worker (which owns the actual
-    /// `Py` object); tracked here so sprite resolution is skipped while nobody listens.
+    pub settings: CaptureSettings,
+    /// A cursor sink is registered on the `wl-cursor` worker (which owns it); tracked here
+    /// so sprite resolution is skipped while nobody listens.
     pub cursor_callback_set: bool,
-    /// Cursor delivery jobs to the `wl-cursor` worker (PNG encode + Python call off-thread).
+    /// Cursor delivery jobs to the `wl-cursor` worker (PNG encode + sink call off-thread).
     pub cursor_tx: std::sync::mpsc::Sender<CursorJob>,
-    pub clipboard_callback: Option<Py<PyAny>>,
+    pub clipboard_callback: Option<Arc<dyn crate::sink::ClipboardSink>>,
     /// The mimes of the current client selection staged for one read, delivered together; an
     /// empty list stages the report of a selection a client cleared.
     pub pending_clipboard_read: Option<Vec<String>>,
@@ -1870,7 +1868,7 @@ impl AppState {
     }
 
     /// Drain the clipboard delivery staged by `new_selection` and hand its `(mime, bytes)`
-    /// entries, the flavors of one copy, to the Python callback off-thread; a cleared selection
+    /// entries, the flavors of one copy, to the clipboard sink off-thread; a cleared selection
     /// is handed over as no entries.
     ///
     /// Runs from the loop *after* the dispatch that stored the new client source, so the requests
@@ -1882,20 +1880,16 @@ impl AppState {
     /// (a large transfer from a slow source still delivers), while one that goes silent for 10 s
     /// without closing its fd is dropped so each clipboard change cannot leak a pinned thread +
     /// pipe. Deliveries leave in the order they were staged: one that a later copy or clear
-    /// overtook is dropped (`clipboard_generation`). The `PY_SHUTDOWN` checks keep this off a
-    /// shutting-down interpreter.
+    /// overtook is dropped (`clipboard_generation`). The `SHUTDOWN` checks keep this off a
+    /// consumer that is gone.
     pub(crate) fn process_pending_clipboard_read(&mut self) {
         let Some(mimes) = self.pending_clipboard_read.take() else {
             return;
         };
-        if crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+        if crate::SHUTDOWN.load(Ordering::Relaxed) {
             return;
         }
-        let Some(cb) = self
-            .clipboard_callback
-            .as_ref()
-            .map(|c| Python::attach(|py| c.clone_ref(py)))
-        else {
+        let Some(cb) = self.clipboard_callback.clone() else {
             return;
         };
         let cleared = mimes.is_empty();
@@ -1924,19 +1918,13 @@ impl AppState {
                 .into_iter()
                 .filter_map(|(mime, reader)| read_selection(reader).map(|bytes| (mime, bytes)))
                 .collect();
-            if (entries.is_empty() && !cleared) || crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+            if (entries.is_empty() && !cleared) || crate::SHUTDOWN.load(Ordering::Relaxed) {
                 return;
             }
-            Python::attach(|py| {
-                if generations.load(Ordering::Relaxed) != generation {
-                    return;
-                }
-                let entries: Vec<(String, Bound<'_, PyBytes>)> = entries
-                    .iter()
-                    .map(|(mime, bytes)| (mime.clone(), PyBytes::new(py, bytes)))
-                    .collect();
-                let _ = cb.call1(py, (entries,));
-            });
+            if generations.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            cb.selection(entries);
         });
     }
 
@@ -2346,7 +2334,7 @@ impl SelectionHandler for AppState {
         // Recorded even with no callback armed, so SetClipboardCallback can re-stage a
         // read of a copy made while nobody was listening.
         self.current_selection_mimes = chosen.clone();
-        if crate::PY_SHUTDOWN.load(Ordering::Relaxed) {
+        if crate::SHUTDOWN.load(Ordering::Relaxed) {
             return;
         }
         if self.clipboard_callback.is_none() {

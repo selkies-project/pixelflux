@@ -68,14 +68,16 @@ use x11rb::protocol::xproto::{self, ConnectionExt as XprotoExt, ImageFormat, Ima
 use x11rb::rust_connection::RustConnection;
 
 use super::{
-    Controls, RootDamage, captured_damage, clamp_offset, cursor_image_origin, require_32bpp,
-    resolve_dims, take_tick, wait_for_frame,
+    Controls, RootDamage, captured_damage, clamp_offset, cursor_image_origin, frame_rects,
+    require_32bpp, resolve_dims, take_tick, wait_for_frame,
 };
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use crate::encoders::software::{EncodedStripe, FrameTiming, StripeState};
 use crate::encoders::{self, FrameEncoder, FrameSource};
 use crate::pace::FramePace;
-use crate::pipeline::{Damage, EncoderQuality, decide_hw_fullframe};
+use crate::pipeline::{
+    Damage, EncoderQuality, decide_hw_fullframe, plan_refinement, refinement_coded,
+};
 use crate::recording_sink::RecordingSink;
 
 /// GPU buffers the screen is blitted into, used round-robin so an encoder still reading the
@@ -159,6 +161,8 @@ struct GpuCapture {
     encoder: Option<FrameEncoder>,
     buffers: Vec<GpuBuffer>,
     cursor: Option<CursorSprite>,
+    /// Where the last grab drew the cursor, in the frame's coordinates.
+    cursor_drawn: Option<smithay::utils::Rectangle<i32, smithay::utils::Physical>>,
     /// The watermark image and where it sits, and the pixmap the server composites it from.
     /// Held rather than blended into host pixels, which is what keeps this path zero-copy.
     overlay: crate::encoders::overlay::OverlayState,
@@ -170,10 +174,10 @@ struct GpuCapture {
     next: usize,
     /// The live session: its geometry is what is captured and encoded, and its rate and quality
     /// fields follow the cross-thread controls.
-    settings: RustCaptureSettings,
+    settings: CaptureSettings,
     /// The geometry that was asked for, which a region change updates and every region is
     /// resolved from, kept apart from `settings` so a capture following the root keeps following.
-    request: RustCaptureSettings,
+    request: CaptureSettings,
     cap_x: i16,
     cap_y: i16,
     root_w: u16,
@@ -210,7 +214,7 @@ fn intel_compressed(modifier: u64) -> bool {
 
 /// Why the DRI3 path was not taken, for the one line that says so.
 fn declined(reason: &str) -> Option<GpuCapture> {
-    println!("[X11] Zero-copy capture (DRI3) unavailable: {reason}; capturing through XShm.");
+    println!("[X11] Zero-copy capture (DRI3) unavailable: {reason}.");
     crate::report::capture_declined("DRI3", reason);
     None
 }
@@ -788,6 +792,7 @@ impl GpuCapture {
                 h,
             )
             .map_err(|e| x_err("CopyArea", e))?;
+        self.cursor_drawn = None;
         if with_cursor {
             self.composite_cursor(idx)?;
         } else if let Some(c) = self.cursor.take() {
@@ -950,6 +955,10 @@ impl GpuCapture {
         {
             return Ok(());
         }
+        self.cursor_drawn = Some(smithay::utils::Rectangle::new(
+            (img_x, img_y).into(),
+            (c.width as i32, c.height as i32).into(),
+        ));
         self.x
             .conn
             .render_composite(
@@ -992,7 +1001,7 @@ impl Drop for GpuCapture {
 /// back to the XShm path with nothing half-built. The server is asked first, over a connection
 /// of our own, because whether it draws on the GPU at all, and on which device, is its answer to
 /// give; the encoder is built on the device the server named.
-fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
+fn open(settings: &CaptureSettings) -> Option<GpuCapture> {
     if !settings.codec.is_video() {
         return declined("the codec is JPEG");
     }
@@ -1058,6 +1067,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
         encoder: None,
         buffers: Vec::new(),
         cursor: None,
+        cursor_drawn: None,
         overlay: watermark,
         watermark: None,
         cap_x: clamp_offset(request.capture_x, geo.width),
@@ -1115,7 +1125,7 @@ fn open(settings: &RustCaptureSettings) -> Option<GpuCapture> {
 /// and only then blits, waits, and encodes through the same send / quality / key-frame policy every
 /// full-frame encoder obeys.
 pub fn run_capture<F>(
-    settings: RustCaptureSettings,
+    settings: CaptureSettings,
     controls: Arc<Controls>,
     encode_tid_tx: std::sync::mpsc::Sender<std::thread::ThreadId>,
     on_frame: &mut F,
@@ -1146,6 +1156,8 @@ where
     let mut sent_frames: u64 = 0;
     let mut damaged_frames: u64 = 0;
     let mut first_frame = true;
+    // Where the cursor was drawn onto the last frame sent.
+    let mut last_cursor = None;
     let mut tid_sent = false;
 
     while !controls.stop.load(Ordering::Relaxed) {
@@ -1258,25 +1270,48 @@ where
             state.lost_frame();
         }
         let quality = EncoderQuality::of(gpu.enc());
-        let decision = decide_hw_fullframe(
+        let damage = match &changed {
+            _ if !is_dirty => Damage::None,
+            Some(rects) => captured_damage(
+                rects,
+                gpu.cap_x.into(),
+                gpu.cap_y.into(),
+                gpu.settings.width,
+                gpu.settings.height,
+            ),
+            None => Damage::Unknown,
+        };
+        let mut decision = decide_hw_fullframe(
             &mut state,
             &gpu.settings,
             frame_counter,
-            match changed {
-                _ if !is_dirty => Damage::None,
-                Some(rects) => captured_damage(
-                    &rects,
-                    gpu.cap_x.into(),
-                    gpu.cap_y.into(),
-                    gpu.settings.width,
-                    gpu.settings.height,
-                ),
-                None => Damage::Unknown,
-            },
+            damage,
             false,
             pending_force_idr,
             quality,
         );
+        // Where the frame changed, in its own coordinates: the server's report and, where the
+        // cursor moved, where it was drawn and is drawn now. Taken once the grab has drawn it.
+        let mut frame_changed = changed.as_ref().map(|rects| {
+            frame_rects(
+                rects,
+                gpu.cap_x,
+                gpu.cap_y,
+                gpu.settings.width as u16,
+                gpu.settings.height as u16,
+            )
+        });
+        if !decision.send {
+            plan_refinement(
+                &mut state,
+                &gpu.settings,
+                &mut decision,
+                damage,
+                frame_changed.as_deref(),
+                None,
+                None,
+            );
+        }
         // A tick that publishes nothing is no frame: counted as one, it would hold a change
         // landing just after it back by a pull's worth of budget or a whole period.
         pace.record_tick(trigger, frame_dur, woke, decision.send);
@@ -1301,6 +1336,21 @@ where
                 }
             };
             let dmabuf = gpu.buffers[idx].dmabuf.clone();
+            if gpu.cursor_drawn != last_cursor {
+                let moved = gpu.cursor_drawn.into_iter().chain(last_cursor);
+                frame_changed.get_or_insert_with(Vec::new).extend(moved);
+                last_cursor = gpu.cursor_drawn;
+            }
+            let (refines, last) = (gpu.enc().refines(), gpu.enc().last_quality());
+            plan_refinement(
+                &mut state,
+                &gpu.settings,
+                &mut decision,
+                damage,
+                frame_changed.as_deref(),
+                refines,
+                last,
+            );
             decision.prepare(gpu.enc());
             let encode_start_ns = crate::wayland::host::now_ns();
             let result = if after_blit {
@@ -1318,6 +1368,9 @@ where
                     decision.force_idr,
                 )
             };
+            let coded = EncoderQuality::of(gpu.enc());
+            let bytes = result.as_ref().map_or(0, Vec::len);
+            refinement_coded(&mut state, &gpu.settings, &decision, coded, bytes);
             match result {
                 Ok(data) if !data.is_empty() => {
                     encode_errors = 0;

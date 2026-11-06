@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use crate::ThreadCommand;
 use crate::encoders::software::EncodedStripe;
 
@@ -94,7 +94,7 @@ pub struct RecordOptions {
     pub backend: Option<PreferredBackend>,
     /// Full capture settings for a recorder-owned capture; `None` derives them (full root /
     /// current output geometry, H.264 full-frame).
-    pub capture: Option<RustCaptureSettings>,
+    pub capture: Option<CaptureSettings>,
     /// Unix socket serving an Ogg Opus stream to record as the audio track; empty for none.
     pub audio_socket: String,
 }
@@ -294,8 +294,8 @@ fn pace_idr_requests(shared: &RecShared, idr: &IdrRequester, interval_us: u64) {
     }
 }
 
-/// Enqueue one delivered frame for muxing. Only a single full-frame H.264 stripe is
-/// recordable; JPEG or striped output is counted and skipped so the surfaces can report a
+/// Enqueue one delivered frame for muxing. Only H.264 is recordable; JPEG or another codec is
+/// counted and skipped so the surfaces can report a
 /// clear "nothing recordable" error instead of writing a corrupt file.
 fn offer_frame(shared: &RecShared, tx: &Sender<Tap>, stripes: &[EncodedStripe]) {
     if stripes.is_empty() {
@@ -416,7 +416,7 @@ fn writer_thread(
     if final_stats.samples == 0 {
         shared.set_error(
             "no recordable H.264 frames received (the session must produce a single \
-             full-frame H.264 stream; JPEG and striped modes cannot be recorded)"
+             full-frame H.264 stream; JPEG and the other codecs cannot be recorded)"
                 .to_string(),
         );
         let _ = std::fs::remove_file(&path);
@@ -560,7 +560,7 @@ fn audio_thread(
 /// Capture settings for a recorder-owned capture: explicit settings when given (validated
 /// H.264), otherwise derived defaults, always forced to the one recordable shape (full-frame
 /// H.264, no socket rebind, scheduled recovery keyframes).
-fn own_capture_settings(opts: &RecordOptions) -> Result<RustCaptureSettings, String> {
+fn own_capture_settings(opts: &RecordOptions) -> Result<CaptureSettings, String> {
     let mut s = match &opts.capture {
         Some(explicit) => {
             if explicit.codec != crate::encoders::Codec::H264 {
@@ -568,7 +568,7 @@ fn own_capture_settings(opts: &RecordOptions) -> Result<RustCaptureSettings, Str
             }
             explicit.clone()
         }
-        None => RustCaptureSettings {
+        None => CaptureSettings {
             width: 0,
             height: 0,
             codec: crate::encoders::Codec::H264,
@@ -577,7 +577,6 @@ fn own_capture_settings(opts: &RecordOptions) -> Result<RustCaptureSettings, Str
             ..Default::default()
         },
     };
-    s.video_fullframe = true;
     s.recording_socket = String::new();
     if opts.fps > 0.0 {
         s.target_fps = opts.fps;

@@ -10,11 +10,18 @@
 //! text and then holds still, optionally with a caret blinking in one place. Measurements to
 //! quote rather than assert; configured through `PF_BENCH_*`:
 //!
-//! `CODEC` (h264, h265, vp8, vp9, av1, jpeg), `CPU` (1 forces software), `FULLFRAME` (1),
+//! `CODEC` (h264, h265, vp8, vp9, av1, jpeg), `CPU` (1 forces software),
 //! `FULLCOLOR` (1 for 4:4:4), `DEPTH` (bits per sample),
 //! `TURBO` (1), `CBR` (1), `KBPS`, `CRF`, `PAINT_CRF`, `PAINT` (use_paint_over_quality, 1),
-//! `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `STEP` (rows the scroll moves a frame, 4), `CARET`
-//! (frames per caret toggle, 0 none),
+//! `KEYFRAME_S` (the scheduled key-frame interval), `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `STEP` (rows the scroll moves a frame, 4), `CARET`
+//! (frames per caret toggle, 0 none), `VIDEO` (`WxH`, a box at the bottom right repainted with a
+//! moving picture every frame for the whole run, the PSNR then measured outside it),
+//! `THREADS` (0 codes on one thread, as `cpu_encode_threading` off does, which makes a
+//! constant-rate x264 stream repeatable: its sliced threads' row control reads each other's
+//! progress), `REPORTED` (1 hands each frame's changed blocks over as a source that reports every change,
+//! `X11Pipeline::process_reported`, rather than for the content hash to confirm),
+//! `VIDEO_STOP` (frames into the still phase the video freezes on its last picture, the PSNR
+//! then measured over the whole screen and the bytes from there reported apart),
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
 //! moving `JUMP` rows at once: a window opening on a clean still screen), `IDR_AT` and `IDR_EVERY`
@@ -28,7 +35,7 @@
 //! `cargo test --release --lib cleanup_bench::cleanup_bench -- --exact --ignored --nocapture
 //! --test-threads=1`, and `cleanup_bench::cleanup_hold_experiment` the same way.
 
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 use crate::encoders::codec::{
     Codec, FRAME_KEY, JPEG_HEADER_LEN, VIDEO_HEADER_LEN, parse_video_type,
 };
@@ -155,7 +162,7 @@ impl Canvas {
 
 /// Source luma the way the stream's decoder reports it: BT.709 at limited range for the video
 /// codecs (BT.601 for VP8), BT.601 at full range for JPEG.
-fn source_luma(bgra: &[u8], codec: Codec) -> Vec<u8> {
+pub(crate) fn source_luma(bgra: &[u8], codec: Codec) -> Vec<u8> {
     let (kr, kb, limited) = match codec {
         Codec::Jpeg => (0.299, 0.114, false),
         Codec::Vp8 => (0.299, 0.114, true),
@@ -219,6 +226,113 @@ fn link_wait(frames: &[(f64, usize)], mbit: f64, from: f64) -> f64 {
     worst * 1e3
 }
 
+/// A moving picture in `area` (`x`, `y`, `width`, `height`) of the `w`-wide BGRA `frame` at
+/// frame `t`: bands that drift a few pixels a frame under a grain that changes every frame, so
+/// a predicted frame has motion to code and texture it cannot predict.
+fn paint_video(
+    frame: &mut [u8],
+    w: usize,
+    (x0, y0, vw, vh): (usize, usize, usize, usize),
+    t: usize,
+) {
+    let mut seed = (t as u32).wrapping_mul(0x9e37_79b9) | 1;
+    for y in y0..y0 + vh {
+        for x in x0..x0 + vw {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let grain = (seed & 15) as usize;
+            let band = ((x - x0) + (y - y0) / 2 + t * 3) % 256;
+            let o = (y * w + x) * 4;
+            frame[o] = (band + grain) as u8;
+            frame[o + 1] = ((band * 3 / 4) + (y - y0) / 4 + grain) as u8;
+            frame[o + 2] = (255 - band / 2 + grain) as u8;
+            frame[o + 3] = 255;
+        }
+    }
+}
+
+/// `psnr` of the `w`-wide luma planes `a` and `b` inside `area`.
+fn psnr_inside(
+    a: &[u8],
+    b: &[u8],
+    w: usize,
+    (x0, y0, vw, vh): (usize, usize, usize, usize),
+) -> f64 {
+    let mut sum = 0f64;
+    for y in y0..y0 + vh {
+        for x in x0..x0 + vw {
+            let d = a[y * w + x] as f64 - b[y * w + x] as f64;
+            sum += d * d;
+        }
+    }
+    let mse = sum / (vw * vh).max(1) as f64;
+    if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+/// `psnr` of the `w`-wide luma planes `a` and `b` outside `area`.
+pub(crate) fn psnr_outside(
+    a: &[u8],
+    b: &[u8],
+    w: usize,
+    (x0, y0, vw, vh): (usize, usize, usize, usize),
+) -> f64 {
+    let (mut sum, mut n) = (0f64, 0usize);
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        let (px, py) = (i % w, i / w);
+        if (x0..x0 + vw).contains(&px) && (y0..y0 + vh).contains(&py) {
+            continue;
+        }
+        let d = x as f64 - y as f64;
+        sum += d * d;
+        n += 1;
+    }
+    let mse = sum / n.max(1) as f64;
+    if mse <= 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+/// The 16x16 blocks of the `w` x `h` BGRA `frame` that differ from `previous`, as rectangles a
+/// run of them along a row: what a source that reports exactly where it drew says.
+fn changed_blocks(
+    frame: &[u8],
+    previous: &[u8],
+    w: usize,
+    h: usize,
+) -> Vec<smithay::utils::Rectangle<i32, smithay::utils::Physical>> {
+    let mut rects = Vec::new();
+    for by in (0..h).step_by(16) {
+        let rows = by..(by + 16).min(h);
+        let mut run: Option<usize> = None;
+        for bx in (0..w).step_by(16).chain(std::iter::once(w)) {
+            let changed = bx < w
+                && rows.clone().any(|y| {
+                    let (a, b) = (y * w * 4 + bx * 4, y * w * 4 + (bx + 16).min(w) * 4);
+                    frame[a..b] != previous[a..b]
+                });
+            match (changed, run) {
+                (true, None) => run = Some(bx),
+                (false, Some(x0)) => {
+                    rects.push(smithay::utils::Rectangle::new(
+                        (x0 as i32, by as i32).into(),
+                        ((bx - x0) as i32, rows.len() as i32).into(),
+                    ));
+                    run = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    rects
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse = a
         .iter()
@@ -242,13 +356,12 @@ fn cleanup_bench() {
     let codec = Codec::parse(&env("CODEC", "h264".to_string())).expect("codec");
     let (w, h): (usize, usize) = (env("W", 1920), env("H", 1080));
     let fps: f64 = env("FPS", 60.0);
-    let settings = RustCaptureSettings {
+    let settings = CaptureSettings {
         width: w as i32,
         height: h as i32,
         target_fps: fps,
         codec,
         use_cpu: env("CPU", 0) == 1,
-        video_fullframe: env("FULLFRAME", 1) == 1,
         video_streaming_mode: env("TURBO", 1) == 1,
         video_cbr_mode: env("CBR", 1) == 1,
         video_bitrate_kbps: env("KBPS", 8000),
@@ -264,6 +377,8 @@ fn cleanup_bench() {
         video_vbv_multiplier: env("VBV", 0.0),
         video_fullcolor: env("FULLCOLOR", 0) == 1,
         video_bit_depth: env("DEPTH", 8),
+        keyframe_interval_s: env("KEYFRAME_S", 0.0),
+        cpu_encode_threading: env("THREADS", 1) == 1,
         ..Default::default()
     };
     let motion: usize = env("MOTION", 90);
@@ -277,17 +392,26 @@ fn cleanup_bench() {
     let ssim_all = env("SSIM", 0) == 1;
     let idr_at: i64 = env("IDR_AT", 0);
     let idr_every: i64 = env("IDR_EVERY", 0);
+    let video = std::env::var("PF_BENCH_VIDEO").ok().and_then(|v| {
+        let (vw, vh) = v.split_once('x')?;
+        let (vw, vh): (usize, usize) = (vw.parse().ok()?, vh.parse().ok()?);
+        Some((
+            w.saturating_sub(vw + 32),
+            h.saturating_sub(vh + 32),
+            vw.min(w),
+            vh.min(h),
+        ))
+    });
+    let reported = env("REPORTED", 0) == 1;
+    let video_stop: Option<usize> = std::env::var("PF_BENCH_VIDEO_STOP")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let canvas = Canvas::for_bench(w, h);
     let mut p = X11Pipeline::new(settings.clone());
     let codec = p.codec();
     println!(
-        "bench {} {} {}x{} turbo={} cbr={} kbps={} crf={} paint={}/{} caret={} prestill={prestill} jump={jump} encoder={}",
+        "bench {} {}x{} turbo={} cbr={} kbps={} crf={} paint={}/{} caret={} prestill={prestill} jump={jump} encoder={}",
         codec.display(),
-        if settings.video_fullframe {
-            "full"
-        } else {
-            "striped"
-        },
         w,
         h,
         settings.video_streaming_mode,
@@ -319,6 +443,9 @@ fn cleanup_bench() {
         .ok()
         .map(|path| std::fs::File::create(&path).unwrap_or_else(|e| panic!("{path}: {e}")));
     let mut frame = vec![0u8; w * 4 * h];
+    let mut previous = vec![0u8; w * 4 * h];
+    let mut video_psnr: Vec<(i64, f64)> = Vec::new();
+    let (mut stopped_bytes, mut stopped_keys, mut stopped_max) = (0usize, 0usize, (0usize, 0i64));
     for t in 0..total {
         let scroll = if t < motion {
             t * step
@@ -331,12 +458,23 @@ fn cleanup_bench() {
         };
         let caret = caret_period > 0 && t >= stop && ((t - stop) / caret_period).is_multiple_of(2);
         canvas.frame(&mut frame, h, scroll, caret);
+        let frozen = video_stop.map(|v| stop + v);
+        let video_plays = frozen.is_none_or(|f| t < f);
+        if let Some(area) = video {
+            paint_video(&mut frame, w, area, frozen.map_or(t, |f| t.min(f)));
+        }
         let since = t as i64 - stop as i64 - idr_at;
         if idr_at > 0 && since >= 0 && (since == 0 || (idr_every > 0 && since % idr_every == 0)) {
             p.request_idr();
         }
+        let changed = changed_blocks(&frame, &previous, w, h);
+        previous.copy_from_slice(&frame);
         let start = Instant::now();
-        let out = p.process(&frame, w * 4);
+        let out = if reported {
+            p.process_reported(&frame, w * 4, &changed)
+        } else {
+            p.process_damaged(&frame, w * 4, &changed)
+        };
         let ms = start.elapsed().as_secs_f64() * 1e3;
         let mut bytes = 0usize;
         let mut kinds = String::new();
@@ -403,10 +541,23 @@ fn cleanup_bench() {
         if t >= stop + still {
             resume_bytes += bytes;
         }
+        if in_still && !video_plays {
+            stopped_bytes += bytes;
+            stopped_keys += usize::from(kinds.contains('K'));
+            if bytes > stopped_max.0 {
+                stopped_max = (bytes, rel);
+            }
+        }
         let measure = !out.is_empty() || rel % 30 == 0 || t + 1 == total || rel == 0;
         if measure {
             let src = source_luma(&frame, codec);
-            last_psnr = psnr(&shown, &src);
+            last_psnr = match video.filter(|_| video_plays) {
+                Some(area) => psnr_outside(&shown, &src, w, area),
+                None => psnr(&shown, &src),
+            };
+            if let Some(area) = video.filter(|_| in_still && video_plays) {
+                video_psnr.push((rel, psnr_inside(&shown, &src, w, area)));
+            }
             last_ssim = if ssim_all || rel >= -1 {
                 ssim(&shown, &src, w, h)
             } else {
@@ -487,6 +638,31 @@ fn cleanup_bench() {
         .map(|&m| format!("{m:.0}:{:.0}", link_wait(&sent, m, from)))
         .collect();
     println!("  still frames sent: {still_sent} of {still}; psnr at stop {psnr_at_stop:.2}");
+    if !video_psnr.is_empty() {
+        let least = video_psnr
+            .iter()
+            .cloned()
+            .fold((0, f64::INFINITY), |a, b| if b.1 < a.1 { b } else { a });
+        println!(
+            "  video area psnr over the still phase: mean {:.2}, least {:.2} at t={:+}",
+            video_psnr.iter().map(|v| v.1).sum::<f64>() / video_psnr.len() as f64,
+            least.1,
+            least.0
+        );
+        if std::env::var("PF_BENCH_VIDEO_ROWS").is_ok() {
+            for (t, v) in video_psnr.iter().filter(|(t, _)| *t < 120) {
+                println!("  video t={t:+} {v:.2}");
+            }
+        }
+    }
+    if let Some(v) = video_stop {
+        println!(
+            "  after the video stopped (t={v:+}): {:.1} kB, {stopped_keys} key frames, largest {:.1} kB at t={:+}",
+            stopped_bytes as f64 / 1000.0,
+            stopped_max.0 as f64 / 1000.0,
+            stopped_max.1
+        );
+    }
     println!(
         "summary codec={} turbo={} cbr={} kbps={} {}x{} first_key={:?} keys={still_keys} max_kB={:.1}@{} still_kB={:.1} still_kbps={:.0} resume_kB={:.1} end_psnr={:.2} end_ssim={:.5} to_end-1dB={} to_end-0.5dB={} to_target({target:.2})={} link_wait_ms={}",
         codec.name(),
@@ -511,7 +687,7 @@ fn cleanup_bench() {
 }
 
 /// One session of the backend the settings select, driven directly: `x264` for the software
-/// H.264 session a full-frame capture runs (one stripe), else the ladder's full-frame encoder.
+/// H.264 session the CPU path runs, else the ladder's full-frame encoder.
 enum Session {
     #[cfg(feature = "gpl")]
     X264(
@@ -522,7 +698,7 @@ enum Session {
 }
 
 impl Session {
-    fn open(settings: &RustCaptureSettings) -> (Self, String) {
+    fn open(settings: &CaptureSettings) -> (Self, String) {
         #[cfg(feature = "gpl")]
         if settings.codec == Codec::H264 && settings.use_cpu {
             let bps = settings.video_bitrate_kbps.max(1) as u32 * 1000;
@@ -589,7 +765,7 @@ impl Session {
                 let mut out = Vec::new();
                 let cw = planes.chroma_width() as i32;
                 if !enc.encode_with_headers(
-                    &planes.y, &planes.u, &planes.v, w as i32, cw, cw, n as u16, 0, key, false,
+                    &planes.y, &planes.u, &planes.v, w as i32, cw, cw, n as u16, key, false,
                     &mut out,
                 ) {
                     return (Vec::new(), false);
@@ -624,13 +800,12 @@ fn cleanup_hold_experiment() {
     let codec = Codec::parse(&env("CODEC", "h264".to_string())).expect("codec");
     let (w, h): (usize, usize) = (env("W", 1920), env("H", 1080));
     let fps: f64 = env("FPS", 60.0);
-    let settings = RustCaptureSettings {
+    let settings = CaptureSettings {
         width: w as i32,
         height: h as i32,
         target_fps: fps,
         codec,
         use_cpu: env("CPU", 0) == 1,
-        video_fullframe: true,
         video_cbr_mode: env("CBR", 1) == 1,
         video_bitrate_kbps: env("KBPS", 8000),
         video_crf: env("CRF", 25),
@@ -721,4 +896,59 @@ fn cleanup_hold_experiment() {
             resume_first.join(" ")
         );
     }
+}
+
+/// What still blocks beside motion are coded at, through the X11 host-frame pipeline and x264
+/// at a constant quality: a texture with a box in it that changes every frame, the frame never
+/// still. The texture around the box is refined to the paint-over quality while the box keeps
+/// changing (`ledger`), where without the ledger it stayed at the session's quality. OpenH264,
+/// the H.264 encoder of a build without `gpl`, takes no quantizer per macroblock.
+#[cfg(feature = "gpl")]
+#[test]
+fn still_blocks_beside_motion_are_refined() {
+    let (w, h) = (256usize, 128usize);
+    let settings = CaptureSettings {
+        width: w as i32,
+        height: h as i32,
+        target_fps: 60.0,
+        codec: Codec::H264,
+        use_cpu: true,
+        video_streaming_mode: false,
+        video_cbr_mode: false,
+        video_crf: 35,
+        video_paintover_crf: 18,
+        use_paint_over_quality: true,
+        paint_over_trigger_frames: 15,
+        ..Default::default()
+    };
+    let area = (192, 64, 64, 64);
+    let mut p = X11Pipeline::new(settings);
+    let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
+    let mut shown = vec![0u8; w * h];
+    let mut frame = vec![0u8; w * h * 4];
+    let mut seed = 0x1234_5678u32;
+    for px in frame.chunks_mut(4) {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        px.copy_from_slice(&[seed as u8, (seed >> 8) as u8, (seed >> 16) as u8, 255]);
+    }
+    let changed = [smithay::utils::Rectangle::new(
+        (area.0 as i32, area.1 as i32).into(),
+        (area.2 as i32, area.3 as i32).into(),
+    )];
+    for t in 0..240 {
+        paint_video(&mut frame, w, area, t);
+        for s in p.process_damaged(&frame, w * 4, if t == 0 { &[] } else { &changed }) {
+            if dec.decode(&s.data[VIDEO_HEADER_LEN..]).expect("decode") {
+                let pic = dec.frame().expect("picture");
+                for r in 0..h {
+                    shown[r * w..(r + 1) * w].copy_from_slice(&pic.y[r * pic.y_stride..][..w]);
+                }
+            }
+        }
+    }
+    let around = psnr_outside(&shown, &source_luma(&frame, Codec::H264), w, area);
+    println!("around the box: {around:.2} dB");
+    assert!(around > 40.0, "the still texture reached {around:.2} dB");
 }

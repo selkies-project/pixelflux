@@ -61,7 +61,7 @@ use super::reference::{
 };
 use super::session::{RateSettings, check_host_frame};
 use super::sps::{NoReorder, h264_frame_num_range};
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 
 /// The slices an H.264 or HEVC picture is cut into, a decoder threading a frame across them.
 /// AMD's VCE is the exception for H.264: it codes a picture cut into four slices at less than
@@ -853,6 +853,10 @@ pub(super) struct Negotiated {
     /// The highest H.264 level the driver is told (`Device::h264_driver_level`); the
     /// packed SPS still declares the level the stream needs.
     pub h264_driver_level: u32,
+    /// The regions of interest a frame may name with a quantizer delta
+    /// (`VAConfigAttribEncROI`), 0 where the driver takes none, or none under its rate control
+    /// at a constant rate.
+    pub roi_regions: u32,
 }
 
 /// One frame as the codec arms see it: what it is, where its reconstruction and coded output
@@ -970,6 +974,20 @@ struct HostUpload {
 /// The dmabuf imports a zero-copy session keeps, past the few buffers any capture cycles.
 const DMABUF_IMPORTS: usize = 8;
 
+/// Quality index steps finer than the paint-over one a refined block is coded at
+/// (`VaapiEncoder::refines`): on Intel's iHD (N97) 1080p H.264 text beside a video went from
+/// 41.3 dB to 44.1, 45.4, and 47.1 at a constant quantizer at 0, 3, and 6 steps finer, where the
+/// driver's cleanup of the still screen reaches 46.2; at a constant rate, held to `REFINE_REACH`,
+/// from 31.0 to 33.3 at 8 Mbit/s and from 19.0 to 21.1 at 2, the video unchanged.
+const REFINE_FINER: u32 = 3;
+
+/// The most quantizer steps off the frame's own a refined region is coded at
+/// (`VaapiEncoder::refines`): on Intel's iHD (N97, H.264 on the low-power entry point, 3 Mbit/s
+/// CBR at 1080p60) a region 10 finer came out at a quantizer 7 under the rest with the rate held,
+/// 25 finer at 20 under it at 54 Mbit/s, the rate control lost; 5 finer, a delta the driver
+/// codes natively, moved nothing.
+const REFINE_REACH: u32 = 10;
+
 /// One VA-API encoder session, hardware, for one capture.
 pub struct VaapiEncoder {
     codec: Codec,
@@ -1009,6 +1027,10 @@ pub struct VaapiEncoder {
     qp: u32,
     /// The quantizer the next frame is held at (`hold_quantizer`).
     held: Option<u32>,
+    /// The blocks the next frame of the rate control's refines (`refine_blocks`), and the
+    /// regions of interest of the frame being issued (`roi_parameter`).
+    refinement: Option<crate::ledger::Refinement>,
+    roi: Vec<VAEncROI>,
     /// Whether the driver caps each coded frame at the size a constant-rate session names.
     frame_cap: bool,
     /// The bytes of the last coded frame, padding aside.
@@ -1078,7 +1100,7 @@ impl Drop for VaapiEncoder {
 impl VaapiEncoder {
     /// Stand up a session for `codec` on the render node the settings select, fed through
     /// `input`, with the libva of this process.
-    pub fn new(settings: &RustCaptureSettings, codec: Codec, input: Input) -> Result<Self, String> {
+    pub fn new(settings: &CaptureSettings, codec: Codec, input: Input) -> Result<Self, String> {
         if !codec.is_video() {
             return Err("JPEG has no VA-API encoder".into());
         }
@@ -1093,7 +1115,7 @@ impl VaapiEncoder {
     /// `new` on an open device.
     pub(crate) fn on_device(
         device: Arc<Device>,
-        settings: &RustCaptureSettings,
+        settings: &CaptureSettings,
         codec: Codec,
         input: Input,
     ) -> Result<Self, String> {
@@ -1152,7 +1174,7 @@ impl VaapiEncoder {
     #[allow(clippy::too_many_arguments)]
     fn open(
         device: &Arc<Device>,
-        settings: &RustCaptureSettings,
+        settings: &CaptureSettings,
         codec: Codec,
         input: Input,
         profile: VAProfile,
@@ -1323,6 +1345,16 @@ impl VaapiEncoder {
                 },
                 unit_qp_deltas,
                 h264_driver_level: device.h264_driver_level(),
+                roi_regions: device
+                    .attribute(profile, entrypoint, VAConfigAttribEncROI)
+                    .map_or(0, |v| {
+                        let qp_deltas_under_rate_control = v & (1 << 9) != 0;
+                        if rate.cbr && !qp_deltas_under_rate_control {
+                            0
+                        } else {
+                            v & 0xff
+                        }
+                    }),
             },
             fourcc,
             rt_format,
@@ -1343,6 +1375,8 @@ impl VaapiEncoder {
             rate,
             qp: codec.hardware_quantizer(device.hardware(), settings.video_crf),
             held: None,
+            refinement: None,
+            roi: Vec::new(),
             frame_cap: false,
             last_bytes: None,
             cleanup_bps: None,
@@ -1738,7 +1772,7 @@ impl VaapiEncoder {
 
     /// Take a rate or frame-rate change: the next frame opens a sequence with the new rate
     /// control, as a key frame.
-    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
+    pub fn reconfigure_rate(&mut self, settings: &CaptureSettings) -> Result<(), String> {
         let Some(rate) = self.rate.changed(settings) else {
             return Ok(());
         };
@@ -1952,6 +1986,74 @@ impl VaapiEncoder {
     /// says no there. A key frame held there, the cleanup of a session whose rate control
     /// cannot refine (`ends_cleanup_on_key`), is coded with the budget `held_key_bits` gives it,
     /// sent with the picture.
+    /// How the session refines blocks of a frame of its rate control's (`refine_blocks`): an
+    /// H.264 session whose driver takes regions of interest with a quantizer delta, one region a
+    /// run of blocks along a row (`Negotiated::roi_regions`), each at most `REFINE_REACH` steps
+    /// off the frame's quality. HEVC takes none: on Intel's iHD (N97) refined regions took 1080p
+    /// text beside a video from 41.4 dB to 25.4 at 8 Mbit/s and the video from 34.7 to 30.3, and
+    /// from 47.6 to 44.5 at a constant quantizer, where the driver's HEVC path carries the
+    /// regions as a delta map it lays out wrong.
+    pub fn refines(&self) -> Option<crate::ledger::Refiner> {
+        (self.codec == Codec::H264 && self.negotiated.roi_regions > 0).then_some(
+            crate::ledger::Refiner {
+                finer: REFINE_FINER,
+                reach: REFINE_REACH,
+                runs: self.negotiated.roi_regions as usize,
+            },
+        )
+    }
+
+    /// Code the blocks `refinement` names in the next frame of the rate control's at its target
+    /// quality, as regions of interest (`roi_parameter`).
+    pub fn refine_blocks(&mut self, refinement: &crate::ledger::Refinement) {
+        self.refinement = self.refines().map(|_| refinement.clone());
+    }
+
+    /// The regions of interest of `refinement` into `out`: a rectangle a run of its blocks
+    /// along a row, each at the quantizer delta from the rate control's last to the target,
+    /// within `REFINE_REACH`. The driver reads the rectangles through the parameter's pointer
+    /// when the picture is issued, so they live in the session until then.
+    fn roi_parameter(&mut self, refinement: &crate::ledger::Refinement, out: &mut Buffers) {
+        use crate::ledger::BLOCK;
+        let hw = |index: i32| self.codec.hardware_quantizer(self.device.hardware(), index) as i32;
+        let delta =
+            (hw(refinement.target) - hw(refinement.from)).clamp(-(REFINE_REACH as i32), 0) as i8;
+        let plan = &refinement.plan;
+        let (width, height) = (self.negotiated.width as i32, self.negotiated.height as i32);
+        self.roi.clear();
+        for row in 0..plan.rows {
+            let mut col = 0;
+            while col < plan.cols {
+                if !plan.refines(col, row) {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                while col < plan.cols && plan.refines(col, row) {
+                    col += 1;
+                }
+                let (x, y) = (start as i32 * BLOCK, row as i32 * BLOCK);
+                self.roi.push(VAEncROI {
+                    roi_rectangle: VARectangle {
+                        x: x as i16,
+                        y: y as i16,
+                        width: ((col as i32 * BLOCK).min(width) - x) as u16,
+                        height: (BLOCK.min(height - y)) as u16,
+                    },
+                    roi_value: delta,
+                });
+            }
+        }
+        self.roi.truncate(self.negotiated.roi_regions as usize);
+        let mut parameter: VAEncMiscParameterBufferROI = unsafe { std::mem::zeroed() };
+        parameter.num_roi = self.roi.len() as u32;
+        parameter.max_delta_qp = 51;
+        parameter.min_delta_qp = -51;
+        parameter.roi = self.roi.as_mut_ptr();
+        unsafe { parameter.roi_flags.bits.set_roi_value_is_qp_delta(1) };
+        out.push_misc(VAEncMiscParameterTypeROI, &parameter);
+    }
+
     pub fn hold_quantizer(&mut self, crf: u32) {
         self.held = Some(
             self.codec
@@ -2495,6 +2597,10 @@ impl VaapiEncoder {
             self.sent_bps = bps;
         }
         self.arm.picture(&self.negotiated, &frame, &mut out)?;
+        let refinement = self.refinement.take().filter(|_| !key && held_qp.is_none());
+        if let Some(refinement) = &refinement {
+            self.roi_parameter(refinement, &mut out);
+        }
         let header_len = if self.omit_headers {
             0
         } else {
@@ -2960,7 +3066,7 @@ mod tests {
     /// everywhere: a host without a VA-API device exercises the error path.
     #[test]
     fn construction_answers_or_refuses() {
-        let mut settings = RustCaptureSettings {
+        let mut settings = CaptureSettings {
             width: 128,
             height: 128,
             codec: Codec::H264,
@@ -2993,7 +3099,7 @@ mod tests {
     #[ignore]
     fn vaapi_vce_h264_is_one_slice() {
         let (w, h) = (1920usize, 1080usize);
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: w as i32,
             height: h as i32,
             codec: Codec::H264,
@@ -3060,17 +3166,18 @@ mod tests {
     /// Encode `moving_picture` for 120 frames, reporting a loss `depth` frames back every
     /// `every` frames from frame `from`, and decode it twice, once without the frames lost:
     /// the frames predicted past a loss, those from an anchor among them, the key frames after
-    /// the first, how far the second decoder's pictures come from the first's at most, and the
-    /// worst average distance of a picture from its source.
+    /// the first, how far the second decoder's pictures come from the first's at most, the
+    /// worst average distance of a picture from its source, and whether the device keeps
+    /// anchors (`keeps_anchors`).
     fn predict_past_losses(
         codec: Codec,
         from: usize,
         every: usize,
         depth: usize,
-    ) -> Option<(usize, usize, usize, f64, f64)> {
+    ) -> Option<(usize, usize, usize, f64, f64, bool)> {
         use crate::webcam::decode::{Decoder as _, VideoDecoder};
         let (w, h) = (1280usize, 720usize);
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: w as i32,
             height: h as i32,
             codec,
@@ -3140,7 +3247,14 @@ mod tests {
         println!(
             "{codec:?}: {past} frames predicted past a loss ({anchored} from an anchor), {keys} key frames; the lossy decoder at most {apart:.0} levels from the whole one, {worst:.1} on average from the source at worst"
         );
-        Some((past, anchored, keys, apart, worst))
+        Some((
+            past,
+            anchored,
+            keys,
+            apart,
+            worst,
+            enc.device.keeps_anchors(),
+        ))
     }
 
     /// On a VA-API device (`cargo test vaapi_ -- --ignored --nocapture`): a loss reported every
@@ -3150,7 +3264,7 @@ mod tests {
     #[ignore]
     fn vaapi_predicts_past_a_lost_frame() {
         for codec in [Codec::H264, Codec::H265] {
-            if let Some((past, _, keys, apart, worst)) = predict_past_losses(codec, 13, 13, 4) {
+            if let Some((past, _, keys, apart, worst, _)) = predict_past_losses(codec, 13, 13, 4) {
                 assert!(past >= 5, "{codec:?}: {past} predicted past a loss");
                 assert_eq!(keys, 0, "{codec:?}");
                 assert!(
@@ -3168,7 +3282,9 @@ mod tests {
     /// anchor at 48 from the recent frame before it, the lost anchor listed long-term while held;
     /// either way the decoder that never saw the lost frames shows every later picture as one
     /// that saw them all does. (Deeper, a gap FFmpeg fills would push that frame out of a
-    /// browser's decoder, and the window codes a key frame: `forget_stale`.)
+    /// browser's decoder, and the window codes a key frame: `forget_stale`.) On one that keeps
+    /// none (iHD) the loss older than the recent frames is answered with a key frame, and the
+    /// one four frames deep is predicted past from a recent frame, with no key frame.
     #[test]
     #[ignore]
     fn vaapi_predicts_from_an_anchor() {
@@ -3177,14 +3293,26 @@ mod tests {
             (Codec::H264, 52, 1000, 4, 0),
             (Codec::H265, 70, 40, 12, 2),
         ] {
-            if let Some((past, anchored, keys, apart, worst)) =
+            if let Some((past, anchored, keys, apart, worst, anchors)) =
                 predict_past_losses(codec, from, every, depth)
             {
-                assert!(
-                    past >= 1 && anchored == want.min(past),
-                    "{codec:?}: {anchored} of {past} from an anchor"
-                );
-                assert_eq!(keys, 0);
+                if anchors {
+                    assert!(
+                        past >= 1 && anchored == want.min(past),
+                        "{codec:?}: {anchored} of {past} from an anchor"
+                    );
+                    assert_eq!(keys, 0);
+                } else if want > 0 {
+                    assert!(
+                        anchored == 0 && keys >= 1,
+                        "{codec:?}: a loss past the recent frames took {keys} key frames"
+                    );
+                } else {
+                    assert!(
+                        past >= 1 && keys == 0,
+                        "{codec:?}: {past} predicted past the loss, {keys} key frames"
+                    );
+                }
                 assert!(
                     apart < 2.0,
                     "the decoder without the lost frames is {apart} off"
@@ -3209,7 +3337,7 @@ mod tests {
         use crate::encoders::sps::fixtures::assert_no_reorder;
         use crate::webcam::decode::{Decoder as _, VideoDecoder};
         let (w, h) = (1280usize, 720usize);
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: w as i32,
             height: h as i32,
             codec: Codec::H264,
@@ -3244,7 +3372,7 @@ mod tests {
     fn vaapi_h264_constant_rate_decodes_above_level_5_2() {
         use crate::webcam::decode::{Decoder as _, VideoDecoder};
         let (w, h, tile_w, tile_h) = (3840usize, 2160usize, 1280usize, 720usize);
-        let mut settings = RustCaptureSettings {
+        let mut settings = CaptureSettings {
             width: w as i32,
             height: h as i32,
             codec: Codec::H264,
@@ -3328,7 +3456,7 @@ mod tests {
         let Some((gbm, mut renderer)) = gpu_render() else {
             return;
         };
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: w as i32,
             height: h as i32,
             codec: Codec::H264,

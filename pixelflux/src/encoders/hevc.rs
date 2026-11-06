@@ -16,7 +16,7 @@ use std::ffi::CString;
 use super::codec::{Codec, VIDEO_HEADER_LEN, h265_frame_type, push_video_header};
 use super::reference::Reference;
 use super::session::{Pending, Planes, Quality, RateSettings, encode_threads};
-use crate::RustCaptureSettings;
+use crate::CaptureSettings;
 
 /// One software HEVC session for one capture.
 pub struct HevcEncoder {
@@ -33,6 +33,10 @@ pub struct HevcEncoder {
     pending: Pending,
     /// The quantizer the next frame is held at whatever the rate control (`hold_quantizer`).
     held: Option<u32>,
+    /// The blocks the next frame of the rate control's refines (`refine_blocks`), and the
+    /// quantizer offset of each 16x16 block of every frame, 0 where it refines nothing.
+    refinement: Option<crate::ledger::Refinement>,
+    offsets: Vec<f32>,
     /// The quantizer the rate control last coded a frame at, held frames aside.
     last_quality: Option<u32>,
     /// The bytes of that frame.
@@ -68,7 +72,7 @@ struct Coded {
 
 impl HevcEncoder {
     /// Open a session on host frames; `rgba` names the byte order they arrive in.
-    pub fn new(settings: &RustCaptureSettings, rgba: bool) -> Result<Self, String> {
+    pub fn new(settings: &CaptureSettings, rgba: bool) -> Result<Self, String> {
         let _ = rgba;
         let fullcolor = settings.video_fullcolor && Backend::FULLCOLOR;
         let bit_depth = if settings.video_bit_depth >= 10 && Backend::ten_bit() {
@@ -101,6 +105,8 @@ impl HevcEncoder {
             next_pts: 0,
             pending: Pending::default(),
             held: None,
+            refinement: None,
+            offsets: Vec::new(),
             last_quality: None,
             last_bytes: None,
         })
@@ -149,6 +155,26 @@ impl HevcEncoder {
         if self.rate.cbr { HEVC_REACH_FINER } else { 0 }
     }
 
+    /// Whether the session refines blocks of a frame of its rate control's (`refine_blocks`):
+    /// x265, through its per-block quantizer offsets, and kvazaar, through its map of a delta a
+    /// 64x64 tree block, the finest of the blocks it holds.
+    pub fn refines(&self) -> bool {
+        Backend::REFINES
+    }
+
+    /// Quality index steps finer than the paint-over one a refined block is coded at
+    /// (`FrameEncoder::refines`): the library's (`Backend::REFINE_FINER`).
+    pub fn refine_finer(&self) -> u32 {
+        Backend::REFINE_FINER
+    }
+
+    /// Code the blocks `refinement` names in the next frame of the rate control's at its target
+    /// quality (`ledger`): each 16x16 block it refines at the quantizer steps from the rate
+    /// control's last to the target, off the frame's own.
+    pub fn refine_blocks(&mut self, refinement: &crate::ledger::Refinement) {
+        self.refinement = self.refines().then(|| refinement.clone());
+    }
+
     /// The quality index (HEVC's quantizer) the rate control last coded a frame at, held frames
     /// aside.
     pub fn last_quality(&self) -> Option<u32> {
@@ -195,7 +221,7 @@ impl HevcEncoder {
 
     /// Re-open the encoder when a rate or frame-rate setting changed: neither library's rate
     /// control takes a new target while it runs.
-    pub fn reconfigure_rate(&mut self, settings: &RustCaptureSettings) -> Result<(), String> {
+    pub fn reconfigure_rate(&mut self, settings: &CaptureSettings) -> Result<(), String> {
         let Some(rate) = self.rate.changed(settings) else {
             return Ok(());
         };
@@ -228,6 +254,24 @@ impl HevcEncoder {
         let key = force_idr || self.fresh;
         let full_range = self.is_full_range();
         let pts = self.next_pts;
+        let refinement = self.refinement.take().filter(|_| held.is_none() && !key);
+        let offset = refinement.as_ref().map_or(0.0, |r| {
+            let q = |index: i32| Codec::H265.quantizer(index) as f32;
+            (q(r.target) - q(r.from)).min(0.0)
+        });
+        let cols = self.planes.width.div_ceil(16);
+        let rows = self.planes.height.div_ceil(16);
+        self.offsets.clear();
+        self.offsets.extend((0..rows).flat_map(|row| {
+            let refinement = refinement.as_ref();
+            (0..cols).map(move |col| {
+                if refinement.is_some_and(|r| r.plan.refines(col, row)) {
+                    offset
+                } else {
+                    0.0
+                }
+            })
+        }));
         let coded = self.backend.encode(
             &mut self.planes,
             pixels,
@@ -238,6 +282,7 @@ impl HevcEncoder {
             pts,
             key,
             held,
+            Some(self.offsets.as_mut_slice()),
         )?;
         self.next_pts += 1;
         self.fresh = false;
@@ -327,6 +372,14 @@ mod x265 {
 
         pub const KEY_ON_REQUEST: bool = true;
         pub const HOLDS_QUANTIZER: bool = true;
+        pub const REFINES: bool = true;
+        /// Quality index steps finer than the paint-over one x265 codes a refined block at
+        /// (`FrameEncoder::refines`). Its ultrafast analysis settles many a still block on its merge
+        /// candidate before the offset's quantizer counts, so refining takes 1080p text beside a video
+        /// less far than its cleanup of the still screen does, and every step finer gains: at 8 Mbit/s
+        /// from 31.1 dB to 34.2, 35.5, and 36.3 at 0, 3, and 6 steps finer, against 46.4 still; at a
+        /// constant quality from 37.7 to 40.7, 41.6, and 42.7, against 49.6; the video losing 0.3 dB.
+        pub const REFINE_FINER: u32 = 6;
 
         /// The frame rate the library was configured at, as `(num, den)`.
         #[cfg(test)]
@@ -441,6 +494,11 @@ mod x265 {
             // ones, and a still screen's cleanup at 60 fps 8 Mbit/s ended at 47.6 dB against 53.1
             // on 58% fewer bytes. A 1080p scroll codes as fast, one at 4K a tenth slower.
             options.push(("min-cu-size", "8".into()));
+            // A frame's per-block offsets (`refine_blocks`) reach the quantizer only under
+            // adaptive quantization, which x265 turns off at strength 0, so it runs at one that
+            // moves no block's quantizer by itself.
+            options.push(("aq-mode", "1".into()));
+            options.push(("aq-strength", "0.0001".into()));
             options.extend(Self::rate_options(rate, q));
             for (name, value) in &options {
                 me.set(name, value)?;
@@ -478,6 +536,7 @@ mod x265 {
             pts: u64,
             key: bool,
             held: Option<u32>,
+            offsets: Option<&mut [f32]>,
         ) -> Result<Option<Coded>, String> {
             planes.convert(pixels, stride, rgba, full_range, false, threads)?;
             let api = unsafe { &*self.api };
@@ -506,6 +565,13 @@ mod x265 {
                 X265_TYPE_AUTO as c_int
             };
             pic.forceqp = held.map_or(0, |q| q as c_int + 1);
+            // x265 copies the offsets as the frame is submitted, within this call, into a buffer
+            // the frame object it recycles has only where its first frame came with offsets: a
+            // session hands them with every frame, zero where it refines nothing, or a recycled
+            // frame without one is written through a null pointer.
+            if let Some(offsets) = offsets {
+                pic.quantOffsets = offsets.as_mut_ptr();
+            }
             let mut nals: *mut x265_nal = ptr::null_mut();
             let mut count: u32 = 0;
             let ret = unsafe {
@@ -587,6 +653,14 @@ mod kvazaar {
         }
         pub const KEY_ON_REQUEST: bool = false;
         pub const HOLDS_QUANTIZER: bool = false;
+        pub const REFINES: bool = true;
+        /// Quality index steps finer than the paint-over one kvazaar codes a refined block at
+        /// (`FrameEncoder::refines`): 1080p text beside a video went from 38.5 dB to 43.2, 45.8,
+        /// and 48.0 at a constant quality at 0, 3, and 6 steps finer, where kvazaar's cleanup of
+        /// the still screen reaches 44.3. At a constant rate the refined tree blocks take the
+        /// frame's quantizer off its rate control, which spends what they save elsewhere: 31.8
+        /// dB with the map and without at 8 Mbit/s.
+        pub const REFINE_FINER: u32 = 0;
 
         /// The frame rate the library was configured at, as `(num, den)`.
         #[cfg(test)]
@@ -689,12 +763,43 @@ mod kvazaar {
             pts: u64,
             _key: bool,
             _held: Option<u32>,
+            offsets: Option<&mut [f32]>,
         ) -> Result<Option<Coded>, String> {
             let api = unsafe { &*self.api };
             let pic =
                 unsafe { (api.picture_alloc.unwrap())(planes.width as i32, planes.height as i32) };
             if pic.is_null() {
                 return Err("kvazaar allocated no picture".into());
+            }
+            // kvazaar decides at the key frame whether the stream carries a quantizer delta per
+            // coding unit, from whether that picture has a map, so every picture carries one,
+            // 0 where nothing is refined; it frees the map with the picture.
+            if let Some(offsets) = offsets {
+                let (cols16, cols, rows) = (
+                    planes.width.div_ceil(16),
+                    planes.width.div_ceil(64),
+                    planes.height.div_ceil(64),
+                );
+                let rows16 = planes.height.div_ceil(16);
+                let map = unsafe { libc::malloc(cols * rows) as *mut i8 };
+                if !map.is_null() {
+                    for row in 0..rows {
+                        for col in 0..cols {
+                            let mut dqp = 0f32;
+                            for r in row * 4..(row * 4 + 4).min(rows16) {
+                                for c in col * 4..(col * 4 + 4).min(cols16) {
+                                    dqp = dqp.min(offsets[r * cols16 + c]);
+                                }
+                            }
+                            unsafe { *map.add(row * cols + col) = dqp.round() as i8 };
+                        }
+                    }
+                    unsafe {
+                        (*pic).roi.width = cols as i32;
+                        (*pic).roi.height = rows as i32;
+                        (*pic).roi.roi_array = map;
+                    }
+                }
             }
             let result = unsafe {
                 let p = &mut *pic;
@@ -782,7 +887,7 @@ mod tests {
     /// between are deltas that name no reference.
     #[test]
     fn key_frames_come_on_request_and_deltas_name_no_reference() {
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: 64,
             height: 48,
             target_fps: 30.0,
@@ -817,7 +922,7 @@ mod tests {
     /// than the paint-over quantizer, a constant quality's at it.
     #[test]
     fn a_constant_rate_cleanup_reaches_six_steps_finer() {
-        let mut settings = RustCaptureSettings {
+        let mut settings = CaptureSettings {
             width: 64,
             height: 48,
             target_fps: 30.0,
@@ -847,7 +952,7 @@ mod tests {
     #[test]
     fn x265_codes_with_8x8_coding_units() {
         for (width, height) in [(1920, 1080), (64, 48), (16, 16)] {
-            let settings = RustCaptureSettings {
+            let settings = CaptureSettings {
                 width,
                 height,
                 target_fps: 30.0,
@@ -865,7 +970,7 @@ mod tests {
     #[cfg(feature = "gpl")]
     #[test]
     fn a_constant_rates_filler_stays_off_the_wire() {
-        let settings = RustCaptureSettings {
+        let settings = CaptureSettings {
             width: 320,
             height: 240,
             target_fps: 30.0,
@@ -899,7 +1004,7 @@ mod tests {
     #[test]
     fn the_frame_rate_reaches_the_library_as_its_fraction() {
         for (num, den) in [(60000u32, 1001u32), (120000, 1001), (144000, 1001), (60, 1)] {
-            let settings = RustCaptureSettings {
+            let settings = CaptureSettings {
                 width: 64,
                 height: 48,
                 target_fps: num as f64 / den as f64,
