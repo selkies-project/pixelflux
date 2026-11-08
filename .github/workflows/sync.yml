@@ -9,7 +9,8 @@
 # transition note, and the wheels, checked against the pre-release's
 # SHA256SUMS, become a pre-release here. The first stable Selkies release past
 # LEGACY_VERSION is published here as a stable GitHub release, not to PyPI,
-# with the transition notes; at the stable release after it the mirror stops.
+# with the transition notes; at the stable release after it the mirror stops. The
+# repository is archived before Selkies 2.4.0.
 name: Sync from Selkies
 
 on:
@@ -129,7 +130,7 @@ jobs:
           {
             cat <<EOF
           > [!IMPORTANT]
-          > **${COMPONENT} is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/${COMPONENT}) now.** This repository mirrors its \`crates/${COMPONENT}\` directory, without history, for one release cycle: send issues and pull requests to Selkies. ${COMPONENT} keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the wheels of each Selkies pre-release are published here as a GitHub pre-release too. The first stable Selkies release after the move is published here as a GitHub release, and the mirror stops at the stable release after it, when this repository is archived. This tree is \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}.
+          > **${COMPONENT} is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/${COMPONENT}). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' \`crates/${COMPONENT}\` directory, without history, and will be archived before Selkies 2.4.0. ${COMPONENT} keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; each Selkies pre-release's wheels are published here as a GitHub pre-release, and the first stable Selkies release with ${COMPONENT} in it as a GitHub release. This tree is \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}.
 
           EOF
             cat "../source/crates/${COMPONENT}/README.md"
@@ -166,7 +167,7 @@ jobs:
             cat > notes.md <<EOF
           ${COMPONENT} ${TAG} is the ${COMPONENT} of [Selkies ${TAG}](https://github.com/${SOURCE}/releases/tag/${TAG}), built from \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}; the wheels here are the ones on PyPI.
 
-          **${COMPONENT} has moved into [selkies-project/selkies](https://github.com/${SOURCE}).** From ${TAG} on it is developed in Selkies' \`crates/${COMPONENT}\` and released with Selkies, at Selkies' version, from that repository: to PyPI as \`${COMPONENT}\`, with the same Python API, and as wheels on every Selkies release. Selkies itself links ${COMPONENT} as a Rust crate. This repository mirrors that directory until the next stable Selkies release, and stops syncing there; it is then archived. Send issues and pull requests to Selkies.
+          **${COMPONENT} has moved into [selkies-project/selkies](https://github.com/${SOURCE}).** From ${TAG} on it is developed in Selkies' \`crates/${COMPONENT}\` and released with Selkies, at Selkies' version, from that repository: to PyPI as \`${COMPONENT}\`, with the same Python API, and as wheels on every Selkies release. Selkies itself links ${COMPONENT} as a Rust crate. This repository mirrors that directory until it is archived, before Selkies 2.4.0. Open issues and pull requests in Selkies.
 
           Nothing changes for an installation from PyPI. One that installs from this repository's source moves to the Selkies repository's \`crates/${COMPONENT}\`.
           EOF
