@@ -1,0 +1,181 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+#
+# Mirror crates/pixelflux of selkies-project/selkies, where the library is
+# developed and released now. The newest Selkies pre-release carrying this
+# library's wheels names the commit: that commit's crate replaces this
+# repository's tree on main, without its history, README.md opening with the
+# transition note, and the wheels, checked against the pre-release's
+# SHA256SUMS, become a pre-release here. The first stable Selkies release past
+# LEGACY_VERSION is published here as a stable GitHub release, not to PyPI,
+# with the transition notes; at the stable release after it the mirror stops.
+name: Sync from Selkies
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+env:
+  COMPONENT: pixelflux
+  SOURCE: selkies-project/selkies
+  # The last release this repository made on its own
+  LEGACY_VERSION: 2.2.3
+
+jobs:
+  sync:
+    name: Mirror crates/pixelflux
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: mirror
+      - name: Pick the Selkies release to mirror
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Stable Selkies releases past this repository's own, oldest first
+          mapfile -t stable < <(gh release list -R "${SOURCE}" --exclude-pre-releases --exclude-drafts \
+              --limit 100 --json tagName --jq '.[].tagName' \
+            | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+            | while read -r tag; do
+                [ "$(printf '%s\n%s\n' "${LEGACY_VERSION}" "${tag}" | sort -V | tail -1)" = "${tag}" ] \
+                  && [ "${tag}" != "${LEGACY_VERSION}" ] && echo "${tag}"
+              done | sort -V)
+          if [ "${#stable[@]}" -ge 2 ]; then
+            echo "Selkies ${stable[1]} is out: this mirror has ended at ${stable[0]}."
+            exit 0
+          fi
+          kind=""
+          if [ "${#stable[@]}" -eq 1 ] && ! gh release view "${stable[0]}" -R "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+            kind=stable tag="${stable[0]}"
+          else
+            # The newest pre-release whose assets carry this library's wheels
+            tag="$(gh release list -R "${SOURCE}" --limit 30 --json tagName,isPrerelease \
+                --jq '.[] | select(.isPrerelease) | .tagName' \
+              | while read -r t; do
+                  if gh release view "${t}" -R "${SOURCE}" --json assets \
+                      --jq '.assets[].name' | grep -q "^${COMPONENT}-.*\.whl$"; then
+                    echo "${t}"
+                    break
+                  fi
+                done)"
+            if [ -z "${tag}" ]; then
+              echo "No Selkies pre-release carries ${COMPONENT} wheels yet."
+              exit 0
+            fi
+            if gh release view "selkies-${tag}" -R "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
+              echo "selkies-${tag} is mirrored already."
+              exit 0
+            fi
+            kind=prerelease
+          fi
+          sha="$(gh api "repos/${SOURCE}/commits/${tag}" --jq .sha)"
+          {
+            echo "kind=${kind}"
+            echo "tag=${tag}"
+            echo "sha=${sha}"
+          } >> "${GITHUB_OUTPUT}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.pick.outputs.kind != ''
+        with:
+          repository: selkies-project/selkies
+          ref: ${{ steps.pick.outputs.sha }}
+          path: source
+          persist-credentials: false
+      - name: Take the release's wheels
+        if: steps.pick.outputs.kind != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "${TAG}" -R "${SOURCE}" -D wheels \
+            --pattern "${COMPONENT}-*.whl" --pattern SHA256SUMS
+          cd wheels
+          shopt -s nullglob
+          wheels=("${COMPONENT}"-*.whl)
+          [ "${#wheels[@]}" -gt 0 ] || { echo "::error::${TAG} carries no ${COMPONENT} wheels"; exit 1; }
+          for wheel in "${wheels[@]}"; do
+            grep -E "^[0-9a-f]{64}  ${wheel}\$" SHA256SUMS | sha256sum -c -
+          done
+          rm SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+      - name: Mirror the crate
+        if: steps.pick.outputs.kind != ''
+        id: mirror
+        env:
+          KIND: ${{ steps.pick.outputs.kind }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          SHA: ${{ steps.pick.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd mirror
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name .github -exec rm -rf {} +
+          cp -a "../source/crates/${COMPONENT}/." ./
+          {
+            cat <<EOF
+          > [!IMPORTANT]
+          > **${COMPONENT} is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/${COMPONENT}) now.** This repository mirrors its \`crates/${COMPONENT}\` directory, without history, for one release cycle: send issues and pull requests to Selkies. ${COMPONENT} keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the wheels of each Selkies pre-release are published here as a GitHub pre-release too. The first stable Selkies release after the move is published here as a GitHub release, and the mirror stops at the stable release after it, when this repository is archived. This tree is \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}.
+
+          EOF
+            cat "../source/crates/${COMPONENT}/README.md"
+          } > README.md
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          message="chore: Mirror crates/${COMPONENT} from selkies-project/selkies@${SHA}"
+          if [ "${KIND}" = stable ]; then
+            # A stable release's commit can be older than main, which keeps the newest mirror
+            tree="$(git write-tree)"
+            commit="$(git commit-tree "${tree}" -p HEAD -m "${message}")"
+            git tag "${TAG}" "${commit}"
+            git push origin "refs/tags/${TAG}"
+          elif git diff --cached --quiet; then
+            commit="$(git rev-parse HEAD)"
+          else
+            git commit -q -m "${message}"
+            git push origin HEAD:main
+            commit="$(git rev-parse HEAD)"
+          fi
+          echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
+      - name: Publish the wheels
+        if: steps.pick.outputs.kind != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          SHA: ${{ steps.pick.outputs.sha }}
+          COMMIT: ${{ steps.mirror.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [ "${KIND}" = stable ]; then
+            cat > notes.md <<EOF
+          ${COMPONENT} ${TAG} is the ${COMPONENT} of [Selkies ${TAG}](https://github.com/${SOURCE}/releases/tag/${TAG}), built from \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}; the wheels here are the ones on PyPI.
+
+          **${COMPONENT} has moved into [selkies-project/selkies](https://github.com/${SOURCE}).** From ${TAG} on it is developed in Selkies' \`crates/${COMPONENT}\` and released with Selkies, at Selkies' version, from that repository: to PyPI as \`${COMPONENT}\`, with the same Python API, and as wheels on every Selkies release. Selkies itself links ${COMPONENT} as a Rust crate. This repository mirrors that directory until the next stable Selkies release, and stops syncing there; it is then archived. Send issues and pull requests to Selkies.
+
+          Nothing changes for an installation from PyPI. One that installs from this repository's source moves to the Selkies repository's \`crates/${COMPONENT}\`.
+          EOF
+            sed -i 's/^          //' notes.md
+            gh release create "${TAG}" -R "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
+              --notes-file notes.md --latest wheels/*
+          else
+            gh release create "selkies-${TAG}" -R "${GITHUB_REPOSITORY}" --target "${COMMIT}" \
+              --title "selkies-${TAG}" --prerelease --latest=false \
+              --notes "The ${COMPONENT} wheels of Selkies pre-release [${TAG}](https://github.com/${SOURCE}/releases/tag/${TAG}), built from \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}." \
+              wheels/*
+          fi

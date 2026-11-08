@@ -1,18 +1,21 @@
+> [!IMPORTANT]
+> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux) now.** This repository mirrors its `crates/pixelflux` directory, without history, for one release cycle: send issues and pull requests to Selkies. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the wheels of each Selkies pre-release are published here as a GitHub pre-release too. The first stable Selkies release after the move is published here as a GitHub release, and the mirror stops at the stable release after it, when this repository is archived. This tree is `crates/pixelflux` at selkies-project/selkies@98148af62.
+
 <h1 align="center">pixelflux</h1>
 
-<p align="center">Part of <a href="https://www.linuxserver.io"><img src="https://raw.githubusercontent.com/selkies-project/pixelflux/main/assets/linuxserver.svg" alt="LinuxServer.io" title="LinuxServer.io" width="182" align="middle"></a></p>
+<p align="center">Part of <a href="https://www.linuxserver.io"><img src="https://raw.githubusercontent.com/selkies-project/selkies/main/crates/pixelflux/assets/linuxserver.svg" alt="LinuxServer.io" title="LinuxServer.io" width="182" align="middle"></a></p>
 
-[![Tests](https://github.com/selkies-project/pixelflux/actions/workflows/tests.yml/badge.svg)](https://github.com/selkies-project/pixelflux/actions/workflows/tests.yml) [![Release](https://img.shields.io/github/v/release/selkies-project/pixelflux?display_name=tag)](https://github.com/selkies-project/pixelflux/releases/latest) [![PyPI](https://img.shields.io/pypi/v/pixelflux)](https://pypi.org/project/pixelflux/) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-pixelflux.selkies.io-blue)](https://pixelflux.selkies.io/) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/pixelflux)
+[![CI](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml/badge.svg)](https://github.com/selkies-project/selkies/actions/workflows/ci.yaml) [![Release](https://img.shields.io/github/v/release/selkies-project/selkies?display_name=tag)](https://github.com/selkies-project/selkies/releases/latest) [![PyPI](https://img.shields.io/pypi/v/pixelflux)](https://pypi.org/project/pixelflux/) [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0) [![Docs](https://img.shields.io/badge/docs-docs.selkies.io-blue)](https://docs.selkies.io/rustdoc/pixelflux/index.html) [![Discord](https://img.shields.io/badge/dynamic/json?logo=discord&label=Discord%20Members&query=approximate_member_count&url=https%3A%2F%2Fdiscordapp.com%2Fapi%2Finvites%2FwDNGDeSW5F%3Fwith_counts%3Dtrue)](https://discord.gg/wDNGDeSW5F) [![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/selkies-project/selkies)
 
 **A performant pixel delivery pipeline for diverse sources, blending flexible and high-performance modern encoding formats.**
 
-This module provides a Python interface to a high-performance capture library supporting both **X11** and **Wayland** environments. It captures pixel data, detects changes, and encodes modified stripes into JPEG or H.264.
+pixelflux is a high-performance capture library for both **X11** and **Wayland** environments, a Rust crate with a Python extension module built on it (the `python` feature, which the wheel turns on). It captures pixel data, detects changes, and encodes whole video frames or parallel JPEG stripes.
 
-It encodes JPEG, H.264, H.265, VP8, VP9, and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264, H.265, and AV1 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG and H.264 can be cut into stripes encoded in parallel; the other codecs stream whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so are the X11 paths that encode on the GPU: DRI3 has the X server blit the screen into GPU buffers the hardware encoder reads in place, on any server drawing on the encode GPU (NVIDIA's included), and on an NVIDIA server DRI3 cannot serve, NvFBC has the driver composite the screen straight into video memory registered with NVENC in place, so a frame is never read, written, or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
+It encodes JPEG, H.264, H.265, VP8, VP9, and AV1. Every video codec runs on NVIDIA's NVENC (H.264, H.265, AV1) or on VA-API for Intel/AMD GPUs (all five) where the GPU carries it, H.264, H.265, and AV1 additionally on a Jetson's Tegra encoder through the vendor V4L2 interface, and otherwise on the software encoder the build resolves for it: x264 or, in a GPL-free build, the BSD-licensed OpenH264 for H.264; x265 or kvazaar for H.265; libvpx for VP8 and VP9; SVT-AV1 for AV1. JPEG can be cut into stripes encoded in parallel; every video codec streams whole frames. **About "zero copy":** the Wayland GPU path is truly zero-copy (dmabuf frames flow GBM → encoder without touching system RAM), and so are the X11 paths that encode on the GPU: DRI3 has the X server blit the screen into GPU buffers the hardware encoder reads in place, on any server drawing on the encode GPU (NVIDIA's included), and on an NVIDIA server DRI3 cannot serve, NvFBC has the driver composite the screen straight into video memory registered with NVENC in place, so a frame is never read, written, or copied by the CPU. Every other X11 session copies **exactly once**: the X server renders each frame into a shared-memory surface (`XShmGetImage`); the encoder threads then read that mapped surface **in place** and pass the encoded bytes to Python through the buffer protocol without any further copies.
 
 ## Installation
 
-pixelflux is a single self-contained **Rust** extension compiled during installation. Both the X11 and Wayland backends, all encoders, and the Python API live in it. (`libjpeg-turbo` — and, in a GPL-free build, `openh264` — C sources are vendored and built by their Rust `-sys` crates, so `cmake` and `nasm` are required, but no system copies of those libraries are used.)
+pixelflux is a single self-contained **Rust** crate compiled during installation. Both the X11 and Wayland backends, all encoders, the Rust API, and the Python bridge over it live in it. (`libjpeg-turbo` — and, in a GPL-free build, `openh264` — C sources are vendored and built by their Rust `-sys` crates, so `cmake` and `nasm` are required, but no system copies of those libraries are used.)
 
 ### 1. Prerequisites
 
@@ -48,7 +51,7 @@ sudo apt-get install -y \
 
 > **Notes:** the software codec libraries are linked directly and bound at build time from the headers of the copies that are linked (`codec-sys`, through `pkg-config`), so any release from the oldest the build takes on builds: libvpx 1.11 for VP8 and VP9, SVT-AV1 1.0 for AV1, x265 3.5 for H.265 (or, in a GPL-free build, kvazaar 2.3.2, the first whose rate control belongs to each encoder rather than to the process: Ubuntu 26.04 packages it, and elsewhere build it from source as the wheel recipe does), and dav1d 1.0 and libde265 1.0.8 as the virtual camera's AV1 and HEVC decoders. Each full-frame encoder is opened once in a forked child, and `pixelflux.SOFTWARE_ENCODERS` reports which encoder each codec has in the build that runs on the machine; `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` reports the hardware half, the codecs the NVENC or VA-API of the node those two capture settings resolve to has an engine for, probed once per node. Software AV1 wants **SVT-AV1 2.3.0 or newer**, where the encoder's packet call became blocking for low delay: below it a session still encodes, but the encoder holds two frames before its first packet and every frame ships that late. `libjpeg-turbo` is vendored and built statically by its crate — **no `libturbojpeg` system package is needed** (only `cmake` + `nasm`). X11 capture uses pure-Rust XCB; colorspace conversion is pure-Rust; the NVENC/CUDA libraries and libva are loaded at runtime (no compile-time NVIDIA or VA-API packages).
 >
-> **GPL components (`libx264`, `x265`):** software H.264 uses the system `libx264` (GPL-2.0+) and software H.265 the system `x265` (GPL-2.0+), the only GPL-licensed dependencies **of pixelflux itself**. They are enabled **by default**; to build without them, set `PIXELFLUX_ENABLE_GPL=0` (or `=false`) before `pip install`. The build then substitutes the BSD-licensed Cisco OpenH264 (vendored, built from source) as the software H.264 encoder behind the very same API and wire format — striped and full-frame sessions, CRF and CBR, live bitrate/quality changes all keep working, and neither `libx264-dev` nor `libx265-dev` is required. Software H.265 follows the same switch, with the BSD-licensed kvazaar in x265's place. What you lose is 4:4:4 software H.264 and H.265: OpenH264 and kvazaar are 4:2:0-only, so `video_fullcolor` is encoded 4:2:0 on the CPU (NVENC still carries it). JPEG, NVENC, and VA-API are unaffected. `pixelflux.SOFTWARE_ENCODERS` maps each codec to the software encoder the build in use carries (`{"h264": "x264", "h265": "x265", "vp8": "libvpx", "vp9": "libvpx", "av1": "svt-av1"}` for the wheels), and a notice is printed at install time whether GPL components are enabled or not.
+> **GPL components (`libx264`, `x265`):** software H.264 uses the system `libx264` (GPL-2.0+) and software H.265 the system `x265` (GPL-2.0+), the only GPL-licensed dependencies **of pixelflux itself**. They are enabled **by default**; to build without them, set `PIXELFLUX_ENABLE_GPL=0` (or `=false`) before `pip install`. The build then substitutes the BSD-licensed Cisco OpenH264 (vendored, built from source) as the software H.264 encoder behind the very same API and wire format — CRF and CBR, live bitrate/quality changes all keep working, and neither `libx264-dev` nor `libx265-dev` is required. Software H.265 follows the same switch, with the BSD-licensed kvazaar in x265's place. What you lose is 4:4:4 software H.264 and H.265: OpenH264 and kvazaar are 4:2:0-only, so `video_fullcolor` is encoded 4:2:0 on the CPU (NVENC still carries it). JPEG, NVENC, and VA-API are unaffected. `pixelflux.SOFTWARE_ENCODERS` maps each codec to the software encoder the build in use carries (`{"h264": "x264", "h265": "x265", "vp8": "libvpx", "vp9": "libvpx", "av1": "svt-av1"}` for the wheels), and a notice is printed at install time whether GPL components are enabled or not.
 >
 > **Official wheels are always GPL-enabled** (x264 and x265 as the software H.264 and H.265 encoders); the `PIXELFLUX_ENABLE_GPL=0` path is for verified license-minimal source builds.
 
@@ -61,16 +64,16 @@ sudo apt-get install -y \
 
 **Option A: Install a prebuilt wheel**
 
-Every release on the [GitHub Releases page](https://github.com/selkies-project/pixelflux/releases) carries wheels (`manylinux_2_28` and `musllinux`, x86_64 and aarch64, CPython 3.9 and newer), the pre-releases cut per commit included; take the one for your interpreter and platform:
+Every release on the [GitHub Releases page](https://github.com/selkies-project/selkies/releases) carries one `cp311-abi3` wheel per platform (`manylinux_2_28` and `musllinux_1_2`, x86_64 and aarch64), the pre-releases cut per commit included. A wheel installs on GIL-enabled CPython 3.11 and newer on its own libc and architecture; free-threaded CPython is not supported by ordinary abi3 wheels. The stable ABI covers only the CPython extension interface, not the native codec, CUDA/NVENC, Rust, libc, OS, or CPU-architecture interfaces. Native releases publish wheels only: on CPython 3.9/3.10, build the full-CPython-API extension from a source tree with `pip wheel . --no-deps` (or `pip install .`). Package `Requires-Python: >=3.9` covers that source build; it does not make a `cp311-abi3` wheel compatible with an older interpreter.
 ```bash
-pip install ./pixelflux-<version>-cp312-cp312-manylinux_2_28_x86_64.whl
+pip install ./pixelflux-<version>-cp311-abi3-manylinux_2_28_x86_64.whl
 ```
 A wheel leaves a few libraries to the host, the ones a desktop already carries: `libgbm1`, `libpixman-1-0`, and `libxkbcommon0` on Debian and Ubuntu (`mesa-libgbm`, `pixman`, and `libxkbcommon` on Fedora and RHEL), and `libegl1` for NVENC's zero-copy dmabuf import; a musllinux wheel also takes the C++ runtime from Alpine (`apk add libstdc++ libgcc mesa-gbm pixman libxkbcommon`).
 
 **Option B: Install from local source**
 ```bash
 # From the root of the project repository
-pip install .
+pip install ./crates/pixelflux
 ```
 
 ## Usage
@@ -244,8 +247,7 @@ settings.scale = 1.0  # Fractional scaling (Wayland only)
 settings.wayland_host_display = ""                  # Capture from an EXTERNAL compositor instead of the built-in one (host-capture mode)
 
 # --- Codec ---
-# "jpeg" (striped stills), "h264" (striped, or full-frame with video_fullframe), or a
-# full-frame video codec: "h265", "vp8", "vp9", "av1"
+# "jpeg" (striped stills), or a full-frame video codec: "h264", "h265", "vp8", "vp9", "av1"
 settings.codec = "h264"
 # Force CPU encoding and ignore hardware encoders. The software encoder behind each codec
 # is the build's (pixelflux.SOFTWARE_ENCODERS): x264 or OpenH264 for H.264, x265 or kvazaar
@@ -254,8 +256,7 @@ settings.use_cpu = False
 # Software encoders thread within a frame (x264's and OpenH264's slices, x265's and
 # kvazaar's wavefront, libvpx's partitions and rows, SVT-AV1's processors, and the color
 # conversion ahead of each), on one less than the host's cores, up to four for H.264 and eight
-# otherwise; the striped encoders (H.264 without video_fullframe, JPEG) code their stripes in
-# parallel. False codes each frame on one thread, the stripes one after another, to bound what one
+# otherwise; JPEG codes its stripes in parallel. False codes each frame on one thread, the stripes one after another, to bound what one
 # capture takes of a host that runs many; a Turbo session still hashes its frame on a thread
 # beside the encode.
 settings.cpu_encode_threading = True
@@ -273,7 +274,6 @@ settings.video_paintover_crf = 18                  # Quality index a still scree
 settings.video_paintover_burst_frames = 5          # Frames sent after a cleanup or a key frame on a still screen, so rate control settles.
 settings.video_fullcolor = False                   # Use 4:4:4 chroma instead of 4:2:0 where the codec carries it (H.264 and H.265): software x264/x265 and NVENC take it, VA-API negotiates it per device.
 settings.video_bit_depth = 8                       # Bits per sample, 8 or 10: 10 where the codec has a 10-bit profile an encoder here codes (H.264 on x264; H.265, VP9, and AV1 on VA-API, x265, libvpx, and SVT-AV1; H.265 and AV1 on NVENC). An engine without it hands the session to the software encoder, as it does a 4:4:4 it lacks; OpenH264, kvazaar, and VP8 stay 8-bit. A software encoder pays for it in CPU, and the source is 8-bit, so it is recommended only with 4:4:4 (`video_fullcolor`).
-settings.video_fullframe = True                    # H.264 only: encode full frames instead of changed stripes (every other video codec is full-frame)
 settings.video_streaming_mode = False              # Bypass all VNC logic and work like a normal video encoder, higher constant CPU usage for fullscreen gaming/videos
 settings.keyframe_interval_s = 0.0                   # Periodic keyframe interval in seconds (0 = keyframes only on demand/paint-over)
 settings.video_cbr_mode = False                    # Switches to CBR mode and ignores CRF value. Used in conjunction with video_bitrate_kbps.
@@ -294,8 +294,8 @@ settings.encode_node_path = None
 settings.render_node_path = None
 
 # --- Wire Format / Zero-Copy (X11) ---
-# False (default): prepend the per-stripe header to each packet (the WebSocket path): the tag,
-# the codec and frame kind, then the frame id, the stripe's top row, its width and height, and
+# False (default): prepend the wire header to each packet (the WebSocket path): the tag,
+# the codec and frame kind, then the frame id, the top row, its width and height, and
 # the id of the frame it predicts from, all big-endian u16.
 # True: emit the raw encoded payload with no header (for a WebRTC path that frames itself).
 settings.omit_stripe_headers = False
@@ -306,7 +306,7 @@ settings.video_max_qp = 0
 settings.use_paint_over_quality = True  # Clean up a still screen at the paint-over quality, whatever video_streaming_mode sends (CBR video cleans up without it too, at video_crf)
 settings.paint_over_trigger_frames = 15 # Frames without change before a held cleanup, counted at 60 fps (a lower frame rate waits as long; a cleanup through the rate control starts on the first still frame; a screen changing only in small places gets it after four times this)
 settings.damage_block_threshold = 10    # Consecutive changes to trigger "damaged" state
-settings.damage_block_duration = 30     # Frames a stripe stays "damaged"
+settings.damage_block_duration = 30     # Frames a region stays "damaged"
 
 # --- Watermarking ---
 # Must be a bytes object. The path to your PNG image.
@@ -318,17 +318,15 @@ settings.watermark_location_enum = 4
 
 ### Raw H.264 Annex-B Output (WebCodecs)
 
-Two settings together make an H.264 capture emit bare Annex-B access units, the form a WebCodecs `VideoDecoder` takes:
+One setting makes an H.264 capture emit bare Annex-B access units, the form a WebCodecs `VideoDecoder` takes:
 
 ```python
 settings.codec = "h264"
-settings.video_fullframe = True
 settings.omit_stripe_headers = True
 ```
 
-- **`omit_stripe_headers`** drops the 12-byte header (`VIDEO_HEADER_LEN`) that otherwise precedes each payload: the tag, the codec and frame kind, the frame id, the stripe's top row, its width and height, and the id of the frame it predicts from. The payload is the encoder's bitstream and nothing else, and the metadata is carried only on the `StripeFrame` attributes (`frame_id`, `stripe_y_start`, `stripe_height`, `data_type`, `reference_frame_id`). Every encoder reads it, software, NVENC, VA-API, V4L2, and Tegra alike, and it applies to JPEG stripes as well, which then arrive as bare JFIF.
-- **`video_fullframe`** makes an H.264 capture encode whole frames instead of horizontal stripes. Without it a software H.264 session cuts the picture into stripes, and each stripe is an independent stream that only covers its own rows. The other video codecs are always full-frame, and a hardware H.264 encoder is always full-frame whatever this is set to.
-- **Together** each callback delivers one complete access unit of one picture, start-code prefixed (`b_annexb` in libx264), with `stripe_y_start` 0 and the full capture size.
+- **`omit_stripe_headers`** drops the 12-byte header (`VIDEO_HEADER_LEN`) that otherwise precedes each payload: the tag, the codec and frame kind, the frame id, the top row, its width and height, and the id of the frame it predicts from. The payload is the encoder's bitstream and nothing else, and the metadata is carried only on the `StripeFrame` attributes (`frame_id`, `stripe_y_start`, `stripe_height`, `data_type`, `reference_frame_id`). Every encoder reads it, software, NVENC, VA-API, V4L2, and Tegra alike, and it applies to JPEG stripes as well, which then arrive as bare JFIF.
+- Each callback delivers one complete access unit of one picture, start-code prefixed (`b_annexb` in libx264), with `stripe_y_start` 0 and the full capture size.
 
 Points to code against:
 
@@ -441,6 +439,35 @@ GPU, so a caller with an event loop makes the call off it.
 into a rate. They are relaxed atomics tallied once per delivered frame and read only on the
 call, so a capture nobody inspects pays nothing for them.
 
+### Rust API
+
+The Python classes are thin wrappers over the crate's public Rust API, which a Rust program uses directly with no interpreter in its build (`pixelflux = { version = "...", default-features = ... }` with the `gpl` or `openh264` feature and without `python`). The same types stand behind both bridges: `CaptureSettings` (every field of the Python class, with `wants_wayland` deciding the backend), `ScreenCapture`, `Compositor` (what `ensure_wayland_display` brings up, the Python `WaylandBackend`), `webcam::VirtualCamera`, and the module functions by their Python names. Frames, cursor images, and clipboard contents arrive through the `sink` traits, each of which a closure implements, on the same threads and with the same one-batch-in-flight handoff the Python callback has.
+
+```rust
+use std::sync::Arc;
+use pixelflux::encoders::Codec;
+use pixelflux::sink::Frame;
+use pixelflux::{CaptureSettings, ScreenCapture};
+
+let mut settings = CaptureSettings::default();
+settings.width = 1920;
+settings.height = 1080;
+settings.codec = Codec::H264;
+let capture = ScreenCapture::new();
+capture.start_capture(
+    Arc::new(|frames: Vec<Frame>| {
+        for frame in frames {
+            // frame.as_bytes() shares the encoder's buffer; frame.frame_id, frame.timing,
+            // and frame.reference_frame_id() carry what the Python attributes do.
+            send(frame.as_bytes());
+        }
+    }),
+    settings,
+)?;
+```
+
+`cargo doc --no-deps` renders the reference; every `Error` names the part that refused (settings, capture, compositor, or a capability the session lacks).
+
 ## Zero-Copy Pipeline (Wayland)
 
 The Wayland backend implements a **Zero-Copy** architecture for hardware encoding.
@@ -455,7 +482,7 @@ The Wayland backend implements a **Zero-Copy** architecture for hardware encodin
 
 For convenience, the extension ships its own fragmented-MP4 muxer (no `avformat` dependency) with the `start_recording(...)`, `stop_recording()`, and `recording_status()` Python functions, controllable through the `PIXELFLUX_RECORD*` environment variables. Recording taps the encoded full-frame H.264 stream, and HTTP endpoints allow remote trigger/stop/status.
 
-`start_recording(path, settings=None, audio_socket="")` adds an Opus audio track when `audio_socket` (or `PIXELFLUX_RECORD_AUDIO`) names a Unix socket serving an Ogg Opus stream, such as [pcmflux](https://github.com/selkies-project/pcmflux)'s `output_socket`: the recorder connects, keeps the packets as they are, and places them by their granule positions against the video clock, so the file is muxed without a decode or re-encode. `recording_status()` counts them as `audio_frames`.
+`start_recording(path, settings=None, audio_socket="")` adds an Opus audio track when `audio_socket` (or `PIXELFLUX_RECORD_AUDIO`) names a Unix socket serving an Ogg Opus stream, such as [pcmflux](../pcmflux)'s `output_socket`: the recorder connects, keeps the packets as they are, and places them by their granule positions against the video clock, so the file is muxed without a decode or re-encode. `recording_status()` counts them as `audio_frames`.
 
 ## Screenshots
 
@@ -469,7 +496,7 @@ PNGs contain 8-bit RGBA pixels. Unused alpha bytes in opaque host formats become
 
 The capture session can output the raw video stream directly to a Unix domain socket for external recording: Annex-B for H.264 and H.265, an OBU stream for AV1, and IVF for VP8 and VP9.
 
-*Note: This feature requires full-frame video encoding and does not work with JPEG or striped H.264 modes.*
+*Note: This feature requires a video codec and does not work with JPEG.*
 
 ```python
 # Enable the unix socket (forces IDR frames every 30 frames and on connect)
@@ -704,14 +731,14 @@ so no frame is converted on a CPU core.
 *   **Live changes:** the CBR target bitrate can be changed on a running session; the frame
     rate and the resolution rebuild it, as elsewhere.
 *   **Measured on a Jetson Nano** (L4T R32.6.1, four Cortex-A57 cores) in a live Selkies
-    session, against the striped software encoder on the same board: 0.17 cores at 1080p30 and
+    session, against x264 coding the frame in stripes on the same board: 0.17 cores at 1080p30 and
     0.30 at 1080p60, against 2.26 cores for x264 at 1080p30. At 4K30 it holds 29 fps on
     0.44 cores. The encode itself is 0.10 ms a frame at 1080p and 0.21 ms at 4K; what the path
     actually spends is the copy of the captured frame into the staging surface (2.8 ms at
     1080p, 9.6 ms at 4K) and the VIC conversion (1.7 ms and 5.9 ms).
 *   **Measured on an AGX Orin** (L4T R36.4.3, twelve Cortex-A78AE cores), isolated encode path
     over 200 frames: 0.05 cores at 1080p30, 0.10 at 1080p60, 0.20 at 1080p120, and 0.15 at 4K30,
-    against 0.49 cores for the striped software encoder in a live session at 1080p30. 4K60 is
+    against 0.49 cores for x264 coding the frame in stripes in a live session at 1080p30. 4K60 is
     not reachable on that board either: the VIC conversion alone is 12 ms a frame there and the
     path holds 46 fps. The conversion is pinned to the VIC rather than left at the API's
     default; both cost 4.9 ms a frame at 1080p there and the GPU 0.9 ms, and that GPU is what a
@@ -828,12 +855,12 @@ asked for.
     *   **X11:** zero-copy capture through NvFBC on the NVIDIA X driver or through DRI3 on any server whose screen lives on the GPU, else XShm capture via pure-Rust XCB with XFixes cursor and watermark compositing.
     *   **Wayland:** Modern, secure, headless compositor based on [Smithay](https://github.com/Smithay/smithay).
 *   **Flexible Encoding:**
-    *   **Software:** H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG — both with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, each linked directly; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call. `pixelflux.SOFTWARE_FULLCOLOR` and `pixelflux.hardware_fullcolor(encode_node_index, auto_gpu)` name, of those, the codecs each side encodes 4:4:4 when `video_fullcolor` asks for it, so a caller knows the chroma a session will carry before it opens one. `pixelflux.hardware_formats(encode_node_index, auto_gpu)` lists every format the node's engine encodes per codec (`"420-8"`, `"444-8"`, `"420-10"`, `"444-10"`), and `pixelflux.SOFTWARE_FORMATS` the same for each software encoder of the build, which is what `video_bit_depth` is answered from, and `ScreenCapture.stream_info` reports the `bit_depth` a session came up with.
+    *   **Software:** full-frame H.264 through x264 (incl. 4:4:4 — GPL, the default) or, in a GPL-free build, the BSD-licensed OpenH264 (4:2:0), and JPEG with multi-threaded striping; full-frame H.265 through x265 (incl. 4:4:4) or kvazaar, VP8 and VP9 through libvpx, AV1 through SVT-AV1, each linked directly; `pixelflux.SOFTWARE_ENCODERS` names the build's encoder per codec, and `pixelflux.hardware_encoders(encode_node_index, auto_gpu)` the codecs a render node's NVENC or VA-API serves, the node resolved as a capture resolves it, probed once per node at first call. `pixelflux.SOFTWARE_FULLCOLOR` and `pixelflux.hardware_fullcolor(encode_node_index, auto_gpu)` name, of those, the codecs each side encodes 4:4:4 when `video_fullcolor` asks for it, so a caller knows the chroma a session will carry before it opens one. `pixelflux.hardware_formats(encode_node_index, auto_gpu)` lists every format the node's engine encodes per codec (`"420-8"`, `"444-8"`, `"420-10"`, `"444-10"`), and `pixelflux.SOFTWARE_FORMATS` the same for each software encoder of the build, which is what `video_bit_depth` is answered from, and `ScreenCapture.stream_info` reports the `bit_depth` a session came up with.
     *   **Hardware:** NVIDIA NVENC (H.264, H.265, and AV1; incl. 4:4:4 for H.264 and H.265, ARGB-direct with matched VUI color signaling, multi-GPU containers, API-version negotiation) and VA-API (Intel/AMD; H.264, H.265, VP8, VP9, and AV1 through libva directly, loaded at runtime, the session writing the headers the driver takes packed; VA-VPP convert, per-device 4:4:4 negotiation, low-power entry points) with Zero-Copy support.
     *   **Driver-aware GPU auto-selection** via the `auto_gpu` setting.
 *   **Zero-Copy Frames (X11 & Wayland):** the native frame object (buffer protocol) hands the encoded buffer to Python with no copy, on every supported Python version (3.9 and newer).
 *   **Smart Bandwidth Management:**
-    *   **Change Detection:** Encodes only changed stripes (Software/JPEG mode).
+    *   **Change Detection:** Encodes only changed stripes (JPEG) and changed frames (video).
     *   **Paint-Over:** Cleans up a still screen once its content stops changing, even while
         `video_streaming_mode` encodes every frame: a refresh at the paint-over quality, and, at a
         constant rate on an encoder that holds a quantizer, after a large change a key frame at it
@@ -874,9 +901,9 @@ asked for.
 
 ## Development
 
-`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. The crate builds in two configurations, `cargo test --lib` (the default `gpl` feature, libx264) and `cargo test --lib --no-default-features --features openh264`, and both are expected to pass. The `#[ignore]`d `gpu_` tests run on an NVIDIA GPU with `cargo test gpu_ -- --ignored --nocapture --test-threads=1`, the `gpu_dmabuf_` ones need a render node, and the `gpu_bench_` ones print measurements. `pip wheel . --no-deps` builds the extension the way the released wheels are built (`PIXELFLUX_ENABLE_GPL=0` for the OpenH264 build), and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end suites. The `.devcontainer` installs the native dependencies the build needs.
+`AGENTS.md` carries the conventions and the invariants of this tree, for contributors and coding agents alike. The crate builds in three configurations, `cargo test --lib` (the default `gpl` feature, libx264, no Python), `cargo test --lib --features python` (the Python bridge), and `cargo test --lib --no-default-features --features openh264`, and all are expected to pass. The `#[ignore]`d `gpu_` tests run on an NVIDIA GPU with `cargo test gpu_ -- --ignored --nocapture --test-threads=1`, the `gpu_dmabuf_` ones need a render node, and the `gpu_bench_` ones print measurements. `pip wheel . --no-deps` builds the extension the way the released wheels are built (`PIXELFLUX_ENABLE_GPL=0` for the OpenH264 build), and that wheel installed into a [selkies](https://github.com/selkies-project/selkies) checkout set up as its development documentation describes puts the change under the end-to-end suites. Selkies' root `.devcontainer` installs the native dependencies the build needs.
 
-Releases are cut by running the [Release](https://github.com/selkies-project/pixelflux/actions/workflows/release.yml) workflow from the Actions tab, **Run workflow** with **Use workflow from** on `main` and the tag, or by pushing the tag. A run releases the commit it started from: a new tag is created on it once the checks pass, and a tag that already exists has to be on it, so an earlier commit's tag is released by a run started from that tag. The `latest` input decides the "Latest" badge: `auto` gives it to a release and not to a pre-release, `never` holds it back for a fix to an older series, and `always` gives it to a pre-release as well. The tag is the version the wheels carry, a PEP 440 one such as `2.1.0` or `2.1.0rc1`, and its notes are `release-notes/<tag>.md`, or for a pre-release the notes of the release it leads to. The `pypi` input decides whether the wheels go to PyPI as well: `auto` publishes a release designated as the latest and no pre-release.
+Selkies' [Release](https://github.com/selkies-project/selkies/actions/workflows/release.yaml) workflow builds pixelflux from `crates/pixelflux` and attaches its CPython 3.11+ `cp311-abi3` wheels beside the server artifacts. The tag stamps this crate's literal Cargo version, its standalone lock, and the root lock together. `release-published.yaml` uploads the wheels through PyPI trusted publishing. Before the standalone repository and its Pages site can be archived, a maintainer must register the pixelflux trusted publisher for Selkies' `release-published.yaml` and `pypi` environment and migrate the old documentation destination; neither external registration nor archival is performed by this source tree.
 
 ## License
 
@@ -885,4 +912,4 @@ A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
 
 Note that the default build links the GPL-2.0+ `libx264` as its software H.264 encoder and the GPL-2.0+ x265 for H.265; build with `PIXELFLUX_ENABLE_GPL=0` to exclude every GPL-licensed component (the BSD-licensed OpenH264 and kvazaar then take their places).
 
-[LICENSES.md](LICENSES.md) inventories every third-party component of both builds (crates, linked and vendored native libraries, what is loaded at run time) with its license, and describes the check (`scripts/check-licenses.py`, `pixelflux/deny.toml`, the `Licenses` workflow) that keeps the non-GPL build free of copyleft code.
+[LICENSES.md](LICENSES.md) inventories every third-party component of both builds (crates, linked and vendored native libraries, what is loaded at run time) with its license, and describes the check (`scripts/check-licenses.py`, `deny.toml`, the root license checks) that keeps the non-GPL build free of copyleft code.
