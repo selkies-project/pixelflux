@@ -4,13 +4,13 @@
 #
 # Mirror crates/pixelflux of selkies-project/selkies, where the library is
 # developed and released now. The newest Selkies pre-release carrying this
-# library's wheels names the commit: that commit's crate replaces this
-# repository's tree on main, without its history, README.md opening with the
-# transition note, and the wheels, checked against the pre-release's
-# SHA256SUMS, become a pre-release here. The first stable Selkies release past
-# LEGACY_VERSION is published here as a stable GitHub release, not to PyPI,
-# with the transition notes; at the stable release after it the mirror stops. The
-# repository is archived before Selkies 2.4.0.
+# library's wheels names the commit whose crate replaces this repository's tree
+# on main, without its history, README.md opening with the transition note; no
+# pre-release is published here. The first stable Selkies release past
+# LEGACY_VERSION is published here as a stable GitHub release with its wheels,
+# checked against its SHA256SUMS, not to PyPI, with the transition notes; at the
+# stable release after it the mirror stops. The repository is archived before
+# Selkies 2.4.0.
 name: Sync from Selkies
 
 on:
@@ -78,10 +78,6 @@ jobs:
               echo "No Selkies pre-release carries ${COMPONENT} wheels yet."
               exit 0
             fi
-            if gh release view "selkies-${tag}" -R "${GITHUB_REPOSITORY}" > /dev/null 2>&1; then
-              echo "selkies-${tag} is mirrored already."
-              exit 0
-            fi
             kind=prerelease
           fi
           sha="$(gh api "repos/${SOURCE}/commits/${tag}" --jq .sha)"
@@ -96,9 +92,10 @@ jobs:
           repository: selkies-project/selkies
           ref: ${{ steps.pick.outputs.sha }}
           path: source
+          sparse-checkout: crates/${{ env.COMPONENT }}
           persist-credentials: false
       - name: Take the release's wheels
-        if: steps.pick.outputs.kind != ''
+        if: steps.pick.outputs.kind == 'stable'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.pick.outputs.tag }}
@@ -130,7 +127,7 @@ jobs:
           {
             cat <<EOF
           > [!IMPORTANT]
-          > **${COMPONENT} is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/${COMPONENT}). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' \`crates/${COMPONENT}\` directory, without history, and will be archived before Selkies 2.4.0. ${COMPONENT} keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; each Selkies pre-release's wheels are published here as a GitHub pre-release, and the first stable Selkies release with ${COMPONENT} in it as a GitHub release. This tree is \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}.
+          > **${COMPONENT} is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/${COMPONENT}). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' \`crates/${COMPONENT}\` directory, without history, and will be archived before Selkies 2.4.0. ${COMPONENT} keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with ${COMPONENT} in it is published here as a GitHub release. This tree is \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}.
 
           EOF
             cat "../source/crates/${COMPONENT}/README.md"
@@ -145,7 +142,9 @@ jobs:
             commit="$(git commit-tree "${tree}" -p HEAD -m "${message}")"
             git tag "${TAG}" "${commit}"
             git push origin "refs/tags/${TAG}"
-          elif git diff --cached --quiet; then
+          elif git diff --cached --quiet -- . ':!README.md'; then
+            # The crate as mirrored already: no commit for the README's line alone
+            git reset -q --hard HEAD
             commit="$(git rev-parse HEAD)"
           else
             git commit -q -m "${message}"
@@ -154,29 +153,20 @@ jobs:
           fi
           echo "commit=${commit}" >> "${GITHUB_OUTPUT}"
       - name: Publish the wheels
-        if: steps.pick.outputs.kind != ''
+        if: steps.pick.outputs.kind == 'stable'
         env:
           GH_TOKEN: ${{ github.token }}
-          KIND: ${{ steps.pick.outputs.kind }}
           TAG: ${{ steps.pick.outputs.tag }}
           SHA: ${{ steps.pick.outputs.sha }}
-          COMMIT: ${{ steps.mirror.outputs.commit }}
         run: |
           set -euo pipefail
-          if [ "${KIND}" = stable ]; then
-            cat > notes.md <<EOF
+          cat > notes.md <<EOF
           ${COMPONENT} ${TAG} is the ${COMPONENT} of [Selkies ${TAG}](https://github.com/${SOURCE}/releases/tag/${TAG}), built from \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}; the wheels here are the ones on PyPI.
 
           **${COMPONENT} has moved into [selkies-project/selkies](https://github.com/${SOURCE}).** From ${TAG} on it is developed in Selkies' \`crates/${COMPONENT}\` and released with Selkies, at Selkies' version, from that repository: to PyPI as \`${COMPONENT}\`, with the same Python API, and as wheels on every Selkies release. Selkies itself links ${COMPONENT} as a Rust crate. This repository mirrors that directory until it is archived, before Selkies 2.4.0. Open issues and pull requests in Selkies.
 
           Nothing changes for an installation from PyPI. One that installs from this repository's source moves to the Selkies repository's \`crates/${COMPONENT}\`.
           EOF
-            sed -i 's/^          //' notes.md
-            gh release create "${TAG}" -R "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
-              --notes-file notes.md --latest wheels/*
-          else
-            gh release create "selkies-${TAG}" -R "${GITHUB_REPOSITORY}" --target "${COMMIT}" \
-              --title "selkies-${TAG}" --prerelease --latest=false \
-              --notes "The ${COMPONENT} wheels of Selkies pre-release [${TAG}](https://github.com/${SOURCE}/releases/tag/${TAG}), built from \`crates/${COMPONENT}\` at selkies-project/selkies@${SHA}." \
-              wheels/*
-          fi
+          sed -i 's/^          //' notes.md
+          gh release create "${TAG}" -R "${GITHUB_REPOSITORY}" --verify-tag --title "${TAG}" \
+            --notes-file notes.md --latest wheels/*
