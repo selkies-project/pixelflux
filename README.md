@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@737808616358250ee8708776f10c7129e247bb6e.
+> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@d5e09f395869ace43361ba9a40fadf7e9ffafa2f.
 
 <h1 align="center">pixelflux</h1>
 
@@ -555,7 +555,7 @@ and, for inter-coded codecs, waits for the next keyframe rather than decoding ag
 
 ## Computer Use Interface (X11 and Wayland)
 
-Both backends implement the [Anthropic Computer Use specification](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo), providing an HTTP API for AI agents to control the desktop. On Wayland the compositor injects input natively; on X11 the existing display is driven through XTEST with root-window screenshots. Enable it by setting the `PIXELFLUX_CU` environment variable to the port the server should listen on:
+Both backends implement the [Anthropic Computer Use specification](https://github.com/anthropics/claude-quickstarts/tree/main/computer-use-demo), providing an API for AI agents to control the desktop. On Wayland the compositor injects input natively; on X11 the existing display is driven through XTEST with root-window screenshots. The actions and the recorder's commands are library functions with no transport in them (`computer_use::action`, `record_start`, `record_stop`, `record_status`), which a Rust host serves from its own HTTP server, as Selkies does on its routes. The Python package carries a small HTTP server over the same functions (the `computer-use-server` cargo feature, part of `python`). Enable it by setting the `PIXELFLUX_CU` environment variable to the port the server should listen on:
 
 ```bash
 export PIXELFLUX_CU=5000
