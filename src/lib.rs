@@ -798,6 +798,17 @@ pub enum ThreadCommand {
     ListWindows {
         reply: std::sync::mpsc::Sender<Vec<WindowDesc>>,
     },
+    /// Reply with the desktop as the installed window policy holds it; `None` without one.
+    DesktopView {
+        reply: std::sync::mpsc::Sender<Option<wm::DesktopView>>,
+    },
+    /// Hand the installed window policy a request about a window it placed, as a taskbar
+    /// would; reply whether a policy took it.
+    WindowRequest {
+        id: wm::WindowId,
+        request: wm::Request,
+        reply: std::sync::mpsc::Sender<bool>,
+    },
     SetCursorCallback(Option<Arc<dyn crate::sink::CursorSink>>),
     SetClipboardCallback(Arc<dyn crate::sink::ClipboardSink>),
     /// Install the window policy that manages the compositor's windows from here on.
@@ -4897,11 +4908,8 @@ fn render_node_tick(
 
     // The cursor is composited only on the output the pointer is on, at that output's
     // scale; its position is output-local.
-    let pointer_local: Option<Point<f64, smithay::utils::Logical>> = state
-        .seat
-        .get_pointer()
-        .map(|p| p.current_location())
-        .and_then(|pos| {
+    let pointer_local: Option<Point<f64, smithay::utils::Logical>> =
+        state.pointer_shown_at().and_then(|pos| {
             let rect = Rectangle::<f64, smithay::utils::Logical>::new(
                 origin.to_f64(),
                 (logical_w, logical_h).into(),
@@ -7283,6 +7291,13 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 };
                 let _ = reply.send(ok);
             }
+            ThreadCommand::DesktopView { reply } => {
+                let _ = reply.send(wayland::wm::view(state));
+            }
+            ThreadCommand::WindowRequest { id, request, reply } => {
+                let known = wayland::wm::rect_of(state, id).is_some();
+                let _ = reply.send(known && wayland::wm::request(state, id, request));
+            }
             ThreadCommand::ListWindows { reply } => {
                 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
                 let mut list = Vec::new();
@@ -7614,7 +7629,12 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 let serial = next_serial();
 
                 if let Some(pointer) = state.seat.get_pointer() {
-                    let current_pos = pointer.current_location();
+                    // A delta adds to where the policy last took the pointer while it takes
+                    // it: under a client's grab (the press that starts a frame drag) the seat
+                    // is not moved, and adding to the seat would start every delta of the
+                    // drag from where it began.
+                    let current_pos =
+                        wayland::wm::judged_location(state, pointer.current_location());
                     let event = RelativeMotionEvent {
                         time,
                         delta: (dx, dy).into(),
@@ -7637,10 +7657,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let new_pos =
                         state.clamp_logical((current_pos.x + dx, current_pos.y + dy).into());
 
-                    let under = state
-                        .space
-                        .element_under(new_pos)
-                        .map(|(window, loc)| (FocusTarget::Window(window.clone()), loc.to_f64()));
+                    let under = state.pointer_target_under(new_pos);
                     if wayland::wm::pointer(
                         state,
                         crate::wm::PointerKind::Motion,
@@ -7802,8 +7819,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     {
                         return;
                     }
-                    let (_, _, scale) =
-                        state.layout_logical_to_physical_scaled(pointer.current_location());
+                    let (_, _, scale) = state.layout_logical_to_physical_scaled(pos);
                     let mut frame = AxisFrame::new(time).source(AxisSource::Finger);
                     if dx != 0.0 {
                         frame = frame.value(Axis::Horizontal, dx / scale);
@@ -7987,9 +8003,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             }
             ThreadCommand::CuCursorPosition { resp } => {
                 let pos = state
-                    .seat
-                    .get_pointer()
-                    .map(|p| p.current_location())
+                    .pointer_shown_at()
                     .unwrap_or_else(|| (0.0f64, 0.0f64).into());
                 let _ = resp.send(state.layout_logical_to_physical(pos));
             }
@@ -8283,9 +8297,9 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         state.process_pending_clipboard_read();
         state.flush_pending_cursor();
         if state.host.is_none()
-            && let Some(pointer) = state.seat.get_pointer()
+            && let Some(at) = state.pointer_shown_at()
         {
-            let (x, y, scale) = state.layout_logical_to_physical_scaled(pointer.current_location());
+            let (x, y, scale) = state.layout_logical_to_physical_scaled(at);
             state
                 .pointer_share
                 .publish(crate::wayland::frontend::PointerAt {
@@ -8620,6 +8634,34 @@ impl Compositor {
         Ok(reply_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap_or_default())
+    }
+
+    /// The desktop as the installed window policy holds it: every window's place, state, and
+    /// stacking. `None` with no policy installed, or where the compositor does not answer.
+    pub fn desktop_view(&self) -> Result<Option<wm::DesktopView>, Error> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ThreadCommand::DesktopView { reply: reply_tx })
+            .map_err(|e| Error::Compositor(format!("Failed to describe the desktop: {e}")))?;
+        Ok(reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default())
+    }
+
+    /// Ask the installed window policy to act on a window (activate, close, minimize, and the
+    /// like), as a taskbar asks. False with no policy installed, for a window the policy has
+    /// not placed, or where the compositor does not answer; the policy decides what becomes of
+    /// the request.
+    pub fn window_request(&self, id: wm::WindowId, request: wm::Request) -> Result<bool, Error> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.send(ThreadCommand::WindowRequest {
+            id,
+            request,
+            reply: reply_tx,
+        })
+        .map_err(|e| Error::Compositor(format!("Failed to send a window request: {e}")))?;
+        Ok(reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or(false))
     }
 
     /// Recreate the cursor theme at `size` pixels — no restart: subsequent named-cursor
@@ -9272,6 +9314,18 @@ pub fn install_window_policy(policy: Box<dyn crate::wm::WindowPolicy>) -> Result
     running_compositor()
         .ok_or_else(|| Error::Compositor("no compositor is running".to_string()))?
         .install_window_policy(policy)
+}
+
+/// The desktop as the window policy installed on the running compositor holds it; `None` where
+/// no compositor runs or none has a policy.
+pub fn desktop_view() -> Option<wm::DesktopView> {
+    running_compositor()?.desktop_view().ok().flatten()
+}
+
+/// Ask the window policy installed on the running compositor to act on a window; false where
+/// no compositor runs or none has a policy.
+pub fn window_request(id: wm::WindowId, request: wm::Request) -> bool {
+    running_compositor().is_some_and(|be| be.window_request(id, request).unwrap_or(false))
 }
 
 /// Start Xwayland on the running compositor; `notify` is told the display number.
