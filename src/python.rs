@@ -230,6 +230,10 @@ pub(crate) fn extract_settings(settings: &Bound<'_, PyAny>) -> PyResult<CaptureS
 /// where a path does not stamp them.
 #[pyclass]
 struct StripeFrame {
+    #[expect(
+        clippy::rc_buffer,
+        reason = "the encoder's buffer as it hands it over; an `Arc<[u8]>` would copy every frame"
+    )]
     data: Arc<Vec<u8>>,
     #[pyo3(get, set)]
     data_type: i32,
@@ -255,6 +259,10 @@ impl StripeFrame {
     /// Hot-path constructor: shares the encoder's buffer by `Arc` (no copy) and carries stripe
     /// metadata as attributes, so the consumer can read it without parsing a header
     /// (required for omit_stripe_headers).
+    #[expect(
+        clippy::rc_buffer,
+        reason = "the encoder's buffer as it hands it over; an `Arc<[u8]>` would copy every frame"
+    )]
     fn new_owned_meta(
         data: Arc<Vec<u8>>,
         data_type: i32,
@@ -1395,7 +1403,7 @@ impl PyScreenCapture {
     /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
     fn type_text_wayland(&self, py: Python<'_>, display: String, text: String) -> PyResult<()> {
         let c = self.0.clone();
-        py.detach(move || c.type_text_wayland(display, text))
+        py.detach(move || c.type_text_wayland(&display, &text))
             .map_err(PyErr::from)
     }
 
@@ -1409,7 +1417,7 @@ impl PyScreenCapture {
         keysyms: Vec<u32>,
     ) -> PyResult<()> {
         let c = self.0.clone();
-        py.detach(move || c.type_keysyms_wayland(display, keysyms))
+        py.detach(move || c.type_keysyms_wayland(&display, &keysyms))
             .map_err(PyErr::from)
     }
 
@@ -1426,7 +1434,7 @@ impl PyScreenCapture {
         index: usize,
     ) -> PyResult<bool> {
         let c = self.0.clone();
-        py.detach(move || c.set_app_output_scale(display, scale, index))
+        py.detach(move || c.set_app_output_scale(&display, scale, index))
             .map_err(PyErr::from)
     }
 
@@ -1449,7 +1457,7 @@ impl PyScreenCapture {
         index: usize,
     ) -> PyResult<bool> {
         let c = self.0.clone();
-        py.detach(move || c.set_app_screen_geometry(display, width, height, scale, index))
+        py.detach(move || c.set_app_screen_geometry(&display, width, height, scale, index))
             .map_err(PyErr::from)
     }
 
@@ -1467,7 +1475,7 @@ impl PyScreenCapture {
         rects: Vec<(i32, i32, i32, i32)>,
     ) -> PyResult<usize> {
         let c = self.0.clone();
-        py.detach(move || c.set_app_screen_layout(display, rects))
+        py.detach(move || c.set_app_screen_layout(&display, rects))
             .map_err(PyErr::from)
     }
 
@@ -1483,7 +1491,7 @@ impl PyScreenCapture {
         display: String,
     ) -> PyResult<Vec<crate::wayland::AppScreen>> {
         let c = self.0.clone();
-        py.detach(move || c.list_app_screens(display))
+        py.detach(move || c.list_app_screens(&display))
             .map_err(PyErr::from)
     }
 
@@ -1494,7 +1502,7 @@ impl PyScreenCapture {
     /// when a display asks for one (`add_app_screen` refuses one that does not).
     fn app_screen_control_offered(&self, py: Python<'_>, display: String) -> PyResult<bool> {
         let c = self.0.clone();
-        py.detach(move || c.app_screen_control_offered(display))
+        py.detach(move || c.app_screen_control_offered(&display))
             .map_err(PyErr::from)
     }
 
@@ -1513,7 +1521,7 @@ impl PyScreenCapture {
         scale: f64,
     ) -> PyResult<()> {
         let c = self.0.clone();
-        py.detach(move || c.add_app_screen(display, name, width, height, scale))
+        py.detach(move || c.add_app_screen(&display, &name, width, height, scale))
             .map_err(PyErr::from)
     }
 
@@ -1522,7 +1530,7 @@ impl PyScreenCapture {
     /// such screen is held.
     fn remove_app_screen(&self, py: Python<'_>, name: String) -> PyResult<bool> {
         let c = self.0.clone();
-        py.detach(move || c.remove_app_screen(name))
+        py.detach(move || c.remove_app_screen(&name))
             .map_err(PyErr::from)
     }
 
@@ -1539,14 +1547,14 @@ impl PyScreenCapture {
         height: i32,
     ) -> PyResult<usize> {
         let c = self.0.clone();
-        py.detach(move || c.hold_spare_app_screens(display, keep, width, height))
+        py.detach(move || c.hold_spare_app_screens(&display, keep, width, height))
             .map_err(PyErr::from)
     }
 
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
     fn clipboard_types_app(&self, py: Python<'_>, display: String) -> PyResult<Vec<String>> {
         let c = self.0.clone();
-        py.detach(move || c.clipboard_types_app(display))
+        py.detach(move || c.clipboard_types_app(&display))
             .map_err(PyErr::from)
     }
 
@@ -1560,7 +1568,7 @@ impl PyScreenCapture {
     ) -> PyResult<Option<Py<pyo3::types::PyBytes>>> {
         let c = self.0.clone();
         let data = py
-            .detach(move || c.clipboard_read_app(display, mime))
+            .detach(move || c.clipboard_read_app(&display, &mime))
             .map_err(PyErr::from)?;
         Ok(data.map(|d| pyo3::types::PyBytes::new(py, &d).unbind()))
     }
@@ -1574,7 +1582,7 @@ impl PyScreenCapture {
         entries: Vec<(String, Vec<u8>)>,
     ) -> PyResult<()> {
         let c = self.0.clone();
-        py.detach(move || c.clipboard_write_app(display, entries))
+        py.detach(move || c.clipboard_write_app(&display, entries))
             .map_err(PyErr::from)
     }
 
@@ -1589,7 +1597,7 @@ impl PyScreenCapture {
     /// Drop the app compositor's selection.
     fn clipboard_clear_app(&self, py: Python<'_>, display: String) -> PyResult<()> {
         let c = self.0.clone();
-        py.detach(move || c.clipboard_clear_app(display))
+        py.detach(move || c.clipboard_clear_app(&display))
             .map_err(PyErr::from)
     }
 
@@ -1605,14 +1613,14 @@ impl PyScreenCapture {
     ) -> PyResult<()> {
         let watch: Arc<dyn crate::sink::SelectionWatch> = Arc::new(PySelectionWatch::new(callback));
         let c = self.0.clone();
-        py.detach(move || c.clipboard_watch_app(display, watch))
+        py.detach(move || c.clipboard_watch_app(&display, watch))
             .map_err(PyErr::from)
     }
 
     /// Stop the selection watch for `display` (no-op without one).
     fn clipboard_unwatch_app(&self, py: Python<'_>, display: String) {
         let c = self.0.clone();
-        py.detach(move || c.clipboard_unwatch_app(display))
+        py.detach(move || c.clipboard_unwatch_app(&display))
     }
 
     /// The move's number (`pointer_location`), or None without a running compositor.
@@ -1953,7 +1961,7 @@ fn py_probe_wayland_gpu(
     render_node: String,
     auto_gpu: String,
 ) -> PyResult<Py<PyAny>> {
-    let probe = py.detach(|| super::probe_wayland_gpu(render_node, auto_gpu));
+    let probe = py.detach(|| super::probe_wayland_gpu(&render_node, &auto_gpu));
     let d = pyo3::types::PyDict::new(py);
     d.set_item("node", &probe.node)?;
     d.set_item("accelerated", probe.accelerated)?;

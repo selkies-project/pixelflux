@@ -75,10 +75,10 @@ impl Rect {
 
     /// Whether the point, in continuous coordinates, lies inside.
     pub fn contains_f64(&self, x: f64, y: f64) -> bool {
-        x >= self.x as f64
-            && y >= self.y as f64
-            && x < self.right() as f64
-            && y < self.bottom() as f64
+        x >= f64::from(self.x)
+            && y >= f64::from(self.y)
+            && x < f64::from(self.right())
+            && y < f64::from(self.bottom())
     }
 
     /// The overlap with another rectangle, empty when they are apart.
@@ -405,7 +405,8 @@ pub enum PointerKind {
 pub struct Under {
     /// The window whose client area, or whose popup, lies under the point.
     pub window: Option<WindowId>,
-    /// Whether a panel or an overlay surface lies under the point.
+    /// Whether a panel, an overlay surface, or a popup (an xdg popup or an X11
+    /// override-redirect window) lies under the point.
     pub top_layer: bool,
     /// Whether a desktop's wallpaper surface lies under the point: a background or bottom
     /// layer surface, the Wayland shape of an X11 desktop window, so a click there is the

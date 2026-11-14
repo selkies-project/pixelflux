@@ -457,7 +457,7 @@ pub fn list_screens(socket_path: &str) -> Result<Vec<super::AppScreen>, String> 
 /// were positioned; 0 when the compositor serves no `kde_output_management_v2`.
 pub fn set_screen_layout(
     socket_path: &str,
-    rects: Vec<(i32, i32, i32, i32)>,
+    rects: &[(i32, i32, i32, i32)],
 ) -> Result<usize, String> {
     if rects.iter().any(|(_, _, w, h)| *w <= 0 || *h <= 0) {
         return Err("a screen rectangle has a non-positive size".to_string());
@@ -471,12 +471,12 @@ pub fn set_screen_layout(
     let n = order.len().min(rects.len());
     let sizes: Vec<(i32, i32)> = order
         .iter()
-        .zip(&rects)
+        .zip(rects)
         .map(|(&i, r)| {
             let scale = state.devices[i].scale;
             (
-                (r.2 as f64 / scale).round() as i32,
-                (r.3 as f64 / scale).round() as i32,
+                (f64::from(r.2) / scale).round() as i32,
+                (f64::from(r.3) / scale).round() as i32,
             )
         })
         .collect();

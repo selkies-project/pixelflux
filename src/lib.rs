@@ -282,8 +282,8 @@ fn push_window_elements<R>(
                 .map(CompositionElements::Cursor),
             );
         }
-        let sx = effect.rect.w as f64 / geometry.size.w.max(1) as f64;
-        let sy = effect.rect.h as f64 / geometry.size.h.max(1) as f64;
+        let sx = f64::from(effect.rect.w) / f64::from(geometry.size.w.max(1));
+        let sy = f64::from(effect.rect.h) / f64::from(geometry.size.h.max(1));
         let target: Point<i32, smithay::utils::Logical> =
             (effect.rect.x - origin.x, effect.rect.y - origin.y).into();
         let origin_phys = target.to_physical_precise_round(scale);
@@ -1727,7 +1727,7 @@ fn wayland_encode_loop<B: WlPayload>(
         if cfg.controls.rate_dirty.swap(false, Ordering::Acquire) {
             settings.video_bitrate_kbps = cfg.controls.bitrate_kbps.load(Ordering::Relaxed);
             settings.video_vbv_multiplier =
-                cfg.controls.vbv_mult_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+                f64::from(cfg.controls.vbv_mult_milli.load(Ordering::Relaxed)) / 1000.0;
             let fps = f64::from_bits(cfg.controls.fps_bits.load(Ordering::Relaxed));
             if fps > 0.0 {
                 settings.target_fps = fps;
@@ -1821,11 +1821,11 @@ fn wayland_encode_loop<B: WlPayload>(
                     }
                     match f.shm.as_ref() {
                         Some(shm) => encode_shm_rows(shm, width, height, |rows| {
-                            encoder.encode_host(
+                            encoder.encode_client_host(
                                 rows,
                                 (width.max(0) as usize) * 4,
                                 cfg.use_gpu,
-                                f.frame_id as u64,
+                                u64::from(f.frame_id),
                                 decision.target_qp,
                                 force_idr,
                             )
@@ -1835,13 +1835,13 @@ fn wayland_encode_loop<B: WlPayload>(
                             encoder,
                             width,
                             cfg.use_gpu,
-                            f.frame_id as u64,
+                            u64::from(f.frame_id),
                             decision.target_qp,
                             force_idr,
                         ),
                     }
                 } else {
-                    encoder.push_held(f.frame_id as u64)
+                    encoder.push_held(u64::from(f.frame_id))
                 };
                 crate::pipeline::refinement_coded(
                     &mut hw_state,
@@ -1873,7 +1873,7 @@ fn wayland_encode_loop<B: WlPayload>(
                                     codec: settings.codec,
                                     stripe_y_start: 0,
                                     stripe_height: height,
-                                    frame_id: id as i32,
+                                    frame_id: i32::from(id),
                                     timing: FrameTiming {
                                         capture_ns: f.captured_ns,
                                         encode_start_ns,
@@ -2267,7 +2267,7 @@ mod stream_settings_line_tests {
             line(
                 &CaptureSettings {
                     video_cbr_mode: true,
-                    ..crf.clone()
+                    ..crf
                 },
                 None
             )
@@ -2613,8 +2613,8 @@ where
         elements.push(CompositionElements::Cursor(elem));
     }
     let logical: Size<i32, Logical> = (
-        (scene.size.0 as f64 / scale).round() as i32,
-        (scene.size.1 as f64 / scale).round() as i32,
+        (f64::from(scene.size.0) / scale).round() as i32,
+        (f64::from(scene.size.1) / scale).round() as i32,
     )
         .into();
     elements.extend(
@@ -2739,8 +2739,9 @@ where
     if surface.transform() != Transform::Normal {
         return Err("the buffer is transformed");
     }
-    let buffer_full =
-        Rectangle::<f64, smithay::utils::Buffer>::from_size((size.0 as f64, size.1 as f64).into());
+    let buffer_full = Rectangle::<f64, smithay::utils::Buffer>::from_size(
+        (f64::from(size.0), f64::from(size.1)).into(),
+    );
     if surface.src() != buffer_full {
         return Err("the buffer is scaled or cropped");
     }
@@ -3100,7 +3101,7 @@ fn bootstrap_readback_pool(
     c.link_kbps
         .store(settings.video_link_kbps, Ordering::Relaxed);
     let cfg = WlEncodeConfig {
-        settings: settings.clone(),
+        settings,
         display_id,
         use_gpu,
         try_gpu,
@@ -3441,7 +3442,7 @@ fn start_capture_on_display(
                 settings.width = current_w;
                 settings.height = current_h;
                 settings.scale = current_scale;
-                settings.target_fps = current_refresh as f64 / 1000.0;
+                settings.target_fps = f64::from(current_refresh) / 1000.0;
             } else {
                 println!(
                     "[Wayland] Configuring Output {} ({}): {}x{} @ {:.2} FPS (Scale {:.2})",
@@ -3887,7 +3888,7 @@ fn compose_host_frame(
     frame
         .render_texture_from_to(
             &tex,
-            Rectangle::from_size((size.0 as f64, size.1 as f64).into()),
+            Rectangle::from_size((f64::from(size.0), f64::from(size.1)).into()),
             full,
             &[full],
             // Opaque: the capture format's undefined alpha must not blend, it
@@ -4768,8 +4769,8 @@ fn render_node_tick(
         node.view_size = (width, height);
         node.view_scale = output_scale_val;
     }
-    let logical_w = (width as f64 / output_scale_val).round();
-    let logical_h = (height as f64 / output_scale_val).round();
+    let logical_w = (f64::from(width) / output_scale_val).round();
+    let logical_h = (f64::from(height) / output_scale_val).round();
 
     // A reconfigured or freshly created output composites its clear color wherever a client
     // has not yet answered the new size; publishing is held until one covers the output so
@@ -5267,7 +5268,7 @@ fn render_node_tick(
     // readback encode reads in place.
     let mut scanout_hold: Option<SurfaceBuffer> = None;
     let mut shm_hold: Option<SurfaceBuffer> = None;
-    let cursor_time = Duration::from_millis(state.clock.now().as_millis() as u64);
+    let cursor_time = Duration::from_millis(u64::from(state.clock.now().as_millis()));
     let drag_icon = state
         .dnd_icon
         .as_ref()
@@ -5827,8 +5828,18 @@ fn render_node_tick(
 /// touching edges do not count and empty (non-positive-dimension) rectangles never
 /// overlap anything. Arithmetic is widened so extreme coordinates cannot wrap.
 fn rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
-    let (ax, ay, aw, ah) = (a.0 as i64, a.1 as i64, a.2 as i64, a.3 as i64);
-    let (bx, by, bw, bh) = (b.0 as i64, b.1 as i64, b.2 as i64, b.3 as i64);
+    let (ax, ay, aw, ah) = (
+        i64::from(a.0),
+        i64::from(a.1),
+        i64::from(a.2),
+        i64::from(a.3),
+    );
+    let (bx, by, bw, bh) = (
+        i64::from(b.0),
+        i64::from(b.1),
+        i64::from(b.2),
+        i64::from(b.3),
+    );
     aw > 0
         && ah > 0
         && bw > 0
@@ -5907,8 +5918,8 @@ fn create_output_on(
         }
     }
     let logical_size = (
-        (width as f64 / scale).round() as i32,
-        (height as f64 / scale).round() as i32,
+        (f64::from(width) / scale).round() as i32,
+        (f64::from(height) / scale).round() as i32,
     );
     if let Some((oid, flavor, other)) = find_output_overlap(
         &state.output_nodes,
@@ -6323,8 +6334,8 @@ fn configure_windows_for_mode(
     scale: f64,
 ) {
     let scale = scale.max(0.1);
-    let logical_width = (width as f64 / scale).round() as i32;
-    let logical_height = (height as f64 / scale).round() as i32;
+    let logical_width = (f64::from(width) / scale).round() as i32;
+    let logical_height = (f64::from(height) / scale).round() as i32;
     announce_scale_to_windows(state, display_id, output, scale);
     for window in windows_on_display(state, display_id, output) {
         if let Some(toplevel) = window.toplevel() {
@@ -7508,14 +7519,14 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     .map(|kb| {
                         let pressed: Vec<u32> = kb.pressed_keys().iter().map(|c| c.raw()).collect();
                         let m = kb.modifier_state();
-                        let mask = (m.ctrl as u32)
-                            | (m.shift as u32) << 1
-                            | (m.alt as u32) << 2
-                            | (m.logo as u32) << 3
-                            | (m.caps_lock as u32) << 4
-                            | (m.num_lock as u32) << 5
-                            | (m.iso_level3_shift as u32) << 6
-                            | (m.iso_level5_shift as u32) << 7;
+                        let mask = u32::from(m.ctrl)
+                            | u32::from(m.shift) << 1
+                            | u32::from(m.alt) << 2
+                            | u32::from(m.logo) << 3
+                            | u32::from(m.caps_lock) << 4
+                            | u32::from(m.num_lock) << 5
+                            | u32::from(m.iso_level3_shift) << 6
+                            | u32::from(m.iso_level5_shift) << 7;
                         (pressed, mask)
                     })
                     .unwrap_or_default();
@@ -7580,6 +7591,15 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                         return;
                     }
 
+                    // A client reads a repeated position between a press and its release as a
+                    // drag, so under the policy, whose seat Xwayland meets directly, a motion
+                    // that moves nothing is dropped, as a nested wlroots session drops it.
+                    if wayland::wm::active(state)
+                        && pointer.current_location() == p
+                        && pointer.current_focus() == under.as_ref().map(|(t, _)| t.clone())
+                    {
+                        return;
+                    }
                     state.release_grab_across_screens(&pointer, &under, serial, time);
                     let entered = pointer.current_focus() != under.as_ref().map(|(t, _)| t.clone());
                     pointer.motion(
@@ -8189,8 +8209,8 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                     let frames = cap.encode_stats.frames.swap(0, Ordering::Relaxed);
                     let stripes = cap.encode_stats.stripes.swap(0, Ordering::Relaxed);
                     if crate::log::debug_enabled() {
-                        let actual_fps = frames as f64 / elapsed;
-                        let stripes_per_sec = stripes as f64 / elapsed;
+                        let actual_fps = f64::from(frames) / elapsed;
+                        let stripes_per_sec = f64::from(stripes) / elapsed;
                         let mode_str = cap.encode_stats.desc.lock().unwrap().clone();
                         let n_stripes = cap.encode_stats.n_stripes.load(Ordering::Relaxed);
                         let (current_rss, shm_usage) = *mem
@@ -8288,7 +8308,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         )
         .unwrap();
 
-    crate::computer_use::register_wayland_backend(command_tx.clone(), wake_tx);
+    crate::computer_use::register_wayland_backend(command_tx, wake_tx);
     #[cfg(feature = "computer-use-server")]
     crate::computer_use::server::spawn_cu_from_env();
     crate::wayland::ficlient::arm(crate::computer_use::app_wayland_socket_path());
@@ -9101,12 +9121,12 @@ fn live_x11() -> &'static Mutex<Vec<Arc<crate::x11::Controls>>> {
 /// to the same content handle.
 pub(crate) fn unpremultiply_rgba(image: &mut image::RgbaImage) {
     for p in image.pixels_mut() {
-        let a = p.0[3] as u32;
+        let a = u32::from(p.0[3]);
         if a == 0 {
             p.0 = [0, 0, 0, 0];
         } else if a < 255 {
             for c in &mut p.0[..3] {
-                *c = ((*c as u32 * 255 + a / 2) / a).min(255) as u8;
+                *c = ((u32::from(*c) * 255 + a / 2) / a).min(255) as u8;
             }
         }
     }
@@ -9328,6 +9348,10 @@ pub fn desktop_view() -> Option<wm::DesktopView> {
 pub fn window_request(id: wm::WindowId, request: wm::Request) -> bool {
     running_compositor().is_some_and(|be| be.window_request(id, request).unwrap_or(false))
 }
+
+/// The variable naming the Xwayland a caller ships, found ahead of the host's
+/// ([`wayland::xwm::XWAYLAND_VAR`]).
+pub const XWAYLAND_VAR: &str = wayland::xwm::XWAYLAND_VAR;
 
 /// Start Xwayland on the running compositor; `notify` is told the display number.
 pub fn start_xwayland(notify: Option<std::sync::mpsc::Sender<u32>>) -> Result<(), Error> {
@@ -9921,11 +9945,11 @@ impl ScreenCapture {
     /// live under (the nested session's, or pixelflux's own in a direct session).
     /// Blocking; releases the GIL for the duration. Raises
     /// [`VirtualKeyboardUnavailable`] when the compositor lacks the protocol.
-    pub fn type_text_wayland(&self, display: String, text: String) -> Result<(), Error> {
+    pub fn type_text_wayland(&self, display: &str, text: &str) -> Result<(), Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::vkclient::type_text_to(&path, &text)
+            crate::wayland::vkclient::type_text_to(&path, text)
         }
         .map_err(|e: String| {
             if e.contains("zwp_virtual_keyboard_manager_v1") {
@@ -9939,11 +9963,11 @@ impl ScreenCapture {
     /// Tap `keysyms` in order through `display`'s virtual keyboard, verbatim: the
     /// caller owns which keysym spells which character (selkies' policy layer);
     /// this owns delivery. Same one-shot client and errors as `type_text_wayland`.
-    pub fn type_keysyms_wayland(&self, display: String, keysyms: Vec<u32>) -> Result<(), Error> {
+    pub fn type_keysyms_wayland(&self, display: &str, keysyms: &[u32]) -> Result<(), Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::vkclient::type_keysyms_to(&path, &keysyms)
+            crate::wayland::vkclient::type_keysyms_to(&path, keysyms)
         }
         .map_err(|e: String| {
             if e.contains("zwp_virtual_keyboard_manager_v1") {
@@ -9960,12 +9984,12 @@ impl ScreenCapture {
     /// the capture output's instead.
     pub fn set_app_output_scale(
         &self,
-        display: String,
+        display: &str,
         scale: f64,
         index: usize,
     ) -> Result<bool, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             crate::wayland::outclient::set_output_scale(&path, index, scale)
         }
@@ -9983,14 +10007,14 @@ impl ScreenCapture {
     /// scale, which is the capture output's.
     pub fn set_app_screen_geometry(
         &self,
-        display: String,
+        display: &str,
         width: i32,
         height: i32,
         scale: f64,
         index: usize,
     ) -> Result<bool, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             crate::wayland::outclient::set_screen_geometry(&path, index, (width, height), scale)
         }
@@ -10007,15 +10031,15 @@ impl ScreenCapture {
     /// positioned; 0 = that compositor manages no outputs for clients.
     pub fn set_app_screen_layout(
         &self,
-        display: String,
+        display: &str,
         rects: Vec<(i32, i32, i32, i32)>,
     ) -> Result<usize, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             let placed = crate::wayland::outclient::set_screen_layout(&path, rects.clone())?;
             if placed == 0 {
-                crate::wayland::kdeclient::set_screen_layout(&path, rects)
+                crate::wayland::kdeclient::set_screen_layout(&path, &rects)
             } else {
                 Ok(placed)
             }
@@ -10029,12 +10053,9 @@ impl ScreenCapture {
     /// other way to be checked against. The same ladder as
     /// `set_app_screen_layout` (zwlr, then KWin's output devices). Empty =
     /// that compositor manages no outputs for clients.
-    pub fn list_app_screens(
-        &self,
-        display: String,
-    ) -> Result<Vec<crate::wayland::AppScreen>, Error> {
+    pub fn list_app_screens(&self, display: &str) -> Result<Vec<crate::wayland::AppScreen>, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             let screens = crate::wayland::outclient::list_screens(&path)?;
             if screens.is_empty() {
@@ -10051,9 +10072,9 @@ impl ScreenCapture {
     /// session serves no control socket. A registry read that touches no
     /// screen: whether the compositor registers the screen it grows is proven
     /// when a display asks for one (`add_app_screen` refuses one that does not).
-    pub fn app_screen_control_offered(&self, display: String) -> Result<bool, Error> {
+    pub fn app_screen_control_offered(&self, display: &str) -> Result<bool, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             crate::wayland::kdeclient::screen_control_offered(&path)
         }
@@ -10066,16 +10087,16 @@ impl ScreenCapture {
     /// size follows the capture output that adopts its host window.
     pub fn add_app_screen(
         &self,
-        display: String,
-        name: String,
+        display: &str,
+        name: &str,
         width: i32,
         height: i32,
         scale: f64,
     ) -> Result<(), Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
-            crate::wayland::kdeclient::add_screen(&path, &name, (width, height), scale)
+            crate::wayland::kdeclient::add_screen(&path, name, (width, height), scale)
         }
         .map_err(Error::Capture)
     }
@@ -10083,8 +10104,8 @@ impl ScreenCapture {
     /// Remove a screen `add_app_screen` grew; the compositor's own
     /// output-destroy path returns its windows to the primary. False when no
     /// such screen is held.
-    pub fn remove_app_screen(&self, name: String) -> Result<bool, Error> {
-        Ok(crate::wayland::kdeclient::remove_screen(&name))
+    pub fn remove_app_screen(&self, name: &str) -> Result<bool, Error> {
+        Ok(crate::wayland::kdeclient::remove_screen(name))
     }
 
     /// Hold the app compositor's screens past the first `keep` at a small size,
@@ -10093,13 +10114,13 @@ impl ScreenCapture {
     /// resized (0 = that compositor manages no outputs for clients).
     pub fn hold_spare_app_screens(
         &self,
-        display: String,
+        display: &str,
         keep: usize,
         width: i32,
         height: i32,
     ) -> Result<usize, Error> {
         {
-            let path = crate::wayland::wlclient::socket_path(&display)
+            let path = crate::wayland::wlclient::socket_path(display)
                 .ok_or_else(|| "XDG_RUNTIME_DIR is unset".to_string())?;
             crate::wayland::outclient::hold_spare_screens(&path, keep, (width, height))
         }
@@ -10107,18 +10128,14 @@ impl ScreenCapture {
     }
 
     /// Mimes the app compositor's current selection offers (empty = nothing copied).
-    pub fn clipboard_types_app(&self, display: String) -> Result<Vec<String>, Error> {
-        (crate::wayland::dcclient::list_types(&app_socket_path(&display)?)).map_err(Error::Capture)
+    pub fn clipboard_types_app(&self, display: &str) -> Result<Vec<String>, Error> {
+        (crate::wayland::dcclient::list_types(&app_socket_path(display)?)).map_err(Error::Capture)
     }
 
     /// The app compositor selection's payload for `mime`, or None when nothing is
     /// copied or the selection does not offer that mime.
-    pub fn clipboard_read_app(
-        &self,
-        display: String,
-        mime: String,
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let data = (crate::wayland::dcclient::read(&app_socket_path(&display)?, &mime))
+    pub fn clipboard_read_app(&self, display: &str, mime: &str) -> Result<Option<Vec<u8>>, Error> {
+        let data = (crate::wayland::dcclient::read(&app_socket_path(display)?, mime))
             .map_err(Error::Capture)?;
         Ok(data)
     }
@@ -10127,10 +10144,10 @@ impl ScreenCapture {
     /// every paster from a background thread until another client copies.
     pub fn clipboard_write_app(
         &self,
-        display: String,
+        display: &str,
         entries: Vec<(String, Vec<u8>)>,
     ) -> Result<(), Error> {
-        (crate::wayland::dcclient::write(&app_socket_path(&display)?, entries))
+        (crate::wayland::dcclient::write(&app_socket_path(display)?, entries))
             .map_err(Error::Capture)
     }
 
@@ -10147,13 +10164,13 @@ impl ScreenCapture {
     }
 
     /// Drop the app compositor's selection.
-    pub fn clipboard_clear_app(&self, display: String) -> Result<(), Error> {
-        (crate::wayland::dcclient::clear(&app_socket_path(&display)?)).map_err(Error::Capture)
+    pub fn clipboard_clear_app(&self, display: &str) -> Result<(), Error> {
+        (crate::wayland::dcclient::clear(&app_socket_path(display)?)).map_err(Error::Capture)
     }
 
     /// Stop the selection watch for `display` (no-op without one).
-    pub fn clipboard_unwatch_app(&self, display: String) {
-        if let Ok(path) = app_socket_path(&display) {
+    pub fn clipboard_unwatch_app(&self, display: &str) {
+        if let Ok(path) = app_socket_path(display) {
             crate::wayland::dcclient::unwatch(&path);
         }
     }
@@ -10481,8 +10498,7 @@ impl ScreenCapture {
             let _ = tid_tx.send(thread::current().id());
             let res = crate::x11::run_capture(rs, c2, etid_tx, on_frame);
             c3.stop.store(true, Ordering::Release);
-            if let Err(e) = res {
-                let msg = e.to_string();
+            if let Err(msg) = res {
                 eprintln!("[X11] capture error: {msg}");
                 if let Ok(mut g) = err_slot2.lock() {
                     *g = Some(msg);
@@ -10605,10 +10621,10 @@ impl ScreenCapture {
     /// from a thread of its own; a second watch on the same display replaces the first.
     pub fn clipboard_watch_app(
         &self,
-        display: String,
+        display: &str,
         watch: Arc<dyn crate::sink::SelectionWatch>,
     ) -> Result<(), Error> {
-        crate::wayland::dcclient::watch(&app_socket_path(&display)?, watch).map_err(Error::Capture)
+        crate::wayland::dcclient::watch(&app_socket_path(display)?, watch).map_err(Error::Capture)
     }
 }
 
@@ -10799,11 +10815,11 @@ pub struct WaylandGpuProbe {
 /// Probe the render node the compositor would run on: `render_node` explicitly, else the
 /// `auto_gpu` pick. Allocates one GBM buffer, exports it, and opens a GL context on it, so a
 /// deployment learns before starting whether the compositor renders in hardware.
-pub fn probe_wayland_gpu(render_node: String, auto_gpu: String) -> WaylandGpuProbe {
+pub fn probe_wayland_gpu(render_node: &str, auto_gpu: &str) -> WaylandGpuProbe {
     let node = if render_node.is_empty() {
-        auto_render_node(&auto_gpu)
+        auto_render_node(auto_gpu)
     } else {
-        Some(render_node)
+        Some(render_node.to_string())
     };
     let Some(node) = node else {
         return WaylandGpuProbe {

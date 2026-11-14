@@ -365,7 +365,7 @@ impl NvStruct {
 /// `version_tests` module asserts that identity.
 fn nvenc_struct_ver(s: NvStruct, maj: u32, min: u32) -> u32 {
     let (rev, high_bit) = s.rev((maj << 4) | (min & 0xF));
-    (maj & 0xFF) | ((min & 0xF) << 24) | (rev << 16) | (0x7 << 28) | ((high_bit as u32) << 31)
+    (maj & 0xFF) | ((min & 0xF) << 24) | (rev << 16) | (0x7 << 28) | (u32::from(high_bit) << 31)
 }
 
 /// The process's effective NVENC API version `(major, minor)`: the negotiated value once
@@ -418,21 +418,21 @@ impl<T> Negotiated<T> {
 /// The reconfigure params re-initializing with `init` at API `(maj, min)`, resetting the encoder
 /// and forcing an IDR as asked; below 12.2 the driver reads the two flags from the tail.
 fn reconfigure_params(
-    init: NV_ENC_INITIALIZE_PARAMS,
+    init: &NV_ENC_INITIALIZE_PARAMS,
     (maj, min): (u32, u32),
     reset: bool,
     force_idr: bool,
 ) -> Negotiated<NV_ENC_RECONFIGURE_PARAMS> {
     let mut p = Negotiated::new(NV_ENC_RECONFIGURE_PARAMS {
         version: nvenc_struct_ver(NvStruct::ReconfigureParams, maj, min),
-        reInitEncodeParams: init,
+        reInitEncodeParams: *init,
         ..Default::default()
     });
     if (maj << 4) | min < 0xC2 {
-        p.tail[0] = reset as u32 | (force_idr as u32) << 1;
+        p.tail[0] = u32::from(reset) | u32::from(force_idr) << 1;
     } else {
-        p.value.set_resetEncoder(reset as u32);
-        p.value.set_forceIDR(force_idr as u32);
+        p.value.set_resetEncoder(u32::from(reset));
+        p.value.set_forceIDR(u32::from(force_idr));
     }
     p
 }
@@ -796,7 +796,7 @@ fn split_mode(
         && engines.is_some_and(|n| n > 1)
         && match codec {
             Codec::Av1 => true,
-            Codec::H265 => width as u64 * height as u64 >= 3840 * 2160,
+            Codec::H265 => u64::from(width) * u64::from(height) >= 3840 * 2160,
             _ => false,
         };
     match (forced, codec, engines) {
@@ -817,7 +817,7 @@ fn cbr_bps(settings: &CaptureSettings) -> u32 {
 /// Say so where `cbr_bps` held the target `settings` asks for to the codec's ceiling.
 fn log_held_rate(settings: &CaptureSettings, bps: u32) {
     let asked = settings.video_bitrate_kbps.max(0) as u64 * 1000;
-    if (bps as u64) < asked {
+    if u64::from(bps) < asked {
         eprintln!(
             "[NVENC] {} opens at {} kbps at most, its top level's ceiling: {} kbps is held there",
             settings.codec.display(),
@@ -2540,10 +2540,10 @@ impl NvencEncoder {
                 config.rcParams.constQP.qpInterB = q;
                 config.rcParams.constQP.qpIntra = q;
             }
-            config.rcParams.set_enableAQ(tuning.spatial_aq as u32);
+            config.rcParams.set_enableAQ(u32::from(tuning.spatial_aq));
             config
                 .rcParams
-                .set_enableTemporalAQ(tuning.temporal_aq as u32);
+                .set_enableTemporalAQ(u32::from(tuning.temporal_aq));
             config.frameIntervalP = 1;
             config.gopLength = 0xFFFFFFFF;
             config.rcParams.set_zeroReorderDelay(1);
@@ -2557,7 +2557,7 @@ impl NvencEncoder {
                     width,
                     height,
                     rate.ceil(),
-                    level_rate(codec, config.rcParams.maxBitRate as u64, weighted),
+                    level_rate(codec, u64::from(config.rcParams.maxBitRate), weighted),
                     tuning.hevc_high_tier,
                 )
             };
@@ -3091,7 +3091,7 @@ impl NvencEncoder {
             fps,
             level_rate(
                 self.codec,
-                self.encode_config.rcParams.maxBitRate as u64,
+                u64::from(self.encode_config.rcParams.maxBitRate),
                 NVENC_AV1_WEIGHTED.load(Ordering::Relaxed),
             ),
             high_tier,
@@ -3582,7 +3582,7 @@ impl NvencEncoder {
     /// as asked.
     unsafe fn reconfigure(&mut self, reset: bool, force_idr: bool) -> NVENCSTATUS {
         self.init_params.encodeConfig = &mut self.encode_config;
-        let mut params = reconfigure_params(self.init_params, nvenc_cur_ver(), reset, force_idr);
+        let mut params = reconfigure_params(&self.init_params, nvenc_cur_ver(), reset, force_idr);
         (self.nvenc_funcs.nvEncReconfigureEncoder.unwrap())(self.encoder_session, &mut params.value)
     }
 
@@ -3720,11 +3720,11 @@ impl NvencEncoder {
         }
         let hw = |index: i32| self.codec.hardware_quantizer(Hardware::Nvenc, index) as i32;
         let refine = refinement.map(|r| {
-            let delta = (hw(r.target) - hw(r.from)).clamp(i8::MIN as i32, 0) as i8;
+            let delta = (hw(r.target) - hw(r.from)).clamp(i32::from(i8::MIN), 0) as i8;
             (&r.plan, delta)
         });
         let defer = (self.codec.quantizer_max() as i32 - self.current_qp as i32)
-            .clamp(0, i8::MAX as i32) as i8;
+            .clamp(0, i32::from(i8::MAX)) as i8;
         let unit = match self.codec {
             Codec::H264 => 16,
             Codec::H265 => 32,
@@ -4102,7 +4102,7 @@ impl NvencEncoder {
                 }
                 if let Some(slot) = anchor {
                     p.set_ltrMarkFrame(1);
-                    p.ltrMarkFrameIdx = slot as u32;
+                    p.ltrMarkFrameIdx = u32::from(slot);
                 }
             }};
         }
@@ -4118,7 +4118,7 @@ impl NvencEncoder {
             let rest = self
                 .codec
                 .quantizer_max()
-                .min(q + i8::MIN.unsigned_abs() as u32);
+                .min(q + u32::from(i8::MIN.unsigned_abs()));
             match band {
                 Some(share) if rest > q => {
                     let first = fill_band_map(
@@ -4164,9 +4164,10 @@ impl NvencEncoder {
                     && (force_idr
                         || band.is_none()
                             && coded.len() as f64
-                                > rc.averageBitRate as f64 / 8.0 * super::HELD_REFRESH_LIMIT_S) =>
+                                > f64::from(rc.averageBitRate) / 8.0
+                                    * super::HELD_REFRESH_LIMIT_S) =>
             {
-                let cap = (rc.averageBitRate as f64 / 8.0 * super::HELD_KEY_BUDGET_S) as usize;
+                let cap = (f64::from(rc.averageBitRate) / 8.0 * super::HELD_KEY_BUDGET_S) as usize;
                 super::held_key_retry(crf, coded.len(), cap)
             }
             _ => None,
@@ -4205,7 +4206,7 @@ impl NvencEncoder {
                     let rest = self
                         .codec
                         .quantizer_max()
-                        .min(q + i8::MIN.unsigned_abs() as u32);
+                        .min(q + u32::from(i8::MIN.unsigned_abs()));
                     let end = from + (to - from) * REFIT_SHARE * cap as f64 / coded.len() as f64;
                     fill_band_map(
                         &mut self.qp_map,
@@ -5044,6 +5045,26 @@ impl NvencEncoder {
         }
     }
 
+    /// `encode_cpu_packed` for rows a client owns, such as a wl_shm pool's, uploaded without
+    /// page-locking them. The client unmaps its pool whenever it likes, and a registration
+    /// outlives the mapping: a pool mapped later over the same addresses would be read from the
+    /// old pool's pages, or fail to upload where it straddles them.
+    pub fn encode_client_packed(
+        &mut self,
+        pixels: &[u8],
+        src_stride: usize,
+        rgba_input: bool,
+        frame_number: u64,
+        crf: u32,
+        force_idr: bool,
+    ) -> Result<Vec<u8>, String> {
+        let pin = std::mem::replace(&mut self.pin_uploads, false);
+        let out =
+            self.encode_cpu_packed(pixels, src_stride, rgba_input, frame_number, crf, force_idr);
+        self.pin_uploads = pin;
+        out
+    }
+
     /// Run the chroma convert over an array-typed import through `tex`, answering the input
     /// NVENC should be handed. `None` where the session has no convert, or where the driver gave
     /// no texture for the import and NVENC's own conversion stands in, which a 10-bit session,
@@ -5619,7 +5640,7 @@ pub(crate) mod gpu_tests {
                 ra[..a.width]
                     .iter()
                     .zip(&rb[..a.width])
-                    .map(|(&x, &y)| (x as f64 - y as f64).abs())
+                    .map(|(&x, &y)| (f64::from(x) - f64::from(y)).abs())
             })
             .sum::<f64>()
             / (a.width * a.height) as f64
@@ -5698,7 +5719,7 @@ pub(crate) mod gpu_tests {
                     [p[2], p[1], p[0]].map(f64::from),
                     crate::encoders::chroma_siting::BT709,
                 )[0];
-                let d = v.y[y * v.y_stride + x] as f64 - luma;
+                let d = f64::from(v.y[y * v.y_stride + x]) - luma;
                 se += d * d;
             }
         }
@@ -5752,7 +5773,7 @@ pub(crate) mod gpu_tests {
             sizes.iter().min().unwrap() * 8 / 1000,
             sizes.iter().max().unwrap() * 8 / 1000,
             psnr.iter().sum::<f64>() / n as f64,
-            psnr.iter().cloned().fold(f64::INFINITY, f64::min),
+            psnr.iter().copied().fold(f64::INFINITY, f64::min),
         );
     }
 
@@ -5992,7 +6013,7 @@ pub(crate) mod gpu_tests {
                 let Some(mut enc) = codec_session(&s) else {
                     continue;
                 };
-                let carried = formats.ten_bit[(fullcolor && formats.fullcolor) as usize];
+                let carried = formats.ten_bit[usize::from(fullcolor && formats.fullcolor)];
                 println!("{codec:?} 4:4:4 {fullcolor}: {}-bit", enc.bit_depth());
                 assert_eq!(enc.bit_depth(), if carried { 10 } else { 8 }, "{codec:?}");
                 assert_eq!(
@@ -6332,7 +6353,7 @@ pub(crate) mod gpu_tests {
                 let before = pts(&enc);
                 let (out, reference) = encode(&mut enc, first + 3, Some(20));
                 assert_eq!(reference, Reference::Frame(first as u16 + 2), "{codec:?}");
-                let spent = out.len() as f64 / (kbps as f64 * 1000.0 / 8.0);
+                let spent = out.len() as f64 / (f64::from(kbps) * 1000.0 / 8.0);
                 let coded = pts(&enc) - before;
                 println!(
                     "{codec:?}: a held frame at {kbps} kbps goes out at {} bytes, {spent:.2} s of the target, encoded {coded} times",
@@ -6919,7 +6940,7 @@ pub(crate) mod gpu_tests {
                      answer PSNR {:.2} dB mean ({:.2} worst), with the 14 after {:.2} dB mean",
                     sizes[sizes.len() / 2],
                     mean(&first),
-                    first.iter().cloned().fold(f64::INFINITY, f64::min),
+                    first.iter().copied().fold(f64::INFINITY, f64::min),
                     mean(&after),
                 );
             }
@@ -7210,7 +7231,7 @@ pub(crate) mod gpu_tests {
             (funcs.nvEncDestroyEncoder.unwrap())(session);
             assert_eq!(status, NVENCSTATUS::NV_ENC_SUCCESS, "initialize");
             let reconfigure = guarded(reconfigure_params(
-                enc.init_params,
+                &enc.init_params,
                 nvenc_cur_ver(),
                 true,
                 true,
@@ -7282,6 +7303,59 @@ pub(crate) mod gpu_tests {
                     "source {source}, frame {i}: {psnr:.1} dB against the picture just painted"
                 );
             }
+        }
+    }
+
+    /// A client's memfd pool replaced by one mapped at the same address, as a toolkit swaps its
+    /// buffers, uploads the picture the new pool holds: the rows are read where they lie and
+    /// never page-locked, so no registration keeps the old pool's pages at that address.
+    /// Ignored by default.
+    #[test]
+    #[ignore]
+    fn gpu_a_client_pool_mapped_where_the_last_one_was_uploads_its_own_picture() {
+        use crate::webcam::decode::VideoDecoder;
+        let (w, h) = (1280usize, 720usize);
+        let len = w * h * 4;
+        let mut enc = NvencEncoder::new(&settings(w as i32, h as i32, 60.0), ptr::null())
+            .expect("NVENC init");
+        assert!(enc.pin_uploads, "the production default pins");
+        let mut dec = VideoDecoder::new(Codec::H264).expect("decoder");
+        let mut at: *mut c_void = ptr::null_mut();
+        for (pool, frames) in [(0, 0..4usize), (1, 4..8usize)] {
+            let fd = crate::memfd_create(c"client-pool", libc::MFD_CLOEXEC);
+            assert!(fd >= 0, "memfd_create");
+            let flags = if at.is_null() {
+                libc::MAP_SHARED
+            } else {
+                libc::MAP_SHARED | libc::MAP_FIXED
+            };
+            // SAFETY: a fresh memfd sized to `len` and mapped whole; the second pool is placed
+            // over the range the first one was unmapped from, which nothing else holds.
+            let rows = unsafe {
+                assert_eq!(libc::ftruncate(fd, len as libc::off_t), 0);
+                let p = libc::mmap(at, len, libc::PROT_READ | libc::PROT_WRITE, flags, fd, 0);
+                libc::close(fd);
+                assert_ne!(p, libc::MAP_FAILED, "mmap");
+                std::slice::from_raw_parts_mut(p as *mut u8, len)
+            };
+            at = rows.as_mut_ptr().cast();
+            for i in frames {
+                rows.copy_from_slice(&moving_frame(w, h, i));
+                let pkt = enc
+                    .encode_client_packed(rows, w * 4, false, i as u64, 25, i == 0)
+                    .expect("encode");
+                let psnr = luma_psnr(&mut dec, &pkt, &moving_frame(w, h, i), w, h);
+                assert!(
+                    psnr > 30.0,
+                    "pool {pool}, frame {i}: {psnr:.1} dB against the picture just painted"
+                );
+            }
+            assert!(
+                enc.pin_uploads,
+                "the client path restores the production default"
+            );
+            // SAFETY: the mapping made above, which no slice outlives.
+            unsafe { libc::munmap(at, len) };
         }
     }
 
@@ -7466,7 +7540,7 @@ pub(crate) mod gpu_tests {
         let f = frame(640, 360, 30);
         for codec in [Codec::H264, Codec::H265, Codec::Av1] {
             for (num, den) in [(60000u32, 1001u32), (120000, 1001), (144000, 1001), (60, 1)] {
-                let fps = num as f64 / den as f64;
+                let fps = f64::from(num) / f64::from(den);
                 let mut s = settings(640, 360, fps);
                 s.codec = codec;
                 s.video_cbr_mode = true;
@@ -7491,8 +7565,8 @@ pub(crate) mod gpu_tests {
                     let (tick, scale) = crate::encoders::sps::h264_timing(&pkt[VIDEO_HEADER_LEN..])
                         .expect("SPS timing");
                     assert_eq!(
-                        scale as u64 * den as u64,
-                        2 * num as u64 * tick as u64,
+                        u64::from(scale) * u64::from(den),
+                        2 * u64::from(num) * u64::from(tick),
                         "the SPS declares {scale}/2x{tick}, not {num}/{den}"
                     );
                 }
@@ -7649,13 +7723,13 @@ pub(crate) mod gpu_tests {
             s.video_bitrate_kbps
         );
         assert!(
-            held <= 1.1 * s.video_bitrate_kbps as f64,
+            held <= 1.1 * f64::from(s.video_bitrate_kbps),
             "the session ran at {held:.0} kbps under a {} kbps peak",
             s.video_bitrate_kbps
         );
         s.video_bitrate_kbps = 200_000;
         enc.reconfigure_rate(&s);
-        for i in 150..150 + PeakBucket::RELEASE_FRAMES as u64 + 10 {
+        for i in 150..150 + u64::from(PeakBucket::RELEASE_FRAMES) + 10 {
             code(&mut enc, i, 25);
         }
         assert_eq!(
@@ -7829,7 +7903,7 @@ pub(crate) mod gpu_tests {
                             .map(rbsp)
                             .expect("an SPS on the key frame");
                         assert_eq!(
-                            sps[3] as u32,
+                            u32::from(sps[3]),
                             nvenc_level(Codec::H264, w as u32, h as u32, 60, 0, true),
                             "level_idc at {w}x{h}"
                         );
@@ -7846,7 +7920,7 @@ pub(crate) mod gpu_tests {
                         // compatibility flags and the 48 constraint bits.
                         assert_eq!((sps[3] >> 5) & 1, 1, "general_tier_flag at {w}x{h}");
                         assert_eq!(
-                            sps[14] as u32,
+                            u32::from(sps[14]),
                             nvenc_level(Codec::H265, w as u32, h as u32, 60, 0, true),
                             "general_level_idc at {w}x{h}"
                         );
@@ -7867,7 +7941,7 @@ pub(crate) mod gpu_tests {
                 (0..n).fold(0, |acc, _| {
                     let bit = (self.0[self.1 / 8] >> (7 - self.1 % 8)) & 1;
                     self.1 += 1;
-                    (acc << 1) | bit as u32
+                    (acc << 1) | u32::from(bit)
                 })
             }
             fn ue(&mut self) -> u32 {
@@ -9383,9 +9457,9 @@ pub(crate) mod gpu_tests {
         for y in 0..v.height {
             for x in 0..v.width {
                 let k = if inside(x, y) { 0 } else { 1 };
-                acc[k][0] += v.y[y * v.y_stride + x] as f64;
-                acc[k][1] += v.u[(y / 2) * v.uv_stride + x / 2] as f64;
-                acc[k][2] += v.v[(y / 2) * v.uv_stride + x / 2] as f64;
+                acc[k][0] += f64::from(v.y[y * v.y_stride + x]);
+                acc[k][1] += f64::from(v.u[(y / 2) * v.uv_stride + x / 2]);
+                acc[k][2] += f64::from(v.v[(y / 2) * v.uv_stride + x / 2]);
                 cnt[k] += 1.0;
             }
         }
@@ -9921,7 +9995,7 @@ pub(crate) mod gpu_tests {
                             times[n / 2],
                             times[(n * 99) / 100],
                             bytes as f64 * 8.0 * 60.0 / n as f64 / 1e6,
-                            kbps as f64 / 1000.0,
+                            f64::from(kbps) / 1000.0,
                             psnr / n as f64
                         );
                     }
@@ -10258,7 +10332,7 @@ mod version_tests {
             (13, 0, 1808),
         ] {
             let params =
-                reconfigure_params(NV_ENC_INITIALIZE_PARAMS::default(), (maj, min), true, true);
+                reconfigure_params(&NV_ENC_INITIALIZE_PARAMS::default(), (maj, min), true, true);
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     (&params as *const Negotiated<_>).cast::<u8>(),
@@ -10486,20 +10560,20 @@ mod decision_tests {
         assert_eq!(nvenc_level(Codec::H265, 1280, 720, 144, 0, true), 150);
         // The current level admits the current picture on every codec.
         for (w, h) in [(1280u32, 720u32), (1920, 1080), (3840, 2160)] {
-            let macroblocks = (w as u64 / 16) * (h as u64 / 16);
+            let macroblocks = (u64::from(w) / 16) * (u64::from(h) / 16);
             assert!(
                 h264_max_macroblocks(nvenc_level(Codec::H264, w, h, 60, 0, true)) >= macroblocks,
                 "H.264 level at {w}x{h} cannot hold the picture"
             );
             assert!(
                 h265_max_picture(nvenc_level(Codec::H265, w, h, 60, 0, true))
-                    >= (w as u64) * (h as u64),
+                    >= u64::from(w) * u64::from(h),
                 "HEVC level at {w}x{h} cannot hold the picture"
             );
         }
         // AV1 holds the headroom level whatever the capture, since NVENC checks it against
         // maxEncodeWidth x maxEncodeHeight at init.
-        let pixels = (HEADROOM_WIDTH * HEADROOM_HEIGHT) as u64;
+        let pixels = u64::from(HEADROOM_WIDTH * HEADROOM_HEIGHT);
         for (w, h) in [(1280, 720), (1920, 1080), (3840, 2160)] {
             assert_eq!(
                 nvenc_level(Codec::Av1, w, h, 60, 0, true),
@@ -10623,7 +10697,7 @@ mod decision_tests {
                 1920,
                 1080,
                 240,
-                nvenc_rate_ceiling(Codec::Av1) as u64,
+                u64::from(nvenc_rate_ceiling(Codec::Av1)),
                 true
             ),
             18

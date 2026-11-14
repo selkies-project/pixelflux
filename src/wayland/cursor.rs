@@ -170,9 +170,9 @@ fn cap_and_encode(mut img: RgbaImage, cap: i32) -> Option<CappedSprite> {
     let longest = w.max(h);
     let mut scale = 1.0;
     if cap > 0 && longest > cap as u32 {
-        scale = cap as f64 / longest as f64;
-        let nw = ((w as f64 * scale).round() as u32).max(1);
-        let nh = ((h as f64 * scale).round() as u32).max(1);
+        scale = f64::from(cap) / f64::from(longest);
+        let nw = ((f64::from(w) * scale).round() as u32).max(1);
+        let nh = ((f64::from(h) * scale).round() as u32).max(1);
         img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
     }
     crate::unpremultiply_rgba(&mut img);
@@ -192,8 +192,8 @@ fn cap_and_encode(mut img: RgbaImage, cap: i32) -> Option<CappedSprite> {
 /// land one pixel past its right or bottom edge.
 fn scaled_hotspot(sprite: &CappedSprite, hot_x: i32, hot_y: i32) -> (i32, i32) {
     (
-        ((hot_x as f64 * sprite.scale).round() as i32).clamp(0, sprite.width as i32 - 1),
-        ((hot_y as f64 * sprite.scale).round() as i32).clamp(0, sprite.height as i32 - 1),
+        ((f64::from(hot_x) * sprite.scale).round() as i32).clamp(0, sprite.width as i32 - 1),
+        ((f64::from(hot_y) * sprite.scale).round() as i32).clamp(0, sprite.height as i32 - 1),
     )
 }
 
@@ -337,8 +337,10 @@ impl Cursor {
     /// Load the theme named by `XCURSOR_THEME` (default `"default"`) at the requested size.
     ///
     /// `size_override` comes from `CaptureSettings.cursor_size` (selkies `--cursor-size` /
-    /// `XCURSOR_SIZE`); a value `<= 0` falls back to 24. When the theme's default icon cannot be
-    /// loaded, a 16×16 solid-red placeholder stands in so the caller always has a valid image.
+    /// `XCURSOR_SIZE`); a value `<= 0` falls back to 24. A named theme that is not installed, or
+    /// that has no default icon, gives way to the `default` theme the system points at, as
+    /// libXcursor's lookup does; only where that has none either does a 16×16 solid-red
+    /// placeholder stand in, so the caller always has a valid image.
     pub fn load(size_override: i32) -> Cursor {
         let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
         let size: u32 = if size_override > 0 {
@@ -347,8 +349,16 @@ impl Cursor {
             24
         };
 
-        let theme = CursorTheme::load(&name);
-        let icons = load_icon(&theme, "default").unwrap_or_else(|_| {
+        let mut theme = CursorTheme::load(&name);
+        let mut icons = load_icon(&theme, "default");
+        if icons.is_err() && name != "default" {
+            crate::log::debug!(
+                "[Wayland] Cursor theme {name:?} has no default cursor; using the default theme."
+            );
+            theme = CursorTheme::load("default");
+            icons = load_icon(&theme, "default");
+        }
+        let icons = icons.unwrap_or_else(|_| {
             let size = 16;
             let mut pixels = Vec::with_capacity((size * size * 4) as usize);
             for _ in 0..(size * size) {

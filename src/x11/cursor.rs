@@ -366,8 +366,8 @@ fn cursor_to_png(img: &GetCursorImageReply, cap: i32) -> (&'static str, Vec<u8>,
             rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
         }
     }
-    let mut hot_x = img.xhot as i32 - x0 as i32;
-    let mut hot_y = img.yhot as i32 - y0 as i32;
+    let mut hot_x = i32::from(img.xhot) - x0 as i32;
+    let mut hot_y = i32::from(img.yhot) - y0 as i32;
     let mut image = match image::RgbaImage::from_raw(cw as u32, ch as u32, rgba) {
         Some(i) => i,
         None => return ("error", Vec::new(), 0, 0),
@@ -431,7 +431,7 @@ mod tests {
     fn application_sprite_travels_whole_within_the_cap() {
         // A 128px sprite, a game's own pointer, at the default cap: delivered at 128.
         let opaque = vec![0xff00_0000u32; 128 * 128];
-        let (t, data, _, _) = cursor_to_png(&reply(128, 128, 0, 0, opaque.clone()), 128);
+        let (t, data, _, _) = cursor_to_png(&reply(128, 128, 0, 0, opaque), 128);
         assert_eq!(t, "png");
         let img = image::load_from_memory(&data).unwrap();
         assert_eq!((img.width(), img.height()), (128, 128));

@@ -60,6 +60,10 @@ const QUEUE_CAP: usize = 256;
 /// offset where the Annex-B stream starts (past the wire header when present), and the
 /// wall-clock capture time; or an audio packet with its decode time on the 48 kHz clock.
 enum Tap {
+    #[expect(
+        clippy::rc_buffer,
+        reason = "the encoder's buffer as it hands it over; an `Arc<[u8]>` would copy every frame"
+    )]
     Video(Arc<Vec<u8>>, usize, u64),
     Audio(Vec<u8>, u64),
 }
@@ -510,7 +514,7 @@ fn audio_thread(
         } else {
             match reader.next_packet() {
                 Ok(Some((packet, granule))) => {
-                    let samples = mp4::opus_packet_samples(&packet) as u64;
+                    let samples = u64::from(mp4::opus_packet_samples(&packet));
                     page.push((packet, samples));
                     match granule {
                         Some(granule) => Some(granule),
@@ -537,7 +541,7 @@ fn audio_thread(
         position = granule.map_or(position, |g| page_start(position, g, samples));
         let (clock, base) = *anchor.get_or_insert_with(|| {
             (
-                shared.start.elapsed().as_micros() as u64 * (mp4::OPUS_TIMESCALE as u64)
+                shared.start.elapsed().as_micros() as u64 * u64::from(mp4::OPUS_TIMESCALE)
                     / 1_000_000,
                 position,
             )

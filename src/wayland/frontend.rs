@@ -413,7 +413,7 @@ pub fn output_content_covers(
 ) -> bool {
     windows_on_output(space, display_id).any(|w| {
         let size = w.geometry().size;
-        size.w as f64 >= logical_w && size.h as f64 >= logical_h
+        f64::from(size.w) >= logical_w && f64::from(size.h) >= logical_h
     })
 }
 
@@ -435,8 +435,8 @@ impl OutputNode {
         Some(Rectangle::new(
             Point::from(self.pos),
             (
-                (w as f64 / scale).round() as i32,
-                (h as f64 / scale).round() as i32,
+                (f64::from(w) / scale).round() as i32,
+                (f64::from(h) / scale).round() as i32,
             )
                 .into(),
         ))
@@ -824,7 +824,8 @@ pub struct PointerShare {
 impl PointerShare {
     /// Called from the compositor thread alone.
     pub fn publish(&self, at: PointerAt) {
-        let position = (at.x as f32).to_bits() as u64 | ((at.y as f32).to_bits() as u64) << 32;
+        let position =
+            u64::from((at.x as f32).to_bits()) | u64::from((at.y as f32).to_bits()) << 32;
         let scale = at.scale.to_bits();
         let version = self.version.load(Ordering::Relaxed);
         if version != 0
@@ -855,8 +856,8 @@ impl PointerShare {
                 fence(Ordering::Acquire);
                 if self.version.load(Ordering::Relaxed) == version {
                     return Some(PointerAt {
-                        x: f32::from_bits(position as u32) as f64,
-                        y: f32::from_bits((position >> 32) as u32) as f64,
+                        x: f64::from(f32::from_bits(position as u32)),
+                        y: f64::from(f32::from_bits((position >> 32) as u32)),
                         scale: f64::from_bits(scale),
                         motion,
                     });
@@ -1245,7 +1246,7 @@ impl WlrLayerShellHandler for AppState {
 
             surface.with_pending_state(|state| {
                 state.size =
-                    Some(((mode.size.w as f64) as i32, (mode.size.h as f64) as i32).into());
+                    Some((f64::from(mode.size.w) as i32, f64::from(mode.size.h) as i32).into());
             });
             surface.send_configure();
 
@@ -1507,8 +1508,8 @@ impl CompositorHandler for AppState {
                 } else {
                     let scale = self.settings.scale.max(0.1);
                     (
-                        (self.settings.width as f64 / scale).round() as i32,
-                        (self.settings.height as f64 / scale).round() as i32,
+                        (f64::from(self.settings.width) / scale).round() as i32,
+                        (f64::from(self.settings.height) / scale).round() as i32,
                     )
                 };
 
@@ -1623,7 +1624,7 @@ impl CompositorHandler for AppState {
                     let serial = next_serial();
                     let target = FocusTarget::Window(window.clone());
                     if let Some(keyboard) = self.seat.get_keyboard() {
-                        keyboard.set_focus(self, Some(target.clone()), serial);
+                        keyboard.set_focus(self, Some(target), serial);
                     }
                     crate::wayland::foreign_toplevel::add(self, &window);
                     self.refocus_pointer();
@@ -1707,13 +1708,13 @@ impl AppState {
                 continue;
             };
             let scale = node.output.current_scale().fractional_scale();
-            let (px, py) = (node.pos.0 as f64, node.pos.1 as f64);
-            let cx = x.max(px).min(px + mode.size.w as f64 - 1.0);
-            let cy = y.max(py).min(py + mode.size.h as f64 - 1.0);
+            let (px, py) = (f64::from(node.pos.0), f64::from(node.pos.1));
+            let cx = x.max(px).min(px + f64::from(mode.size.w) - 1.0);
+            let cy = y.max(py).min(py + f64::from(mode.size.h) - 1.0);
             let d2 = (x - cx).powi(2) + (y - cy).powi(2);
             let logical = Point::from((
-                node.pos.0 as f64 + (cx - px) / scale,
-                node.pos.1 as f64 + (cy - py) / scale,
+                f64::from(node.pos.0) + (cx - px) / scale,
+                f64::from(node.pos.1) + (cy - py) / scale,
             ));
             if best.as_ref().map(|(bd, _)| d2 < *bd).unwrap_or(true) {
                 best = Some((d2, logical));
@@ -1820,12 +1821,15 @@ impl AppState {
         found.map(|(target, origin)| target.under_point(origin, p))
     }
 
-    /// The topmost X11 popup menu that is open, with where it lies.
+    /// The topmost X11 popup menu that is open, with where it lies. A menu Xwayland has not yet
+    /// given its surface is not one: the pointer would take it as its focus with no enter sent,
+    /// and Xwayland drops every motion after that until the focus changes again.
     fn x11_menu_open(&self) -> Option<(FocusTarget, Point<f64, Logical>)> {
         use smithay::xwayland::xwm::WmWindowType;
         let menu = self.space.elements().rev().find(|window| {
             window.x11_surface().is_some_and(|surface| {
                 surface.is_override_redirect()
+                    && surface.wl_surface().is_some()
                     && matches!(
                         surface.window_type(),
                         Some(
@@ -1836,7 +1840,7 @@ impl AppState {
                     )
             })
         })?;
-        let loc = self.space.element_location(menu)?;
+        let loc = self.space.element_location(menu)? - menu.geometry().loc;
         Some((FocusTarget::Window(menu.clone()), loc.to_f64()))
     }
 
@@ -1954,8 +1958,8 @@ impl AppState {
         };
         let scale = node.output.current_scale().fractional_scale();
         (
-            node.pos.0 as f64 + (p.x - node.pos.0 as f64) * scale,
-            node.pos.1 as f64 + (p.y - node.pos.1 as f64) * scale,
+            f64::from(node.pos.0) + (p.x - f64::from(node.pos.0)) * scale,
+            f64::from(node.pos.1) + (p.y - f64::from(node.pos.1)) * scale,
             scale,
         )
     }
@@ -2458,8 +2462,8 @@ impl AppState {
         } else {
             let scale = self.settings.scale.max(0.1);
             (
-                (self.settings.width as f64 / scale).round() as i32,
-                (self.settings.height as f64 / scale).round() as i32,
+                (f64::from(self.settings.width) / scale).round() as i32,
+                (f64::from(self.settings.height) / scale).round() as i32,
             )
         };
         toplevel.with_pending_state(|state| {
@@ -2595,7 +2599,7 @@ impl SelectionHandler for AppState {
         let chosen = source.map_or_else(Vec::new, |source| clipboard_flavors(&source.mime_types()));
         // Recorded even with no callback armed, so SetClipboardCallback can re-stage a
         // read of a copy made while nobody was listening.
-        self.current_selection_mimes = chosen.clone();
+        self.current_selection_mimes.clone_from(&chosen);
         if crate::SHUTDOWN.load(Ordering::Relaxed) {
             return;
         }
@@ -3997,7 +4001,6 @@ impl Dispatch<ZwpVirtualKeyboardV1, PfVirtualKeyboard> for AppState {
                 drop(vk);
                 let pressed = key_state == 1;
                 if let Some(keyboard) = state.seat.get_keyboard() {
-                    let keyboard = keyboard.clone();
                     let serial = next_serial();
                     let time = wayland_time();
                     keyboard.input(
@@ -4040,7 +4043,6 @@ impl Dispatch<ZwpVirtualKeyboardV1, PfVirtualKeyboard> for AppState {
             return;
         }
         if let Some(keyboard) = state.seat.get_keyboard() {
-            let keyboard = keyboard.clone();
             for kc in held {
                 let serial = next_serial();
                 let time = wayland_time();
@@ -4221,7 +4223,7 @@ mod pointer_share_tests {
         let mut seen = 0;
         while !writer.is_finished() || seen == 0 {
             if let Some(p) = share.read() {
-                assert_eq!(p.x, p.motion as f32 as f64);
+                assert_eq!(p.x, f64::from(p.motion as f32));
                 assert_eq!(p.y, (p.motion % 4096) as f64);
                 seen += 1;
             }

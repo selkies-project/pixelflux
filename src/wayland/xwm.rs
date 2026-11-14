@@ -26,7 +26,9 @@
 //! Where the host has no DRM render node, the EGL vendor library a GPU container runtime injects
 //! (NVIDIA's) segfaults inside Xwayland's EGL initialization, and glamor would have nothing to
 //! accelerate there anyway, so Xwayland starts pinned to Mesa's EGL vendor, loading no external
-//! EGL platform, with its buffers in shared memory (`-shm`, `no_render_node_launch`).
+//! EGL platform, with its buffers in shared memory (`-shm`, `no_render_node_launch`). An
+//! Xwayland a caller ships beside its own executables is named by `PIXELFLUX_XWAYLAND`
+//! ([`XWAYLAND_VAR`]) and found ahead of the host's for that child alone.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -170,22 +172,57 @@ impl Extras {
     }
 }
 
-/// The environment and arguments Xwayland starts with: none where the host has a DRM render
-/// node, else Mesa's EGL vendor where it is installed, no external EGL platform, and `-shm`.
-fn no_render_node_launch() -> (Vec<(&'static str, &'static str)>, Vec<&'static str>) {
+/// Where the Xwayland a caller ships is named, an executable called `Xwayland`; unset, the
+/// first on the `PATH`.
+pub const XWAYLAND_VAR: &str = "PIXELFLUX_XWAYLAND";
+
+/// The `PATH` Xwayland is looked up on: the directory of the one [`XWAYLAND_VAR`] names ahead of
+/// the process's own, so a bundle's Xwayland is found first for this child alone and the
+/// session's applications keep the host's programs; `None` where none is named or it is not
+/// there.
+fn xwayland_path(
+    named: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> Option<String> {
+    let named = std::path::PathBuf::from(named?);
+    let dir = named.parent()?.to_string_lossy().into_owned();
+    if !named.is_file() || dir.is_empty() {
+        return None;
+    }
+    let rest = path
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(if rest.is_empty() {
+        dir
+    } else {
+        format!("{dir}:{rest}")
+    })
+}
+
+/// The environment and arguments Xwayland starts with: the `PATH` that finds a named Xwayland
+/// ([`xwayland_path`]); nothing more where the host has a DRM render node, else Mesa's EGL
+/// vendor where it is installed, no external EGL platform, and `-shm`.
+fn no_render_node_launch() -> (Vec<(&'static str, String)>, Vec<&'static str>) {
+    let mut env = Vec::new();
+    if let Some(path) = xwayland_path(std::env::var_os(XWAYLAND_VAR), std::env::var_os("PATH")) {
+        env.push(("PATH", path));
+    }
     let has_render_node = std::fs::read_dir("/dev/dri").is_ok_and(|dir| {
         dir.flatten()
             .any(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
     });
     if has_render_node {
-        return (Vec::new(), Vec::new());
+        return (env, Vec::new());
     }
     println!(
         "[Wayland] No DRM render node: Xwayland starts on Mesa's EGL with shared-memory buffers."
     );
-    let mut env = vec![("__EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES", "")];
+    env.push(("__EGL_EXTERNAL_PLATFORM_CONFIG_FILENAMES", String::new()));
     if std::path::Path::new(MESA_EGL_VENDOR).exists() {
-        env.push(("__EGL_VENDOR_LIBRARY_FILENAMES", MESA_EGL_VENDOR));
+        env.push((
+            "__EGL_VENDOR_LIBRARY_FILENAMES",
+            MESA_EGL_VENDOR.to_string(),
+        ));
     }
     (env, vec!["-shm"])
 }
@@ -355,6 +392,7 @@ pub fn window_info(
     });
     let hints = surface.size_hints();
     let geometry = surface.geometry();
+    let origin = surface.last_configure().loc;
     let decoration = if surface.is_decorated() {
         Decoration::None
     } else {
@@ -385,14 +423,14 @@ pub fn window_info(
             base: surface.base_size().map(|s| Size { w: s.w, h: s.h }),
         },
         requested: Some(Rect::new(
-            geometry.loc.x,
-            geometry.loc.y,
+            origin.x,
+            origin.y,
             geometry.size.w,
             geometry.size.h,
         )),
         positioned: hints
             .as_ref()
-            .is_some_and(|h| h.position.is_some() && (geometry.loc.x != 0 || geometry.loc.y != 0))
+            .is_some_and(|h| h.position.is_some() && (origin.x != 0 || origin.y != 0))
             || !matches!(
                 window_type_of(surface),
                 WindowType::Normal | WindowType::Dialog | WindowType::Utility | WindowType::Toolbar
@@ -406,6 +444,13 @@ pub fn window_info(
         skip_taskbar: surface.is_skip_taskbar(),
         accepts_focus,
     }
+}
+
+/// Where an X11 window's visible area sits on the root: the position the X server holds for
+/// it, inside the shadow its toolkit draws (`_GTK_FRAME_EXTENTS`). [`X11Surface::geometry`]
+/// is relative to the window's own origin, so it gives that inset and never a position.
+fn root_location(surface: &X11Surface) -> Point<i32, Logical> {
+    surface.last_configure().loc + surface.geometry().loc
 }
 
 /// Carry a configure out on an X11 window: its geometry and its states.
@@ -650,8 +695,9 @@ impl XwmHandler for AppState {
         let rect = wm::rect_of(self, id)
             .filter(|r| r.w > 0 && r.h > 0)
             .unwrap_or_else(|| {
-                let g = surface.geometry();
-                Rect::new(g.loc.x, g.loc.y, g.size.w.max(1), g.size.h.max(1))
+                let at = surface.last_configure().loc;
+                let size = surface.geometry().size;
+                Rect::new(at.x, at.y, size.w.max(1), size.h.max(1))
             });
         let _ = surface.configure(Some(Rectangle::<i32, Logical>::new(
             (rect.x, rect.y).into(),
@@ -685,7 +731,7 @@ impl XwmHandler for AppState {
     fn map_window_notify(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, surface: X11Surface) {
-        let location = surface.geometry().loc;
+        let location = root_location(&surface);
         let window = Window::new_x11_window(surface);
         window
             .user_data()
@@ -746,7 +792,7 @@ impl XwmHandler for AppState {
         h: Option<u32>,
         reorder: Option<Reorder>,
     ) {
-        let mut geo = surface.geometry();
+        let mut geo = surface.last_configure();
         if let Some(x) = x {
             geo.loc.x = x;
         }
@@ -786,7 +832,7 @@ impl XwmHandler for AppState {
         &mut self,
         _xwm: XwmId,
         surface: X11Surface,
-        geometry: Rectangle<i32, Logical>,
+        _geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
         if !surface.is_override_redirect() {
@@ -798,7 +844,8 @@ impl XwmHandler for AppState {
             .find(|w| w.x11_surface() == Some(&surface))
             .cloned();
         if let Some(window) = found {
-            self.space.map_element(window, geometry.loc, false);
+            self.space
+                .map_element(window, root_location(&surface), false);
             for node in &mut self.output_nodes {
                 if let Some(cap) = node.capture.as_mut() {
                     cap.change_pending = true;
@@ -979,7 +1026,7 @@ impl XwmHandler for AppState {
             SelectionTarget::Clipboard => {
                 let flavors = crate::wayland::frontend::clipboard_flavors(&mime_types);
                 set_data_device_selection(&dh, &self.seat, mime_types, Arc::new(Vec::new()));
-                self.current_selection_mimes = flavors.clone();
+                self.current_selection_mimes.clone_from(&flavors);
                 if self.clipboard_callback.is_some() {
                     self.pending_clipboard_read = Some(flavors);
                 }
@@ -1028,5 +1075,32 @@ impl XwmHandler for AppState {
         self.xwm.display = None;
         self.xwm.extras = None;
         self.xwm.restart_at = Some(Instant::now() + RESTART_DELAY);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_named_xwayland_is_found_first_and_a_missing_one_is_not_named() {
+        let dir = std::env::temp_dir().join(format!("pixelflux-xwayland-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("Xwayland");
+        std::fs::write(&bin, "").unwrap();
+        assert_eq!(
+            xwayland_path(Some(bin.clone().into()), Some("/usr/bin:/bin".into())),
+            Some(format!("{}:/usr/bin:/bin", dir.display()))
+        );
+        assert_eq!(
+            xwayland_path(Some(bin.into()), None),
+            Some(dir.display().to_string())
+        );
+        assert_eq!(
+            xwayland_path(Some(dir.join("missing").into()), Some("/usr/bin".into())),
+            None
+        );
+        assert_eq!(xwayland_path(None, Some("/usr/bin".into())), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
