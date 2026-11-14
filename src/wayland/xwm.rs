@@ -751,6 +751,22 @@ impl XWaylandShellHandler for AppState {
     }
 }
 
+/// Hand a selection a Wayland client or the consumer took to Xwayland, so X11 clients paste
+/// it; `None` drops the X11 ownership this side holds. A selection an X11 client took is
+/// never announced back, since only the compositor's own setters carry it and they reach no
+/// [`SelectionHandler`](smithay::wayland::selection::SelectionHandler).
+pub(crate) fn announce_selection(
+    state: &mut AppState,
+    selection: SelectionTarget,
+    mime_types: Option<Vec<String>>,
+) {
+    if let Some(xwm) = state.xwm.wm.as_mut()
+        && let Err(e) = xwm.new_selection(selection, mime_types)
+    {
+        eprintln!("[Wayland] Selection not offered to X11 clients: {e:?}");
+    }
+}
+
 impl XwmHandler for AppState {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
         self.xwm
@@ -767,21 +783,30 @@ impl XwmHandler for AppState {
         }
     }
 
+    /// A client maps a top-level window: manage it and place it where the policy says.
+    ///
+    /// A window withdrawn and mapped again, as an application hiding to its tray icon does,
+    /// keeps the entry and id it had, as a Wayland toplevel keeps its own across a null-buffer
+    /// unmap: a second entry for the same surface would leave [`window_of`] answering with
+    /// the unmapped one, whose moves, maximizes, and fullscreen requests the policy ignores.
     fn map_window_request(&mut self, _xwm: XwmId, surface: X11Surface) {
-        let output = self.pointer_display();
-        let window = Window::new_x11_window(surface.clone());
-        let id = NEXT_WINDOW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        window
-            .user_data()
-            .insert_if_missing_threadsafe(|| WindowMeta {
-                id,
-                output: std::sync::atomic::AtomicU32::new(output),
-                placed: std::sync::atomic::AtomicBool::new(true),
-                parked: std::sync::atomic::AtomicBool::new(false),
-            });
-        self.xwm.windows.insert(id, window.clone());
+        let (id, window) = window_of(self, &surface).unwrap_or_else(|| {
+            let window = Window::new_x11_window(surface.clone());
+            let id = NEXT_WINDOW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let output = self.pointer_display();
+            window
+                .user_data()
+                .insert_if_missing_threadsafe(|| WindowMeta {
+                    id,
+                    output: std::sync::atomic::AtomicU32::new(output),
+                    placed: std::sync::atomic::AtomicBool::new(true),
+                    parked: std::sync::atomic::AtomicBool::new(false),
+                });
+            self.xwm.windows.insert(id, window.clone());
+            (id, window)
+        });
         let _ = surface.set_mapped(true);
-        if wm::active(self) {
+        if wm::active(self) && !wm::knows(self, id) {
             wm::window_added(self, &window);
         }
         let rect = wm::rect_of(self, id)
@@ -1112,6 +1137,18 @@ impl XwmHandler for AppState {
         mime_type: String,
         fd: OwnedFd,
     ) {
+        let owned = match selection {
+            SelectionTarget::Clipboard => {
+                current_data_device_selection_userdata(&self.seat).map(|e| e.clone())
+            }
+            SelectionTarget::Primary => {
+                current_primary_selection_userdata(&self.seat).map(|e| e.clone())
+            }
+        };
+        if let Some(entries) = owned.filter(|e| !e.is_empty()) {
+            crate::wayland::frontend::serve_selection(entries, &mime_type, fd);
+            return;
+        }
         match selection {
             SelectionTarget::Clipboard => {
                 let _ = request_data_device_client_selection(&self.seat, mime_type, fd);
