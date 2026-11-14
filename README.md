@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@71147be4ca9dd3d50cec54a9cd0b8154bdd3c4d6.
+> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@78df189f768a324bd210046988f95af5a4d0a0ba.
 
 <h1 align="center">pixelflux</h1>
 
@@ -912,4 +912,4 @@ A copy of the MPL 2.0 can be found at https://mozilla.org/MPL/2.0/.
 
 Note that the default build links the GPL-2.0+ `libx264` as its software H.264 encoder and the GPL-2.0+ x265 for H.265; build with `PIXELFLUX_ENABLE_GPL=0` to exclude every GPL-licensed component (the BSD-licensed OpenH264 and kvazaar then take their places).
 
-[LICENSES.md](LICENSES.md) inventories every third-party component of both builds (crates, linked and vendored native libraries, what is loaded at run time) with its license, and describes the check (`scripts/check-licenses.py`, `deny.toml`, the root license checks) that keeps the non-GPL build free of copyleft code.
+[LICENSES.md](LICENSES.md) inventories every third-party component of both builds (crates, linked and vendored native libraries, what is loaded at run time) with its license, and describes the check (Selkies' `cargo xtask licenses --crate crates/pixelflux`, `deny.toml`, the root license checks) that keeps the non-GPL build free of copyleft code.
