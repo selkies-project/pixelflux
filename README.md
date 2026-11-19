@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@de79d7c4ad30c3a5e1975ef10788e4b3c7aef2ab.
+> **pixelflux is developed in [selkies-project/selkies](https://github.com/selkies-project/selkies/tree/main/crates/pixelflux). Open [issues](https://github.com/selkies-project/selkies/issues) and [pull requests](https://github.com/selkies-project/selkies/pulls) there, not here.** This repository mirrors Selkies' `crates/pixelflux` directory, without history, and will be archived before Selkies 2.4.0. pixelflux keeps its name and its Python API on PyPI, released from Selkies at Selkies' version; the first stable Selkies release with pixelflux in it is published here as a GitHub release. This tree is `crates/pixelflux` at selkies-project/selkies@e07fe3f048203a795d0d812ad2afeec886b9bf64.
 
 <h1 align="center">pixelflux</h1>
 
@@ -190,13 +190,21 @@ backend shows one (GNOME; KDE shows none to an unsandboxed process), blocks only
 start: the restore token the backend hands back is kept in
 `$XDG_STATE_HOME/pixelflux/portal-restore-token` (`~/.local/state` by default) and restores the
 session without a dialog when it is reopened to change the cursor mode and on every later
-start. `libpipewire-0.3` is loaded at run time as for the virtual camera; the bus client is pure
+start; a display grown on a virtual monitor keeps its session's token in
+`portal-virtual-restore-token` beside it. `libpipewire-0.3` is loaded at run time as for the virtual camera; the bus client is pure
 Rust.
 
 Displays map onto host outputs by rank, so multi-display capture needs the host to expose that
 many outputs: `ScreenCapture.output_capacity()` reports the host's output count (`-1` when
 self-compositing, where outputs are created on demand), and `create_output` refuses ids the
-host cannot back rather than minting an output that would never receive a frame.
+host cannot back rather than minting an output that would never receive a frame. An unscaled
+Mutter host whose portal serves virtual sources backs one display more, on a virtual monitor
+that exists while that display captures and that DisplayConfig places where the layout puts it.
+Its session streams the cursor as metadata whatever the consumer wants, since the cursor mode is
+fixed when a session selects its sources and reopening the session would remove the monitor:
+with the cursor wanted in the video, pixelflux paints the metadata's sprite into that display's
+frames itself, so toggling it leaves the session and the monitor as they are. A portal without
+metadata streams the grown display with the cursor it paints (or hides) whatever the toggle.
 
 A capture's size is asked of the host through `wlr-output-management`, but what it captures is
 the mode the host ends up running. A host that refuses the request, offers no layout management
