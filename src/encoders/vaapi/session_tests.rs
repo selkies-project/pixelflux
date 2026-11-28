@@ -2592,3 +2592,106 @@ fn an_hevc_key_frame_names_no_collocated_picture() {
     assert_eq!(coded(&mut enc, 0, true), (0xff, 0), "the key frame");
     assert_eq!(coded(&mut enc, 1, false), (0, 1), "a predicted frame");
 }
+
+/// A tiled dmabuf of a `W` x `H` frame over a memfd, of `modifier`.
+fn tiled_dmabuf(modifier: u64) -> Dmabuf {
+    use smithay::backend::allocator::{Fourcc, Modifier, dmabuf::DmabufFlags};
+    let fd = crate::memfd_create(c"tiled", libc::MFD_CLOEXEC);
+    assert!(fd >= 0, "memfd_create");
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let size = libc::off_t::from(W * H * 4);
+    assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), size) }, 0);
+    let mut builder = Dmabuf::builder(
+        (W, H),
+        Fourcc::Xrgb8888,
+        Modifier::from(modifier),
+        DmabufFlags::empty(),
+    );
+    builder.add_plane(fd, 0, (W * 4) as u32);
+    builder.build().unwrap()
+}
+
+#[test]
+fn a_dmabuf_takes_the_prime_2_descriptor_only_where_the_driver_lists_it() {
+    const Y_TILED: u64 = 0x0100_0000_0000_0002;
+    let listed = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
+    for (types, expected) in [
+        (None, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2),
+        (
+            Some(listed | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2),
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        ),
+        (
+            Some(listed | VA_SURFACE_ATTRIB_MEM_TYPE_KERNEL_DRM),
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME,
+        ),
+    ] {
+        mock::reset(Driver::generous());
+        mock::with(|d| d.memory_types = types);
+        let mut enc = VaapiEncoder::on_device(
+            device(),
+            &settings(Codec::H264, false),
+            Codec::H264,
+            Input::Dmabuf,
+        )
+        .unwrap();
+        enc.encode_dmabuf(&tiled_dmabuf(Y_TILED), 0, 25, true)
+            .unwrap();
+        assert_eq!(
+            mock::with(|d| d.imported.clone()),
+            vec![expected],
+            "memory types {types:x?}"
+        );
+    }
+}
+
+/// A constant-rate H.264 session on i965's own rate control, the parts before Skylake, hands
+/// the driver a buffer of no size with every sequence, so it codes each frame once rather than
+/// again until the frame fits, and the driver's own buffer, which it gives a sequence that
+/// names none, never returns; i965 on a later part, and every other driver, keeps the
+/// session's buffer.
+#[test]
+fn i965_before_skylake_codes_a_constant_rate_without_a_buffer() {
+    for (vendor, unchecked) in [
+        (
+            Some(c"Intel i965 driver for Intel(R) Haswell - 2.4.1"),
+            true,
+        ),
+        (
+            Some(c"Intel i965 driver for Intel(R) Ivybridge Desktop - 2.4.1"),
+            true,
+        ),
+        (
+            Some(c"Intel i965 driver for Intel(R) Broadwell - 2.4.1"),
+            true,
+        ),
+        (
+            Some(c"Intel i965 driver for Intel(R) Skylake - 2.4.1"),
+            false,
+        ),
+        (None, false),
+    ] {
+        let mut driver = Driver::generous();
+        driver.vendor = vendor;
+        mock::reset(driver);
+        let mut enc = session(Codec::H264, true);
+        for t in 0..2 {
+            encode(&mut enc, t, true);
+            mock::with(|d| {
+                let (_, bytes) = d
+                    .last_misc()
+                    .into_iter()
+                    .find(|m| m.0 == VAEncMiscParameterTypeHRD)
+                    .unwrap_or_else(|| panic!("{vendor:?}: no HRD"));
+                let hrd: VAEncMiscParameterHRD =
+                    unsafe { ptr::read_unaligned(bytes.as_ptr() as *const _) };
+                let size = (hrd.buffer_size, hrd.initial_buffer_fullness);
+                if unchecked {
+                    assert_eq!(size, (0, 0), "{vendor:?} frame {t}");
+                } else {
+                    assert_eq!(size, (200_000, 200_000), "{vendor:?} frame {t}");
+                }
+            });
+        }
+    }
+}

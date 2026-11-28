@@ -210,12 +210,26 @@ unsafe extern "C" fn log_info(_user: *mut c_void, message: *const c_char) {
 /// tolerance holds an H.264 frame to three budgets, but leaves a still screen of dense text
 /// at 27 dB, every block skipped; a cap of six budgets cost HEVC 3 dB. Its VP9 refines in
 /// the default buffer and keeps it.
+///
+/// Intel's i965 codes the H.264 of the parts before Skylake (`reencodes_against_its_buffer`)
+/// through a rate control that codes a frame again, at a quantizer it predicts, for as long as
+/// the frame overflows or underflows the buffer, stopping only at the quantizer's bounds. A
+/// still screen's frame is a few skips at the quantizer the picture was coded at and a
+/// refinement of many budgets below it, so the frame overflows the buffer at one quantizer and
+/// underflows it at the next one tried, and the driver codes it forever: on Haswell at 1080p
+/// and 60 fps, 17.6 and 156 kbit at 51 and 46, alternating, at 8 Mbit/s in a buffer of a frame
+/// and a half, and a buffer of eight frames hung the same at 2 Mbit/s. A buffer of no size is
+/// one the driver checks no frame against, so there its rate control codes each frame once, at
+/// the quantizer the frames before it predict: one pass a frame at 2 to 20 Mbit/s, 17 ms at
+/// worst.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ConstantRate {
     /// The session's buffer, and the frame cap where the driver takes one.
     Buffer,
     /// No buffer and no cap.
     Unbounded,
+    /// A buffer of no size, which i965 checks no frame against, and no cap.
+    Unchecked,
     /// A buffer of this many seconds of the target and no cap.
     Seconds(f64),
 }
@@ -477,6 +491,24 @@ impl Device {
         self.vendor.contains("iHD")
     }
 
+    /// Whether the driver's H.264 rate control codes a frame again until it fits the buffer
+    /// (`ConstantRate::Unchecked`): i965 on the parts it encodes through its own rate control,
+    /// named in its vendor string, Sandy Bridge to Broadwell and CherryView. From Skylake on it
+    /// runs the rate control in a GPU kernel that codes a frame once.
+    fn reencodes_against_its_buffer(&self) -> bool {
+        self.vendor.contains("i965")
+            && [
+                "Sandybridge",
+                "Ivybridge",
+                "Bay Trail",
+                "Haswell",
+                "Broadwell",
+                "CherryView",
+            ]
+            .iter()
+            .any(|part| self.vendor.contains(part))
+    }
+
     /// The highest H.264 `level_idc` the driver's sequence parameters may name
     /// (`Negotiated::h264_driver_level`). iHD's level table ends at 5.2: above it its rate
     /// control is handed a maximum frame size of 0 (`GetProfileLevelMaxFrameSize`), and every
@@ -596,6 +628,15 @@ impl Device {
             .filter(|a| a.type_ == VASurfaceAttribPixelFormat)
             .map(|a| unsafe { a.value.value.i } as u32)
             .collect()
+    }
+
+    /// The memory types a configuration's surfaces may be created over
+    /// (`VA_SURFACE_ATTRIB_MEM_TYPE_*`), None where it lists none.
+    fn memory_types(&self, config: VAConfigID) -> Option<u32> {
+        self.surface_attributes(config)
+            .iter()
+            .find(|a| a.type_ == VASurfaceAttribMemoryType)
+            .map(|a| unsafe { a.value.value.i } as u32)
     }
 
     /// The surface alignment a configuration asks for, as `(width, height)`, one where it
@@ -761,6 +802,8 @@ pub(crate) fn probe_codecs_on(device: &Device) -> Result<Vec<Served>, String> {
                 super::Formats {
                     fullcolor: carries(true, 8),
                     ten_bit: [carries(false, 10), carries(true, 10)],
+                    constant_rate_streams: codec == Codec::H264
+                        && device.reencodes_against_its_buffer(),
                 },
             )
         })
@@ -1099,6 +1142,9 @@ pub struct VaapiEncoder {
     /// The surface over each dmabuf a zero-copy session encoded, by fd, oldest first, at most
     /// `DMABUF_IMPORTS` (`dmabuf_surface`).
     imports: Vec<(i32, DmaBufIdentity, VASurfaceID)>,
+    /// Whether a dmabuf is imported through the PRIME 2 descriptor (`import_dmabuf`): where the
+    /// video processor's configuration lists that memory type, or lists none at all.
+    imports_prime2: bool,
     coded: VABufferID,
     arm: Arm,
     references: Option<References>,
@@ -1456,6 +1502,7 @@ impl VaapiEncoder {
             key_count: 0,
             surfaces_of: HashMap::new(),
             imports: Vec::new(),
+            imports_prime2: true,
             last_reference: Reference::Untracked,
             rate,
             qp: codec.hardware_quantizer(device.hardware(), settings.video_crf),
@@ -1717,6 +1764,9 @@ impl VaapiEncoder {
             color_standard(&input_standards, ColorDescription::SRGB_SOURCE),
             color_standard(&output_standards, self.declared_color()),
         );
+        self.imports_prime2 = device
+            .memory_types(self.vpp_config)
+            .is_none_or(|types| types & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0);
         if let Input::Host { rgba } = input {
             let fourcc = if rgba { VA_FOURCC_RGBA } else { VA_FOURCC_BGRA };
             let surface = device.create_surfaces(
@@ -2026,6 +2076,9 @@ impl VaapiEncoder {
 
     /// How this driver's rate control is bounded (`ConstantRate`).
     fn constant_rate(&self) -> ConstantRate {
+        if matches!(self.arm, Arm::H264(_)) && self.device.reencodes_against_its_buffer() {
+            return ConstantRate::Unchecked;
+        }
         if !self.device.starves_in_a_small_buffer() {
             return ConstantRate::Buffer;
         }
@@ -2202,6 +2255,7 @@ impl VaapiEncoder {
                     Some((seconds(RESET_BUFFER_S), seconds(RESET_FULLNESS_S)))
                 }
                 ConstantRate::Unbounded => None,
+                ConstantRate::Unchecked => Some((0, 0)),
             };
             if let Some((size, fullness)) = buffer {
                 let hrd = VAEncMiscParameterHRD {
@@ -2377,9 +2431,20 @@ impl VaapiEncoder {
         }
     }
 
+    /// Whether a dmabuf reaches the driver with its format modifier (`imports_prime2`): the
+    /// older descriptor carries none, and the driver takes the layout from what the kernel says
+    /// of the object, which is nothing for a buffer a client allocated with an explicit
+    /// modifier, such as the Y-tiled swapchain images of Mesa's Haswell Vulkan driver.
+    pub fn imports_modifiers(&self) -> bool {
+        self.imports_prime2
+    }
+
     /// A VA surface over a dmabuf: through the PRIME 2 descriptor, which carries the format
     /// modifier, else the older external-buffer one where it reads the buffer as laid out
-    /// (`legacy_descriptor_reads`).
+    /// (`legacy_descriptor_reads`). The PRIME 2 descriptor is tried only where the driver lists
+    /// it (`imports_prime2`): Intel's i965 lists it for no configuration, yet answers an import
+    /// through it with a new blank surface rather than an error, which a Haswell session encodes
+    /// as black frames; the older descriptor reads the buffer's tiling from the kernel there.
     fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> Result<VASurfaceID, String> {
         let api = self.device.api;
         let display = self.device.display;
@@ -2439,7 +2504,7 @@ impl VaapiEncoder {
         attribs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
         attribs[1].value.type_ = VAGenericValueTypePointer;
         let mut prime2 = None;
-        if modifier != DRM_FORMAT_MOD_INVALID {
+        if modifier != DRM_FORMAT_MOD_INVALID && self.imports_prime2 {
             let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
             desc.fourcc = fourcc;
             desc.width = width;
